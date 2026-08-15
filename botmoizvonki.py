@@ -10,7 +10,14 @@ from fastapi import FastAPI, Request
 
 app = FastAPI()
 
-a="sdfsd"
+a=""""
+
+cd ~/PycharmProjects/botmoizvonki
+git add .
+git commit -m "обновил бота"
+git push
+
+"""
 # -----------------------------
 # ENV
 # -----------------------------
