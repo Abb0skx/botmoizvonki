@@ -314,13 +314,15 @@ def stats():
                 ) AS total_duration,
 
                 AVG(
-                    CASE
-                        WHEN answered = 1
-                             AND answer_time > 0
-                             AND start_time > 0
-                        THEN answer_time - start_time
-                    END
-                ) AS avg_answer_delay
+AVG(
+    CASE
+        WHEN direction = 0
+             AND answered = 1
+             AND answer_time > 0
+             AND start_time > 0
+        THEN answer_time - start_time
+    END
+) AS avg_answer_delay
 
             FROM calls
             WHERE date(start_time, 'unixepoch', '+5 hours') =
