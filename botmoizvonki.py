@@ -165,10 +165,6 @@ def init_db():
             """
         )
 
-        # -------------------------------------------------
-        # Миграции старой базы
-        # -------------------------------------------------
-
         columns = {
             row["name"]
             for row in conn.execute(
@@ -197,10 +193,6 @@ def init_db():
         for column, sql in migrations.items():
             if column not in columns:
                 conn.execute(sql)
-
-        # -------------------------------------------------
-        # Нормализуем старые номера
-        # -------------------------------------------------
 
         old_rows = conn.execute(
             """
@@ -231,11 +223,6 @@ def init_db():
                 ),
             )
 
-        # -------------------------------------------------
-        # Старые записи не считаем
-        # "неотправленными" в Telegram
-        # -------------------------------------------------
-
         conn.execute(
             """
             UPDATE calls
@@ -243,10 +230,6 @@ def init_db():
             WHERE telegram_sent IS NULL
             """
         )
-
-        # -------------------------------------------------
-        # Индексы
-        # -------------------------------------------------
 
         conn.execute(
             """
@@ -293,17 +276,6 @@ init_db()
 def prepare_recording(
     recording_url: str,
 ):
-    """
-    Запись скачивается ОДИН раз.
-
-    Возвращает:
-
-    (
-        audio_duration_seconds | None,
-        voice_ogg_bytes | None
-    )
-    """
-
     if not recording_url:
         return None, None
 
@@ -324,21 +296,19 @@ def prepare_recording(
         return None, None
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        source_path = Path(
-            tmpdir
-        ) / "call_source"
+        source_path = (
+            Path(tmpdir)
+            / "call_source"
+        )
 
-        voice_path = Path(
-            tmpdir
-        ) / "call.ogg"
+        voice_path = (
+            Path(tmpdir)
+            / "call.ogg"
+        )
 
         source_path.write_bytes(
             response.content
         )
-
-        # -------------------------------------------------
-        # FFPROBE
-        # -------------------------------------------------
 
         audio_duration = None
 
@@ -348,17 +318,14 @@ def prepare_recording(
                     "ffprobe",
                     "-v",
                     "error",
-
                     "-show_entries",
                     "format=duration",
-
                     "-of",
                     (
                         "default="
                         "noprint_wrappers=1:"
                         "nokey=1"
                     ),
-
                     str(source_path),
                 ],
                 check=True,
@@ -388,10 +355,6 @@ def prepare_recording(
                 exc,
             )
 
-        # -------------------------------------------------
-        # FFMPEG -> Telegram Voice
-        # -------------------------------------------------
-
         voice_bytes = None
 
         try:
@@ -399,24 +362,17 @@ def prepare_recording(
                 [
                     "ffmpeg",
                     "-y",
-
                     "-i",
                     str(source_path),
-
                     "-vn",
-
                     "-c:a",
                     "libopus",
-
                     "-b:a",
                     "32k",
-
                     "-vbr",
                     "on",
-
                     "-application",
                     "voip",
-
                     str(voice_path),
                 ],
                 check=True,
@@ -445,14 +401,6 @@ def get_talk_duration(
     event: dict,
     audio_duration: int | None = None,
 ):
-    """
-    Приоритет:
-
-    1. Реальная длительность аудиозаписи.
-    2. end_time - answer_time.
-    3. duration от API.
-    """
-
     answered = int(
         event.get(
             "answered",
@@ -463,10 +411,6 @@ def get_talk_duration(
 
     if not answered:
         return 0, "none"
-
-    # -------------------------------------------------
-    # 1. AUDIO
-    # -------------------------------------------------
 
     if (
         audio_duration is not None
@@ -493,10 +437,6 @@ def get_talk_duration(
         or 0
     )
 
-    # -------------------------------------------------
-    # 2. TIMESTAMPS
-    # -------------------------------------------------
-
     if (
         answer_time > 0
         and end_time > answer_time
@@ -505,10 +445,6 @@ def get_talk_duration(
             end_time - answer_time,
             "timestamps",
         )
-
-    # -------------------------------------------------
-    # 3. API
-    # -------------------------------------------------
 
     api_duration = int(
         event.get(
@@ -595,25 +531,15 @@ def save_call(
             )
             VALUES (
                 ?, ?,
-
                 ?, ?, ?,
-
                 ?, ?,
-
                 ?, ?,
-
                 ?, ?, ?,
-
                 ?,
-
                 ?, ?, ?,
-
                 ?, ?, ?,
-
                 ?,
-
                 ?, ?,
-
                 0
             )
 
@@ -951,6 +877,10 @@ def build_telegram_message(
         "start_time"
     )
 
+    answer_time = event.get(
+        "answer_time"
+    )
+
     history = get_client_history(
         client_number
     )
@@ -992,14 +922,14 @@ def build_telegram_message(
             "⚠️ <b>Исходящий без ответа</b>"
         )
 
-    # -------------------------------------------------
-    # CLIENT
-    # -------------------------------------------------
-
     lines = [
         title,
         "",
     ]
+
+    # -------------------------------------------------
+    # CLIENT
+    # -------------------------------------------------
 
     if client_name:
         lines.append(
@@ -1007,13 +937,14 @@ def build_telegram_message(
             f"<b>{escape(str(client_name))}</b>"
         )
 
+    # Обычный номер, без <code>
     lines.append(
         "📞 "
-        f"<code>{escape(str(client_number or '—'))}</code>"
+        f"{escape(str(client_number or '—'))}"
     )
 
     # -------------------------------------------------
-    # NEW / REPEAT CLIENT
+    # CLIENT HISTORY
     # -------------------------------------------------
 
     if contacts <= 1:
@@ -1033,26 +964,32 @@ def build_telegram_message(
     # CALL DETAILS
     # -------------------------------------------------
 
-    lines.append(
-        "👨‍💼 "
-        f"{escape(str(manager or '—'))}"
-    )
-
-    lines.append(
-        "📲 "
-        f"{escape(str(sim or '—'))}"
-    )
-
-    lines.append(
-        "🕐 "
-        f"{format_call_time(start_time)}"
-    )
-
     if answered:
+        lines.append(
+            "🕐 Начало разговора: "
+            f"<b>{format_call_time(answer_time)}</b>"
+        )
+
         lines.append(
             "⏱ Разговор: "
             f"<b>{format_duration(talk_duration)}</b>"
         )
+
+    else:
+        lines.append(
+            "🕐 Время звонка: "
+            f"<b>{format_call_time(start_time)}</b>"
+        )
+
+    lines.append(
+        "👨‍💼 Менеджер: "
+        f"{escape(str(manager or '—'))}"
+    )
+
+    lines.append(
+        "📲 SIM: "
+        f"{escape(str(sim or '—'))}"
+    )
 
     return "\n".join(
         lines
@@ -2601,22 +2538,6 @@ tbody tr:last-child td {
         monospace;
 }
 
-.badge {
-    display: inline-block;
-    border-radius: 20px;
-    padding: 5px 9px;
-    font-size: 11px;
-    background: #282828;
-}
-
-.badge.good {
-    color: #a9e5b3;
-}
-
-.badge.bad {
-    color: #ff9d9d;
-}
-
 @media (max-width: 1000px) {
 
     .header {
@@ -3814,10 +3735,6 @@ async def moizvonki_webhook(
         "recording"
     )
 
-    # -------------------------------------------------
-    # Один раз скачиваем запись
-    # -------------------------------------------------
-
     audio_duration = None
     voice_bytes = None
 
@@ -3832,10 +3749,6 @@ async def moizvonki_webhook(
             recording
         )
 
-    # -------------------------------------------------
-    # Определяем реальную длительность
-    # -------------------------------------------------
-
     (
         talk_duration,
         duration_source,
@@ -3844,20 +3757,12 @@ async def moizvonki_webhook(
         audio_duration,
     )
 
-    # -------------------------------------------------
-    # Сохраняем
-    # -------------------------------------------------
-
     already_sent = save_call(
         webhook,
         event,
         talk_duration,
         duration_source,
     )
-
-    # -------------------------------------------------
-    # Защита от повторного webhook
-    # -------------------------------------------------
 
     if already_sent:
         print(
@@ -3872,19 +3777,11 @@ async def moizvonki_webhook(
             "duplicate": True,
         }
 
-    # -------------------------------------------------
-    # Telegram text
-    # -------------------------------------------------
-
     text = build_telegram_message(
         event,
         webhook,
         talk_duration,
     )
-
-    # -------------------------------------------------
-    # Telegram
-    # -------------------------------------------------
 
     try:
         if (
