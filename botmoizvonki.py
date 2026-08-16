@@ -106,16 +106,6 @@ def normalize_phone(
 def get_talk_duration(
     event: dict,
 ) -> int:
-    """
-    Реальная длительность разговора.
-
-    Для отвеченного звонка считаем:
-    end_time - answer_time.
-
-    duration от API используем только
-    как запасной вариант.
-    """
-
     answered = int(
         event.get(
             "answered",
@@ -126,6 +116,25 @@ def get_talk_duration(
 
     if not answered:
         return 0
+
+    recording = event.get(
+        "recording"
+    )
+
+    # 1. Самый надёжный источник —
+    # фактическая длина записи разговора
+    if recording:
+        audio_duration = (
+            get_audio_duration_seconds(
+                recording
+            )
+        )
+
+        if (
+            audio_duration is not None
+            and audio_duration >= 0
+        ):
+            return audio_duration
 
     answer_time = int(
         event.get(
@@ -143,6 +152,8 @@ def get_talk_duration(
         or 0
     )
 
+    # 2. Если запись недоступна —
+    # считаем по timestamps
     if (
         answer_time > 0
         and end_time > answer_time
@@ -152,6 +163,7 @@ def get_talk_duration(
             - answer_time
         )
 
+    # 3. Последний запасной вариант
     return int(
         event.get(
             "duration",
@@ -160,6 +172,74 @@ def get_talk_duration(
         or 0
     )
 
+def get_audio_duration_seconds(
+    recording_url: str,
+) -> int | None:
+    if not recording_url:
+        return None
+
+    try:
+        audio_response = requests.get(
+            recording_url,
+            timeout=60,
+        )
+
+        audio_response.raise_for_status()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_path = os.path.join(
+                tmpdir,
+                "call_source",
+            )
+
+            with open(
+                source_path,
+                "wb",
+            ) as file:
+                file.write(
+                    audio_response.content
+                )
+
+            result = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    source_path,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            value = result.stdout.strip()
+
+            if not value:
+                return None
+
+            duration = float(
+                value
+            )
+
+            if duration <= 0:
+                return None
+
+            return round(
+                duration
+            )
+
+    except Exception as exc:
+        print(
+            "AUDIO DURATION ERROR:",
+            exc,
+        )
+
+        return None
 
 def init_db():
     with connect_db() as conn:
