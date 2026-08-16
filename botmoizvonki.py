@@ -298,7 +298,29 @@ def stats():
                 SUM(CASE WHEN direction = 1 THEN 1 ELSE 0 END) AS outgoing,
 
                 SUM(CASE WHEN answered = 1 THEN 1 ELSE 0 END) AS answered,
-                SUM(CASE WHEN answered = 0 THEN 1 ELSE 0 END) AS missed
+                SUM(CASE WHEN answered = 0 THEN 1 ELSE 0 END) AS missed,
+
+                AVG(
+                    CASE
+                        WHEN answered = 1 THEN duration
+                    END
+                ) AS avg_duration,
+
+                SUM(
+                    CASE
+                        WHEN answered = 1 THEN duration
+                        ELSE 0
+                    END
+                ) AS total_duration,
+
+                AVG(
+                    CASE
+                        WHEN answered = 1
+                             AND answer_time > 0
+                             AND start_time > 0
+                        THEN answer_time - start_time
+                    END
+                ) AS avg_answer_delay
 
             FROM calls
             WHERE date(start_time, 'unixepoch', '+5 hours') =
@@ -306,14 +328,79 @@ def stats():
             """
         ).fetchone()
 
+        clients_row = conn.execute(
+            """
+            WITH today_clients AS (
+                SELECT DISTINCT client_number
+                FROM calls
+                WHERE date(start_time, 'unixepoch', '+5 hours') =
+                      date('now', '+5 hours')
+                  AND client_number IS NOT NULL
+                  AND client_number != ''
+            )
+
+            SELECT
+                SUM(
+                    CASE
+                        WHEN NOT EXISTS (
+                            SELECT 1
+                            FROM calls old_calls
+                            WHERE old_calls.client_number = today_clients.client_number
+                              AND date(
+                                  old_calls.start_time,
+                                  'unixepoch',
+                                  '+5 hours'
+                              ) < date('now', '+5 hours')
+                        )
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS new_clients,
+
+                SUM(
+                    CASE
+                        WHEN EXISTS (
+                            SELECT 1
+                            FROM calls old_calls
+                            WHERE old_calls.client_number = today_clients.client_number
+                              AND date(
+                                  old_calls.start_time,
+                                  'unixepoch',
+                                  '+5 hours'
+                              ) < date('now', '+5 hours')
+                        )
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS repeat_clients
+
+            FROM today_clients
+            """
+        ).fetchone()
+
     return {
         "today": {
             "calls": row["calls"] or 0,
             "unique_clients": row["unique_clients"] or 0,
+
             "incoming": row["incoming"] or 0,
             "outgoing": row["outgoing"] or 0,
+
             "answered": row["answered"] or 0,
             "missed": row["missed"] or 0,
+
+            "new_clients": clients_row["new_clients"] or 0,
+            "repeat_clients": clients_row["repeat_clients"] or 0,
+
+            "average_duration_seconds": round(
+                row["avg_duration"] or 0
+            ),
+
+            "total_duration_seconds": row["total_duration"] or 0,
+
+            "average_answer_delay_seconds": round(
+                row["avg_answer_delay"] or 0
+            ),
         }
     }
 
