@@ -402,13 +402,10 @@ def stats():
                     CASE
                         WHEN NOT EXISTS (
                             SELECT 1
-
                             FROM calls AS old_calls
-
                             WHERE
                                 old_calls.client_number =
                                 today_clients.client_number
-
                                 AND date(
                                     old_calls.start_time,
                                     'unixepoch',
@@ -429,13 +426,10 @@ def stats():
                     CASE
                         WHEN EXISTS (
                             SELECT 1
-
                             FROM calls AS old_calls
-
                             WHERE
                                 old_calls.client_number =
                                 today_clients.client_number
-
                                 AND date(
                                     old_calls.start_time,
                                     'unixepoch',
@@ -493,9 +487,7 @@ def stats():
                     CASE
                         WHEN EXISTS (
                             SELECT 1
-
                             FROM calls AS callback
-
                             WHERE
                                 callback.client_number =
                                 missed_clients.client_number
@@ -514,9 +506,7 @@ def stats():
                     CASE
                         WHEN NOT EXISTS (
                             SELECT 1
-
                             FROM calls AS callback
-
                             WHERE
                                 callback.client_number =
                                 missed_clients.client_number
@@ -696,12 +686,10 @@ def dashboard():
 
             .grid {
                 display: grid;
-
                 grid-template-columns: repeat(
                     auto-fit,
                     minmax(200px, 1fr)
                 );
-
                 gap: 16px;
             }
 
@@ -737,34 +725,43 @@ def dashboard():
 
             .chart-legend {
                 display: flex;
-                gap: 16px;
-                margin-bottom: 12px;
-                font-size: 13px;
-                color: #ddd;
+                gap: 18px;
+                margin-bottom: 18px;
             }
 
-            .chart-legend .muted {
-                opacity: 0.45;
+            .legend-btn {
+                border: 0;
+                background: transparent;
+                color: #777;
+                font-size: 14px;
+                font-weight: 600;
+                cursor: pointer;
+                padding: 0;
+            }
+
+            .legend-btn.active {
+                color: #fff;
             }
 
             .chart {
                 display: flex;
                 align-items: flex-end;
-                gap: 8px;
+                gap: 10px;
                 height: 260px;
                 overflow-x: auto;
                 padding-top: 20px;
             }
 
             .bar-wrap {
-                min-width: 42px;
+                min-width: 48px;
                 text-align: center;
             }
 
             .bar {
+                width: 100%;
                 min-height: 2px;
                 background: #d6b36a;
-                border-radius: 6px 6px 0 0;
+                border-radius: 7px 7px 0 0;
             }
 
             .bar-value {
@@ -778,7 +775,6 @@ def dashboard():
                 font-size: 11px;
             }
         </style>
-
     </head>
 
     <body>
@@ -793,111 +789,62 @@ def dashboard():
                 <div class="label">
                     Всего звонков
                 </div>
-
-                <div
-                    class="value"
-                    id="calls"
-                >
-                    —
-                </div>
+                <div class="value" id="calls">—</div>
             </div>
 
             <div class="card">
                 <div class="label">
                     Уникальные клиенты
                 </div>
-
-                <div
-                    class="value"
-                    id="unique_clients"
-                >
-                    —
-                </div>
+                <div class="value" id="unique_clients">—</div>
             </div>
 
             <div class="card">
                 <div class="label">
                     Входящие
                 </div>
-
-                <div
-                    class="value"
-                    id="incoming"
-                >
-                    —
-                </div>
+                <div class="value" id="incoming">—</div>
             </div>
 
             <div class="card">
                 <div class="label">
                     Исходящие
                 </div>
-
-                <div
-                    class="value"
-                    id="outgoing"
-                >
-                    —
-                </div>
+                <div class="value" id="outgoing">—</div>
             </div>
 
             <div class="card">
                 <div class="label">
                     Отвеченные
                 </div>
-
-                <div
-                    class="value"
-                    id="answered"
-                >
-                    —
-                </div>
+                <div class="value" id="answered">—</div>
             </div>
 
             <div class="card">
                 <div class="label">
                     Пропущенные
                 </div>
-
-                <div
-                    class="value"
-                    id="missed"
-                >
-                    —
-                </div>
+                <div class="value" id="missed">—</div>
             </div>
 
             <div class="card">
                 <div class="label">
                     Новые клиенты
                 </div>
-
-                <div
-                    class="value"
-                    id="new_clients"
-                >
-                    —
-                </div>
+                <div class="value" id="new_clients">—</div>
             </div>
 
             <div class="card">
                 <div class="label">
                     Повторные клиенты
                 </div>
-
-                <div
-                    class="value"
-                    id="repeat_clients"
-                >
-                    —
-                </div>
+                <div class="value" id="repeat_clients">—</div>
             </div>
 
             <div class="card">
                 <div class="label">
                     Не перезвонили
                 </div>
-
                 <div
                     class="value"
                     id="missed_not_called_back"
@@ -910,7 +857,6 @@ def dashboard():
                 <div class="label">
                     Средняя длительность
                 </div>
-
                 <div
                     class="value"
                     id="average_duration"
@@ -923,7 +869,6 @@ def dashboard():
                 <div class="label">
                     Общее время разговоров
                 </div>
-
                 <div
                     class="value"
                     id="total_duration"
@@ -936,7 +881,6 @@ def dashboard():
                 <div class="label">
                     Среднее время ответа
                 </div>
-
                 <div
                     class="value"
                     id="average_answer_delay"
@@ -954,13 +898,23 @@ def dashboard():
             </h2>
 
             <div class="chart-legend">
-                <span>
-                    Входящие
-                </span>
 
-                <span class="muted">
+                <button
+                    class="legend-btn active"
+                    id="show_incoming"
+                    type="button"
+                >
+                    Входящие
+                </button>
+
+                <button
+                    class="legend-btn"
+                    id="show_outgoing"
+                    type="button"
+                >
                     Исходящие
-                </span>
+                </button>
+
             </div>
 
             <div
@@ -971,6 +925,10 @@ def dashboard():
         </div>
 
         <script>
+
+            let chartMode = "incoming";
+            let hourlyData = [];
+
 
             function formatTime(seconds) {
                 seconds = Number(
@@ -1079,21 +1037,7 @@ def dashboard():
             }
 
 
-            async function loadHourlyChart() {
-                const response = await fetch(
-                    "/stats/hourly"
-                );
-
-                const data =
-                    await response.json();
-
-                const rows =
-                    data.today.filter(
-                        item =>
-                            item.hour >= 8 &&
-                            item.hour <= 22
-                    );
-
+            function renderHourlyChart() {
                 const chart =
                     document.getElementById(
                         "hourly_chart"
@@ -1101,14 +1045,29 @@ def dashboard():
 
                 chart.innerHTML = "";
 
-                const maxCalls = Math.max(
+                const rows =
+                    hourlyData.filter(
+                        item =>
+                            item.hour >= 8 &&
+                            item.hour <= 22
+                    );
+
+                const maxValue = Math.max(
                     ...rows.map(
-                        item => item.calls
+                        item =>
+                            chartMode === "incoming"
+                                ? item.incoming
+                                : item.outgoing
                     ),
                     1
                 );
 
                 for (const item of rows) {
+
+                    const currentValue =
+                        chartMode === "incoming"
+                            ? item.incoming
+                            : item.outgoing;
 
                     const wrap =
                         document.createElement(
@@ -1128,93 +1087,46 @@ def dashboard():
                         "bar-value";
 
                     value.textContent =
-                        item.calls;
+                        currentValue > 0
+                            ? currentValue
+                            : "";
 
 
-                    const bars =
+                    const bar =
                         document.createElement(
                             "div"
                         );
 
-                    bars.style.display =
-                        "flex";
-
-                    bars.style.alignItems =
-                        "flex-end";
-
-                    bars.style.gap =
-                        "3px";
-
-                    bars.style.height =
-                        "200px";
-
-
-                    const incomingBar =
-                        document.createElement(
-                            "div"
-                        );
-
-                    incomingBar.className =
+                    bar.className =
                         "bar";
 
-                    incomingBar.style.width =
-                        "48%";
-
-                    incomingBar.style.height =
+                    bar.style.height =
                         Math.max(
                             2,
                             Math.round(
                                 (
-                                    item.incoming /
-                                    maxCalls
+                                    currentValue /
+                                    maxValue
                                 ) * 200
                             )
                         ) + "px";
 
-                    incomingBar.title =
+                    if (
+                        chartMode === "outgoing"
+                    ) {
+                        bar.style.opacity =
+                            "0.55";
+                    }
+
+                    bar.title =
                         item.hour +
-                        ":00 — входящие: " +
-                        item.incoming;
-
-
-                    const outgoingBar =
-                        document.createElement(
-                            "div"
-                        );
-
-                    outgoingBar.className =
-                        "bar";
-
-                    outgoingBar.style.width =
-                        "48%";
-
-                    outgoingBar.style.opacity =
-                        "0.45";
-
-                    outgoingBar.style.height =
-                        Math.max(
-                            2,
-                            Math.round(
-                                (
-                                    item.outgoing /
-                                    maxCalls
-                                ) * 200
-                            )
-                        ) + "px";
-
-                    outgoingBar.title =
-                        item.hour +
-                        ":00 — исходящие: " +
-                        item.outgoing;
-
-
-                    bars.appendChild(
-                        incomingBar
-                    );
-
-                    bars.appendChild(
-                        outgoingBar
-                    );
+                        ":00 — " +
+                        (
+                            chartMode === "incoming"
+                                ? "входящие: "
+                                : "исходящие: "
+                        ) +
+                        currentValue;
 
 
                     const hour =
@@ -1240,7 +1152,7 @@ def dashboard():
                     );
 
                     wrap.appendChild(
-                        bars
+                        bar
                     );
 
                     wrap.appendChild(
@@ -1252,6 +1164,72 @@ def dashboard():
                     );
                 }
             }
+
+
+            async function loadHourlyChart() {
+                const response = await fetch(
+                    "/stats/hourly"
+                );
+
+                const data =
+                    await response.json();
+
+                hourlyData =
+                    data.today;
+
+                renderHourlyChart();
+            }
+
+
+            function setChartMode(mode) {
+                chartMode = mode;
+
+                const incomingButton =
+                    document.getElementById(
+                        "show_incoming"
+                    );
+
+                const outgoingButton =
+                    document.getElementById(
+                        "show_outgoing"
+                    );
+
+                incomingButton.classList.toggle(
+                    "active",
+                    mode === "incoming"
+                );
+
+                outgoingButton.classList.toggle(
+                    "active",
+                    mode === "outgoing"
+                );
+
+                renderHourlyChart();
+            }
+
+
+            document.getElementById(
+                "show_incoming"
+            ).addEventListener(
+                "click",
+                () => {
+                    setChartMode(
+                        "incoming"
+                    );
+                }
+            );
+
+
+            document.getElementById(
+                "show_outgoing"
+            ).addEventListener(
+                "click",
+                () => {
+                    setChartMode(
+                        "outgoing"
+                    );
+                }
+            );
 
 
             loadStats();
