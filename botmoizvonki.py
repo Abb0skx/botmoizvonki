@@ -681,7 +681,10 @@ def dashboard():
 
             .grid {
                 display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                grid-template-columns: repeat(
+                    auto-fit,
+                    minmax(200px, 1fr)
+                );
                 gap: 16px;
             }
 
@@ -702,67 +705,68 @@ def dashboard():
                 font-size: 32px;
                 font-weight: bold;
             }
-            
+
             .chart-card {
-    margin-top: 30px;
-    background: #1c1c1c;
-    border: 1px solid #333;
-    border-radius: 14px;
-    padding: 20px;
-}
+                margin-top: 30px;
+                background: #1c1c1c;
+                border: 1px solid #333;
+                border-radius: 14px;
+                padding: 20px;
+            }
 
-.chart-card h2 {
-    margin-top: 0;
-}
+            .chart-card h2 {
+                margin-top: 0;
+            }
 
-.chart {
-    display: flex;
-    align-items: flex-end;
-    gap: 8px;
-    height: 260px;
-    overflow-x: auto;
-    padding-top: 20px;
-}
+            .chart {
+                display: flex;
+                align-items: flex-end;
+                gap: 8px;
+                height: 260px;
+                overflow-x: auto;
+                padding-top: 20px;
+            }
 
-.bar-wrap {
-    min-width: 34px;
-    text-align: center;
-}
+            .bar-wrap {
+                min-width: 34px;
+                text-align: center;
+            }
 
-.bar {
-    width: 100%;
-    min-height: 2px;
-    background: #d6b36a;
-    border-radius: 6px 6px 0 0;
-}
+            .bar {
+                width: 100%;
+                min-height: 2px;
+                background: #d6b36a;
+                border-radius: 6px 6px 0 0;
+            }
 
-.bar-value {
-    font-size: 12px;
-    margin-bottom: 5px;
-}
+            .bar-value {
+                font-size: 12px;
+                margin-bottom: 5px;
+            }
 
-.bar-hour {
-    margin-top: 7px;
-    color: #999;
-    font-size: 11px;
-}
+            .bar-hour {
+                margin-top: 7px;
+                color: #999;
+                font-size: 11px;
+            }
         </style>
     </head>
 
     <body>
+
         <h1>Texnikach — статистика звонков</h1>
 
-        <div class="chart-card">
-    <h2>Звонки по часам</h2>
-    <div id="hourly_chart" class="chart"></div>
-</div>
+        <div class="grid">
+
             <div class="card">
                 <div class="label">Всего звонков</div>
                 <div class="value" id="calls">—</div>
             </div>
 
             <div class="card">
-                <div class="label">Уникальные клиенты</div>
+                <div class="label">
+                    Уникальные клиенты
+                </div>
                 <div class="value" id="unique_clients">—</div>
             </div>
 
@@ -792,79 +796,252 @@ def dashboard():
             </div>
 
             <div class="card">
-                <div class="label">Повторные клиенты</div>
+                <div class="label">
+                    Повторные клиенты
+                </div>
                 <div class="value" id="repeat_clients">—</div>
             </div>
 
             <div class="card">
                 <div class="label">Не перезвонили</div>
-                <div class="value" id="missed_not_called_back">—</div>
+                <div
+                    class="value"
+                    id="missed_not_called_back"
+                >
+                    —
+                </div>
             </div>
 
             <div class="card">
-                <div class="label">Средняя длительность</div>
-                <div class="value" id="average_duration">—</div>
+                <div class="label">
+                    Средняя длительность
+                </div>
+                <div
+                    class="value"
+                    id="average_duration"
+                >
+                    —
+                </div>
             </div>
 
             <div class="card">
-                <div class="label">Общее время разговоров</div>
-                <div class="value" id="total_duration">—</div>
+                <div class="label">
+                    Общее время разговоров
+                </div>
+                <div
+                    class="value"
+                    id="total_duration"
+                >
+                    —
+                </div>
             </div>
 
             <div class="card">
-                <div class="label">Среднее время ответа</div>
-                <div class="value" id="average_answer_delay">—</div>
+                <div class="label">
+                    Среднее время ответа
+                </div>
+                <div
+                    class="value"
+                    id="average_answer_delay"
+                >
+                    —
+                </div>
             </div>
+
+        </div>
+
+        <div class="chart-card">
+            <h2>Звонки по часам</h2>
+            <div
+                id="hourly_chart"
+                class="chart"
+            ></div>
         </div>
 
         <script>
             function formatTime(seconds) {
                 seconds = Number(seconds || 0);
 
-                const minutes = Math.floor(seconds / 60);
+                const minutes = Math.floor(
+                    seconds / 60
+                );
+
                 const secs = seconds % 60;
 
                 if (minutes === 0) {
                     return secs + " сек";
                 }
 
-                return minutes + " мин " + secs + " сек";
+                return (
+                    minutes +
+                    " мин " +
+                    secs +
+                    " сек"
+                );
             }
 
             async function loadStats() {
-                const response = await fetch("/stats");
+                const response = await fetch(
+                    "/stats"
+                );
+
                 const data = await response.json();
+
                 const s = data.today;
 
-                document.getElementById("calls").textContent = s.calls;
-                document.getElementById("unique_clients").textContent = s.unique_clients;
-                document.getElementById("incoming").textContent = s.incoming;
-                document.getElementById("outgoing").textContent = s.outgoing;
-                document.getElementById("answered").textContent = s.answered;
-                document.getElementById("missed").textContent = s.missed;
-                document.getElementById("new_clients").textContent = s.new_clients;
-                document.getElementById("repeat_clients").textContent = s.repeat_clients;
-                document.getElementById("missed_not_called_back").textContent =
+                document.getElementById(
+                    "calls"
+                ).textContent = s.calls;
+
+                document.getElementById(
+                    "unique_clients"
+                ).textContent =
+                    s.unique_clients;
+
+                document.getElementById(
+                    "incoming"
+                ).textContent =
+                    s.incoming;
+
+                document.getElementById(
+                    "outgoing"
+                ).textContent =
+                    s.outgoing;
+
+                document.getElementById(
+                    "answered"
+                ).textContent =
+                    s.answered;
+
+                document.getElementById(
+                    "missed"
+                ).textContent =
+                    s.missed;
+
+                document.getElementById(
+                    "new_clients"
+                ).textContent =
+                    s.new_clients;
+
+                document.getElementById(
+                    "repeat_clients"
+                ).textContent =
+                    s.repeat_clients;
+
+                document.getElementById(
+                    "missed_not_called_back"
+                ).textContent =
                     s.missed_not_called_back;
 
-                document.getElementById("average_duration").textContent =
-                    formatTime(s.average_duration_seconds);
+                document.getElementById(
+                    "average_duration"
+                ).textContent =
+                    formatTime(
+                        s.average_duration_seconds
+                    );
 
-                document.getElementById("total_duration").textContent =
-                    formatTime(s.total_duration_seconds);
+                document.getElementById(
+                    "total_duration"
+                ).textContent =
+                    formatTime(
+                        s.total_duration_seconds
+                    );
 
-                document.getElementById("average_answer_delay").textContent =
-                    formatTime(s.average_answer_delay_seconds);
+                document.getElementById(
+                    "average_answer_delay"
+                ).textContent =
+                    formatTime(
+                        s.average_answer_delay_seconds
+                    );
             }
+            
+            async function loadHourlyChart() {
+    const response = await fetch("/stats/hourly");
+    const data = await response.json();
+    const rows = data.today;
+
+    const chart = document.getElementById(
+        "hourly_chart"
+    );
+
+    chart.innerHTML = "";
+
+    const maxCalls = Math.max(
+        ...rows.map(item => item.calls),
+        1
+    );
+
+    for (const item of rows) {
+        const wrap = document.createElement(
+            "div"
+        );
+
+        wrap.className = "bar-wrap";
+
+        const value = document.createElement(
+            "div"
+        );
+
+        value.className = "bar-value";
+        value.textContent = item.calls;
+
+        const bar = document.createElement(
+            "div"
+        );
+
+        bar.className = "bar";
+
+        const height = Math.max(
+            2,
+            Math.round(
+                (item.calls / maxCalls) * 200
+            )
+        );
+
+        bar.style.height = height + "px";
+
+        bar.title =
+            item.hour +
+            ":00 — всего " +
+            item.calls +
+            ", входящих " +
+            item.incoming +
+            ", исходящих " +
+            item.outgoing;
+
+        const hour = document.createElement(
+            "div"
+        );
+
+        hour.className = "bar-hour";
+
+        hour.textContent =
+            String(item.hour).padStart(2, "0") +
+            ":00";
+
+        wrap.appendChild(value);
+        wrap.appendChild(bar);
+        wrap.appendChild(hour);
+
+        chart.appendChild(wrap);
+    }
+}
 
             loadStats();
+loadHourlyChart();
 
-            setInterval(loadStats, 30000);
+setInterval(
+    () => {
+        loadStats();
+        loadHourlyChart();
+    },
+    30000
+);
         </script>
+
     </body>
     </html>
     """
-
 # -----------------------------
 # MOIZVONKI WEBHOOK
 # -----------------------------
