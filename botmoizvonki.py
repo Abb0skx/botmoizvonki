@@ -3,6 +3,7 @@ import sqlite3
 import subprocess
 import tempfile
 from datetime import datetime, timedelta, timezone
+from html import escape
 from pathlib import Path
 
 import requests
@@ -10,6 +11,10 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
+
+# =========================================================
+# APP
+# =========================================================
 
 app = FastAPI()
 
@@ -49,6 +54,8 @@ DB_PATH.parent.mkdir(
     parents=True,
     exist_ok=True,
 )
+
+HTTP = requests.Session()
 
 print(
     "ENV EXISTS:",
@@ -92,7 +99,7 @@ def connect_db():
 
 def normalize_phone(
     phone: str | None,
-):
+) -> str:
     if not phone:
         return ""
 
@@ -102,144 +109,6 @@ def normalize_phone(
         if char.isdigit()
     )
 
-
-def get_talk_duration(
-    event: dict,
-) -> int:
-    answered = int(
-        event.get(
-            "answered",
-            0,
-        )
-        or 0
-    )
-
-    if not answered:
-        return 0
-
-    recording = event.get(
-        "recording"
-    )
-
-    # 1. Самый надёжный источник —
-    # фактическая длина записи разговора
-    if recording:
-        audio_duration = (
-            get_audio_duration_seconds(
-                recording
-            )
-        )
-
-        if (
-            audio_duration is not None
-            and audio_duration >= 0
-        ):
-            return audio_duration
-
-    answer_time = int(
-        event.get(
-            "answer_time",
-            0,
-        )
-        or 0
-    )
-
-    end_time = int(
-        event.get(
-            "end_time",
-            0,
-        )
-        or 0
-    )
-
-    # 2. Если запись недоступна —
-    # считаем по timestamps
-    if (
-        answer_time > 0
-        and end_time > answer_time
-    ):
-        return (
-            end_time
-            - answer_time
-        )
-
-    # 3. Последний запасной вариант
-    return int(
-        event.get(
-            "duration",
-            0,
-        )
-        or 0
-    )
-
-def get_audio_duration_seconds(
-    recording_url: str,
-) -> int | None:
-    if not recording_url:
-        return None
-
-    try:
-        audio_response = requests.get(
-            recording_url,
-            timeout=60,
-        )
-
-        audio_response.raise_for_status()
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            source_path = os.path.join(
-                tmpdir,
-                "call_source",
-            )
-
-            with open(
-                source_path,
-                "wb",
-            ) as file:
-                file.write(
-                    audio_response.content
-                )
-
-            result = subprocess.run(
-                [
-                    "ffprobe",
-                    "-v",
-                    "error",
-                    "-show_entries",
-                    "format=duration",
-                    "-of",
-                    "default=noprint_wrappers=1:nokey=1",
-                    source_path,
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-
-            value = result.stdout.strip()
-
-            if not value:
-                return None
-
-            duration = float(
-                value
-            )
-
-            if duration <= 0:
-                return None
-
-            return round(
-                duration
-            )
-
-    except Exception as exc:
-        print(
-            "AUDIO DURATION ERROR:",
-            exc,
-        )
-
-        return None
 
 def init_db():
     with connect_db() as conn:
@@ -280,11 +149,15 @@ def init_db():
                 end_time INTEGER,
 
                 duration INTEGER,
+                api_duration INTEGER,
+                duration_source TEXT,
 
                 recording TEXT,
 
                 account_id TEXT,
                 account_name TEXT,
+
+                telegram_sent INTEGER DEFAULT 0,
 
                 created_at TIMESTAMP
                     DEFAULT CURRENT_TIMESTAMP
@@ -292,9 +165,9 @@ def init_db():
             """
         )
 
-        # -----------------------------------------
-        # Миграция старой базы
-        # -----------------------------------------
+        # -------------------------------------------------
+        # Миграции старой базы
+        # -------------------------------------------------
 
         columns = {
             row["name"]
@@ -303,17 +176,31 @@ def init_db():
             ).fetchall()
         }
 
-        if "client_key" not in columns:
-            conn.execute(
-                """
-                ALTER TABLE calls
-                ADD COLUMN client_key TEXT
-                """
-            )
+        migrations = {
+            "client_key":
+                "ALTER TABLE calls "
+                "ADD COLUMN client_key TEXT",
 
-        # -----------------------------------------
-        # Нормализация старых телефонов
-        # -----------------------------------------
+            "api_duration":
+                "ALTER TABLE calls "
+                "ADD COLUMN api_duration INTEGER",
+
+            "duration_source":
+                "ALTER TABLE calls "
+                "ADD COLUMN duration_source TEXT",
+
+            "telegram_sent":
+                "ALTER TABLE calls "
+                "ADD COLUMN telegram_sent INTEGER DEFAULT 0",
+        }
+
+        for column, sql in migrations.items():
+            if column not in columns:
+                conn.execute(sql)
+
+        # -------------------------------------------------
+        # Нормализуем старые номера
+        # -------------------------------------------------
 
         old_rows = conn.execute(
             """
@@ -344,48 +231,22 @@ def init_db():
                 ),
             )
 
-        # -----------------------------------------
-        # Исправляем длительность старых звонков
-        #
-        # Для отвеченных звонков:
-        # duration = end_time - answer_time
-        # -----------------------------------------
+        # -------------------------------------------------
+        # Старые записи не считаем
+        # "неотправленными" в Telegram
+        # -------------------------------------------------
 
         conn.execute(
             """
             UPDATE calls
-
-            SET duration =
-                end_time - answer_time
-
-            WHERE
-                answered = 1
-
-                AND answer_time IS NOT NULL
-                AND end_time IS NOT NULL
-
-                AND answer_time > 0
-                AND end_time > answer_time
+            SET telegram_sent = 1
+            WHERE telegram_sent IS NULL
             """
         )
 
-        # -----------------------------------------
-        # Пропущенные не имеют разговора
-        # -----------------------------------------
-
-        conn.execute(
-            """
-            UPDATE calls
-
-            SET duration = 0
-
-            WHERE answered = 0
-            """
-        )
-
-        # -----------------------------------------
+        # -------------------------------------------------
         # Индексы
-        # -----------------------------------------
+        # -------------------------------------------------
 
         conn.execute(
             """
@@ -422,9 +283,256 @@ def init_db():
         conn.commit()
 
 
+init_db()
+
+
+# =========================================================
+# RECORDING
+# =========================================================
+
+def prepare_recording(
+    recording_url: str,
+):
+    """
+    Запись скачивается ОДИН раз.
+
+    Возвращает:
+
+    (
+        audio_duration_seconds | None,
+        voice_ogg_bytes | None
+    )
+    """
+
+    if not recording_url:
+        return None, None
+
+    try:
+        response = HTTP.get(
+            recording_url,
+            timeout=60,
+        )
+
+        response.raise_for_status()
+
+    except Exception as exc:
+        print(
+            "RECORDING DOWNLOAD ERROR:",
+            exc,
+        )
+
+        return None, None
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        source_path = Path(
+            tmpdir
+        ) / "call_source"
+
+        voice_path = Path(
+            tmpdir
+        ) / "call.ogg"
+
+        source_path.write_bytes(
+            response.content
+        )
+
+        # -------------------------------------------------
+        # FFPROBE
+        # -------------------------------------------------
+
+        audio_duration = None
+
+        try:
+            result = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+
+                    "-show_entries",
+                    "format=duration",
+
+                    "-of",
+                    (
+                        "default="
+                        "noprint_wrappers=1:"
+                        "nokey=1"
+                    ),
+
+                    str(source_path),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            value = (
+                result.stdout
+                .strip()
+            )
+
+            if value:
+                seconds = float(
+                    value
+                )
+
+                if seconds >= 0:
+                    audio_duration = round(
+                        seconds
+                    )
+
+        except Exception as exc:
+            print(
+                "FFPROBE ERROR:",
+                exc,
+            )
+
+        # -------------------------------------------------
+        # FFMPEG -> Telegram Voice
+        # -------------------------------------------------
+
+        voice_bytes = None
+
+        try:
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+
+                    "-i",
+                    str(source_path),
+
+                    "-vn",
+
+                    "-c:a",
+                    "libopus",
+
+                    "-b:a",
+                    "32k",
+
+                    "-vbr",
+                    "on",
+
+                    "-application",
+                    "voip",
+
+                    str(voice_path),
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=60,
+            )
+
+            voice_bytes = (
+                voice_path.read_bytes()
+            )
+
+        except Exception as exc:
+            print(
+                "FFMPEG ERROR:",
+                exc,
+            )
+
+        return (
+            audio_duration,
+            voice_bytes,
+        )
+
+
+def get_talk_duration(
+    event: dict,
+    audio_duration: int | None = None,
+):
+    """
+    Приоритет:
+
+    1. Реальная длительность аудиозаписи.
+    2. end_time - answer_time.
+    3. duration от API.
+    """
+
+    answered = int(
+        event.get(
+            "answered",
+            0,
+        )
+        or 0
+    )
+
+    if not answered:
+        return 0, "none"
+
+    # -------------------------------------------------
+    # 1. AUDIO
+    # -------------------------------------------------
+
+    if (
+        audio_duration is not None
+        and audio_duration >= 0
+    ):
+        return (
+            audio_duration,
+            "audio",
+        )
+
+    answer_time = int(
+        event.get(
+            "answer_time",
+            0,
+        )
+        or 0
+    )
+
+    end_time = int(
+        event.get(
+            "end_time",
+            0,
+        )
+        or 0
+    )
+
+    # -------------------------------------------------
+    # 2. TIMESTAMPS
+    # -------------------------------------------------
+
+    if (
+        answer_time > 0
+        and end_time > answer_time
+    ):
+        return (
+            end_time - answer_time,
+            "timestamps",
+        )
+
+    # -------------------------------------------------
+    # 3. API
+    # -------------------------------------------------
+
+    api_duration = int(
+        event.get(
+            "duration",
+            0,
+        )
+        or 0
+    )
+
+    return (
+        api_duration,
+        "api",
+    )
+
+
+# =========================================================
+# SAVE CALL
+# =========================================================
+
 def save_call(
     webhook: dict,
     event: dict,
+    talk_duration: int,
+    duration_source: str,
 ):
     client_number = event.get(
         "client_number"
@@ -434,14 +542,23 @@ def save_call(
         client_number
     )
 
-    talk_duration = get_talk_duration(
-        event
+    api_duration = int(
+        event.get(
+            "duration",
+            0,
+        )
+        or 0
+    )
+
+    db_call_id = event.get(
+        "db_call_id"
     )
 
     with connect_db() as conn:
+
         conn.execute(
             """
-            INSERT OR IGNORE INTO calls (
+            INSERT INTO calls (
                 db_call_id,
                 event_pbx_call_id,
 
@@ -466,11 +583,15 @@ def save_call(
                 end_time,
 
                 duration,
+                api_duration,
+                duration_source,
 
                 recording,
 
                 account_id,
-                account_name
+                account_name,
+
+                telegram_sent
             )
             VALUES (
                 ?, ?,
@@ -487,17 +608,71 @@ def save_call(
 
                 ?, ?, ?,
 
-                ?,
+                ?, ?, ?,
 
                 ?,
 
-                ?, ?
+                ?, ?,
+
+                0
             )
+
+            ON CONFLICT(db_call_id)
+            DO UPDATE SET
+
+                client_number =
+                    excluded.client_number,
+
+                client_key =
+                    excluded.client_key,
+
+                client_name =
+                    excluded.client_name,
+
+                direction =
+                    excluded.direction,
+
+                answered =
+                    excluded.answered,
+
+                user_id =
+                    excluded.user_id,
+
+                user_login =
+                    excluded.user_login,
+
+                src_number =
+                    excluded.src_number,
+
+                src_id =
+                    excluded.src_id,
+
+                src_slot =
+                    excluded.src_slot,
+
+                start_time =
+                    excluded.start_time,
+
+                answer_time =
+                    excluded.answer_time,
+
+                end_time =
+                    excluded.end_time,
+
+                duration =
+                    excluded.duration,
+
+                api_duration =
+                    excluded.api_duration,
+
+                duration_source =
+                    excluded.duration_source,
+
+                recording =
+                    excluded.recording
             """,
             (
-                event.get(
-                    "db_call_id"
-                ),
+                db_call_id,
 
                 event.get(
                     "event_pbx_call_id"
@@ -555,6 +730,8 @@ def save_call(
                 ),
 
                 talk_duration,
+                api_duration,
+                duration_source,
 
                 event.get(
                     "recording"
@@ -572,8 +749,383 @@ def save_call(
 
         conn.commit()
 
+        row = conn.execute(
+            """
+            SELECT
+                telegram_sent
 
-init_db()
+            FROM calls
+
+            WHERE db_call_id = ?
+            """,
+            (
+                db_call_id,
+            ),
+        ).fetchone()
+
+    return bool(
+        row
+        and row["telegram_sent"]
+    )
+
+
+def mark_telegram_sent(
+    db_call_id,
+):
+    if db_call_id is None:
+        return
+
+    with connect_db() as conn:
+        conn.execute(
+            """
+            UPDATE calls
+
+            SET telegram_sent = 1
+
+            WHERE db_call_id = ?
+            """,
+            (
+                db_call_id,
+            ),
+        )
+
+        conn.commit()
+
+
+# =========================================================
+# CLIENT HISTORY
+# =========================================================
+
+def get_client_history(
+    client_number: str,
+):
+    client_key = normalize_phone(
+        client_number
+    )
+
+    if not client_key:
+        return {
+            "calls_count": 0,
+            "first_contact": None,
+            "last_contact": None,
+        }
+
+    with connect_db() as conn:
+        row = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS calls_count,
+
+                MIN(start_time)
+                    AS first_contact,
+
+                MAX(start_time)
+                    AS last_contact
+
+            FROM calls
+
+            WHERE client_key = ?
+            """,
+            (
+                client_key,
+            ),
+        ).fetchone()
+
+    return {
+        "calls_count":
+            row["calls_count"]
+            or 0,
+
+        "first_contact":
+            row["first_contact"],
+
+        "last_contact":
+            row["last_contact"],
+    }
+
+
+# =========================================================
+# FORMATTERS
+# =========================================================
+
+def format_duration(
+    seconds: int,
+):
+    seconds = int(
+        seconds or 0
+    )
+
+    hours, remainder = divmod(
+        seconds,
+        3600,
+    )
+
+    minutes, secs = divmod(
+        remainder,
+        60,
+    )
+
+    if hours:
+        if minutes:
+            return (
+                f"{hours} ч "
+                f"{minutes} мин"
+            )
+
+        return (
+            f"{hours} ч"
+        )
+
+    if minutes:
+        if secs:
+            return (
+                f"{minutes} мин "
+                f"{secs} сек"
+            )
+
+        return (
+            f"{minutes} мин"
+        )
+
+    return (
+        f"{secs} сек"
+    )
+
+
+def format_call_time(
+    timestamp,
+):
+    if not timestamp:
+        return "—"
+
+    return datetime.fromtimestamp(
+        int(timestamp),
+        UZ_TZ,
+    ).strftime(
+        "%H:%M"
+    )
+
+
+# =========================================================
+# TELEGRAM MESSAGE
+# =========================================================
+
+def build_telegram_message(
+    event: dict,
+    webhook: dict,
+    talk_duration: int,
+):
+    direction = event.get(
+        "direction"
+    )
+
+    answered = int(
+        event.get(
+            "answered",
+            0,
+        )
+        or 0
+    )
+
+    client_number = event.get(
+        "client_number",
+        "",
+    )
+
+    client_name = event.get(
+        "client_name",
+        "",
+    )
+
+    manager = webhook.get(
+        "user_login",
+        "",
+    )
+
+    sim = event.get(
+        "src_number",
+        "",
+    )
+
+    start_time = event.get(
+        "start_time"
+    )
+
+    history = get_client_history(
+        client_number
+    )
+
+    contacts = history[
+        "calls_count"
+    ]
+
+    # -------------------------------------------------
+    # TITLE
+    # -------------------------------------------------
+
+    if (
+        direction == 0
+        and answered
+    ):
+        title = (
+            "📥 <b>Входящий звонок</b>"
+        )
+
+    elif (
+        direction == 0
+        and not answered
+    ):
+        title = (
+            "❌ <b>Пропущенный звонок</b>"
+        )
+
+    elif (
+        direction == 1
+        and answered
+    ):
+        title = (
+            "📤 <b>Исходящий звонок</b>"
+        )
+
+    else:
+        title = (
+            "⚠️ <b>Исходящий без ответа</b>"
+        )
+
+    # -------------------------------------------------
+    # CLIENT
+    # -------------------------------------------------
+
+    lines = [
+        title,
+        "",
+    ]
+
+    if client_name:
+        lines.append(
+            "👤 "
+            f"<b>{escape(str(client_name))}</b>"
+        )
+
+    lines.append(
+        "📞 "
+        f"<code>{escape(str(client_number or '—'))}</code>"
+    )
+
+    # -------------------------------------------------
+    # NEW / REPEAT CLIENT
+    # -------------------------------------------------
+
+    if contacts <= 1:
+        lines.append(
+            "🆕 Новый клиент"
+        )
+
+    else:
+        lines.append(
+            "🔁 "
+            f"Контактов с номером: <b>{contacts}</b>"
+        )
+
+    lines.append("")
+
+    # -------------------------------------------------
+    # CALL DETAILS
+    # -------------------------------------------------
+
+    lines.append(
+        "👨‍💼 "
+        f"{escape(str(manager or '—'))}"
+    )
+
+    lines.append(
+        "📲 "
+        f"{escape(str(sim or '—'))}"
+    )
+
+    lines.append(
+        "🕐 "
+        f"{format_call_time(start_time)}"
+    )
+
+    if answered:
+        lines.append(
+            "⏱ Разговор: "
+            f"<b>{format_duration(talk_duration)}</b>"
+        )
+
+    return "\n".join(
+        lines
+    )
+
+
+# =========================================================
+# TELEGRAM SEND
+# =========================================================
+
+def send_text_message(
+    text: str,
+):
+    url = (
+        "https://api.telegram.org/"
+        f"bot{TELEGRAM_BOT_TOKEN}/"
+        "sendMessage"
+    )
+
+    response = HTTP.post(
+        url,
+        data={
+            "chat_id":
+                TELEGRAM_CHAT_ID,
+
+            "text":
+                text,
+
+            "parse_mode":
+                "HTML",
+
+            "disable_web_page_preview":
+                True,
+        },
+        timeout=30,
+    )
+
+    response.raise_for_status()
+
+
+def send_voice_bytes(
+    voice_bytes: bytes,
+    caption: str,
+):
+    url = (
+        "https://api.telegram.org/"
+        f"bot{TELEGRAM_BOT_TOKEN}/"
+        "sendVoice"
+    )
+
+    response = HTTP.post(
+        url,
+        data={
+            "chat_id":
+                TELEGRAM_CHAT_ID,
+
+            "caption":
+                caption,
+
+            "parse_mode":
+                "HTML",
+        },
+        files={
+            "voice": (
+                "call.ogg",
+                voice_bytes,
+                "audio/ogg",
+            )
+        },
+        timeout=60,
+    )
+
+    response.raise_for_status()
 
 
 # =========================================================
@@ -604,11 +1156,9 @@ def get_period(
     date_from: str | None = None,
     date_to: str | None = None,
 ):
-    now = datetime.now(
+    today = datetime.now(
         UZ_TZ
-    )
-
-    today = now.date()
+    ).date()
 
     if period == "today":
         start_date = today
@@ -673,7 +1223,8 @@ def get_period(
             )
 
         if (
-            end_date - start_date
+            end_date
+            - start_date
         ).days > 366:
             raise HTTPException(
                 status_code=400,
@@ -685,7 +1236,7 @@ def get_period(
 
         label = (
             f"{start_date.strftime('%d.%m.%Y')}"
-            f" — "
+            " — "
             f"{end_date.strftime('%d.%m.%Y')}"
         )
 
@@ -712,19 +1263,6 @@ def get_period(
         + timedelta(days=1)
     )
 
-    start_ts = int(
-        start_dt.timestamp()
-    )
-
-    end_ts = int(
-        end_dt.timestamp()
-    )
-
-    days = (
-        end_date
-        - start_date
-    ).days + 1
-
     return {
         "period":
             period,
@@ -739,142 +1277,21 @@ def get_period(
             end_date.isoformat(),
 
         "start_ts":
-            start_ts,
+            int(
+                start_dt.timestamp()
+            ),
 
         "end_ts":
-            end_ts,
+            int(
+                end_dt.timestamp()
+            ),
 
         "days":
-            days,
+            (
+                end_date
+                - start_date
+            ).days + 1,
     }
-
-
-# =========================================================
-# TELEGRAM
-# =========================================================
-
-def send_text_message(
-    text: str,
-):
-    url = (
-        "https://api.telegram.org/"
-        f"bot{TELEGRAM_BOT_TOKEN}/"
-        "sendMessage"
-    )
-
-    response = requests.post(
-        url,
-        data={
-            "chat_id":
-                TELEGRAM_CHAT_ID,
-
-            "text":
-                text,
-
-            "parse_mode":
-                "HTML",
-
-            "disable_web_page_preview":
-                True,
-        },
-        timeout=30,
-    )
-
-    response.raise_for_status()
-
-
-def send_as_voice(
-    recording_url: str,
-    caption: str,
-):
-    audio_response = requests.get(
-        recording_url,
-        timeout=60,
-    )
-
-    audio_response.raise_for_status()
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        source_path = os.path.join(
-            tmpdir,
-            "call_source",
-        )
-
-        voice_path = os.path.join(
-            tmpdir,
-            "call.ogg",
-        )
-
-        with open(
-            source_path,
-            "wb",
-        ) as file:
-            file.write(
-                audio_response.content
-            )
-
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-
-                "-i",
-                source_path,
-
-                "-vn",
-
-                "-c:a",
-                "libopus",
-
-                "-b:a",
-                "32k",
-
-                "-vbr",
-                "on",
-
-                "-application",
-                "voip",
-
-                voice_path,
-            ],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-        url = (
-            "https://api.telegram.org/"
-            f"bot{TELEGRAM_BOT_TOKEN}/"
-            "sendVoice"
-        )
-
-        with open(
-            voice_path,
-            "rb",
-        ) as voice:
-            response = requests.post(
-                url,
-                data={
-                    "chat_id":
-                        TELEGRAM_CHAT_ID,
-
-                    "caption":
-                        caption,
-
-                    "parse_mode":
-                        "HTML",
-                },
-                files={
-                    "voice": (
-                        "call.ogg",
-                        voice,
-                        "audio/ogg",
-                    )
-                },
-                timeout=60,
-            )
-
-        response.raise_for_status()
 
 
 # =========================================================
@@ -908,7 +1325,6 @@ def stats(
     end_ts = p["end_ts"]
 
     with connect_db() as conn:
-
         row = conn.execute(
             """
             SELECT
@@ -948,11 +1364,30 @@ def stats(
 
                 SUM(
                     CASE
-                        WHEN answered = 0
+                        WHEN direction = 0
+                             AND answered = 0
                         THEN 1
                         ELSE 0
                     END
                 ) AS missed,
+
+                SUM(
+                    CASE
+                        WHEN direction = 1
+                             AND answered = 0
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS unanswered_outgoing,
+
+                SUM(
+                    CASE
+                        WHEN direction = 0
+                             AND answered = 1
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS incoming_answered,
 
                 AVG(
                     CASE
@@ -1060,6 +1495,7 @@ def stats(
             WITH missed_clients AS (
                 SELECT
                     client_key,
+
                     MIN(start_time)
                         AS first_missed_time
 
@@ -1132,24 +1568,24 @@ def stats(
             ),
         ).fetchone()
 
-    answered = (
-        row["answered"]
+    incoming = (
+        row["incoming"]
         or 0
     )
 
-    calls = (
-        row["calls"]
+    incoming_answered = (
+        row["incoming_answered"]
         or 0
     )
 
     answer_rate = (
         round(
-            answered
-            / calls
+            incoming_answered
+            / incoming
             * 100,
             1,
         )
-        if calls
+        if incoming
         else 0
     )
 
@@ -1173,25 +1609,30 @@ def stats(
 
         "stats": {
             "calls":
-                calls,
+                row["calls"]
+                or 0,
 
             "unique_clients":
                 row["unique_clients"]
                 or 0,
 
             "incoming":
-                row["incoming"]
-                or 0,
+                incoming,
 
             "outgoing":
                 row["outgoing"]
                 or 0,
 
             "answered":
-                answered,
+                row["answered"]
+                or 0,
 
             "missed":
                 row["missed"]
+                or 0,
+
+            "unanswered_outgoing":
+                row["unanswered_outgoing"]
                 or 0,
 
             "answer_rate":
@@ -1311,7 +1752,8 @@ def stats_timeline(
             ).fetchall()
 
             by_hour = {
-                row["bucket"]: row
+                row["bucket"]:
+                    row
                 for row in rows
             }
 
@@ -1397,7 +1839,8 @@ def stats_timeline(
             ).fetchall()
 
             by_date = {
-                row["bucket"]: row
+                row["bucket"]:
+                    row
                 for row in rows
             }
 
@@ -1412,7 +1855,9 @@ def stats_timeline(
             )
 
             while current <= last:
-                key = current.isoformat()
+                key = (
+                    current.isoformat()
+                )
 
                 row = by_date.get(
                     key
@@ -1524,15 +1969,8 @@ def stats_managers(
 
                 SUM(
                     CASE
-                        WHEN answered = 1
-                        THEN 1
-                        ELSE 0
-                    END
-                ) AS answered,
-
-                SUM(
-                    CASE
-                        WHEN answered = 0
+                        WHEN direction = 0
+                             AND answered = 0
                         THEN 1
                         ELSE 0
                     END
@@ -1540,29 +1978,20 @@ def stats_managers(
 
                 SUM(
                     CASE
+                        WHEN direction = 0
+                             AND answered = 1
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS incoming_answered,
+
+                SUM(
+                    CASE
                         WHEN answered = 1
                         THEN duration
                         ELSE 0
                     END
-                ) AS total_duration,
-
-                AVG(
-                    CASE
-                        WHEN answered = 1
-                        THEN duration
-                    END
-                ) AS avg_duration,
-
-                AVG(
-                    CASE
-                        WHEN direction = 0
-                             AND answered = 1
-                             AND answer_time > start_time
-                        THEN
-                            answer_time
-                            - start_time
-                    END
-                ) AS avg_answer_delay
+                ) AS total_duration
 
             FROM calls
 
@@ -1580,77 +2009,64 @@ def stats_managers(
             ),
         ).fetchall()
 
-    result = []
+    results = []
 
     for row in rows:
-        calls = (
-            row["calls"]
+        incoming = (
+            row["incoming"]
             or 0
         )
 
-        answered = (
-            row["answered"]
+        incoming_answered = (
+            row["incoming_answered"]
             or 0
         )
 
-        result.append(
+        results.append(
             {
                 "manager":
                     row["manager"],
 
                 "calls":
-                    calls,
+                    row["calls"]
+                    or 0,
 
                 "unique_clients":
                     row["unique_clients"]
                     or 0,
 
                 "incoming":
-                    row["incoming"]
-                    or 0,
+                    incoming,
 
                 "outgoing":
                     row["outgoing"]
                     or 0,
-
-                "answered":
-                    answered,
 
                 "missed":
                     row["missed"]
                     or 0,
 
                 "answer_rate":
-                    round(
-                        answered
-                        / calls
-                        * 100,
-                        1,
-                    )
-                    if calls
-                    else 0,
+                    (
+                        round(
+                            incoming_answered
+                            / incoming
+                            * 100,
+                            1,
+                        )
+                        if incoming
+                        else 0
+                    ),
 
                 "total_duration_seconds":
                     row["total_duration"]
                     or 0,
-
-                "average_duration_seconds":
-                    round(
-                        row["avg_duration"]
-                        or 0
-                    ),
-
-                "average_answer_delay_seconds":
-                    round(
-                        row["avg_answer_delay"]
-                        or 0
-                    ),
             }
         )
 
     return {
         "results":
-            result
+            results
     }
 
 
@@ -1713,15 +2129,8 @@ def stats_sims(
 
                 SUM(
                     CASE
-                        WHEN answered = 1
-                        THEN 1
-                        ELSE 0
-                    END
-                ) AS answered,
-
-                SUM(
-                    CASE
-                        WHEN answered = 0
+                        WHEN direction = 0
+                             AND answered = 0
                         THEN 1
                         ELSE 0
                     END
@@ -1778,10 +2187,6 @@ def stats_sims(
                     row["outgoing"]
                     or 0,
 
-                "answered":
-                    row["answered"]
-                    or 0,
-
                 "missed":
                     row["missed"]
                     or 0,
@@ -1796,7 +2201,7 @@ def stats_sims(
 
 
 # =========================================================
-# RECENT CALLS
+# RECENT
 # =========================================================
 
 @app.get("/stats/recent")
@@ -1837,10 +2242,8 @@ def stats_recent(
                 src_number,
 
                 start_time,
-                answer_time,
-                end_time,
-
-                duration
+                duration,
+                duration_source
 
             FROM calls
 
@@ -1867,19 +2270,16 @@ def stats_recent(
             or 0
         )
 
-        if start_time:
-            local_time = (
-                datetime.fromtimestamp(
-                    start_time,
-                    UZ_TZ,
-                )
-                .strftime(
-                    "%d.%m.%Y %H:%M"
-                )
+        local_time = (
+            datetime.fromtimestamp(
+                start_time,
+                UZ_TZ,
+            ).strftime(
+                "%d.%m.%Y %H:%M"
             )
-
-        else:
-            local_time = "—"
+            if start_time
+            else "—"
+        )
 
         results.append(
             {
@@ -1912,15 +2312,16 @@ def stats_recent(
                     row["src_number"]
                     or "—",
 
-                "start_time":
-                    start_time,
-
                 "local_time":
                     local_time,
 
                 "duration":
                     row["duration"]
                     or 0,
+
+                "duration_source":
+                    row["duration_source"]
+                    or "legacy",
             }
         )
 
@@ -1941,7 +2342,6 @@ def stats_recent(
 def dashboard():
     return """
 <!DOCTYPE html>
-
 <html lang="ru">
 
 <head>
@@ -2010,7 +2410,7 @@ body {
 .apply-btn {
     appearance: none;
     border: 1px solid #333;
-    border-radius: 9px;
+    border-radius: 10px;
     background: #1b1b1b;
     color: #999;
     padding: 10px 14px;
@@ -2031,7 +2431,7 @@ body {
     padding: 16px;
     background: #1b1b1b;
     border: 1px solid #333;
-    border-radius: 12px;
+    border-radius: 14px;
     gap: 10px;
     align-items: center;
     flex-wrap: wrap;
@@ -2069,7 +2469,7 @@ body {
 .panel {
     background: #1b1b1b;
     border: 1px solid #333;
-    border-radius: 14px;
+    border-radius: 16px;
 }
 
 .card {
@@ -2119,10 +2519,7 @@ body {
     gap: 9px;
     min-height: 280px;
     overflow-x: auto;
-    padding:
-        30px
-        4px
-        0;
+    padding: 30px 4px 0;
 }
 
 .bar-wrap {
@@ -2143,8 +2540,7 @@ body {
     min-height: 2px;
     margin: 0 auto;
     background: #d9b565;
-    border-radius: 7px 7px 0 0;
-    transition: height .2s ease;
+    border-radius: 8px 8px 2px 2px;
 }
 
 .bar.outgoing {
@@ -2221,9 +2617,8 @@ tbody tr:last-child td {
     color: #ff9d9d;
 }
 
-@media (
-    max-width: 1000px
-) {
+@media (max-width: 1000px) {
+
     .header {
         flex-direction: column;
     }
@@ -2233,9 +2628,8 @@ tbody tr:last-child td {
     }
 }
 
-@media (
-    max-width: 600px
-) {
+@media (max-width: 600px) {
+
     .container {
         padding: 14px;
     }
@@ -2250,6 +2644,7 @@ tbody tr:last-child td {
                 2,
                 minmax(0, 1fr)
             );
+
         gap: 10px;
     }
 
@@ -2333,6 +2728,7 @@ tbody tr:last-child td {
 
     </div>
 
+
     <div
         class="custom-panel"
         id="custom_panel"
@@ -2365,107 +2761,77 @@ tbody tr:last-child td {
     <div class="grid">
 
         <div class="card">
-            <div class="label">
-                Всего звонков
-            </div>
+            <div class="label">Всего звонков</div>
             <div class="value" id="calls">—</div>
         </div>
 
         <div class="card">
-            <div class="label">
-                Уникальные клиенты
-            </div>
+            <div class="label">Уникальные клиенты</div>
             <div class="value" id="unique_clients">—</div>
         </div>
 
         <div class="card">
-            <div class="label">
-                Входящие
-            </div>
+            <div class="label">Входящие</div>
             <div class="value" id="incoming">—</div>
         </div>
 
         <div class="card">
-            <div class="label">
-                Исходящие
-            </div>
+            <div class="label">Исходящие</div>
             <div class="value" id="outgoing">—</div>
         </div>
 
         <div class="card">
-            <div class="label">
-                Отвеченные
-            </div>
+            <div class="label">Отвеченные</div>
             <div class="value" id="answered">—</div>
         </div>
 
         <div class="card">
-            <div class="label">
-                Пропущенные
-            </div>
+            <div class="label">Пропущенные входящие</div>
             <div class="value" id="missed">—</div>
         </div>
 
         <div class="card">
-            <div class="label">
-                Ответили, %
-            </div>
+            <div class="label">Ответили на входящие</div>
             <div class="value" id="answer_rate">—</div>
         </div>
 
         <div class="card">
-            <div class="label">
-                Новые клиенты
-            </div>
+            <div class="label">Новые клиенты</div>
             <div class="value" id="new_clients">—</div>
         </div>
 
         <div class="card">
-            <div class="label">
-                Повторные клиенты
-            </div>
+            <div class="label">Повторные клиенты</div>
             <div class="value" id="repeat_clients">—</div>
         </div>
 
         <div class="card">
-            <div class="label">
-                Уникально пропущено
-            </div>
+            <div class="label">Уникально пропущено</div>
             <div class="value" id="unique_missed_clients">—</div>
         </div>
 
         <div class="card">
-            <div class="label">
-                Потом перезвонили
-            </div>
+            <div class="label">Потом перезвонили</div>
             <div class="value" id="missed_called_back">—</div>
         </div>
 
         <div class="card">
-            <div class="label">
-                Не перезвонили
-            </div>
+            <div class="label">Не перезвонили</div>
             <div class="value" id="missed_not_called_back">—</div>
         </div>
 
         <div class="card">
-            <div class="label">
-                Средний разговор
-            </div>
+            <div class="label">Средний разговор</div>
             <div class="value" id="average_duration">—</div>
         </div>
 
         <div class="card">
-            <div class="label">
-                Общее время разговоров
-            </div>
+            <div class="label">Общее время разговоров</div>
             <div class="value" id="total_duration">—</div>
         </div>
 
         <div class="card">
-            <div class="label">
-                Среднее время ответа
-            </div>
+            <div class="label">Среднее время ответа</div>
             <div class="value" id="average_answer_delay">—</div>
         </div>
 
@@ -2605,7 +2971,7 @@ tbody tr:last-child td {
                     <th>Статус</th>
                     <th>Менеджер</th>
                     <th>SIM</th>
-                    <th>Длительность</th>
+                    <th>Разговор</th>
                 </tr>
                 </thead>
 
@@ -2657,35 +3023,21 @@ function formatDuration(seconds) {
 
     if (hours > 0) {
 
-        if (minutes > 0) {
-            return (
-                hours +
-                " ч " +
-                minutes +
-                " мин"
-            );
-        }
-
         return (
             hours +
-            " ч"
+            " ч " +
+            minutes +
+            " мин"
         );
     }
 
     if (minutes > 0) {
 
-        if (secs > 0) {
-            return (
-                minutes +
-                " мин " +
-                secs +
-                " сек"
-            );
-        }
-
         return (
             minutes +
-            " мин"
+            " мин " +
+            secs +
+            " сек"
         );
     }
 
@@ -2709,6 +3061,7 @@ function queryString() {
     if (
         selectedPeriod === "custom"
     ) {
+
         params.set(
             "date_from",
             customFrom
@@ -2736,11 +3089,8 @@ async function getJson(url) {
 
     if (!response.ok) {
 
-        const text =
-            await response.text();
-
         throw new Error(
-            text
+            await response.text()
         );
     }
 
@@ -2915,109 +3265,100 @@ function renderTimeline() {
             1
         );
 
-    for (
-        let i = 0;
-        i < timelineData.length;
-        i++
-    ) {
+    timelineData.forEach(
+        (
+            item,
+            index
+        ) => {
 
-        const item =
-            timelineData[i];
+            const value =
+                values[index];
 
-        const value =
-            values[i];
+            const wrap =
+                document.createElement(
+                    "div"
+                );
 
-        const wrap =
-            document.createElement(
-                "div"
-            );
-
-        wrap.className =
-            "bar-wrap";
+            wrap.className =
+                "bar-wrap";
 
 
-        const valueText =
-            document.createElement(
-                "div"
-            );
+            const valueText =
+                document.createElement(
+                    "div"
+                );
 
-        valueText.className =
-            "bar-value";
+            valueText.className =
+                "bar-value";
 
-        valueText.textContent =
-            value > 0
-                ? value
-                : "";
+            valueText.textContent =
+                value > 0
+                    ? value
+                    : "";
 
 
-        const bar =
-            document.createElement(
-                "div"
-            );
+            const bar =
+                document.createElement(
+                    "div"
+                );
 
-        bar.className =
-            "bar";
+            bar.className =
+                "bar";
 
-        if (
-            chartMode ===
-            "outgoing"
-        ) {
-            bar.classList.add(
+            if (
+                chartMode ===
                 "outgoing"
-            );
-        }
+            ) {
+                bar.classList.add(
+                    "outgoing"
+                );
+            }
 
-        bar.style.height =
-            Math.max(
-                2,
-                Math.round(
-                    (
-                        value /
-                        maxValue
+            bar.style.height =
+                Math.max(
+                    2,
+
+                    Math.round(
+                        (
+                            value
+                            / maxValue
+                        )
+                        * 210
                     )
-                    * 210
                 )
-            )
-            + "px";
-
-        bar.title =
-            item.label +
-            " — всего: " +
-            item.calls +
-            ", входящие: " +
-            item.incoming +
-            ", исходящие: " +
-            item.outgoing;
+                + "px";
 
 
-        const label =
-            document.createElement(
-                "div"
+            const label =
+                document.createElement(
+                    "div"
+                );
+
+            label.className =
+                "bar-label";
+
+            label.textContent =
+                item.label;
+
+
+            wrap.appendChild(
+                valueText
             );
 
-        label.className =
-            "bar-label";
+            wrap.appendChild(
+                bar
+            );
 
-        label.textContent =
-            item.label;
+            wrap.appendChild(
+                label
+            );
 
+            chart.appendChild(
+                wrap
+            );
 
-        wrap.appendChild(
-            valueText
-        );
-
-        wrap.appendChild(
-            bar
-        );
-
-        wrap.appendChild(
-            label
-        );
-
-        chart.appendChild(
-            wrap
-        );
-    }
+        }
+    );
 }
 
 
@@ -3035,51 +3376,51 @@ async function loadManagers() {
 
     body.innerHTML = "";
 
-    for (
-        const row
-        of data.results
-    ) {
+    data.results.forEach(
+        row => {
 
-        const tr =
-            document.createElement(
-                "tr"
-            );
-
-        const values = [
-            row.manager,
-            row.calls,
-            row.unique_clients,
-            row.incoming,
-            row.outgoing,
-            row.missed,
-            row.answer_rate + "%",
-            formatDuration(
-                row.total_duration_seconds
-            ),
-        ];
-
-        for (
-            const value
-            of values
-        ) {
-
-            const td =
+            const tr =
                 document.createElement(
-                    "td"
+                    "tr"
                 );
 
-            td.textContent =
-                value;
+            const values = [
+                row.manager,
+                row.calls,
+                row.unique_clients,
+                row.incoming,
+                row.outgoing,
+                row.missed,
+                row.answer_rate + "%",
+                formatDuration(
+                    row.total_duration_seconds
+                ),
+            ];
 
-            tr.appendChild(
-                td
+            values.forEach(
+                value => {
+
+                    const td =
+                        document.createElement(
+                            "td"
+                        );
+
+                    td.textContent =
+                        value;
+
+                    tr.appendChild(
+                        td
+                    );
+
+                }
             );
-        }
 
-        body.appendChild(
-            tr
-        );
-    }
+            body.appendChild(
+                tr
+            );
+
+        }
+    );
 }
 
 
@@ -3097,56 +3438,56 @@ async function loadSims() {
 
     body.innerHTML = "";
 
-    for (
-        const row
-        of data.results
-    ) {
+    data.results.forEach(
+        row => {
 
-        const tr =
-            document.createElement(
-                "tr"
-            );
-
-        const values = [
-            row.sim,
-
-            row.slot === null
-                ? "—"
-                : row.slot + 1,
-
-            row.calls,
-            row.unique_clients,
-            row.incoming,
-            row.outgoing,
-            row.missed,
-
-            formatDuration(
-                row.total_duration_seconds
-            ),
-        ];
-
-        for (
-            const value
-            of values
-        ) {
-
-            const td =
+            const tr =
                 document.createElement(
-                    "td"
+                    "tr"
                 );
 
-            td.textContent =
-                value;
+            const values = [
+                row.sim,
 
-            tr.appendChild(
-                td
+                row.slot === null
+                    ? "—"
+                    : row.slot + 1,
+
+                row.calls,
+                row.unique_clients,
+                row.incoming,
+                row.outgoing,
+                row.missed,
+
+                formatDuration(
+                    row.total_duration_seconds
+                ),
+            ];
+
+            values.forEach(
+                value => {
+
+                    const td =
+                        document.createElement(
+                            "td"
+                        );
+
+                    td.textContent =
+                        value;
+
+                    tr.appendChild(
+                        td
+                    );
+
+                }
             );
-        }
 
-        body.appendChild(
-            tr
-        );
-    }
+            body.appendChild(
+                tr
+            );
+
+        }
+    );
 }
 
 
@@ -3164,146 +3505,77 @@ async function loadRecent() {
 
     body.innerHTML = "";
 
-    for (
-        const row
-        of data.results
-    ) {
+    data.results.forEach(
+        row => {
 
-        const tr =
-            document.createElement(
-                "tr"
-            );
+            const tr =
+                document.createElement(
+                    "tr"
+                );
 
-        const time =
-            document.createElement(
-                "td"
-            );
+            const values = [
+                row.local_time,
 
-        time.textContent =
-            row.local_time;
+                row.client_name
+                    ? (
+                        row.client_name
+                        + " · "
+                        + row.client_number
+                    )
+                    : row.client_number,
 
+                row.direction === 0
+                    ? "Входящий"
+                    : "Исходящий",
 
-        const client =
-            document.createElement(
-                "td"
-            );
-
-        client.className =
-            "phone";
-
-        client.textContent =
-            row.client_name
-                ? (
-                    row.client_name
-                    + " · "
-                    + row.client_number
-                )
-                : row.client_number;
-
-
-        const direction =
-            document.createElement(
-                "td"
-            );
-
-        direction.textContent =
-            row.direction === 0
-                ? "Входящий"
-                : "Исходящий";
-
-
-        const status =
-            document.createElement(
-                "td"
-            );
-
-        const badge =
-            document.createElement(
-                "span"
-            );
-
-        badge.className =
-            "badge " +
-            (
                 row.answered
-                    ? "good"
-                    : "bad"
+                    ? "Отвечен"
+                    : "Не отвечен",
+
+                row.manager,
+
+                row.sim,
+
+                formatDuration(
+                    row.duration
+                ),
+            ];
+
+            values.forEach(
+                (
+                    value,
+                    index
+                ) => {
+
+                    const td =
+                        document.createElement(
+                            "td"
+                        );
+
+                    td.textContent =
+                        value;
+
+                    if (
+                        index === 1
+                        || index === 5
+                    ) {
+                        td.className =
+                            "phone";
+                    }
+
+                    tr.appendChild(
+                        td
+                    );
+
+                }
             );
 
-        badge.textContent =
-            row.answered
-                ? "Отвечен"
-                : "Не отвечен";
-
-        status.appendChild(
-            badge
-        );
-
-
-        const manager =
-            document.createElement(
-                "td"
+            body.appendChild(
+                tr
             );
 
-        manager.textContent =
-            row.manager;
-
-
-        const sim =
-            document.createElement(
-                "td"
-            );
-
-        sim.className =
-            "phone";
-
-        sim.textContent =
-            row.sim;
-
-
-        const duration =
-            document.createElement(
-                "td"
-            );
-
-        duration.textContent =
-            formatDuration(
-                row.duration
-            );
-
-
-        tr.appendChild(
-            time
-        );
-
-        tr.appendChild(
-            client
-        );
-
-        tr.appendChild(
-            direction
-        );
-
-        tr.appendChild(
-            status
-        );
-
-        tr.appendChild(
-            manager
-        );
-
-        tr.appendChild(
-            sim
-        );
-
-        tr.appendChild(
-            duration
-        );
-
-        body.appendChild(
-            tr
-        );
-    }
+        }
+    );
 }
 
 
@@ -3345,26 +3617,31 @@ function selectPeriod(
 
                 button.classList.toggle(
                     "active",
+
                     button.dataset.period
-                        === period
+                    === period
                 );
 
             }
         );
 
-    const customPanel =
-        document.getElementById(
+    document
+        .getElementById(
             "custom_panel"
+        )
+        .classList
+        .toggle(
+            "visible",
+
+            period ===
+            "custom"
         );
 
-    customPanel.classList.toggle(
-        "visible",
-        period === "custom"
-    );
-
     if (
-        period !== "custom"
+        period !==
+        "custom"
     ) {
+
         loadAll();
     }
 }
@@ -3379,6 +3656,7 @@ document
 
             button.addEventListener(
                 "click",
+
                 () => {
 
                     selectPeriod(
@@ -3401,6 +3679,7 @@ document
 
             button.addEventListener(
                 "click",
+
                 () => {
 
                     chartMode =
@@ -3413,16 +3692,12 @@ document
                         .forEach(
                             item => {
 
-                                item
-                                    .classList
-                                    .toggle(
-                                        "active",
-                                        item
-                                            .dataset
-                                            .chart
-                                            ===
-                                            chartMode
-                                    );
+                                item.classList.toggle(
+                                    "active",
+
+                                    item.dataset.chart
+                                    === chartMode
+                                );
 
                             }
                         );
@@ -3442,6 +3717,7 @@ document
     )
     .addEventListener(
         "click",
+
         () => {
 
             customFrom =
@@ -3462,6 +3738,7 @@ document
                 !customFrom
                 || !customTo
             ) {
+
                 alert(
                     "Выберите обе даты"
                 );
@@ -3486,7 +3763,6 @@ setInterval(
 </script>
 
 </body>
-
 </html>
     """
 
@@ -3526,37 +3802,6 @@ async def moizvonki_webhook(
             "ok": True
         }
 
-    # -----------------------------------------
-    # Сначала сохраняем звонок
-    # -----------------------------------------
-
-    save_call(
-        webhook,
-        event,
-    )
-
-    direction = event.get(
-        "direction"
-    )
-
-    client_number = event.get(
-        "client_number",
-        "Неизвестно",
-    )
-
-    client_name = event.get(
-        "client_name",
-        "",
-    )
-
-    # -----------------------------------------
-    # Реальная длительность разговора
-    # -----------------------------------------
-
-    duration = get_talk_duration(
-        event
-    )
-
     answered = int(
         event.get(
             "answered",
@@ -3569,86 +3814,113 @@ async def moizvonki_webhook(
         "recording"
     )
 
-    src_number = event.get(
-        "src_number",
-        "",
-    )
+    # -------------------------------------------------
+    # Один раз скачиваем запись
+    # -------------------------------------------------
 
-    user_login = webhook.get(
-        "user_login",
-        "",
-    )
-
-    minutes, seconds = divmod(
-        duration,
-        60,
-    )
-
-    if (
-        not answered
-        and direction == 0
-    ):
-        call_type = (
-            "❌ Пропущенный звонок"
-        )
-
-    elif (
-        not answered
-        and direction == 1
-    ):
-        call_type = (
-            "⚠️ Неотвеченный исходящий"
-        )
-
-    elif direction == 0:
-        call_type = (
-            "📥 Входящий звонок"
-        )
-
-    else:
-        call_type = (
-            "📤 Исходящий звонок"
-        )
-
-    text = (
-        f"<b>{call_type}</b>\n\n"
-
-        f"👤 Клиент: "
-        f"{client_name or '—'}\n"
-
-        f"📱 Номер: "
-        f"<code>{client_number}</code>\n"
-
-        f"👨‍💼 Менеджер: "
-        f"{user_login or '—'}\n"
-
-        f"📲 SIM: "
-        f"{src_number or '—'}\n"
-
-        f"⏱ Длительность: "
-        f"{minutes}:{seconds:02d}\n"
-
-        f"✅ Ответ: "
-        f"{'Да' if answered else 'Нет'}"
-    )
+    audio_duration = None
+    voice_bytes = None
 
     if (
         answered
         and recording
     ):
-        send_as_voice(
-            recording_url=
-                recording,
+        (
+            audio_duration,
+            voice_bytes,
+        ) = prepare_recording(
+            recording
+        )
 
-            caption=
+    # -------------------------------------------------
+    # Определяем реальную длительность
+    # -------------------------------------------------
+
+    (
+        talk_duration,
+        duration_source,
+    ) = get_talk_duration(
+        event,
+        audio_duration,
+    )
+
+    # -------------------------------------------------
+    # Сохраняем
+    # -------------------------------------------------
+
+    already_sent = save_call(
+        webhook,
+        event,
+        talk_duration,
+        duration_source,
+    )
+
+    # -------------------------------------------------
+    # Защита от повторного webhook
+    # -------------------------------------------------
+
+    if already_sent:
+        print(
+            "DUPLICATE CALL:",
+            event.get(
+                "db_call_id"
+            ),
+        )
+
+        return {
+            "ok": True,
+            "duplicate": True,
+        }
+
+    # -------------------------------------------------
+    # Telegram text
+    # -------------------------------------------------
+
+    text = build_telegram_message(
+        event,
+        webhook,
+        talk_duration,
+    )
+
+    # -------------------------------------------------
+    # Telegram
+    # -------------------------------------------------
+
+    try:
+        if (
+            answered
+            and voice_bytes
+        ):
+            send_voice_bytes(
+                voice_bytes,
                 text,
+            )
+
+        else:
+            send_text_message(
+                text
+            )
+
+        mark_telegram_sent(
+            event.get(
+                "db_call_id"
+            )
         )
 
-    else:
-        send_text_message(
-            text
+    except Exception as exc:
+        print(
+            "TELEGRAM ERROR:",
+            exc,
         )
+
+        raise
 
     return {
-        "ok": True
+        "ok": True,
+
+        "duration":
+            talk_duration,
+
+        "duration_source":
+            duration_source,
     }
