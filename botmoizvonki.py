@@ -292,7 +292,6 @@ def stats():
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
 
-        # Основная статистика за сегодня
         row = conn.execute(
             """
             SELECT
@@ -377,10 +376,6 @@ def stats():
             """
         ).fetchone()
 
-        # -----------------------------
-        # Новые / повторные клиенты
-        # -----------------------------
-
         clients_row = conn.execute(
             """
             WITH today_clients AS (
@@ -464,30 +459,110 @@ def stats():
             """
         ).fetchone()
 
+        missed_row = conn.execute(
+            """
+            WITH missed_clients AS (
+                SELECT
+                    client_number,
+                    MIN(start_time) AS first_missed_time
+
+                FROM calls
+
+                WHERE
+                    direction = 0
+                    AND answered = 0
+
+                    AND date(
+                        start_time,
+                        'unixepoch',
+                        '+5 hours'
+                    )
+                    =
+                    date(
+                        'now',
+                        '+5 hours'
+                    )
+
+                    AND client_number IS NOT NULL
+                    AND client_number != ''
+
+                GROUP BY client_number
+            )
+
+            SELECT
+                COUNT(*) AS unique_missed_clients,
+
+                SUM(
+                    CASE
+                        WHEN EXISTS (
+                            SELECT 1
+
+                            FROM calls AS callback
+
+                            WHERE
+                                callback.client_number =
+                                missed_clients.client_number
+
+                                AND callback.direction = 1
+
+                                AND callback.start_time >
+                                missed_clients.first_missed_time
+                        )
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS missed_called_back,
+
+                SUM(
+                    CASE
+                        WHEN NOT EXISTS (
+                            SELECT 1
+
+                            FROM calls AS callback
+
+                            WHERE
+                                callback.client_number =
+                                missed_clients.client_number
+
+                                AND callback.direction = 1
+
+                                AND callback.start_time >
+                                missed_clients.first_missed_time
+                        )
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS missed_not_called_back
+
+            FROM missed_clients
+            """
+        ).fetchone()
+
     return {
         "today": {
             "calls": row["calls"] or 0,
+            "unique_clients": row["unique_clients"] or 0,
 
-            "unique_clients":
-                row["unique_clients"] or 0,
+            "incoming": row["incoming"] or 0,
+            "outgoing": row["outgoing"] or 0,
 
-            "incoming":
-                row["incoming"] or 0,
-
-            "outgoing":
-                row["outgoing"] or 0,
-
-            "answered":
-                row["answered"] or 0,
-
-            "missed":
-                row["missed"] or 0,
+            "answered": row["answered"] or 0,
+            "missed": row["missed"] or 0,
 
             "new_clients":
                 clients_row["new_clients"] or 0,
 
             "repeat_clients":
                 clients_row["repeat_clients"] or 0,
+
+            "unique_missed_clients":
+                missed_row["unique_missed_clients"] or 0,
+
+            "missed_called_back":
+                missed_row["missed_called_back"] or 0,
+
+            "missed_not_called_back":
+                missed_row["missed_not_called_back"] or 0,
 
             "average_duration_seconds": round(
                 row["avg_duration"] or 0
