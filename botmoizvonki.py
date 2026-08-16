@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 
+
 app = FastAPI()
 
 
@@ -199,7 +200,6 @@ def send_as_voice(
     recording_url: str,
     caption: str,
 ):
-    # Скачиваем запись из "Мои Звонки"
     audio_response = requests.get(
         recording_url,
         timeout=60,
@@ -218,12 +218,9 @@ def send_as_voice(
             "call.ogg",
         )
 
-        # Сохраняем оригинальную запись
         with open(source_path, "wb") as file:
             file.write(audio_response.content)
 
-        # Конвертируем запись в OGG/Opus,
-        # чтобы Telegram показывал её как Voice Message
         subprocess.run(
             [
                 "ffmpeg",
@@ -576,6 +573,8 @@ def stats():
             ),
         }
     }
+
+
 @app.get("/stats/hourly")
 def stats_hourly():
     with sqlite3.connect(DB_PATH) as conn:
@@ -656,15 +655,31 @@ def stats_hourly():
         "today": result
     }
 
-@app.get("/dashboard", response_class=HTMLResponse)
+
+# -----------------------------
+# DASHBOARD
+# -----------------------------
+
+@app.get(
+    "/dashboard",
+    response_class=HTMLResponse,
+)
 def dashboard():
     return """
     <!DOCTYPE html>
     <html lang="ru">
+
     <head>
         <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Texnikach Call Dashboard</title>
+
+        <meta
+            name="viewport"
+            content="width=device-width, initial-scale=1.0"
+        >
+
+        <title>
+            Texnikach Call Dashboard
+        </title>
 
         <style>
             body {
@@ -674,18 +689,6 @@ def dashboard():
                 background: #111;
                 color: #fff;
             }
-            
-            .chart-legend {
-    display: flex;
-    gap: 16px;
-    margin-bottom: 12px;
-    font-size: 13px;
-    color: #ddd;
-}
-
-.chart-legend .muted {
-    opacity: 0.45;
-}
 
             h1 {
                 margin-bottom: 30px;
@@ -693,10 +696,12 @@ def dashboard():
 
             .grid {
                 display: grid;
+
                 grid-template-columns: repeat(
                     auto-fit,
                     minmax(200px, 1fr)
                 );
+
                 gap: 16px;
             }
 
@@ -730,6 +735,18 @@ def dashboard():
                 margin-top: 0;
             }
 
+            .chart-legend {
+                display: flex;
+                gap: 16px;
+                margin-bottom: 12px;
+                font-size: 13px;
+                color: #ddd;
+            }
+
+            .chart-legend .muted {
+                opacity: 0.45;
+            }
+
             .chart {
                 display: flex;
                 align-items: flex-end;
@@ -740,12 +757,11 @@ def dashboard():
             }
 
             .bar-wrap {
-                min-width: 34px;
+                min-width: 42px;
                 text-align: center;
             }
 
             .bar {
-                width: 100%;
                 min-height: 2px;
                 background: #d6b36a;
                 border-radius: 6px 6px 0 0;
@@ -762,60 +778,126 @@ def dashboard():
                 font-size: 11px;
             }
         </style>
+
     </head>
 
     <body>
 
-        <h1>Texnikach — статистика звонков</h1>
+        <h1>
+            Texnikach — статистика звонков
+        </h1>
 
         <div class="grid">
 
             <div class="card">
-                <div class="label">Всего звонков</div>
-                <div class="value" id="calls">—</div>
+                <div class="label">
+                    Всего звонков
+                </div>
+
+                <div
+                    class="value"
+                    id="calls"
+                >
+                    —
+                </div>
             </div>
 
             <div class="card">
                 <div class="label">
                     Уникальные клиенты
                 </div>
-                <div class="value" id="unique_clients">—</div>
+
+                <div
+                    class="value"
+                    id="unique_clients"
+                >
+                    —
+                </div>
             </div>
 
             <div class="card">
-                <div class="label">Входящие</div>
-                <div class="value" id="incoming">—</div>
+                <div class="label">
+                    Входящие
+                </div>
+
+                <div
+                    class="value"
+                    id="incoming"
+                >
+                    —
+                </div>
             </div>
 
             <div class="card">
-                <div class="label">Исходящие</div>
-                <div class="value" id="outgoing">—</div>
+                <div class="label">
+                    Исходящие
+                </div>
+
+                <div
+                    class="value"
+                    id="outgoing"
+                >
+                    —
+                </div>
             </div>
 
             <div class="card">
-                <div class="label">Отвеченные</div>
-                <div class="value" id="answered">—</div>
+                <div class="label">
+                    Отвеченные
+                </div>
+
+                <div
+                    class="value"
+                    id="answered"
+                >
+                    —
+                </div>
             </div>
 
             <div class="card">
-                <div class="label">Пропущенные</div>
-                <div class="value" id="missed">—</div>
+                <div class="label">
+                    Пропущенные
+                </div>
+
+                <div
+                    class="value"
+                    id="missed"
+                >
+                    —
+                </div>
             </div>
 
             <div class="card">
-                <div class="label">Новые клиенты</div>
-                <div class="value" id="new_clients">—</div>
+                <div class="label">
+                    Новые клиенты
+                </div>
+
+                <div
+                    class="value"
+                    id="new_clients"
+                >
+                    —
+                </div>
             </div>
 
             <div class="card">
                 <div class="label">
                     Повторные клиенты
                 </div>
-                <div class="value" id="repeat_clients">—</div>
+
+                <div
+                    class="value"
+                    id="repeat_clients"
+                >
+                    —
+                </div>
             </div>
 
             <div class="card">
-                <div class="label">Не перезвонили</div>
+                <div class="label">
+                    Не перезвонили
+                </div>
+
                 <div
                     class="value"
                     id="missed_not_called_back"
@@ -828,6 +910,7 @@ def dashboard():
                 <div class="label">
                     Средняя длительность
                 </div>
+
                 <div
                     class="value"
                     id="average_duration"
@@ -840,6 +923,7 @@ def dashboard():
                 <div class="label">
                     Общее время разговоров
                 </div>
+
                 <div
                     class="value"
                     id="total_duration"
@@ -852,6 +936,7 @@ def dashboard():
                 <div class="label">
                     Среднее время ответа
                 </div>
+
                 <div
                     class="value"
                     id="average_answer_delay"
@@ -863,29 +948,47 @@ def dashboard():
         </div>
 
         <div class="chart-card">
-            <h2>Звонки по часам</h2>
+
+            <h2>
+                Звонки по часам
+            </h2>
+
             <div class="chart-legend">
-    <span>Входящие</span>
-    <span class="muted">Исходящие</span>
-</div>
+                <span>
+                    Входящие
+                </span>
+
+                <span class="muted">
+                    Исходящие
+                </span>
+            </div>
+
             <div
                 id="hourly_chart"
                 class="chart"
             ></div>
+
         </div>
 
         <script>
+
             function formatTime(seconds) {
-                seconds = Number(seconds || 0);
+                seconds = Number(
+                    seconds || 0
+                );
 
                 const minutes = Math.floor(
                     seconds / 60
                 );
 
-                const secs = seconds % 60;
+                const secs =
+                    seconds % 60;
 
                 if (minutes === 0) {
-                    return secs + " сек";
+                    return (
+                        secs +
+                        " сек"
+                    );
                 }
 
                 return (
@@ -896,18 +999,22 @@ def dashboard():
                 );
             }
 
+
             async function loadStats() {
                 const response = await fetch(
                     "/stats"
                 );
 
-                const data = await response.json();
+                const data =
+                    await response.json();
 
-                const s = data.today;
+                const s =
+                    data.today;
 
                 document.getElementById(
                     "calls"
-                ).textContent = s.calls;
+                ).textContent =
+                    s.calls;
 
                 document.getElementById(
                     "unique_clients"
@@ -970,134 +1077,201 @@ def dashboard():
                         s.average_answer_delay_seconds
                     );
             }
-            
+
+
             async function loadHourlyChart() {
-    const response = await fetch("/stats/hourly");
-    const data = await response.json();
-    const rows = data.today.filter(
-    item => item.hour >= 8 && item.hour <= 22
-);
+                const response = await fetch(
+                    "/stats/hourly"
+                );
 
-    const chart = document.getElementById(
-        "hourly_chart"
-    );
+                const data =
+                    await response.json();
 
-    chart.innerHTML = "";
+                const rows =
+                    data.today.filter(
+                        item =>
+                            item.hour >= 8 &&
+                            item.hour <= 22
+                    );
 
-    const maxCalls = Math.max(
-        ...rows.map(item => item.calls),
-        1
-    );
+                const chart =
+                    document.getElementById(
+                        "hourly_chart"
+                    );
 
-    for (const item of rows) {
-        const wrap = document.createElement(
-            "div"
-        );
+                chart.innerHTML = "";
 
-        wrap.className = "bar-wrap";
+                const maxCalls = Math.max(
+                    ...rows.map(
+                        item => item.calls
+                    ),
+                    1
+                );
 
-        const value = document.createElement(
-            "div"
-        );
+                for (const item of rows) {
 
-        value.className = "bar-value";
-        value.textContent = item.calls;
+                    const wrap =
+                        document.createElement(
+                            "div"
+                        );
 
-        const bars = document.createElement(
-    "div"
-);
+                    wrap.className =
+                        "bar-wrap";
 
-bars.style.display = "flex";
-bars.style.alignItems = "flex-end";
-bars.style.gap = "3px";
-bars.style.height = "200px";
 
-const incomingBar = document.createElement(
-    "div"
-);
+                    const value =
+                        document.createElement(
+                            "div"
+                        );
 
-incomingBar.className = "bar";
+                    value.className =
+                        "bar-value";
 
-incomingBar.style.width = "48%";
+                    value.textContent =
+                        item.calls;
 
-incomingBar.style.height =
-    Math.max(
-        2,
-        Math.round(
-            (item.incoming / maxCalls) * 200
-        )
-    ) + "px";
 
-incomingBar.title =
-    "Входящие: " + item.incoming;
+                    const bars =
+                        document.createElement(
+                            "div"
+                        );
 
-const outgoingBar = document.createElement(
-    "div"
-);
+                    bars.style.display =
+                        "flex";
 
-outgoingBar.className = "bar";
+                    bars.style.alignItems =
+                        "flex-end";
 
-outgoingBar.style.width = "48%";
-outgoingBar.style.opacity = "0.45";
+                    bars.style.gap =
+                        "3px";
 
-outgoingBar.style.height =
-    Math.max(
-        2,
-        Math.round(
-            (item.outgoing / maxCalls) * 200
-        )
-    ) + "px";
+                    bars.style.height =
+                        "200px";
 
-outgoingBar.title =
-    "Исходящие: " + item.outgoing;
 
-bars.appendChild(incomingBar);
-bars.appendChild(outgoingBar);
+                    const incomingBar =
+                        document.createElement(
+                            "div"
+                        );
 
-        bar.style.height = height + "px";
+                    incomingBar.className =
+                        "bar";
 
-        bar.title =
-            item.hour +
-            ":00 — всего " +
-            item.calls +
-            ", входящих " +
-            item.incoming +
-            ", исходящих " +
-            item.outgoing;
+                    incomingBar.style.width =
+                        "48%";
 
-        const hour = document.createElement(
-            "div"
-        );
+                    incomingBar.style.height =
+                        Math.max(
+                            2,
+                            Math.round(
+                                (
+                                    item.incoming /
+                                    maxCalls
+                                ) * 200
+                            )
+                        ) + "px";
 
-        hour.className = "bar-hour";
+                    incomingBar.title =
+                        item.hour +
+                        ":00 — входящие: " +
+                        item.incoming;
 
-        hour.textContent =
-            String(item.hour).padStart(2, "0") +
-            ":00";
 
-        wrap.appendChild(value);
-        wrap.appendChild(bars);
-        wrap.appendChild(hour);
+                    const outgoingBar =
+                        document.createElement(
+                            "div"
+                        );
 
-        chart.appendChild(wrap);
-    }
-}
+                    outgoingBar.className =
+                        "bar";
+
+                    outgoingBar.style.width =
+                        "48%";
+
+                    outgoingBar.style.opacity =
+                        "0.45";
+
+                    outgoingBar.style.height =
+                        Math.max(
+                            2,
+                            Math.round(
+                                (
+                                    item.outgoing /
+                                    maxCalls
+                                ) * 200
+                            )
+                        ) + "px";
+
+                    outgoingBar.title =
+                        item.hour +
+                        ":00 — исходящие: " +
+                        item.outgoing;
+
+
+                    bars.appendChild(
+                        incomingBar
+                    );
+
+                    bars.appendChild(
+                        outgoingBar
+                    );
+
+
+                    const hour =
+                        document.createElement(
+                            "div"
+                        );
+
+                    hour.className =
+                        "bar-hour";
+
+                    hour.textContent =
+                        String(
+                            item.hour
+                        ).padStart(
+                            2,
+                            "0"
+                        ) +
+                        ":00";
+
+
+                    wrap.appendChild(
+                        value
+                    );
+
+                    wrap.appendChild(
+                        bars
+                    );
+
+                    wrap.appendChild(
+                        hour
+                    );
+
+                    chart.appendChild(
+                        wrap
+                    );
+                }
+            }
+
 
             loadStats();
-loadHourlyChart();
+            loadHourlyChart();
 
-setInterval(
-    () => {
-        loadStats();
-        loadHourlyChart();
-    },
-    30000
-);
+            setInterval(
+                () => {
+                    loadStats();
+                    loadHourlyChart();
+                },
+                30000
+            );
+
         </script>
 
     </body>
     </html>
     """
+
+
 # -----------------------------
 # MOIZVONKI WEBHOOK
 # -----------------------------
@@ -1108,7 +1282,10 @@ async def moizvonki_webhook(
 ):
     data = await request.json()
 
-    print("MOIZVONKI:", data)
+    print(
+        "MOIZVONKI:",
+        data,
+    )
 
     webhook = data.get(
         "webhook",
@@ -1120,24 +1297,15 @@ async def moizvonki_webhook(
         {},
     )
 
-    # Нас интересует только завершение звонка
     if webhook.get("action") != "call.finish":
         return {
             "ok": True
         }
 
-    # -----------------------------
-    # Сохраняем звонок
-    # -----------------------------
-
     save_call(
         webhook,
         event,
     )
-
-    # -----------------------------
-    # Получаем данные звонка
-    # -----------------------------
 
     direction = event.get(
         "direction"
@@ -1186,10 +1354,6 @@ async def moizvonki_webhook(
         60,
     )
 
-    # -----------------------------
-    # Тип звонка
-    # -----------------------------
-
     if (
         not answered
         and direction == 0
@@ -1216,10 +1380,6 @@ async def moizvonki_webhook(
             "📤 Исходящий звонок"
         )
 
-    # -----------------------------
-    # Telegram сообщение
-    # -----------------------------
-
     text = (
         f"<b>{call_type}</b>\n\n"
 
@@ -1242,19 +1402,11 @@ async def moizvonki_webhook(
         f"{'Да' if answered else 'Нет'}"
     )
 
-    # -----------------------------
-    # Отвеченный звонок + запись
-    # -----------------------------
-
     if answered and recording:
         send_as_voice(
             recording_url=recording,
             caption=text,
         )
-
-    # -----------------------------
-    # Пропущенный / записи нет
-    # -----------------------------
 
     else:
         send_text_message(
