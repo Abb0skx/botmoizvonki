@@ -674,6 +674,18 @@ def dashboard():
                 background: #111;
                 color: #fff;
             }
+            
+            .chart-legend {
+    display: flex;
+    gap: 16px;
+    margin-bottom: 12px;
+    font-size: 13px;
+    color: #ddd;
+}
+
+.chart-legend .muted {
+    opacity: 0.45;
+}
 
             h1 {
                 margin-bottom: 30px;
@@ -852,6 +864,10 @@ def dashboard():
 
         <div class="chart-card">
             <h2>Звонки по часам</h2>
+            <div class="chart-legend">
+    <span>Входящие</span>
+    <span class="muted">Исходящие</span>
+</div>
             <div
                 id="hourly_chart"
                 class="chart"
