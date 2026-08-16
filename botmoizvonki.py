@@ -1,8 +1,8 @@
 import os
-import tempfile
-import subprocess
-from pathlib import Path
 import sqlite3
+import subprocess
+import tempfile
+from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
@@ -11,17 +11,7 @@ from fastapi import FastAPI, Request
 
 app = FastAPI()
 
-a=""""
 
-cd ~/PycharmProjects/botmoizvonki
-git add .
-git commit -m "обновил бота"
-git push
-
-cd ~/PycharmProjects/botmoizvonki
-git push
-
-"""
 # -----------------------------
 # ENV
 # -----------------------------
@@ -29,7 +19,10 @@ git push
 BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / "data" / ".env"
 
-load_dotenv(dotenv_path=ENV_FILE, override=True)
+load_dotenv(
+    dotenv_path=ENV_FILE,
+    override=True,
+)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -37,7 +30,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 print("ENV FILE:", ENV_FILE)
 print("ENV EXISTS:", ENV_FILE.exists())
 print("TOKEN EXISTS:", bool(TELEGRAM_BOT_TOKEN))
-print("CHAT_ID:", TELEGRAM_CHAT_ID)
+print("CHAT ID EXISTS:", bool(TELEGRAM_CHAT_ID))
+
 
 # -----------------------------
 # DATABASE
@@ -176,6 +170,7 @@ init_db()
 
 print("DATABASE:", DB_PATH)
 
+
 # -----------------------------
 # TELEGRAM
 # -----------------------------
@@ -200,31 +195,35 @@ def send_text_message(text: str):
     response.raise_for_status()
 
 
-def send_as_voice(recording_url: str, caption: str):
+def send_as_voice(
+    recording_url: str,
+    caption: str,
+):
     # Скачиваем запись из "Мои Звонки"
     audio_response = requests.get(
         recording_url,
         timeout=60,
     )
+
     audio_response.raise_for_status()
 
     with tempfile.TemporaryDirectory() as tmpdir:
         source_path = os.path.join(
             tmpdir,
-            "call_source"
+            "call_source",
         )
 
         voice_path = os.path.join(
             tmpdir,
-            "call.ogg"
+            "call.ogg",
         )
 
         # Сохраняем оригинальную запись
-        with open(source_path, "wb") as f:
-            f.write(audio_response.content)
+        with open(source_path, "wb") as file:
+            file.write(audio_response.content)
 
-        # Конвертируем в OGG/Opus,
-        # чтобы Telegram показал как Voice Message
+        # Конвертируем запись в OGG/Opus,
+        # чтобы Telegram показывал её как Voice Message
         subprocess.run(
             [
                 "ffmpeg",
@@ -264,7 +263,7 @@ def send_as_voice(recording_url: str, caption: str):
                     "voice": (
                         "call.ogg",
                         voice,
-                        "audio/ogg"
+                        "audio/ogg",
                     )
                 },
                 timeout=60,
@@ -283,62 +282,127 @@ def root():
         "status": "ok"
     }
 
+
+# -----------------------------
+# STATISTICS
+# -----------------------------
+
 @app.get("/stats")
 def stats():
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
 
+        # Основная статистика за сегодня
         row = conn.execute(
             """
             SELECT
                 COUNT(*) AS calls,
-                COUNT(DISTINCT client_number) AS unique_clients,
 
-                SUM(CASE WHEN direction = 0 THEN 1 ELSE 0 END) AS incoming,
-                SUM(CASE WHEN direction = 1 THEN 1 ELSE 0 END) AS outgoing,
+                COUNT(
+                    DISTINCT client_number
+                ) AS unique_clients,
 
-                SUM(CASE WHEN answered = 1 THEN 1 ELSE 0 END) AS answered,
-                SUM(CASE WHEN answered = 0 THEN 1 ELSE 0 END) AS missed,
+                SUM(
+                    CASE
+                        WHEN direction = 0
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS incoming,
+
+                SUM(
+                    CASE
+                        WHEN direction = 1
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS outgoing,
+
+                SUM(
+                    CASE
+                        WHEN answered = 1
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS answered,
+
+                SUM(
+                    CASE
+                        WHEN answered = 0
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS missed,
 
                 AVG(
                     CASE
-                        WHEN answered = 1 THEN duration
+                        WHEN answered = 1
+                        THEN duration
+                        ELSE NULL
                     END
                 ) AS avg_duration,
 
                 SUM(
                     CASE
-                        WHEN answered = 1 THEN duration
+                        WHEN answered = 1
+                        THEN duration
                         ELSE 0
                     END
                 ) AS total_duration,
 
                 AVG(
-AVG(
-    CASE
-        WHEN direction = 0
-             AND answered = 1
-             AND answer_time > 0
-             AND start_time > 0
-        THEN answer_time - start_time
-    END
-) AS avg_answer_delay
+                    CASE
+                        WHEN direction = 0
+                             AND answered = 1
+                             AND answer_time > 0
+                             AND start_time > 0
+                        THEN answer_time - start_time
+                        ELSE NULL
+                    END
+                ) AS avg_answer_delay
 
             FROM calls
-            WHERE date(start_time, 'unixepoch', '+5 hours') =
-                  date('now', '+5 hours')
+
+            WHERE
+                date(
+                    start_time,
+                    'unixepoch',
+                    '+5 hours'
+                )
+                =
+                date(
+                    'now',
+                    '+5 hours'
+                )
             """
         ).fetchone()
+
+        # -----------------------------
+        # Новые / повторные клиенты
+        # -----------------------------
 
         clients_row = conn.execute(
             """
             WITH today_clients AS (
-                SELECT DISTINCT client_number
+                SELECT DISTINCT
+                    client_number
+
                 FROM calls
-                WHERE date(start_time, 'unixepoch', '+5 hours') =
-                      date('now', '+5 hours')
-                  AND client_number IS NOT NULL
-                  AND client_number != ''
+
+                WHERE
+                    date(
+                        start_time,
+                        'unixepoch',
+                        '+5 hours'
+                    )
+                    =
+                    date(
+                        'now',
+                        '+5 hours'
+                    )
+
+                    AND client_number IS NOT NULL
+                    AND client_number != ''
             )
 
             SELECT
@@ -346,13 +410,23 @@ AVG(
                     CASE
                         WHEN NOT EXISTS (
                             SELECT 1
-                            FROM calls old_calls
-                            WHERE old_calls.client_number = today_clients.client_number
-                              AND date(
-                                  old_calls.start_time,
-                                  'unixepoch',
-                                  '+5 hours'
-                              ) < date('now', '+5 hours')
+
+                            FROM calls AS old_calls
+
+                            WHERE
+                                old_calls.client_number =
+                                today_clients.client_number
+
+                                AND date(
+                                    old_calls.start_time,
+                                    'unixepoch',
+                                    '+5 hours'
+                                )
+                                <
+                                date(
+                                    'now',
+                                    '+5 hours'
+                                )
                         )
                         THEN 1
                         ELSE 0
@@ -363,13 +437,23 @@ AVG(
                     CASE
                         WHEN EXISTS (
                             SELECT 1
-                            FROM calls old_calls
-                            WHERE old_calls.client_number = today_clients.client_number
-                              AND date(
-                                  old_calls.start_time,
-                                  'unixepoch',
-                                  '+5 hours'
-                              ) < date('now', '+5 hours')
+
+                            FROM calls AS old_calls
+
+                            WHERE
+                                old_calls.client_number =
+                                today_clients.client_number
+
+                                AND date(
+                                    old_calls.start_time,
+                                    'unixepoch',
+                                    '+5 hours'
+                                )
+                                <
+                                date(
+                                    'now',
+                                    '+5 hours'
+                                )
                         )
                         THEN 1
                         ELSE 0
@@ -383,22 +467,34 @@ AVG(
     return {
         "today": {
             "calls": row["calls"] or 0,
-            "unique_clients": row["unique_clients"] or 0,
 
-            "incoming": row["incoming"] or 0,
-            "outgoing": row["outgoing"] or 0,
+            "unique_clients":
+                row["unique_clients"] or 0,
 
-            "answered": row["answered"] or 0,
-            "missed": row["missed"] or 0,
+            "incoming":
+                row["incoming"] or 0,
 
-            "new_clients": clients_row["new_clients"] or 0,
-            "repeat_clients": clients_row["repeat_clients"] or 0,
+            "outgoing":
+                row["outgoing"] or 0,
+
+            "answered":
+                row["answered"] or 0,
+
+            "missed":
+                row["missed"] or 0,
+
+            "new_clients":
+                clients_row["new_clients"] or 0,
+
+            "repeat_clients":
+                clients_row["repeat_clients"] or 0,
 
             "average_duration_seconds": round(
                 row["avg_duration"] or 0
             ),
 
-            "total_duration_seconds": row["total_duration"] or 0,
+            "total_duration_seconds":
+                row["total_duration"] or 0,
 
             "average_answer_delay_seconds": round(
                 row["avg_answer_delay"] or 0
@@ -407,14 +503,27 @@ AVG(
     }
 
 
+# -----------------------------
+# MOIZVONKI WEBHOOK
+# -----------------------------
+
 @app.post("/webhooks/moizvonki")
-async def moizvonki_webhook(request: Request):
+async def moizvonki_webhook(
+    request: Request,
+):
     data = await request.json()
 
     print("MOIZVONKI:", data)
 
-    webhook = data.get("webhook", {})
-    event = data.get("event", {})
+    webhook = data.get(
+        "webhook",
+        {},
+    )
+
+    event = data.get(
+        "event",
+        {},
+    )
 
     # Нас интересует только завершение звонка
     if webhook.get("action") != "call.finish":
@@ -422,27 +531,45 @@ async def moizvonki_webhook(request: Request):
             "ok": True
         }
 
-    # Сохраняем завершённый звонок в базу
-    save_call(webhook, event)
+    # -----------------------------
+    # Сохраняем звонок
+    # -----------------------------
 
-    direction = event.get("direction")
+    save_call(
+        webhook,
+        event,
+    )
+
+    # -----------------------------
+    # Получаем данные звонка
+    # -----------------------------
+
+    direction = event.get(
+        "direction"
+    )
 
     client_number = event.get(
         "client_number",
-        "Неизвестно"
+        "Неизвестно",
     )
 
     client_name = event.get(
         "client_name",
-        ""
+        "",
     )
 
     duration = int(
-        event.get("duration", 0) or 0
+        event.get(
+            "duration",
+            0,
+        ) or 0
     )
 
     answered = int(
-        event.get("answered", 0) or 0
+        event.get(
+            "answered",
+            0,
+        ) or 0
     )
 
     recording = event.get(
@@ -451,47 +578,71 @@ async def moizvonki_webhook(request: Request):
 
     src_number = event.get(
         "src_number",
-        ""
+        "",
     )
 
     user_login = webhook.get(
         "user_login",
-        ""
+        "",
     )
 
     minutes, seconds = divmod(
         duration,
-        60
+        60,
     )
 
     # -----------------------------
     # Тип звонка
     # -----------------------------
 
-    if not answered and direction == 0:
-        call_type = "❌ Пропущенный звонок"
+    if (
+        not answered
+        and direction == 0
+    ):
+        call_type = (
+            "❌ Пропущенный звонок"
+        )
 
-    elif not answered and direction == 1:
-        call_type = "⚠️ Неотвеченный исходящий"
+    elif (
+        not answered
+        and direction == 1
+    ):
+        call_type = (
+            "⚠️ Неотвеченный исходящий"
+        )
 
     elif direction == 0:
-        call_type = "📥 Входящий звонок"
+        call_type = (
+            "📥 Входящий звонок"
+        )
 
     else:
-        call_type = "📤 Исходящий звонок"
+        call_type = (
+            "📤 Исходящий звонок"
+        )
 
     # -----------------------------
-    # Текст сообщения
+    # Telegram сообщение
     # -----------------------------
 
     text = (
         f"<b>{call_type}</b>\n\n"
-        f"👤 Клиент: {client_name or '—'}\n"
-        f"📱 Номер: <code>{client_number}</code>\n"
-        f"👨‍💼 Менеджер: {user_login or '—'}\n"
-        f"📲 SIM: {src_number or '—'}\n"
+
+        f"👤 Клиент: "
+        f"{client_name or '—'}\n"
+
+        f"📱 Номер: "
+        f"<code>{client_number}</code>\n"
+
+        f"👨‍💼 Менеджер: "
+        f"{user_login or '—'}\n"
+
+        f"📲 SIM: "
+        f"{src_number or '—'}\n"
+
         f"⏱ Длительность: "
         f"{minutes}:{seconds:02d}\n"
+
         f"✅ Ответ: "
         f"{'Да' if answered else 'Нет'}"
     )
