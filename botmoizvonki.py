@@ -96,13 +96,69 @@ def normalize_phone(
     if not phone:
         return ""
 
-    digits = "".join(
+    return "".join(
         char
         for char in str(phone)
         if char.isdigit()
     )
 
-    return digits
+
+def get_talk_duration(
+    event: dict,
+) -> int:
+    """
+    Реальная длительность разговора.
+
+    Для отвеченного звонка считаем:
+    end_time - answer_time.
+
+    duration от API используем только
+    как запасной вариант.
+    """
+
+    answered = int(
+        event.get(
+            "answered",
+            0,
+        )
+        or 0
+    )
+
+    if not answered:
+        return 0
+
+    answer_time = int(
+        event.get(
+            "answer_time",
+            0,
+        )
+        or 0
+    )
+
+    end_time = int(
+        event.get(
+            "end_time",
+            0,
+        )
+        or 0
+    )
+
+    if (
+        answer_time > 0
+        and end_time > answer_time
+    ):
+        return (
+            end_time
+            - answer_time
+        )
+
+    return int(
+        event.get(
+            "duration",
+            0,
+        )
+        or 0
+    )
 
 
 def init_db():
@@ -176,7 +232,7 @@ def init_db():
             )
 
         # -----------------------------------------
-        # Заполняем client_key для старых звонков
+        # Нормализация старых телефонов
         # -----------------------------------------
 
         old_rows = conn.execute(
@@ -207,6 +263,45 @@ def init_db():
                     row["id"],
                 ),
             )
+
+        # -----------------------------------------
+        # Исправляем длительность старых звонков
+        #
+        # Для отвеченных звонков:
+        # duration = end_time - answer_time
+        # -----------------------------------------
+
+        conn.execute(
+            """
+            UPDATE calls
+
+            SET duration =
+                end_time - answer_time
+
+            WHERE
+                answered = 1
+
+                AND answer_time IS NOT NULL
+                AND end_time IS NOT NULL
+
+                AND answer_time > 0
+                AND end_time > answer_time
+            """
+        )
+
+        # -----------------------------------------
+        # Пропущенные не имеют разговора
+        # -----------------------------------------
+
+        conn.execute(
+            """
+            UPDATE calls
+
+            SET duration = 0
+
+            WHERE answered = 0
+            """
+        )
 
         # -----------------------------------------
         # Индексы
@@ -257,6 +352,10 @@ def save_call(
 
     client_key = normalize_phone(
         client_number
+    )
+
+    talk_duration = get_talk_duration(
+        event
     )
 
     with connect_db() as conn:
@@ -375,9 +474,7 @@ def save_call(
                     "end_time"
                 ),
 
-                event.get(
-                    "duration"
-                ),
+                talk_duration,
 
                 event.get(
                     "recording"
@@ -436,7 +533,6 @@ def get_period(
     if period == "today":
         start_date = today
         end_date = today
-
         label = "Сегодня"
 
     elif period == "yesterday":
@@ -446,7 +542,6 @@ def get_period(
         )
 
         end_date = start_date
-
         label = "Вчера"
 
     elif period == "7d":
@@ -456,7 +551,6 @@ def get_period(
         )
 
         end_date = today
-
         label = "Последние 7 дней"
 
     elif period == "30d":
@@ -466,7 +560,6 @@ def get_period(
         )
 
         end_date = today
-
         label = "Последние 30 дней"
 
     elif period == "custom":
@@ -548,12 +641,16 @@ def get_period(
     )
 
     days = (
-        end_date - start_date
+        end_date
+        - start_date
     ).days + 1
 
     return {
-        "period": period,
-        "label": label,
+        "period":
+            period,
+
+        "label":
+            label,
 
         "start_date":
             start_date.isoformat(),
@@ -815,10 +912,6 @@ def stats(
             ),
         ).fetchone()
 
-        # -----------------------------------------
-        # Новые / повторные клиенты
-        # -----------------------------------------
-
         clients_row = conn.execute(
             """
             WITH period_clients AS (
@@ -877,15 +970,10 @@ def stats(
             (
                 start_ts,
                 end_ts,
-
                 start_ts,
                 start_ts,
             ),
         ).fetchone()
-
-        # -----------------------------------------
-        # Пропущенные
-        # -----------------------------------------
 
         missed_row = conn.execute(
             """
@@ -1094,10 +1182,6 @@ def stats_timeline(
 
     with connect_db() as conn:
 
-        # -----------------------------------------
-        # Один день → по часам
-        # -----------------------------------------
-
         if p["days"] == 1:
             rows = conn.execute(
                 """
@@ -1187,10 +1271,6 @@ def stats_timeline(
                 )
 
             granularity = "hour"
-
-        # -----------------------------------------
-        # Несколько дней → по дням
-        # -----------------------------------------
 
         else:
             rows = conn.execute(
@@ -1299,10 +1379,6 @@ def stats_timeline(
             points,
     }
 
-
-# =========================================================
-# OLD HOURLY ENDPOINT
-# =========================================================
 
 @app.get("/stats/hourly")
 def stats_hourly():
@@ -1995,10 +2071,6 @@ body {
     opacity: .5;
 }
 
-.bar.all {
-    background: #d9b565;
-}
-
 .bar-label {
     margin-top: 8px;
     color: #999;
@@ -2067,11 +2139,6 @@ tbody tr:last-child td {
 
 .badge.bad {
     color: #ff9d9d;
-}
-
-.empty {
-    padding: 20px 0;
-    color: #777;
 }
 
 @media (
@@ -2221,150 +2288,105 @@ tbody tr:last-child td {
             <div class="label">
                 Всего звонков
             </div>
-            <div
-                class="value"
-                id="calls"
-            >—</div>
+            <div class="value" id="calls">—</div>
         </div>
 
         <div class="card">
             <div class="label">
                 Уникальные клиенты
             </div>
-            <div
-                class="value"
-                id="unique_clients"
-            >—</div>
+            <div class="value" id="unique_clients">—</div>
         </div>
 
         <div class="card">
             <div class="label">
                 Входящие
             </div>
-            <div
-                class="value"
-                id="incoming"
-            >—</div>
+            <div class="value" id="incoming">—</div>
         </div>
 
         <div class="card">
             <div class="label">
                 Исходящие
             </div>
-            <div
-                class="value"
-                id="outgoing"
-            >—</div>
+            <div class="value" id="outgoing">—</div>
         </div>
 
         <div class="card">
             <div class="label">
                 Отвеченные
             </div>
-            <div
-                class="value"
-                id="answered"
-            >—</div>
+            <div class="value" id="answered">—</div>
         </div>
 
         <div class="card">
             <div class="label">
                 Пропущенные
             </div>
-            <div
-                class="value"
-                id="missed"
-            >—</div>
+            <div class="value" id="missed">—</div>
         </div>
 
         <div class="card">
             <div class="label">
                 Ответили, %
             </div>
-            <div
-                class="value"
-                id="answer_rate"
-            >—</div>
+            <div class="value" id="answer_rate">—</div>
         </div>
 
         <div class="card">
             <div class="label">
                 Новые клиенты
             </div>
-            <div
-                class="value"
-                id="new_clients"
-            >—</div>
+            <div class="value" id="new_clients">—</div>
         </div>
 
         <div class="card">
             <div class="label">
                 Повторные клиенты
             </div>
-            <div
-                class="value"
-                id="repeat_clients"
-            >—</div>
+            <div class="value" id="repeat_clients">—</div>
         </div>
 
         <div class="card">
             <div class="label">
                 Уникально пропущено
             </div>
-            <div
-                class="value"
-                id="unique_missed_clients"
-            >—</div>
+            <div class="value" id="unique_missed_clients">—</div>
         </div>
 
         <div class="card">
             <div class="label">
                 Потом перезвонили
             </div>
-            <div
-                class="value"
-                id="missed_called_back"
-            >—</div>
+            <div class="value" id="missed_called_back">—</div>
         </div>
 
         <div class="card">
             <div class="label">
                 Не перезвонили
             </div>
-            <div
-                class="value"
-                id="missed_not_called_back"
-            >—</div>
+            <div class="value" id="missed_not_called_back">—</div>
         </div>
 
         <div class="card">
             <div class="label">
                 Средний разговор
             </div>
-            <div
-                class="value"
-                id="average_duration"
-            >—</div>
+            <div class="value" id="average_duration">—</div>
         </div>
 
         <div class="card">
             <div class="label">
                 Общее время разговоров
             </div>
-            <div
-                class="value"
-                id="total_duration"
-            >—</div>
+            <div class="value" id="total_duration">—</div>
         </div>
 
         <div class="card">
             <div class="label">
                 Среднее время ответа
             </div>
-            <div
-                class="value"
-                id="average_answer_delay"
-            >—</div>
+            <div class="value" id="average_answer_delay">—</div>
         </div>
 
     </div>
@@ -2418,9 +2440,7 @@ tbody tr:last-child td {
         <div class="panel">
 
             <div class="panel-header">
-                <h2>
-                    Менеджеры
-                </h2>
+                <h2>Менеджеры</h2>
             </div>
 
             <div class="table-wrap">
@@ -2454,9 +2474,7 @@ tbody tr:last-child td {
         <div class="panel">
 
             <div class="panel-header">
-                <h2>
-                    SIM-карты
-                </h2>
+                <h2>SIM-карты</h2>
             </div>
 
             <div class="table-wrap">
@@ -2492,11 +2510,7 @@ tbody tr:last-child td {
     <div class="panel">
 
         <div class="panel-header">
-
-            <h2>
-                Последние звонки
-            </h2>
-
+            <h2>Последние звонки</h2>
         </div>
 
         <div class="table-wrap">
@@ -2627,8 +2641,8 @@ function queryString() {
     }
 
     return (
-        "?" +
-        params.toString()
+        "?"
+        + params.toString()
     );
 }
 
@@ -2873,15 +2887,6 @@ function renderTimeline() {
             );
         }
 
-        if (
-            chartMode ===
-            "all"
-        ) {
-            bar.classList.add(
-                "all"
-            );
-        }
-
         bar.style.height =
             Math.max(
                 2,
@@ -3030,13 +3035,9 @@ async function loadSims() {
                 : row.slot + 1,
 
             row.calls,
-
             row.unique_clients,
-
             row.incoming,
-
             row.outgoing,
-
             row.missed,
 
             formatDuration(
@@ -3445,9 +3446,10 @@ async def moizvonki_webhook(
             "ok": True
         }
 
-    # Сначала сохраняем звонок.
-    # Даже если Telegram временно даст ошибку,
-    # данные уже останутся в базе.
+    # -----------------------------------------
+    # Сначала сохраняем звонок
+    # -----------------------------------------
+
     save_call(
         webhook,
         event,
@@ -3467,12 +3469,12 @@ async def moizvonki_webhook(
         "",
     )
 
-    duration = int(
-        event.get(
-            "duration",
-            0,
-        )
-        or 0
+    # -----------------------------------------
+    # Реальная длительность разговора
+    # -----------------------------------------
+
+    duration = get_talk_duration(
+        event
     )
 
     answered = int(
