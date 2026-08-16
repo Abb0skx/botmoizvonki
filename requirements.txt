@@ -2,3 +2,12 @@ fastapi
 uvicorn
 requests
 python-dotenv
+fastapi
+uvicorn
+requests
+python-dotenv
+pandas
+openpyxl
+gspread
+google-auth
+python-telegram-bot
