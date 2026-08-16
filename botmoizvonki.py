@@ -18,6 +18,9 @@ git add .
 git commit -m "обновил бота"
 git push
 
+cd ~/PycharmProjects/botmoizvonki
+git push
+
 """
 # -----------------------------
 # ENV
@@ -278,6 +281,40 @@ def send_as_voice(recording_url: str, caption: str):
 def root():
     return {
         "status": "ok"
+    }
+
+@app.get("/stats")
+def stats():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+
+        row = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS calls,
+                COUNT(DISTINCT client_number) AS unique_clients,
+
+                SUM(CASE WHEN direction = 0 THEN 1 ELSE 0 END) AS incoming,
+                SUM(CASE WHEN direction = 1 THEN 1 ELSE 0 END) AS outgoing,
+
+                SUM(CASE WHEN answered = 1 THEN 1 ELSE 0 END) AS answered,
+                SUM(CASE WHEN answered = 0 THEN 1 ELSE 0 END) AS missed
+
+            FROM calls
+            WHERE date(start_time, 'unixepoch', '+5 hours') =
+                  date('now', '+5 hours')
+            """
+        ).fetchone()
+
+    return {
+        "today": {
+            "calls": row["calls"] or 0,
+            "unique_clients": row["unique_clients"] or 0,
+            "incoming": row["incoming"] or 0,
+            "outgoing": row["outgoing"] or 0,
+            "answered": row["answered"] or 0,
+            "missed": row["missed"] or 0,
+        }
     }
 
 
