@@ -576,6 +576,85 @@ def stats():
             ),
         }
     }
+@app.get("/stats/hourly")
+def stats_hourly():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+
+        rows = conn.execute(
+            """
+            SELECT
+                CAST(
+                    strftime(
+                        '%H',
+                        start_time,
+                        'unixepoch',
+                        '+5 hours'
+                    )
+                    AS INTEGER
+                ) AS hour,
+
+                COUNT(*) AS calls,
+
+                SUM(
+                    CASE
+                        WHEN direction = 0
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS incoming,
+
+                SUM(
+                    CASE
+                        WHEN direction = 1
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS outgoing
+
+            FROM calls
+
+            WHERE
+                date(
+                    start_time,
+                    'unixepoch',
+                    '+5 hours'
+                )
+                =
+                date(
+                    'now',
+                    '+5 hours'
+                )
+
+            GROUP BY hour
+            ORDER BY hour
+            """
+        ).fetchall()
+
+    result = []
+
+    for hour in range(24):
+        found = next(
+            (
+                row
+                for row in rows
+                if row["hour"] == hour
+            ),
+            None,
+        )
+
+        result.append(
+            {
+                "hour": hour,
+                "calls": found["calls"] if found else 0,
+                "incoming": found["incoming"] if found else 0,
+                "outgoing": found["outgoing"] if found else 0,
+            }
+        )
+
+    return {
+        "today": result
+    }
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
