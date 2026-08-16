@@ -702,13 +702,60 @@ def dashboard():
                 font-size: 32px;
                 font-weight: bold;
             }
+            
+            .chart-card {
+    margin-top: 30px;
+    background: #1c1c1c;
+    border: 1px solid #333;
+    border-radius: 14px;
+    padding: 20px;
+}
+
+.chart-card h2 {
+    margin-top: 0;
+}
+
+.chart {
+    display: flex;
+    align-items: flex-end;
+    gap: 8px;
+    height: 260px;
+    overflow-x: auto;
+    padding-top: 20px;
+}
+
+.bar-wrap {
+    min-width: 34px;
+    text-align: center;
+}
+
+.bar {
+    width: 100%;
+    min-height: 2px;
+    background: #d6b36a;
+    border-radius: 6px 6px 0 0;
+}
+
+.bar-value {
+    font-size: 12px;
+    margin-bottom: 5px;
+}
+
+.bar-hour {
+    margin-top: 7px;
+    color: #999;
+    font-size: 11px;
+}
         </style>
     </head>
 
     <body>
         <h1>Texnikach — статистика звонков</h1>
 
-        <div class="grid">
+        <div class="chart-card">
+    <h2>Звонки по часам</h2>
+    <div id="hourly_chart" class="chart"></div>
+</div>
             <div class="card">
                 <div class="label">Всего звонков</div>
                 <div class="value" id="calls">—</div>
