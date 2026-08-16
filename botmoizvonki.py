@@ -2,6 +2,7 @@ import os
 import tempfile
 import subprocess
 from pathlib import Path
+import sqlite3
 
 import requests
 from dotenv import load_dotenv
@@ -35,6 +36,142 @@ print("ENV EXISTS:", ENV_FILE.exists())
 print("TOKEN EXISTS:", bool(TELEGRAM_BOT_TOKEN))
 print("CHAT_ID:", TELEGRAM_CHAT_ID)
 
+# -----------------------------
+# DATABASE
+# -----------------------------
+
+DB_PATH = Path("/app/data/calls.db")
+
+
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS calls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                db_call_id INTEGER UNIQUE,
+                event_pbx_call_id TEXT,
+
+                client_number TEXT,
+                client_name TEXT,
+
+                direction INTEGER,
+                answered INTEGER,
+
+                user_id INTEGER,
+                user_login TEXT,
+
+                src_number TEXT,
+                src_id INTEGER,
+                src_slot INTEGER,
+
+                event_created TEXT,
+
+                start_time INTEGER,
+                answer_time INTEGER,
+                end_time INTEGER,
+
+                duration INTEGER,
+
+                recording TEXT,
+
+                account_id TEXT,
+                account_name TEXT,
+
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+        conn.commit()
+
+
+def save_call(webhook: dict, event: dict):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO calls (
+                db_call_id,
+                event_pbx_call_id,
+
+                client_number,
+                client_name,
+
+                direction,
+                answered,
+
+                user_id,
+                user_login,
+
+                src_number,
+                src_id,
+                src_slot,
+
+                event_created,
+
+                start_time,
+                answer_time,
+                end_time,
+
+                duration,
+
+                recording,
+
+                account_id,
+                account_name
+            )
+            VALUES (
+                ?, ?,
+                ?, ?,
+                ?, ?,
+                ?, ?,
+                ?, ?, ?,
+                ?,
+                ?, ?, ?,
+                ?,
+                ?,
+                ?, ?
+            )
+            """,
+            (
+                event.get("db_call_id"),
+                event.get("event_pbx_call_id"),
+
+                event.get("client_number"),
+                event.get("client_name"),
+
+                event.get("direction"),
+                event.get("answered"),
+
+                webhook.get("user_id"),
+                webhook.get("user_login"),
+
+                event.get("src_number"),
+                event.get("src_id"),
+                event.get("src_slot"),
+
+                event.get("event_created"),
+
+                event.get("start_time"),
+                event.get("answer_time"),
+                event.get("end_time"),
+
+                event.get("duration"),
+
+                event.get("recording"),
+
+                webhook.get("account_id"),
+                webhook.get("account_name"),
+            ),
+        )
+
+        conn.commit()
+
+
+init_db()
+
+print("DATABASE:", DB_PATH)
 
 # -----------------------------
 # TELEGRAM
@@ -158,6 +295,9 @@ async def moizvonki_webhook(request: Request):
         return {
             "ok": True
         }
+
+    # Сохраняем завершённый звонок в базу
+    save_call(webhook, event)
 
     direction = event.get("direction")
 
