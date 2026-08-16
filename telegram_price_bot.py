@@ -4,6 +4,7 @@ import time
 import asyncio
 import datetime
 import html
+import json
 
 import requests
 import pandas as pd
@@ -111,34 +112,38 @@ def get_formatted_date():
 # ============================================================
 
 def get_google_client():
-    """
-    Создаёт одно подключение к Google Sheets.
-
-    Через него получаем:
-    - bot_prices
-    - bot_settings
-    - product_sort
-    """
-
-    if not os.path.exists(GOOGLE_SA_JSON_PATH):
-        raise FileNotFoundError(
-            "Не найден JSON-ключ Google Service Account:\n"
-            f"{GOOGLE_SA_JSON_PATH}"
-        )
 
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
 
-    creds = Credentials.from_service_account_file(
-        GOOGLE_SA_JSON_PATH,
-        scopes=scopes,
-    )
+    google_json = os.getenv("GOOGLE_SA_JSON_CONTENT")
 
-    client = gspread.authorize(creds)
+    # На сервере — JSON из Environment Variable
+    if google_json:
+        service_account_info = json.loads(google_json)
 
-    return client
+        creds = Credentials.from_service_account_info(
+            service_account_info,
+            scopes=scopes,
+        )
+
+    # На Mac — старый JSON-файл
+    else:
+        if not os.path.exists(GOOGLE_SA_JSON_PATH):
+            raise FileNotFoundError(
+                "Не найден Google Service Account.\n"
+                "Нет GOOGLE_SA_JSON_CONTENT и нет файла:\n"
+                f"{GOOGLE_SA_JSON_PATH}"
+            )
+
+        creds = Credentials.from_service_account_file(
+            GOOGLE_SA_JSON_PATH,
+            scopes=scopes,
+        )
+
+    return gspread.authorize(creds)
 
 
 # ============================================================
