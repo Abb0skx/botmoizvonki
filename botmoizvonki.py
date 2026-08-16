@@ -958,7 +958,9 @@ def dashboard():
             async function loadHourlyChart() {
     const response = await fetch("/stats/hourly");
     const data = await response.json();
-    const rows = data.today;
+    const rows = data.today.filter(
+    item => item.hour >= 8 && item.hour <= 22
+);
 
     const chart = document.getElementById(
         "hourly_chart"
@@ -985,18 +987,56 @@ def dashboard():
         value.className = "bar-value";
         value.textContent = item.calls;
 
-        const bar = document.createElement(
-            "div"
-        );
+        const bars = document.createElement(
+    "div"
+);
 
-        bar.className = "bar";
+bars.style.display = "flex";
+bars.style.alignItems = "flex-end";
+bars.style.gap = "3px";
+bars.style.height = "200px";
 
-        const height = Math.max(
-            2,
-            Math.round(
-                (item.calls / maxCalls) * 200
-            )
-        );
+const incomingBar = document.createElement(
+    "div"
+);
+
+incomingBar.className = "bar";
+
+incomingBar.style.width = "48%";
+
+incomingBar.style.height =
+    Math.max(
+        2,
+        Math.round(
+            (item.incoming / maxCalls) * 200
+        )
+    ) + "px";
+
+incomingBar.title =
+    "Входящие: " + item.incoming;
+
+const outgoingBar = document.createElement(
+    "div"
+);
+
+outgoingBar.className = "bar";
+
+outgoingBar.style.width = "48%";
+outgoingBar.style.opacity = "0.45";
+
+outgoingBar.style.height =
+    Math.max(
+        2,
+        Math.round(
+            (item.outgoing / maxCalls) * 200
+        )
+    ) + "px";
+
+outgoingBar.title =
+    "Исходящие: " + item.outgoing;
+
+bars.appendChild(incomingBar);
+bars.appendChild(outgoingBar);
 
         bar.style.height = height + "px";
 
@@ -1020,7 +1060,7 @@ def dashboard():
             ":00";
 
         wrap.appendChild(value);
-        wrap.appendChild(bar);
+        wrap.appendChild(bars);
         wrap.appendChild(hour);
 
         chart.appendChild(wrap);
