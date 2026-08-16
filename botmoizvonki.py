@@ -7,7 +7,7 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
-
+from fastapi.responses import HTMLResponse
 
 app = FastAPI()
 
@@ -577,6 +577,167 @@ def stats():
         }
     }
 
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    return """
+    <!DOCTYPE html>
+    <html lang="ru">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Texnikach Call Dashboard</title>
+
+        <style>
+            body {
+                margin: 0;
+                padding: 30px;
+                font-family: Arial, sans-serif;
+                background: #111;
+                color: #fff;
+            }
+
+            h1 {
+                margin-bottom: 30px;
+            }
+
+            .grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                gap: 16px;
+            }
+
+            .card {
+                background: #1c1c1c;
+                border: 1px solid #333;
+                border-radius: 14px;
+                padding: 20px;
+            }
+
+            .label {
+                color: #aaa;
+                font-size: 14px;
+                margin-bottom: 10px;
+            }
+
+            .value {
+                font-size: 32px;
+                font-weight: bold;
+            }
+        </style>
+    </head>
+
+    <body>
+        <h1>Texnikach — статистика звонков</h1>
+
+        <div class="grid">
+            <div class="card">
+                <div class="label">Всего звонков</div>
+                <div class="value" id="calls">—</div>
+            </div>
+
+            <div class="card">
+                <div class="label">Уникальные клиенты</div>
+                <div class="value" id="unique_clients">—</div>
+            </div>
+
+            <div class="card">
+                <div class="label">Входящие</div>
+                <div class="value" id="incoming">—</div>
+            </div>
+
+            <div class="card">
+                <div class="label">Исходящие</div>
+                <div class="value" id="outgoing">—</div>
+            </div>
+
+            <div class="card">
+                <div class="label">Отвеченные</div>
+                <div class="value" id="answered">—</div>
+            </div>
+
+            <div class="card">
+                <div class="label">Пропущенные</div>
+                <div class="value" id="missed">—</div>
+            </div>
+
+            <div class="card">
+                <div class="label">Новые клиенты</div>
+                <div class="value" id="new_clients">—</div>
+            </div>
+
+            <div class="card">
+                <div class="label">Повторные клиенты</div>
+                <div class="value" id="repeat_clients">—</div>
+            </div>
+
+            <div class="card">
+                <div class="label">Не перезвонили</div>
+                <div class="value" id="missed_not_called_back">—</div>
+            </div>
+
+            <div class="card">
+                <div class="label">Средняя длительность</div>
+                <div class="value" id="average_duration">—</div>
+            </div>
+
+            <div class="card">
+                <div class="label">Общее время разговоров</div>
+                <div class="value" id="total_duration">—</div>
+            </div>
+
+            <div class="card">
+                <div class="label">Среднее время ответа</div>
+                <div class="value" id="average_answer_delay">—</div>
+            </div>
+        </div>
+
+        <script>
+            function formatTime(seconds) {
+                seconds = Number(seconds || 0);
+
+                const minutes = Math.floor(seconds / 60);
+                const secs = seconds % 60;
+
+                if (minutes === 0) {
+                    return secs + " сек";
+                }
+
+                return minutes + " мин " + secs + " сек";
+            }
+
+            async function loadStats() {
+                const response = await fetch("/stats");
+                const data = await response.json();
+                const s = data.today;
+
+                document.getElementById("calls").textContent = s.calls;
+                document.getElementById("unique_clients").textContent = s.unique_clients;
+                document.getElementById("incoming").textContent = s.incoming;
+                document.getElementById("outgoing").textContent = s.outgoing;
+                document.getElementById("answered").textContent = s.answered;
+                document.getElementById("missed").textContent = s.missed;
+                document.getElementById("new_clients").textContent = s.new_clients;
+                document.getElementById("repeat_clients").textContent = s.repeat_clients;
+                document.getElementById("missed_not_called_back").textContent =
+                    s.missed_not_called_back;
+
+                document.getElementById("average_duration").textContent =
+                    formatTime(s.average_duration_seconds);
+
+                document.getElementById("total_duration").textContent =
+                    formatTime(s.total_duration_seconds);
+
+                document.getElementById("average_answer_delay").textContent =
+                    formatTime(s.average_answer_delay_seconds);
+            }
+
+            loadStats();
+
+            setInterval(loadStats, 30000);
+        </script>
+    </body>
+    </html>
+    """
 
 # -----------------------------
 # MOIZVONKI WEBHOOK
