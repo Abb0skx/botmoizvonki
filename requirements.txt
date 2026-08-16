@@ -11,3 +11,8 @@ openpyxl
 gspread
 google-auth
 python-telegram-bot
+pandas
+gspread
+google-auth
+requests
+openpyxl
