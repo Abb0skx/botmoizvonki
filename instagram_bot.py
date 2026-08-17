@@ -102,3 +102,25 @@ async def instagram_webhook_verify(
         status_code=403,
         detail="Invalid verify token",
     )
+
+# =========================================================
+# INSTAGRAM WEBHOOK EVENTS
+# =========================================================
+
+@router.post(
+    "/webhooks/instagram"
+)
+async def instagram_webhook_event(
+    request: Request,
+):
+
+    data = await request.json()
+
+    print(
+        "INSTAGRAM WEBHOOK EVENT:",
+        data,
+    )
+
+    return {
+        "ok": True
+    }
