@@ -23,9 +23,7 @@ app = FastAPI()
 # CONFIG
 # =========================================================
 
-UZ_TZ = timezone(
-    timedelta(hours=5)
-)
+UZ_TZ = timezone(timedelta(hours=5))
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / "data" / ".env"
@@ -57,25 +55,10 @@ DB_PATH.parent.mkdir(
 
 HTTP = requests.Session()
 
-print(
-    "ENV EXISTS:",
-    ENV_FILE.exists(),
-)
-
-print(
-    "TOKEN EXISTS:",
-    bool(TELEGRAM_BOT_TOKEN),
-)
-
-print(
-    "CHAT ID EXISTS:",
-    bool(TELEGRAM_CHAT_ID),
-)
-
-print(
-    "DATABASE:",
-    DB_PATH,
-)
+print("ENV EXISTS:", ENV_FILE.exists())
+print("TOKEN EXISTS:", bool(TELEGRAM_BOT_TOKEN))
+print("CHAT ID EXISTS:", bool(TELEGRAM_CHAT_ID))
+print("DATABASE:", DB_PATH)
 
 
 # =========================================================
@@ -199,9 +182,7 @@ def init_db():
             SELECT
                 id,
                 client_number
-
             FROM calls
-
             WHERE
                 client_key IS NULL
                 OR client_key = ''
@@ -318,14 +299,17 @@ def prepare_recording(
                     "ffprobe",
                     "-v",
                     "error",
+
                     "-show_entries",
                     "format=duration",
+
                     "-of",
                     (
                         "default="
                         "noprint_wrappers=1:"
                         "nokey=1"
                     ),
+
                     str(source_path),
                 ],
                 check=True,
@@ -362,17 +346,24 @@ def prepare_recording(
                 [
                     "ffmpeg",
                     "-y",
+
                     "-i",
                     str(source_path),
+
                     "-vn",
+
                     "-c:a",
                     "libopus",
+
                     "-b:a",
                     "32k",
+
                     "-vbr",
                     "on",
+
                     "-application",
                     "voip",
+
                     str(voice_path),
                 ],
                 check=True,
@@ -491,7 +482,6 @@ def save_call(
     )
 
     with connect_db() as conn:
-
         conn.execute(
             """
             INSERT INTO calls (
@@ -576,6 +566,9 @@ def save_call(
                 src_slot =
                     excluded.src_slot,
 
+                event_created =
+                    excluded.event_created,
+
                 start_time =
                     excluded.start_time,
 
@@ -595,7 +588,13 @@ def save_call(
                     excluded.duration_source,
 
                 recording =
-                    excluded.recording
+                    excluded.recording,
+
+                account_id =
+                    excluded.account_id,
+
+                account_name =
+                    excluded.account_name
             """,
             (
                 db_call_id,
@@ -679,9 +678,7 @@ def save_call(
             """
             SELECT
                 telegram_sent
-
             FROM calls
-
             WHERE db_call_id = ?
             """,
             (
@@ -705,9 +702,7 @@ def mark_telegram_sent(
         conn.execute(
             """
             UPDATE calls
-
             SET telegram_sent = 1
-
             WHERE db_call_id = ?
             """,
             (
@@ -741,12 +736,8 @@ def get_client_history(
             """
             SELECT
                 COUNT(*) AS calls_count,
-
-                MIN(start_time)
-                    AS first_contact,
-
-                MAX(start_time)
-                    AS last_contact
+                MIN(start_time) AS first_contact,
+                MAX(start_time) AS last_contact
 
             FROM calls
 
@@ -889,10 +880,6 @@ def build_telegram_message(
         "calls_count"
     ]
 
-    # -------------------------------------------------
-    # TITLE
-    # -------------------------------------------------
-
     if (
         direction == 0
         and answered
@@ -927,25 +914,16 @@ def build_telegram_message(
         "",
     ]
 
-    # -------------------------------------------------
-    # CLIENT
-    # -------------------------------------------------
-
     if client_name:
         lines.append(
             "👤 "
             f"<b>{escape(str(client_name))}</b>"
         )
 
-    # Обычный номер, без <code>
     lines.append(
         "📞 "
         f"{escape(str(client_number or '—'))}"
     )
-
-    # -------------------------------------------------
-    # CLIENT HISTORY
-    # -------------------------------------------------
 
     if contacts <= 1:
         lines.append(
@@ -955,14 +933,11 @@ def build_telegram_message(
     else:
         lines.append(
             "🔁 "
-            f"Контактов с номером: <b>{contacts}</b>"
+            f"Контактов с номером: "
+            f"<b>{contacts}</b>"
         )
 
     lines.append("")
-
-    # -------------------------------------------------
-    # CALL DETAILS
-    # -------------------------------------------------
 
     if answered:
         lines.append(
@@ -997,7 +972,7 @@ def build_telegram_message(
 
 
 # =========================================================
-# TELEGRAM SEND
+# TELEGRAM
 # =========================================================
 
 def send_text_message(
@@ -1364,6 +1339,10 @@ def stats(
             ),
         ).fetchone()
 
+        # -------------------------------------------------
+        # Новые / повторные клиенты
+        # -------------------------------------------------
+
         clients_row = conn.execute(
             """
             WITH period_clients AS (
@@ -1427,6 +1406,21 @@ def stats(
             ),
         ).fetchone()
 
+        # -------------------------------------------------
+        # ПРОПУЩЕННЫЕ
+        #
+        # 1. missed_called_back:
+        #    после пропущенного был исходящий звонок
+        #
+        # 2. missed_contacted:
+        #    после пропущенного состоялся ЛЮБОЙ отвеченный
+        #    звонок с этим номером
+        #
+        # 3. missed_not_processed:
+        #    не было ни исходящего звонка,
+        #    ни успешного разговора
+        # -------------------------------------------------
+
         missed_row = conn.execute(
             """
             WITH missed_clients AS (
@@ -1455,6 +1449,10 @@ def stats(
                 COUNT(*)
                     AS unique_missed_clients,
 
+                ------------------------------------------------
+                -- Менеджер пытался перезвонить
+                ------------------------------------------------
+
                 SUM(
                     CASE
                         WHEN EXISTS (
@@ -1476,26 +1474,81 @@ def stats(
                     END
                 ) AS missed_called_back,
 
+                ------------------------------------------------
+                -- После пропущенного состоялся разговор
+                --
+                -- Неважно:
+                -- менеджер перезвонил
+                -- или клиент сам позвонил снова
+                ------------------------------------------------
+
                 SUM(
                     CASE
-                        WHEN NOT EXISTS (
+                        WHEN EXISTS (
                             SELECT 1
 
-                            FROM calls AS callback
+                            FROM calls AS contact
 
                             WHERE
-                                callback.client_key =
+                                contact.client_key =
                                 missed_clients.client_key
 
-                                AND callback.direction = 1
+                                AND contact.answered = 1
 
-                                AND callback.start_time >
+                                AND contact.start_time >
                                 missed_clients.first_missed_time
                         )
                         THEN 1
                         ELSE 0
                     END
-                ) AS missed_not_called_back
+                ) AS missed_contacted,
+
+                ------------------------------------------------
+                -- Вообще не обработан
+                --
+                -- Нет исходящего звонка
+                -- И нет успешного разговора
+                ------------------------------------------------
+
+                SUM(
+                    CASE
+                        WHEN
+                            NOT EXISTS (
+                                SELECT 1
+
+                                FROM calls AS callback
+
+                                WHERE
+                                    callback.client_key =
+                                    missed_clients.client_key
+
+                                    AND callback.direction = 1
+
+                                    AND callback.start_time >
+                                    missed_clients.first_missed_time
+                            )
+
+                            AND
+
+                            NOT EXISTS (
+                                SELECT 1
+
+                                FROM calls AS contact
+
+                                WHERE
+                                    contact.client_key =
+                                    missed_clients.client_key
+
+                                    AND contact.answered = 1
+
+                                    AND contact.start_time >
+                                    missed_clients.first_missed_time
+                            )
+
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS missed_not_processed
 
             FROM missed_clients
             """,
@@ -1595,9 +1648,21 @@ def stats(
                     "missed_called_back"
                 ] or 0,
 
+            "missed_contacted":
+                missed_row[
+                    "missed_contacted"
+                ] or 0,
+
+            "missed_not_processed":
+                missed_row[
+                    "missed_not_processed"
+                ] or 0,
+
+            # Старое имя оставляем для совместимости.
+            # Теперь оно означает именно "не обработано".
             "missed_not_called_back":
                 missed_row[
-                    "missed_not_called_back"
+                    "missed_not_processed"
                 ] or 0,
 
             "average_duration_seconds":
@@ -1792,9 +1857,7 @@ def stats_timeline(
             )
 
             while current <= last:
-                key = (
-                    current.isoformat()
-                )
+                key = current.isoformat()
 
                 row = by_date.get(
                     key
@@ -1877,8 +1940,7 @@ def stats_managers(
                     'Неизвестно'
                 ) AS manager,
 
-                COUNT(*)
-                    AS calls,
+                COUNT(*) AS calls,
 
                 COUNT(
                     DISTINCT
@@ -2037,8 +2099,7 @@ def stats_sims(
 
                 src_slot,
 
-                COUNT(*)
-                    AS calls,
+                COUNT(*) AS calls,
 
                 COUNT(
                     DISTINCT
@@ -2732,13 +2793,28 @@ tbody tr:last-child td {
         </div>
 
         <div class="card">
-            <div class="label">Потом перезвонили</div>
+            <div class="label">Перезвонили</div>
             <div class="value" id="missed_called_back">—</div>
         </div>
 
         <div class="card">
-            <div class="label">Не перезвонили</div>
-            <div class="value" id="missed_not_called_back">—</div>
+            <div class="label">
+                Связались после пропущенного
+            </div>
+            <div
+                class="value"
+                id="missed_contacted"
+            >—</div>
+        </div>
+
+        <div class="card">
+            <div class="label">
+                Не обработано
+            </div>
+            <div
+                class="value"
+                id="missed_not_processed"
+            >—</div>
         </div>
 
         <div class="card">
@@ -2747,13 +2823,20 @@ tbody tr:last-child td {
         </div>
 
         <div class="card">
-            <div class="label">Общее время разговоров</div>
+            <div class="label">
+                Общее время разговоров
+            </div>
             <div class="value" id="total_duration">—</div>
         </div>
 
         <div class="card">
-            <div class="label">Среднее время ответа</div>
-            <div class="value" id="average_answer_delay">—</div>
+            <div class="label">
+                Среднее время ответа
+            </div>
+            <div
+                class="value"
+                id="average_answer_delay"
+            >—</div>
         </div>
 
     </div>
@@ -3092,9 +3175,14 @@ async function loadStats() {
         s.missed_called_back;
 
     document.getElementById(
-        "missed_not_called_back"
+        "missed_contacted"
     ).textContent =
-        s.missed_not_called_back;
+        s.missed_contacted;
+
+    document.getElementById(
+        "missed_not_processed"
+    ).textContent =
+        s.missed_not_processed;
 
     document.getElementById(
         "average_duration"
@@ -3160,23 +3248,17 @@ function renderTimeline() {
                     chartMode ===
                     "incoming"
                 ) {
-                    return (
-                        item.incoming
-                    );
+                    return item.incoming;
                 }
 
                 if (
                     chartMode ===
                     "outgoing"
                 ) {
-                    return (
-                        item.outgoing
-                    );
+                    return item.outgoing;
                 }
 
-                return (
-                    item.calls
-                );
+                return item.calls;
             }
         );
 
@@ -3203,7 +3285,6 @@ function renderTimeline() {
             wrap.className =
                 "bar-wrap";
 
-
             const valueText =
                 document.createElement(
                     "div"
@@ -3216,7 +3297,6 @@ function renderTimeline() {
                 value > 0
                     ? value
                     : "";
-
 
             const bar =
                 document.createElement(
@@ -3238,7 +3318,6 @@ function renderTimeline() {
             bar.style.height =
                 Math.max(
                     2,
-
                     Math.round(
                         (
                             value
@@ -3249,6 +3328,14 @@ function renderTimeline() {
                 )
                 + "px";
 
+            bar.title =
+                item.label
+                + " — всего: "
+                + item.calls
+                + ", входящие: "
+                + item.incoming
+                + ", исходящие: "
+                + item.outgoing;
 
             const label =
                 document.createElement(
@@ -3260,7 +3347,6 @@ function renderTimeline() {
 
             label.textContent =
                 item.label;
-
 
             wrap.appendChild(
                 valueText
@@ -3277,7 +3363,6 @@ function renderTimeline() {
             chart.appendChild(
                 wrap
             );
-
         }
     );
 }
@@ -3332,14 +3417,12 @@ async function loadManagers() {
                     tr.appendChild(
                         td
                     );
-
                 }
             );
 
             body.appendChild(
                 tr
             );
-
         }
     );
 }
@@ -3399,14 +3482,12 @@ async function loadSims() {
                     tr.appendChild(
                         td
                     );
-
                 }
             );
 
             body.appendChild(
                 tr
             );
-
         }
     );
 }
@@ -3487,14 +3568,12 @@ async function loadRecent() {
                     tr.appendChild(
                         td
                     );
-
                 }
             );
 
             body.appendChild(
                 tr
             );
-
         }
     );
 }
@@ -3517,7 +3596,6 @@ async function loadAll() {
         console.error(
             error
         );
-
     }
 }
 
@@ -3542,7 +3620,6 @@ function selectPeriod(
                     button.dataset.period
                     === period
                 );
-
             }
         );
 
@@ -3562,7 +3639,6 @@ function selectPeriod(
         period !==
         "custom"
     ) {
-
         loadAll();
     }
 }
@@ -3583,10 +3659,8 @@ document
                     selectPeriod(
                         button.dataset.period
                     );
-
                 }
             );
-
         }
     );
 
@@ -3619,15 +3693,12 @@ document
                                     item.dataset.chart
                                     === chartMode
                                 );
-
                             }
                         );
 
                     renderTimeline();
-
                 }
             );
-
         }
     );
 
@@ -3668,7 +3739,6 @@ document
             }
 
             loadAll();
-
         }
     );
 
