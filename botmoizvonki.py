@@ -1991,6 +1991,29 @@ def mark_sale_not_bought(
         conn.commit()
 
 
+
+
+
+PRICE_HTML_FILE = Path("/app/price/index.html")
+
+
+@app.get("/price", response_class=HTMLResponse)
+async def price_page():
+    if not PRICE_HTML_FILE.exists():
+        return HTMLResponse(
+            content="<h1>Price page not found</h1>",
+            status_code=404,
+        )
+
+    html_content = PRICE_HTML_FILE.read_text(
+        encoding="utf-8"
+    )
+
+    return HTMLResponse(
+        content=html_content,
+        status_code=200,
+    )
+
 # =========================================================
 # TELEGRAM WEBHOOK
 # =========================================================
