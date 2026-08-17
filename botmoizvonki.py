@@ -7,6 +7,7 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
+from instagram_bot import router as instagram_router
 
 import requests
 
@@ -26,7 +27,7 @@ from fastapi.responses import HTMLResponse
 # =========================================================
 
 app = FastAPI()
-
+app.include_router(instagram_router)
 
 # =========================================================
 # CONFIG
