@@ -3,13 +3,21 @@ import os
 import sqlite3
 import subprocess
 import tempfile
+
 from datetime import datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
 
 import requests
+
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Request,
+)
+
 from fastapi.responses import HTMLResponse
 
 
@@ -28,8 +36,15 @@ UZ_TZ = timezone(
     timedelta(hours=5)
 )
 
-BASE_DIR = Path(__file__).resolve().parent
-ENV_FILE = BASE_DIR / "data" / ".env"
+BASE_DIR = Path(
+    __file__
+).resolve().parent
+
+ENV_FILE = (
+    BASE_DIR
+    / "data"
+    / ".env"
+)
 
 load_dotenv(
     dotenv_path=ENV_FILE,
@@ -44,9 +59,6 @@ TELEGRAM_CHAT_ID = os.getenv(
     "TELEGRAM_CHAT_ID"
 )
 
-# Необязательно.
-# Если потом настроим Telegram secret_token,
-# можно указать его в ENV.
 TELEGRAM_WEBHOOK_SECRET = os.getenv(
     "TELEGRAM_WEBHOOK_SECRET",
     "",
@@ -66,6 +78,7 @@ DB_PATH.parent.mkdir(
 
 HTTP = requests.Session()
 
+
 print(
     "ENV EXISTS:",
     ENV_FILE.exists(),
@@ -73,12 +86,16 @@ print(
 
 print(
     "TOKEN EXISTS:",
-    bool(TELEGRAM_BOT_TOKEN),
+    bool(
+        TELEGRAM_BOT_TOKEN
+    ),
 )
 
 print(
     "CHAT ID EXISTS:",
-    bool(TELEGRAM_CHAT_ID),
+    bool(
+        TELEGRAM_CHAT_ID
+    ),
 )
 
 print(
@@ -88,7 +105,7 @@ print(
 
 
 # =========================================================
-# SALE REASONS
+# SALE RESULTS
 # =========================================================
 
 SALE_REASONS = {
@@ -99,7 +116,7 @@ SALE_REASONS = {
         "💰 Не устроила цена",
 
     "price_changed":
-        "💰 Цена Изменилось",
+        "💰 Цена изменилась",
 
     "thinking":
         "🤔 Думает / сравнивает",
@@ -108,7 +125,7 @@ SALE_REASONS = {
         "🔎 Ищет другой товар",
 
     "credit":
-        "🔎 Хочет На Кредит",
+        "🔎 Хочет на кредит",
 
     "visit_store":
         "🏪 Хочет прийти в магазин",
@@ -135,12 +152,15 @@ SALE_REASONS = {
 # =========================================================
 
 def connect_db():
+
     conn = sqlite3.connect(
         DB_PATH,
         timeout=30,
     )
 
-    conn.row_factory = sqlite3.Row
+    conn.row_factory = (
+        sqlite3.Row
+    )
 
     conn.execute(
         "PRAGMA busy_timeout = 30000"
@@ -152,6 +172,7 @@ def connect_db():
 def normalize_phone(
     phone: str | None,
 ) -> str:
+
     if not phone:
         return ""
 
@@ -163,7 +184,9 @@ def normalize_phone(
 
 
 def init_db():
+
     with connect_db() as conn:
+
         conn.execute(
             "PRAGMA journal_mode = WAL"
         )
@@ -175,9 +198,13 @@ def init_db():
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS calls (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                id INTEGER
+                    PRIMARY KEY
+                    AUTOINCREMENT,
 
                 db_call_id INTEGER UNIQUE,
+
                 event_pbx_call_id TEXT,
 
                 client_number TEXT,
@@ -209,11 +236,14 @@ def init_db():
                 account_id TEXT,
                 account_name TEXT,
 
-                telegram_sent INTEGER DEFAULT 0,
+                telegram_sent INTEGER
+                    DEFAULT 0,
+
                 telegram_chat_id TEXT,
                 telegram_message_id INTEGER,
 
                 sale_status TEXT,
+
                 no_sale_reason TEXT,
                 no_sale_reason_code TEXT,
 
@@ -227,14 +257,21 @@ def init_db():
             """
         )
 
+        # -------------------------------------------------
+        # MIGRATIONS
+        # -------------------------------------------------
+
         columns = {
             row["name"]
             for row in conn.execute(
-                "PRAGMA table_info(calls)"
+                """
+                PRAGMA table_info(calls)
+                """
             ).fetchall()
         }
 
         migrations = {
+
             "client_key":
                 """
                 ALTER TABLE calls
@@ -256,7 +293,8 @@ def init_db():
             "telegram_sent":
                 """
                 ALTER TABLE calls
-                ADD COLUMN telegram_sent INTEGER DEFAULT 0
+                ADD COLUMN telegram_sent INTEGER
+                DEFAULT 0
                 """,
 
             "telegram_chat_id":
@@ -308,15 +346,19 @@ def init_db():
                 """,
         }
 
-        for column, sql in migrations.items():
+        for (
+            column,
+            sql,
+        ) in migrations.items():
+
             if column not in columns:
                 conn.execute(
                     sql
                 )
 
-        # ---------------------------------------------
-        # Нормализация старых номеров
-        # ---------------------------------------------
+        # -------------------------------------------------
+        # OLD CLIENT KEYS
+        # -------------------------------------------------
 
         old_rows = conn.execute(
             """
@@ -328,11 +370,15 @@ def init_db():
 
             WHERE
                 client_key IS NULL
-                OR client_key = ''
+
+                OR
+
+                client_key = ''
             """
         ).fetchall()
 
         for row in old_rows:
+
             conn.execute(
                 """
                 UPDATE calls
@@ -343,16 +389,18 @@ def init_db():
                 """,
                 (
                     normalize_phone(
-                        row["client_number"]
+                        row[
+                            "client_number"
+                        ]
                     ),
 
                     row["id"],
                 ),
             )
 
-        # ---------------------------------------------
-        # Старые записи Telegram
-        # ---------------------------------------------
+        # -------------------------------------------------
+        # OLD TELEGRAM RECORDS
+        # -------------------------------------------------
 
         conn.execute(
             """
@@ -364,9 +412,9 @@ def init_db():
             """
         )
 
-        # ---------------------------------------------
+        # -------------------------------------------------
         # INDEXES
-        # ---------------------------------------------
+        # -------------------------------------------------
 
         conn.execute(
             """
@@ -411,7 +459,7 @@ def init_db():
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS
-            idx_calls_no_sale_reason_code
+            idx_calls_reason
             ON calls(no_sale_reason_code)
             """
         )
@@ -429,10 +477,12 @@ init_db()
 def prepare_recording(
     recording_url: str,
 ):
+
     if not recording_url:
         return None, None
 
     try:
+
         response = HTTP.get(
             recording_url,
             timeout=60,
@@ -441,6 +491,7 @@ def prepare_recording(
         response.raise_for_status()
 
     except Exception as exc:
+
         print(
             "RECORDING DOWNLOAD ERROR:",
             exc,
@@ -449,6 +500,7 @@ def prepare_recording(
         return None, None
 
     with tempfile.TemporaryDirectory() as tmpdir:
+
         source_path = (
             Path(tmpdir)
             / "call_source"
@@ -463,16 +515,18 @@ def prepare_recording(
             response.content
         )
 
-        # ---------------------------------------------
-        # REAL AUDIO DURATION
-        # ---------------------------------------------
+        # -------------------------------------------------
+        # AUDIO DURATION
+        # -------------------------------------------------
 
         audio_duration = None
 
         try:
+
             result = subprocess.run(
                 [
                     "ffprobe",
+
                     "-v",
                     "error",
 
@@ -486,7 +540,9 @@ def prepare_recording(
                         "nokey=1"
                     ),
 
-                    str(source_path),
+                    str(
+                        source_path
+                    ),
                 ],
                 check=True,
                 capture_output=True,
@@ -495,40 +551,48 @@ def prepare_recording(
             )
 
             value = (
-                result.stdout
+                result
+                .stdout
                 .strip()
             )
 
             if value:
+
                 seconds = float(
                     value
                 )
 
                 if seconds >= 0:
+
                     audio_duration = round(
                         seconds
                     )
 
         except Exception as exc:
+
             print(
                 "FFPROBE ERROR:",
                 exc,
             )
 
-        # ---------------------------------------------
-        # CONVERT TO OGG OPUS
-        # ---------------------------------------------
+        # -------------------------------------------------
+        # CONVERT TO TELEGRAM VOICE
+        # -------------------------------------------------
 
         voice_bytes = None
 
         try:
+
             subprocess.run(
                 [
                     "ffmpeg",
+
                     "-y",
 
                     "-i",
-                    str(source_path),
+                    str(
+                        source_path
+                    ),
 
                     "-vn",
 
@@ -544,7 +608,9 @@ def prepare_recording(
                     "-application",
                     "voip",
 
-                    str(voice_path),
+                    str(
+                        voice_path
+                    ),
                 ],
                 check=True,
                 stdout=subprocess.DEVNULL,
@@ -553,10 +619,12 @@ def prepare_recording(
             )
 
             voice_bytes = (
-                voice_path.read_bytes()
+                voice_path
+                .read_bytes()
             )
 
         except Exception as exc:
+
             print(
                 "FFMPEG ERROR:",
                 exc,
@@ -572,6 +640,7 @@ def get_talk_duration(
     event: dict,
     audio_duration: int | None = None,
 ):
+
     answered = int(
         event.get(
             "answered",
@@ -581,16 +650,25 @@ def get_talk_duration(
     )
 
     if not answered:
-        return 0, "none"
 
-    # ---------------------------------------------
-    # 1. AUDIO
-    # ---------------------------------------------
+        return (
+            0,
+            "none",
+        )
+
+    # -------------------------------------------------
+    # AUDIO
+    # -------------------------------------------------
 
     if (
-        audio_duration is not None
-        and audio_duration >= 0
+        audio_duration
+        is not None
+
+        and
+
+        audio_duration >= 0
     ):
+
         return (
             audio_duration,
             "audio",
@@ -612,22 +690,28 @@ def get_talk_duration(
         or 0
     )
 
-    # ---------------------------------------------
-    # 2. TIMESTAMPS
-    # ---------------------------------------------
+    # -------------------------------------------------
+    # TIMESTAMPS
+    # -------------------------------------------------
 
     if (
         answer_time > 0
-        and end_time > answer_time
+
+        and
+
+        end_time > answer_time
     ):
+
         return (
-            end_time - answer_time,
+            end_time
+            - answer_time,
+
             "timestamps",
         )
 
-    # ---------------------------------------------
-    # 3. API
-    # ---------------------------------------------
+    # -------------------------------------------------
+    # API FALLBACK
+    # -------------------------------------------------
 
     api_duration = int(
         event.get(
@@ -653,6 +737,7 @@ def save_call(
     talk_duration: int,
     duration_source: str,
 ):
+
     client_number = event.get(
         "client_number"
     )
@@ -678,9 +763,11 @@ def save_call(
     )
 
     with connect_db() as conn:
+
         cursor = conn.execute(
             """
             INSERT INTO calls (
+
                 db_call_id,
                 event_pbx_call_id,
 
@@ -715,21 +802,34 @@ def save_call(
 
                 telegram_sent
             )
+
             VALUES (
+
                 ?, ?,
+
                 ?, ?, ?,
+
                 ?, ?,
+
                 ?, ?,
+
                 ?, ?, ?,
+
                 ?,
+
                 ?, ?, ?,
+
                 ?, ?, ?,
+
                 ?,
+
                 ?, ?,
+
                 0
             )
 
             ON CONFLICT(db_call_id)
+
             DO UPDATE SET
 
                 event_pbx_call_id =
@@ -797,9 +897,11 @@ def save_call(
             """,
             (
                 db_call_id,
+
                 event_pbx_call_id,
 
                 client_number,
+
                 client_key,
 
                 event.get(
@@ -851,7 +953,9 @@ def save_call(
                 ),
 
                 talk_duration,
+
                 api_duration,
+
                 duration_source,
 
                 event.get(
@@ -871,6 +975,7 @@ def save_call(
         conn.commit()
 
         if db_call_id is not None:
+
             row = conn.execute(
                 """
                 SELECT
@@ -887,6 +992,7 @@ def save_call(
             ).fetchone()
 
         elif event_pbx_call_id:
+
             row = conn.execute(
                 """
                 SELECT
@@ -895,7 +1001,8 @@ def save_call(
 
                 FROM calls
 
-                WHERE event_pbx_call_id = ?
+                WHERE
+                    event_pbx_call_id = ?
 
                 ORDER BY id DESC
 
@@ -907,6 +1014,7 @@ def save_call(
             ).fetchone()
 
         else:
+
             row = conn.execute(
                 """
                 SELECT
@@ -930,58 +1038,73 @@ def save_call(
         "already_sent":
             bool(
                 row
-                and row["telegram_sent"]
+                and row[
+                    "telegram_sent"
+                ]
             ),
     }
 
 
 def mark_telegram_sent(
     call_id: int,
-    telegram_result: dict | None = None,
+    telegram_result: dict | None,
 ):
+
     if not call_id:
         return
 
-    message_id = None
-    chat_id = None
+    telegram_chat_id = None
+    telegram_message_id = None
 
     if telegram_result:
+
         result = telegram_result.get(
             "result",
             {},
         )
 
-        message_id = result.get(
-            "message_id"
+        telegram_message_id = (
+            result.get(
+                "message_id"
+            )
         )
 
-        chat = result.get(
-            "chat",
-            {},
-        )
-
-        chat_id = chat.get(
-            "id"
+        telegram_chat_id = (
+            result.get(
+                "chat",
+                {},
+            )
+            .get(
+                "id"
+            )
         )
 
     with connect_db() as conn:
+
         conn.execute(
             """
             UPDATE calls
 
             SET
                 telegram_sent = 1,
+
                 telegram_chat_id = ?,
+
                 telegram_message_id = ?
 
             WHERE id = ?
             """,
             (
-                str(chat_id)
-                if chat_id is not None
-                else None,
+                (
+                    str(
+                        telegram_chat_id
+                    )
+                    if telegram_chat_id
+                    is not None
+                    else None
+                ),
 
-                message_id,
+                telegram_message_id,
 
                 call_id,
             ),
@@ -997,11 +1120,13 @@ def mark_telegram_sent(
 def get_client_history(
     client_number: str,
 ):
+
     client_key = normalize_phone(
         client_number
     )
 
     if not client_key:
+
         return {
             "calls_count": 0,
             "first_contact": None,
@@ -1009,10 +1134,12 @@ def get_client_history(
         }
 
     with connect_db() as conn:
+
         row = conn.execute(
             """
             SELECT
-                COUNT(*) AS calls_count,
+                COUNT(*)
+                    AS calls_count,
 
                 MIN(start_time)
                     AS first_contact,
@@ -1031,26 +1158,34 @@ def get_client_history(
 
     return {
         "calls_count":
-            row["calls_count"]
+            row[
+                "calls_count"
+            ]
             or 0,
 
         "first_contact":
-            row["first_contact"],
+            row[
+                "first_contact"
+            ],
 
         "last_contact":
-            row["last_contact"],
+            row[
+                "last_contact"
+            ],
     }
 
 
 # =========================================================
-# FORMAT
+# FORMATTERS
 # =========================================================
 
 def format_duration(
     seconds: int,
 ):
+
     seconds = int(
-        seconds or 0
+        seconds
+        or 0
     )
 
     hours, remainder = divmod(
@@ -1064,7 +1199,9 @@ def format_duration(
     )
 
     if hours:
+
         if minutes:
+
             return (
                 f"{hours} ч "
                 f"{minutes} мин"
@@ -1075,7 +1212,9 @@ def format_duration(
         )
 
     if minutes:
+
         if secs:
+
             return (
                 f"{minutes} мин "
                 f"{secs} сек"
@@ -1093,14 +1232,21 @@ def format_duration(
 def format_call_time(
     timestamp,
 ):
+
     if not timestamp:
         return "—"
 
-    return datetime.fromtimestamp(
-        int(timestamp),
-        UZ_TZ,
-    ).strftime(
-        "%H:%M"
+    return (
+        datetime
+        .fromtimestamp(
+            int(
+                timestamp
+            ),
+            UZ_TZ,
+        )
+        .strftime(
+            "%H:%M"
+        )
     )
 
 
@@ -1113,6 +1259,7 @@ def build_telegram_message(
     webhook: dict,
     talk_duration: int,
 ):
+
     direction = event.get(
         "direction"
     )
@@ -1125,24 +1272,32 @@ def build_telegram_message(
         or 0
     )
 
-    client_number = event.get(
-        "client_number",
-        "",
+    client_number = (
+        event.get(
+            "client_number"
+        )
+        or ""
     )
 
-    client_name = event.get(
-        "client_name",
-        "",
+    client_name = (
+        event.get(
+            "client_name"
+        )
+        or ""
     )
 
-    manager = webhook.get(
-        "user_login",
-        "",
+    manager = (
+        webhook.get(
+            "user_login"
+        )
+        or ""
     )
 
-    sim = event.get(
-        "src_number",
-        "",
+    sim = (
+        event.get(
+            "src_number"
+        )
+        or ""
     )
 
     start_time = event.get(
@@ -1161,14 +1316,15 @@ def build_telegram_message(
         "calls_count"
     ]
 
-    # ---------------------------------------------
+    # -------------------------------------------------
     # TITLE
-    # ---------------------------------------------
+    # -------------------------------------------------
 
     if (
         direction == 0
         and answered
     ):
+
         title = (
             "📥 <b>Входящий звонок</b>"
         )
@@ -1177,6 +1333,7 @@ def build_telegram_message(
         direction == 0
         and not answered
     ):
+
         title = (
             "❌ <b>Пропущенный звонок</b>"
         )
@@ -1185,11 +1342,13 @@ def build_telegram_message(
         direction == 1
         and answered
     ):
+
         title = (
             "📤 <b>Исходящий звонок</b>"
         )
 
     else:
+
         title = (
             "⚠️ <b>Исходящий без ответа</b>"
         )
@@ -1199,43 +1358,50 @@ def build_telegram_message(
         "",
     ]
 
-    # ---------------------------------------------
+    # -------------------------------------------------
     # CLIENT
-    # ---------------------------------------------
+    # -------------------------------------------------
 
     if client_name:
+
         lines.append(
             "👤 "
-            f"<b>{escape(str(client_name))}</b>"
+            f"<b>{escape(client_name)}</b>"
         )
 
+    # обычный номер — без <code>
     lines.append(
         "📞 "
-        f"{escape(str(client_number or '—'))}"
+        f"{escape(client_number or '—')}"
     )
 
-    # ---------------------------------------------
+    # -------------------------------------------------
     # HISTORY
-    # ---------------------------------------------
+    # -------------------------------------------------
 
     if contacts <= 1:
+
         lines.append(
             "🆕 Новый клиент"
         )
 
     else:
+
         lines.append(
             "🔁 Контактов с номером: "
             f"<b>{contacts}</b>"
         )
 
-    lines.append("")
+    lines.append(
+        ""
+    )
 
-    # ---------------------------------------------
+    # -------------------------------------------------
     # TIME
-    # ---------------------------------------------
+    # -------------------------------------------------
 
     if answered:
+
         lines.append(
             "🕐 Начало разговора: "
             f"<b>{format_call_time(answer_time)}</b>"
@@ -1247,26 +1413,28 @@ def build_telegram_message(
         )
 
     else:
+
         lines.append(
             "🕐 Время звонка: "
             f"<b>{format_call_time(start_time)}</b>"
         )
 
-    # ---------------------------------------------
+    # -------------------------------------------------
     # MANAGER
-    # ---------------------------------------------
+    # -------------------------------------------------
 
     lines.append(
         "👨‍💼 Менеджер: "
-        f"{escape(str(manager or '—'))}"
+        f"{escape(manager or '—')}"
     )
 
     lines.append(
         "📲 SIM: "
-        f"{escape(str(sim or '—'))}"
+        f"{escape(sim or '—')}"
     )
 
     if answered:
+
         lines.extend(
             [
                 "",
@@ -1286,59 +1454,46 @@ def build_telegram_message(
 def build_sale_keyboard(
     call_id: int,
 ):
+
     return {
         "inline_keyboard": [
+
             [
                 {
                     "text":
                         "✅ Купил",
 
                     "callback_data":
-                        f"sale:bought:{call_id}",
-                },
-                {
-                    "text":
-                        "❌ Не купил",
-
-                    "callback_data":
-                        f"sale:not_bought:{call_id}",
-                },
-            ]
-        ]
-    }
-
-
-def build_reason_keyboard(
-    call_id: int,
-):
-    return {
-        "inline_keyboard": [
-            [
-                {
-                    "text":
-                        "📦 Нет товара",
-
-                    "callback_data":
-                        f"reason:no_stock:{call_id}",
+                        f"result:bought:{call_id}",
                 }
             ],
 
             [
                 {
                     "text":
-                        "💰 Не устроила цена",
+                        "📦 Нет товара",
 
                     "callback_data":
-                        f"reason:price:{call_id}",
+                        f"result:no_stock:{call_id}",
                 },
 
                 {
                     "text":
-                        "💰 Цена Изменилось",
+                        "💰 Не устроила цена",
 
                     "callback_data":
-                        f"reason:price_changed:{call_id}",
+                        f"result:price:{call_id}",
                 },
+            ],
+
+            [
+                {
+                    "text":
+                        "💰 Цена изменилась",
+
+                    "callback_data":
+                        f"result:price_changed:{call_id}",
+                }
             ],
 
             [
@@ -1347,7 +1502,7 @@ def build_reason_keyboard(
                         "🤔 Думает / сравнивает",
 
                     "callback_data":
-                        f"reason:thinking:{call_id}",
+                        f"result:thinking:{call_id}",
                 }
             ],
 
@@ -1357,17 +1512,17 @@ def build_reason_keyboard(
                         "🔎 Ищет другой товар",
 
                     "callback_data":
-                        f"reason:other_product:{call_id}",
+                        f"result:other_product:{call_id}",
                 }
             ],
 
             [
                 {
                     "text":
-                        "🔎 Хочет На Кредит",
+                        "🔎 Хочет на кредит",
 
                     "callback_data":
-                        f"reason:credit:{call_id}",
+                        f"result:credit:{call_id}",
                 }
             ],
 
@@ -1377,7 +1532,7 @@ def build_reason_keyboard(
                         "🏪 Хочет прийти в магазин",
 
                     "callback_data":
-                        f"reason:visit_store:{call_id}",
+                        f"result:visit_store:{call_id}",
                 }
             ],
 
@@ -1387,7 +1542,7 @@ def build_reason_keyboard(
                         "⏳ Купит позже",
 
                     "callback_data":
-                        f"reason:later:{call_id}",
+                        f"result:later:{call_id}",
                 }
             ],
 
@@ -1397,7 +1552,7 @@ def build_reason_keyboard(
                         "🏪 Купил в другом месте",
 
                     "callback_data":
-                        f"reason:bought_elsewhere:{call_id}",
+                        f"result:bought_elsewhere:{call_id}",
                 }
             ],
 
@@ -1407,7 +1562,7 @@ def build_reason_keyboard(
                         "🚚 Не подошли условия",
 
                     "callback_data":
-                        f"reason:conditions:{call_id}",
+                        f"result:conditions:{call_id}",
                 }
             ],
 
@@ -1417,7 +1572,7 @@ def build_reason_keyboard(
                         "🚫 Не целевой звонок",
 
                     "callback_data":
-                        f"reason:not_target:{call_id}",
+                        f"result:not_target:{call_id}",
                 }
             ],
 
@@ -1427,7 +1582,38 @@ def build_reason_keyboard(
                         "📝 Другая причина",
 
                     "callback_data":
-                        f"reason:other:{call_id}",
+                        f"result:other:{call_id}",
+                }
+            ],
+        ]
+    }
+
+
+def build_selected_keyboard(
+    call_id: int,
+    selected_text: str,
+):
+
+    return {
+        "inline_keyboard": [
+
+            [
+                {
+                    "text":
+                        selected_text,
+
+                    "callback_data":
+                        f"selected:{call_id}",
+                }
+            ],
+
+            [
+                {
+                    "text":
+                        "↩️ Изменить результат",
+
+                    "callback_data":
+                        f"result_back:{call_id}",
                 }
             ],
         ]
@@ -1445,6 +1631,13 @@ def telegram_api(
     files: dict | None = None,
     timeout: int = 30,
 ):
+
+    if not TELEGRAM_BOT_TOKEN:
+
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN не указан"
+        )
+
     url = (
         "https://api.telegram.org/"
         f"bot{TELEGRAM_BOT_TOKEN}/"
@@ -1465,8 +1658,11 @@ def telegram_api(
     if not result.get(
         "ok"
     ):
+
         raise RuntimeError(
-            result
+            str(
+                result
+            )
         )
 
     return result
@@ -1476,6 +1672,7 @@ def send_text_message(
     text: str,
     reply_markup: dict | None = None,
 ):
+
     data = {
         "chat_id":
             TELEGRAM_CHAT_ID,
@@ -1491,6 +1688,7 @@ def send_text_message(
     }
 
     if reply_markup:
+
         data[
             "reply_markup"
         ] = json.dumps(
@@ -1510,6 +1708,7 @@ def send_voice_bytes(
     caption: str,
     reply_markup: dict | None = None,
 ):
+
     data = {
         "chat_id":
             TELEGRAM_CHAT_ID,
@@ -1522,6 +1721,7 @@ def send_voice_bytes(
     }
 
     if reply_markup:
+
         data[
             "reply_markup"
         ] = json.dumps(
@@ -1531,7 +1731,9 @@ def send_voice_bytes(
 
     return telegram_api(
         "sendVoice",
+
         data=data,
+
         files={
             "voice": (
                 "call.ogg",
@@ -1539,23 +1741,32 @@ def send_voice_bytes(
                 "audio/ogg",
             )
         },
+
         timeout=60,
     )
 
 
 def answer_callback_query(
     callback_query_id: str,
-    text: str | None = None,
+    text: str = "",
 ):
-    data = {
-        "callback_query_id":
-            callback_query_id,
-    }
 
-    if text:
-        data["text"] = text
+    if not callback_query_id:
+        return
 
     try:
+
+        data = {
+            "callback_query_id":
+                callback_query_id,
+        }
+
+        if text:
+
+            data[
+                "text"
+            ] = text
+
         telegram_api(
             "answerCallbackQuery",
             data=data,
@@ -1563,6 +1774,7 @@ def answer_callback_query(
         )
 
     except Exception as exc:
+
         print(
             "ANSWER CALLBACK ERROR:",
             exc,
@@ -1572,10 +1784,12 @@ def answer_callback_query(
 def edit_reply_markup(
     chat_id,
     message_id,
-    reply_markup: dict | None,
+    reply_markup,
 ):
+
     return telegram_api(
         "editMessageReplyMarkup",
+
         data={
             "chat_id":
                 chat_id,
@@ -1585,127 +1799,13 @@ def edit_reply_markup(
 
             "reply_markup":
                 json.dumps(
-                    reply_markup
-                    if reply_markup
-                    else {
-                        "inline_keyboard": []
-                    },
+                    reply_markup,
                     ensure_ascii=False,
                 ),
         },
+
         timeout=30,
     )
-
-
-def edit_message_result(
-    telegram_message: dict,
-    result_lines: list[str],
-):
-    chat = telegram_message.get(
-        "chat",
-        {},
-    )
-
-    chat_id = chat.get(
-        "id"
-    )
-
-    message_id = telegram_message.get(
-        "message_id"
-    )
-
-    if not chat_id or not message_id:
-        return
-
-    original_text = (
-        telegram_message.get(
-            "caption"
-        )
-        or telegram_message.get(
-            "text"
-        )
-        or ""
-    )
-
-    # Убираем служебную строку перед добавлением результата
-    marker = (
-        "\n\n<b>Результат разговора:</b>"
-    )
-
-    if marker in original_text:
-        original_text = (
-            original_text
-            .split(
-                marker,
-                1,
-            )[0]
-        )
-
-    final_text = (
-        original_text
-        + "\n\n"
-        + "\n".join(
-            result_lines
-        )
-    )
-
-    # Voice / audio / photo обычно используют caption
-    if telegram_message.get(
-        "voice"
-    ):
-        telegram_api(
-            "editMessageCaption",
-            data={
-                "chat_id":
-                    chat_id,
-
-                "message_id":
-                    message_id,
-
-                "caption":
-                    final_text,
-
-                "parse_mode":
-                    "HTML",
-
-                "reply_markup":
-                    json.dumps(
-                        {
-                            "inline_keyboard": []
-                        }
-                    ),
-            },
-            timeout=30,
-        )
-
-    else:
-        telegram_api(
-            "editMessageText",
-            data={
-                "chat_id":
-                    chat_id,
-
-                "message_id":
-                    message_id,
-
-                "text":
-                    final_text,
-
-                "parse_mode":
-                    "HTML",
-
-                "disable_web_page_preview":
-                    True,
-
-                "reply_markup":
-                    json.dumps(
-                        {
-                            "inline_keyboard": []
-                        }
-                    ),
-            },
-            timeout=30,
-        )
 
 
 # =========================================================
@@ -1715,11 +1815,15 @@ def edit_message_result(
 def get_call(
     call_id: int,
 ):
+
     with connect_db() as conn:
+
         return conn.execute(
             """
             SELECT *
+
             FROM calls
+
             WHERE id = ?
             """,
             (
@@ -1728,29 +1832,70 @@ def get_call(
         ).fetchone()
 
 
+def get_telegram_user_name(
+    telegram_user: dict,
+):
+
+    return (
+        telegram_user.get(
+            "username"
+        )
+
+        or
+
+        telegram_user.get(
+            "first_name"
+        )
+
+        or
+
+        telegram_user.get(
+            "last_name"
+        )
+
+        or
+
+        ""
+    )
+
+
 def mark_sale_bought(
     call_id: int,
     telegram_user: dict,
 ):
+
     now_ts = int(
-        datetime.now(
+        datetime
+        .now(
             UZ_TZ
-        ).timestamp()
+        )
+        .timestamp()
     )
 
     with connect_db() as conn:
+
         conn.execute(
             """
             UPDATE calls
 
             SET
-                sale_status = 'bought',
-                no_sale_reason = NULL,
-                no_sale_reason_code = NULL,
+                sale_status =
+                    'bought',
 
-                sale_marked_at = ?,
-                sale_marked_by = ?,
-                sale_marked_username = ?
+                no_sale_reason =
+                    NULL,
+
+                no_sale_reason_code =
+                    NULL,
+
+                sale_marked_at =
+                    ?,
+
+                sale_marked_by =
+                    ?,
+
+                sale_marked_username =
+                    ?
 
             WHERE id = ?
             """,
@@ -1761,13 +1906,9 @@ def mark_sale_bought(
                     "id"
                 ),
 
-                telegram_user.get(
-                    "username"
-                )
-                or telegram_user.get(
-                    "first_name"
-                )
-                or "",
+                get_telegram_user_name(
+                    telegram_user
+                ),
 
                 call_id,
             ),
@@ -1781,40 +1922,55 @@ def mark_sale_not_bought(
     reason_code: str,
     telegram_user: dict,
 ):
+
     reason = SALE_REASONS.get(
         reason_code
     )
 
     if not reason:
+
         raise ValueError(
-            "Unknown reason"
+            "Неизвестная причина"
         )
 
     now_ts = int(
-        datetime.now(
+        datetime
+        .now(
             UZ_TZ
-        ).timestamp()
+        )
+        .timestamp()
     )
 
     with connect_db() as conn:
+
         conn.execute(
             """
             UPDATE calls
 
             SET
-                sale_status = 'not_bought',
+                sale_status =
+                    'not_bought',
 
-                no_sale_reason = ?,
-                no_sale_reason_code = ?,
+                no_sale_reason =
+                    ?,
 
-                sale_marked_at = ?,
-                sale_marked_by = ?,
-                sale_marked_username = ?
+                no_sale_reason_code =
+                    ?,
+
+                sale_marked_at =
+                    ?,
+
+                sale_marked_by =
+                    ?,
+
+                sale_marked_username =
+                    ?
 
             WHERE id = ?
             """,
             (
                 reason,
+
                 reason_code,
 
                 now_ts,
@@ -1823,13 +1979,9 @@ def mark_sale_not_bought(
                     "id"
                 ),
 
-                telegram_user.get(
-                    "username"
-                )
-                or telegram_user.get(
-                    "first_name"
-                )
-                or "",
+                get_telegram_user_name(
+                    telegram_user
+                ),
 
                 call_id,
             ),
@@ -1848,11 +2000,13 @@ def mark_sale_not_bought(
 async def telegram_webhook(
     request: Request,
 ):
-    # ---------------------------------------------
-    # Optional Telegram secret_token protection
-    # ---------------------------------------------
+
+    # -----------------------------------------------------
+    # OPTIONAL SECRET
+    # -----------------------------------------------------
 
     if TELEGRAM_WEBHOOK_SECRET:
+
         received_secret = (
             request.headers.get(
                 "X-Telegram-Bot-Api-Secret-Token",
@@ -1864,18 +2018,27 @@ async def telegram_webhook(
             received_secret
             != TELEGRAM_WEBHOOK_SECRET
         ):
+
             raise HTTPException(
                 status_code=403,
-                detail="Invalid Telegram secret",
+                detail=(
+                    "Invalid Telegram secret"
+                ),
             )
 
     data = await request.json()
+
+    print(
+        "TELEGRAM UPDATE:",
+        data,
+    )
 
     callback = data.get(
         "callback_query"
     )
 
     if not callback:
+
         return {
             "ok": True
         }
@@ -1884,19 +2047,25 @@ async def telegram_webhook(
         "id"
     )
 
-    callback_data = callback.get(
-        "data",
-        "",
+    callback_data = (
+        callback.get(
+            "data"
+        )
+        or ""
     )
 
-    telegram_user = callback.get(
-        "from",
-        {},
+    telegram_user = (
+        callback.get(
+            "from"
+        )
+        or {}
     )
 
-    telegram_message = callback.get(
-        "message",
-        {},
+    telegram_message = (
+        callback.get(
+            "message"
+        )
+        or {}
     )
 
     chat_id = (
@@ -1910,8 +2079,10 @@ async def telegram_webhook(
         )
     )
 
-    message_id = telegram_message.get(
-        "message_id"
+    message_id = (
+        telegram_message.get(
+            "message_id"
+        )
     )
 
     print(
@@ -1921,16 +2092,20 @@ async def telegram_webhook(
 
     try:
 
-        # =========================================
-        # ✅ КУПИЛ
-        # =========================================
+        # =================================================
+        # НАЗАД / ИЗМЕНИТЬ
+        # =================================================
 
         if callback_data.startswith(
-            "sale:bought:"
+            "result_back:"
         ):
+
             call_id = int(
                 callback_data
-                .split(":")[-1]
+                .split(
+                    ":",
+                    1,
+                )[1]
             )
 
             call = get_call(
@@ -1938,6 +2113,7 @@ async def telegram_webhook(
             )
 
             if not call:
+
                 answer_callback_query(
                     callback_id,
                     "Звонок не найден",
@@ -1946,87 +2122,58 @@ async def telegram_webhook(
                 return {
                     "ok": True
                 }
-
-            mark_sale_bought(
-                call_id,
-                telegram_user,
-            )
-
-            answer_callback_query(
-                callback_id,
-                "✅ Сохранено: Купил",
-            )
-
-            edit_message_result(
-                telegram_message,
-                [
-                    "✅ <b>Купил</b>"
-                ],
-            )
-
-            return {
-                "ok": True,
-                "sale_status":
-                    "bought",
-            }
-
-        # =========================================
-        # ❌ НЕ КУПИЛ
-        # =========================================
-
-        if callback_data.startswith(
-            "sale:not_bought:"
-        ):
-            call_id = int(
-                callback_data
-                .split(":")[-1]
-            )
-
-            call = get_call(
-                call_id
-            )
-
-            if not call:
-                answer_callback_query(
-                    callback_id,
-                    "Звонок не найден",
-                )
-
-                return {
-                    "ok": True
-                }
-
-            answer_callback_query(
-                callback_id,
-                "Выберите причину",
-            )
 
             edit_reply_markup(
                 chat_id,
                 message_id,
-                build_reason_keyboard(
+                build_sale_keyboard(
                     call_id
                 ),
             )
 
+            answer_callback_query(
+                callback_id,
+                "Выберите новый результат",
+            )
+
             return {
                 "ok": True,
-                "waiting_reason":
-                    True,
+                "edit_mode": True,
             }
 
-        # =========================================
-        # ПРИЧИНА НЕ ПОКУПКИ
-        # =========================================
+        # =================================================
+        # УЖЕ ВЫБРАННЫЙ РЕЗУЛЬТАТ
+        # =================================================
 
         if callback_data.startswith(
-            "reason:"
+            "selected:"
         ):
+
+            answer_callback_query(
+                callback_id,
+                "Этот результат уже выбран",
+            )
+
+            return {
+                "ok": True
+            }
+
+        # =================================================
+        # RESULT
+        # =================================================
+
+        if callback_data.startswith(
+            "result:"
+        ):
+
             parts = callback_data.split(
                 ":"
             )
 
-            if len(parts) != 3:
+            if len(
+                parts
+            ) != 3:
+
                 answer_callback_query(
                     callback_id,
                     "Ошибка кнопки",
@@ -2036,20 +2183,21 @@ async def telegram_webhook(
                     "ok": True
                 }
 
-            reason_code = parts[1]
-
-            call_id = int(
-                parts[2]
+            result_code = (
+                parts[1]
             )
 
-            reason = SALE_REASONS.get(
-                reason_code
-            )
+            try:
 
-            if not reason:
+                call_id = int(
+                    parts[2]
+                )
+
+            except ValueError:
+
                 answer_callback_query(
                     callback_id,
-                    "Причина не найдена",
+                    "Ошибка ID звонка",
                 )
 
                 return {
@@ -2061,6 +2209,7 @@ async def telegram_webhook(
             )
 
             if not call:
+
                 answer_callback_query(
                     callback_id,
                     "Звонок не найден",
@@ -2070,27 +2219,105 @@ async def telegram_webhook(
                     "ok": True
                 }
 
+            # =============================================
+            # ✅ КУПИЛ
+            # =============================================
+
+            if (
+                result_code
+                == "bought"
+            ):
+
+                mark_sale_bought(
+                    call_id,
+                    telegram_user,
+                )
+
+                edit_reply_markup(
+                    chat_id,
+                    message_id,
+
+                    build_selected_keyboard(
+                        call_id,
+                        "✅ Купил",
+                    ),
+                )
+
+                answer_callback_query(
+                    callback_id,
+                    "✅ Сохранено",
+                )
+
+                print(
+                    "SALE RESULT:",
+                    call_id,
+                    "bought",
+                )
+
+                return {
+                    "ok": True,
+
+                    "call_id":
+                        call_id,
+
+                    "sale_status":
+                        "bought",
+                }
+
+            # =============================================
+            # ПРИЧИНА
+            # =============================================
+
+            reason = (
+                SALE_REASONS.get(
+                    result_code
+                )
+            )
+
+            if not reason:
+
+                answer_callback_query(
+                    callback_id,
+                    "Неизвестный результат",
+                )
+
+                return {
+                    "ok": True
+                }
+
             mark_sale_not_bought(
                 call_id,
-                reason_code,
+                result_code,
                 telegram_user,
+            )
+
+            edit_reply_markup(
+                chat_id,
+                message_id,
+
+                build_selected_keyboard(
+                    call_id,
+                    reason,
+                ),
             )
 
             answer_callback_query(
                 callback_id,
-                "❌ Причина сохранена",
+                "✅ Сохранено",
             )
 
-            edit_message_result(
-                telegram_message,
-                [
-                    "❌ <b>Не купил</b>",
-                    f"Причина: {escape(reason)}",
-                ],
+            print(
+                "SALE RESULT:",
+                call_id,
+                result_code,
+                reason,
             )
 
             return {
                 "ok": True,
+
+                "call_id":
+                    call_id,
 
                 "sale_status":
                     "not_bought",
@@ -2099,15 +2326,26 @@ async def telegram_webhook(
                     reason,
             }
 
+        # =================================================
+        # UNKNOWN
+        # =================================================
+
         answer_callback_query(
             callback_id,
             "Неизвестная команда",
         )
 
+        return {
+            "ok": True
+        }
+
     except Exception as exc:
+
         print(
             "TELEGRAM CALLBACK ERROR:",
-            exc,
+            repr(
+                exc
+            ),
         )
 
         answer_callback_query(
@@ -2117,27 +2355,30 @@ async def telegram_webhook(
 
         raise
 
-    return {
-        "ok": True
-    }
-
 
 # =========================================================
-# PERIOD
+# PERIODS
 # =========================================================
 
 def parse_date(
     value: str,
 ):
+
     try:
-        return datetime.strptime(
-            value,
-            "%Y-%m-%d",
-        ).date()
+
+        return (
+            datetime.strptime(
+                value,
+                "%Y-%m-%d",
+            )
+            .date()
+        )
 
     except ValueError as exc:
+
         raise HTTPException(
             status_code=400,
+
             detail=(
                 "Дата должна быть "
                 "в формате YYYY-MM-DD"
@@ -2150,49 +2391,82 @@ def get_period(
     date_from: str | None = None,
     date_to: str | None = None,
 ):
-    today = datetime.now(
-        UZ_TZ
-    ).date()
+
+    today = (
+        datetime
+        .now(
+            UZ_TZ
+        )
+        .date()
+    )
 
     if period == "today":
+
         start_date = today
         end_date = today
-        label = "Сегодня"
+
+        label = (
+            "Сегодня"
+        )
 
     elif period == "yesterday":
+
         start_date = (
             today
-            - timedelta(days=1)
+            - timedelta(
+                days=1
+            )
         )
 
-        end_date = start_date
-        label = "Вчера"
+        end_date = (
+            start_date
+        )
+
+        label = (
+            "Вчера"
+        )
 
     elif period == "7d":
+
         start_date = (
             today
-            - timedelta(days=6)
+            - timedelta(
+                days=6
+            )
         )
 
         end_date = today
-        label = "Последние 7 дней"
+
+        label = (
+            "Последние 7 дней"
+        )
 
     elif period == "30d":
+
         start_date = (
             today
-            - timedelta(days=29)
+            - timedelta(
+                days=29
+            )
         )
 
         end_date = today
-        label = "Последние 30 дней"
+
+        label = (
+            "Последние 30 дней"
+        )
 
     elif period == "custom":
+
         if (
             not date_from
-            or not date_to
+            or
+            not date_to
         ):
+
             raise HTTPException(
                 status_code=400,
+
                 detail=(
                     "Для custom нужны "
                     "date_from и date_to"
@@ -2207,24 +2481,34 @@ def get_period(
             date_to
         )
 
-        if end_date < start_date:
+        if (
+            end_date
+            < start_date
+        ):
+
             raise HTTPException(
                 status_code=400,
+
                 detail=(
-                    "Конечная дата меньше "
-                    "начальной"
+                    "Конечная дата "
+                    "меньше начальной"
                 ),
             )
 
         if (
-            end_date
-            - start_date
-        ).days > 366:
+            (
+                end_date
+                - start_date
+            ).days
+            > 366
+        ):
+
             raise HTTPException(
                 status_code=400,
+
                 detail=(
-                    "Максимальный период "
-                    "366 дней"
+                    "Максимальный "
+                    "период 366 дней"
                 ),
             )
 
@@ -2235,9 +2519,12 @@ def get_period(
         )
 
     else:
+
         raise HTTPException(
             status_code=400,
-            detail="Неизвестный период",
+            detail=(
+                "Неизвестный период"
+            ),
         )
 
     start_dt = datetime(
@@ -2254,10 +2541,13 @@ def get_period(
             end_date.day,
             tzinfo=UZ_TZ,
         )
-        + timedelta(days=1)
+        + timedelta(
+            days=1
+        )
     )
 
     return {
+
         "period":
             period,
 
@@ -2284,7 +2574,8 @@ def get_period(
             (
                 end_date
                 - start_date
-            ).days + 1,
+            ).days
+            + 1,
     }
 
 
@@ -2294,6 +2585,7 @@ def get_period(
 
 @app.get("/")
 def root():
+
     return {
         "status": "ok"
     }
@@ -2303,34 +2595,50 @@ def root():
 # GENERAL STATS
 # =========================================================
 
-@app.get("/stats")
+@app.get(
+    "/stats"
+)
 def stats(
     period: str = "today",
     date_from: str | None = None,
     date_to: str | None = None,
 ):
+
     p = get_period(
         period,
         date_from,
         date_to,
     )
 
-    start_ts = p["start_ts"]
-    end_ts = p["end_ts"]
+    start_ts = (
+        p["start_ts"]
+    )
+
+    end_ts = (
+        p["end_ts"]
+    )
 
     with connect_db() as conn:
+
         row = conn.execute(
             """
             SELECT
-                COUNT(*) AS calls,
+
+                COUNT(*)
+                    AS calls,
 
                 COUNT(
                     DISTINCT
                     CASE
-                        WHEN client_key != ''
+                        WHEN
+                            client_key IS NOT NULL
+                            AND
+                            client_key != ''
+
                         THEN client_key
                     END
-                ) AS unique_clients,
+                )
+                    AS unique_clients,
 
                 SUM(
                     CASE
@@ -2338,7 +2646,8 @@ def stats(
                         THEN 1
                         ELSE 0
                     END
-                ) AS incoming,
+                )
+                    AS incoming,
 
                 SUM(
                     CASE
@@ -2346,7 +2655,8 @@ def stats(
                         THEN 1
                         ELSE 0
                     END
-                ) AS outgoing,
+                )
+                    AS outgoing,
 
                 SUM(
                     CASE
@@ -2354,41 +2664,55 @@ def stats(
                         THEN 1
                         ELSE 0
                     END
-                ) AS answered,
+                )
+                    AS answered,
 
                 SUM(
                     CASE
-                        WHEN direction = 0
-                             AND answered = 0
+                        WHEN
+                            direction = 0
+                            AND
+                            answered = 0
+
                         THEN 1
                         ELSE 0
                     END
-                ) AS missed,
+                )
+                    AS missed,
 
                 SUM(
                     CASE
-                        WHEN direction = 1
-                             AND answered = 0
+                        WHEN
+                            direction = 1
+                            AND
+                            answered = 0
+
                         THEN 1
                         ELSE 0
                     END
-                ) AS unanswered_outgoing,
+                )
+                    AS unanswered_outgoing,
 
                 SUM(
                     CASE
-                        WHEN direction = 0
-                             AND answered = 1
+                        WHEN
+                            direction = 0
+                            AND
+                            answered = 1
+
                         THEN 1
                         ELSE 0
                     END
-                ) AS incoming_answered,
+                )
+                    AS incoming_answered,
 
                 AVG(
                     CASE
                         WHEN answered = 1
                         THEN duration
                     END
-                ) AS avg_duration,
+                )
+                    AS avg_duration,
 
                 SUM(
                     CASE
@@ -2396,23 +2720,31 @@ def stats(
                         THEN duration
                         ELSE 0
                     END
-                ) AS total_duration,
+                )
+                    AS total_duration,
 
                 AVG(
                     CASE
-                        WHEN direction = 0
-                             AND answered = 1
-                             AND answer_time > start_time
+                        WHEN
+                            direction = 0
+                            AND
+                            answered = 1
+                            AND
+                            answer_time > start_time
+
                         THEN
-                            answer_time - start_time
+                            answer_time
+                            - start_time
                     END
-                ) AS avg_answer_delay
+                )
+                    AS avg_answer_delay
 
             FROM calls
 
             WHERE
                 start_time >= ?
-                AND start_time < ?
+                AND
+                start_time < ?
             """,
             (
                 start_ts,
@@ -2420,13 +2752,14 @@ def stats(
             ),
         ).fetchone()
 
-        # -----------------------------------------
-        # NEW / REPEAT
-        # -----------------------------------------
+        # -------------------------------------------------
+        # NEW / REPEAT CLIENTS
+        # -------------------------------------------------
 
         clients_row = conn.execute(
             """
             WITH period_clients AS (
+
                 SELECT DISTINCT
                     client_key
 
@@ -2434,48 +2767,69 @@ def stats(
 
                 WHERE
                     start_time >= ?
-                    AND start_time < ?
+                    AND
+                    start_time < ?
 
-                    AND client_key IS NOT NULL
-                    AND client_key != ''
+                    AND
+                    client_key IS NOT NULL
+
+                    AND
+                    client_key != ''
             )
 
             SELECT
+
                 SUM(
                     CASE
+
                         WHEN NOT EXISTS (
+
                             SELECT 1
 
-                            FROM calls AS old_call
+                            FROM calls
+                                AS old_call
 
                             WHERE
                                 old_call.client_key =
-                                period_clients.client_key
+                                    period_clients.client_key
 
-                                AND old_call.start_time < ?
+                                AND
+
+                                old_call.start_time < ?
                         )
+
                         THEN 1
                         ELSE 0
+
                     END
-                ) AS new_clients,
+                )
+                    AS new_clients,
 
                 SUM(
                     CASE
+
                         WHEN EXISTS (
+
                             SELECT 1
 
-                            FROM calls AS old_call
+                            FROM calls
+                                AS old_call
 
                             WHERE
                                 old_call.client_key =
-                                period_clients.client_key
+                                    period_clients.client_key
 
-                                AND old_call.start_time < ?
+                                AND
+
+                                old_call.start_time < ?
                         )
+
                         THEN 1
                         ELSE 0
+
                     END
-                ) AS repeat_clients
+                )
+                    AS repeat_clients
 
             FROM period_clients
             """,
@@ -2487,14 +2841,22 @@ def stats(
             ),
         ).fetchone()
 
-        # -----------------------------------------
-        # MISSED PROCESSING
-        # -----------------------------------------
+        # -------------------------------------------------
+        # MISSED CLIENT PROCESSING
+        #
+        # resolved =
+        # после пропущенного был любой
+        # отвеченный разговор:
+        #
+        # входящий ИЛИ исходящий.
+        # -------------------------------------------------
 
         missed_row = conn.execute(
             """
             WITH missed_clients AS (
+
                 SELECT
+
                     client_key,
 
                     MIN(start_time)
@@ -2504,102 +2866,128 @@ def stats(
 
                 WHERE
                     direction = 0
-                    AND answered = 0
 
-                    AND start_time >= ?
-                    AND start_time < ?
+                    AND
 
-                    AND client_key IS NOT NULL
-                    AND client_key != ''
+                    answered = 0
 
-                GROUP BY client_key
+                    AND
+
+                    start_time >= ?
+
+                    AND
+
+                    start_time < ?
+
+                    AND
+
+                    client_key IS NOT NULL
+
+                    AND
+
+                    client_key != ''
+
+                GROUP BY
+                    client_key
             )
 
             SELECT
+
                 COUNT(*)
                     AS unique_missed_clients,
 
                 SUM(
                     CASE
+
                         WHEN EXISTS (
+
                             SELECT 1
 
-                            FROM calls AS callback
+                            FROM calls
+                                AS callback
 
                             WHERE
                                 callback.client_key =
-                                missed_clients.client_key
+                                    missed_clients.client_key
 
-                                AND callback.direction = 1
+                                AND
 
-                                AND callback.start_time >
-                                missed_clients.first_missed_time
+                                callback.direction = 1
+
+                                AND
+
+                                callback.start_time >
+                                    missed_clients.first_missed_time
                         )
+
                         THEN 1
                         ELSE 0
+
                     END
-                ) AS missed_called_back,
+                )
+                    AS missed_called_back,
 
                 SUM(
                     CASE
+
                         WHEN EXISTS (
+
                             SELECT 1
 
-                            FROM calls AS contact
+                            FROM calls
+                                AS contact
 
                             WHERE
                                 contact.client_key =
-                                missed_clients.client_key
+                                    missed_clients.client_key
 
-                                AND contact.answered = 1
+                                AND
 
-                                AND contact.start_time >
-                                missed_clients.first_missed_time
+                                contact.answered = 1
+
+                                AND
+
+                                contact.start_time >
+                                    missed_clients.first_missed_time
                         )
+
                         THEN 1
                         ELSE 0
+
                     END
-                ) AS missed_contacted,
+                )
+                    AS missed_contacted,
 
                 SUM(
                     CASE
-                        WHEN
-                            NOT EXISTS (
-                                SELECT 1
 
-                                FROM calls AS callback
+                        WHEN NOT EXISTS (
 
-                                WHERE
-                                    callback.client_key =
+                            SELECT 1
+
+                            FROM calls
+                                AS contact
+
+                            WHERE
+                                contact.client_key =
                                     missed_clients.client_key
 
-                                    AND callback.direction = 1
+                                AND
 
-                                    AND callback.start_time >
+                                contact.answered = 1
+
+                                AND
+
+                                contact.start_time >
                                     missed_clients.first_missed_time
-                            )
-
-                            AND
-
-                            NOT EXISTS (
-                                SELECT 1
-
-                                FROM calls AS contact
-
-                                WHERE
-                                    contact.client_key =
-                                    missed_clients.client_key
-
-                                    AND contact.answered = 1
-
-                                    AND contact.start_time >
-                                    missed_clients.first_missed_time
-                            )
+                        )
 
                         THEN 1
                         ELSE 0
+
                     END
-                ) AS missed_not_processed
+                )
+                    AS missed_not_processed
 
             FROM missed_clients
             """,
@@ -2609,48 +2997,77 @@ def stats(
             ),
         ).fetchone()
 
-        # -----------------------------------------
+        # -------------------------------------------------
         # SALES
-        # -----------------------------------------
+        # -------------------------------------------------
 
         sales_row = conn.execute(
             """
             SELECT
-                SUM(
-                    CASE
-                        WHEN answered = 1
-                             AND sale_status = 'bought'
-                        THEN 1
-                        ELSE 0
-                    END
-                ) AS bought,
 
                 SUM(
                     CASE
-                        WHEN answered = 1
-                             AND sale_status = 'not_bought'
+
+                        WHEN
+                            answered = 1
+
+                            AND
+
+                            sale_status =
+                                'bought'
+
                         THEN 1
                         ELSE 0
+
                     END
-                ) AS not_bought,
+                )
+                    AS bought,
 
                 SUM(
                     CASE
-                        WHEN answered = 1
-                             AND (
-                                 sale_status IS NULL
-                                 OR sale_status = ''
-                             )
+
+                        WHEN
+                            answered = 1
+
+                            AND
+
+                            sale_status =
+                                'not_bought'
+
                         THEN 1
                         ELSE 0
+
                     END
-                ) AS sale_unmarked
+                )
+                    AS not_bought,
+
+                SUM(
+                    CASE
+
+                        WHEN
+                            answered = 1
+
+                            AND
+
+                            (
+                                sale_status IS NULL
+                                OR
+                                sale_status = ''
+                            )
+
+                        THEN 1
+                        ELSE 0
+
+                    END
+                )
+                    AS sale_unmarked
 
             FROM calls
 
             WHERE
                 start_time >= ?
-                AND start_time < ?
+                AND
+                start_time < ?
             """,
             (
                 start_ts,
@@ -2664,49 +3081,65 @@ def stats(
     )
 
     incoming_answered = (
-        row["incoming_answered"]
+        row[
+            "incoming_answered"
+        ]
         or 0
     )
 
     answer_rate = (
+
         round(
-            incoming_answered
-            / incoming
+            (
+                incoming_answered
+                / incoming
+            )
             * 100,
             1,
         )
+
         if incoming
         else 0
     )
 
     bought = (
-        sales_row["bought"]
+        sales_row[
+            "bought"
+        ]
         or 0
     )
 
     not_bought = (
-        sales_row["not_bought"]
+        sales_row[
+            "not_bought"
+        ]
         or 0
     )
 
-    marked_sales = (
+    marked_results = (
         bought
         + not_bought
     )
 
     sale_conversion = (
+
         round(
-            bought
-            / marked_sales
+            (
+                bought
+                / marked_results
+            )
             * 100,
             1,
         )
-        if marked_sales
+
+        if marked_results
         else 0
     )
 
     return {
+
         "period": {
+
             "type":
                 p["period"],
 
@@ -2724,12 +3157,15 @@ def stats(
         },
 
         "stats": {
+
             "calls":
                 row["calls"]
                 or 0,
 
             "unique_clients":
-                row["unique_clients"]
+                row[
+                    "unique_clients"
+                ]
                 or 0,
 
             "incoming":
@@ -2748,7 +3184,9 @@ def stats(
                 or 0,
 
             "unanswered_outgoing":
-                row["unanswered_outgoing"]
+                row[
+                    "unanswered_outgoing"
+                ]
                 or 0,
 
             "answer_rate":
@@ -2757,50 +3195,61 @@ def stats(
             "new_clients":
                 clients_row[
                     "new_clients"
-                ] or 0,
+                ]
+                or 0,
 
             "repeat_clients":
                 clients_row[
                     "repeat_clients"
-                ] or 0,
+                ]
+                or 0,
 
             "unique_missed_clients":
                 missed_row[
                     "unique_missed_clients"
-                ] or 0,
+                ]
+                or 0,
 
             "missed_called_back":
                 missed_row[
                     "missed_called_back"
-                ] or 0,
+                ]
+                or 0,
 
             "missed_contacted":
                 missed_row[
                     "missed_contacted"
-                ] or 0,
+                ]
+                or 0,
 
             "missed_not_processed":
                 missed_row[
                     "missed_not_processed"
-                ] or 0,
+                ]
+                or 0,
 
             "average_duration_seconds":
                 round(
-                    row["avg_duration"]
+                    row[
+                        "avg_duration"
+                    ]
                     or 0
                 ),
 
             "total_duration_seconds":
-                row["total_duration"]
+                row[
+                    "total_duration"
+                ]
                 or 0,
 
             "average_answer_delay_seconds":
                 round(
-                    row["avg_answer_delay"]
+                    row[
+                        "avg_answer_delay"
+                    ]
                     or 0
                 ),
 
-            # SALES
             "bought":
                 bought,
 
@@ -2810,7 +3259,8 @@ def stats(
             "sale_unmarked":
                 sales_row[
                     "sale_unmarked"
-                ] or 0,
+                ]
+                or 0,
 
             "sale_conversion":
                 sale_conversion,
@@ -2819,7 +3269,7 @@ def stats(
 
 
 # =========================================================
-# SALES REASONS STATS
+# SALES REASONS
 # =========================================================
 
 @app.get(
@@ -2830,6 +3280,7 @@ def stats_sales_reasons(
     date_from: str | None = None,
     date_to: str | None = None,
 ):
+
     p = get_period(
         period,
         date_from,
@@ -2837,28 +3288,40 @@ def stats_sales_reasons(
     )
 
     with connect_db() as conn:
+
         rows = conn.execute(
             """
             SELECT
+
                 no_sale_reason_code,
+
                 no_sale_reason,
 
-                COUNT(*) AS count
+                COUNT(*)
+                    AS count
 
             FROM calls
 
             WHERE
                 start_time >= ?
-                AND start_time < ?
 
-                AND sale_status =
+                AND
+
+                start_time < ?
+
+                AND
+
+                sale_status =
                     'not_bought'
 
             GROUP BY
+
                 no_sale_reason_code,
+
                 no_sale_reason
 
-            ORDER BY count DESC
+            ORDER BY
+                count DESC
             """,
             (
                 p["start_ts"],
@@ -2867,7 +3330,9 @@ def stats_sales_reasons(
         ).fetchall()
 
     return {
+
         "results": [
+
             {
                 "code":
                     row[
@@ -2884,6 +3349,7 @@ def stats_sales_reasons(
                     row["count"]
                     or 0,
             }
+
             for row in rows
         ]
     }
@@ -2893,12 +3359,15 @@ def stats_sales_reasons(
 # TIMELINE
 # =========================================================
 
-@app.get("/stats/timeline")
+@app.get(
+    "/stats/timeline"
+)
 def stats_timeline(
     period: str = "today",
     date_from: str | None = None,
     date_to: str | None = None,
 ):
+
     p = get_period(
         period,
         date_from,
@@ -2907,10 +3376,16 @@ def stats_timeline(
 
     with connect_db() as conn:
 
+        # -------------------------------------------------
+        # ONE DAY -> HOURS
+        # -------------------------------------------------
+
         if p["days"] == 1:
+
             rows = conn.execute(
                 """
                 SELECT
+
                     CAST(
                         strftime(
                             '%H',
@@ -2919,9 +3394,11 @@ def stats_timeline(
                             '+5 hours'
                         )
                         AS INTEGER
-                    ) AS bucket,
+                    )
+                        AS bucket,
 
-                    COUNT(*) AS calls,
+                    COUNT(*)
+                        AS calls,
 
                     SUM(
                         CASE
@@ -2929,7 +3406,8 @@ def stats_timeline(
                             THEN 1
                             ELSE 0
                         END
-                    ) AS incoming,
+                    )
+                        AS incoming,
 
                     SUM(
                         CASE
@@ -2937,15 +3415,20 @@ def stats_timeline(
                             THEN 1
                             ELSE 0
                         END
-                    ) AS outgoing
+                    )
+                        AS outgoing
 
                 FROM calls
 
                 WHERE
                     start_time >= ?
-                    AND start_time < ?
+
+                    AND
+
+                    start_time < ?
 
                 GROUP BY bucket
+
                 ORDER BY bucket
                 """,
                 (
@@ -2955,6 +3438,7 @@ def stats_timeline(
             ).fetchall()
 
             by_hour = {
+
                 row["bucket"]:
                     row
 
@@ -2967,6 +3451,7 @@ def stats_timeline(
                 8,
                 23,
             ):
+
                 row = by_hour.get(
                     hour
                 )
@@ -2980,35 +3465,51 @@ def stats_timeline(
                             f"{hour:02d}:00",
 
                         "calls":
-                            row["calls"]
-                            if row
-                            else 0,
+                            (
+                                row["calls"]
+                                if row
+                                else 0
+                            ),
 
                         "incoming":
-                            row["incoming"]
-                            if row
-                            else 0,
+                            (
+                                row["incoming"]
+                                if row
+                                else 0
+                            ),
 
                         "outgoing":
-                            row["outgoing"]
-                            if row
-                            else 0,
+                            (
+                                row["outgoing"]
+                                if row
+                                else 0
+                            ),
                     }
                 )
 
-            granularity = "hour"
+            granularity = (
+                "hour"
+            )
+
+        # -------------------------------------------------
+        # MULTIPLE DAYS -> DAYS
+        # -------------------------------------------------
 
         else:
+
             rows = conn.execute(
                 """
                 SELECT
+
                     date(
                         start_time,
                         'unixepoch',
                         '+5 hours'
-                    ) AS bucket,
+                    )
+                        AS bucket,
 
-                    COUNT(*) AS calls,
+                    COUNT(*)
+                        AS calls,
 
                     SUM(
                         CASE
@@ -3016,7 +3517,8 @@ def stats_timeline(
                             THEN 1
                             ELSE 0
                         END
-                    ) AS incoming,
+                    )
+                        AS incoming,
 
                     SUM(
                         CASE
@@ -3024,15 +3526,20 @@ def stats_timeline(
                             THEN 1
                             ELSE 0
                         END
-                    ) AS outgoing
+                    )
+                        AS outgoing
 
                 FROM calls
 
                 WHERE
                     start_time >= ?
-                    AND start_time < ?
+
+                    AND
+
+                    start_time < ?
 
                 GROUP BY bucket
+
                 ORDER BY bucket
                 """,
                 (
@@ -3042,6 +3549,7 @@ def stats_timeline(
             ).fetchall()
 
             by_date = {
+
                 row["bucket"]:
                     row
 
@@ -3058,8 +3566,13 @@ def stats_timeline(
                 p["end_date"]
             )
 
-            while current <= last:
-                key = current.isoformat()
+            while (
+                current <= last
+            ):
+
+                key = (
+                    current.isoformat()
+                )
 
                 row = by_date.get(
                     key
@@ -3076,19 +3589,25 @@ def stats_timeline(
                             ),
 
                         "calls":
-                            row["calls"]
-                            if row
-                            else 0,
+                            (
+                                row["calls"]
+                                if row
+                                else 0
+                            ),
 
                         "incoming":
-                            row["incoming"]
-                            if row
-                            else 0,
+                            (
+                                row["incoming"]
+                                if row
+                                else 0
+                            ),
 
                         "outgoing":
-                            row["outgoing"]
-                            if row
-                            else 0,
+                            (
+                                row["outgoing"]
+                                if row
+                                else 0
+                            ),
                     }
                 )
 
@@ -3096,9 +3615,12 @@ def stats_timeline(
                     days=1
                 )
 
-            granularity = "day"
+            granularity = (
+                "day"
+            )
 
     return {
+
         "granularity":
             granularity,
 
@@ -3107,16 +3629,29 @@ def stats_timeline(
     }
 
 
+@app.get(
+    "/stats/hourly"
+)
+def stats_hourly():
+
+    return stats_timeline(
+        period="today"
+    )
+
+
 # =========================================================
 # MANAGERS
 # =========================================================
 
-@app.get("/stats/managers")
+@app.get(
+    "/stats/managers"
+)
 def stats_managers(
     period: str = "today",
     date_from: str | None = None,
     date_to: str | None = None,
 ):
+
     p = get_period(
         period,
         date_from,
@@ -3124,26 +3659,39 @@ def stats_managers(
     )
 
     with connect_db() as conn:
+
         rows = conn.execute(
             """
             SELECT
+
                 COALESCE(
                     NULLIF(
                         user_login,
                         ''
                     ),
                     'Неизвестно'
-                ) AS manager,
+                )
+                    AS manager,
 
-                COUNT(*) AS calls,
+                COUNT(*)
+                    AS calls,
 
                 COUNT(
                     DISTINCT
+
                     CASE
-                        WHEN client_key != ''
+                        WHEN
+                            client_key
+                            IS NOT NULL
+
+                            AND
+
+                            client_key != ''
+
                         THEN client_key
                     END
-                ) AS unique_clients,
+                )
+                    AS unique_clients,
 
                 SUM(
                     CASE
@@ -3151,7 +3699,8 @@ def stats_managers(
                         THEN 1
                         ELSE 0
                     END
-                ) AS incoming,
+                )
+                    AS incoming,
 
                 SUM(
                     CASE
@@ -3159,25 +3708,34 @@ def stats_managers(
                         THEN 1
                         ELSE 0
                     END
-                ) AS outgoing,
+                )
+                    AS outgoing,
 
                 SUM(
                     CASE
-                        WHEN direction = 0
-                             AND answered = 0
+                        WHEN
+                            direction = 0
+                            AND
+                            answered = 0
+
                         THEN 1
                         ELSE 0
                     END
-                ) AS missed,
+                )
+                    AS missed,
 
                 SUM(
                     CASE
-                        WHEN direction = 0
-                             AND answered = 1
+                        WHEN
+                            direction = 0
+                            AND
+                            answered = 1
+
                         THEN 1
                         ELSE 0
                     END
-                ) AS incoming_answered,
+                )
+                    AS incoming_answered,
 
                 SUM(
                     CASE
@@ -3185,33 +3743,46 @@ def stats_managers(
                         THEN duration
                         ELSE 0
                     END
-                ) AS total_duration,
+                )
+                    AS total_duration,
 
                 SUM(
                     CASE
-                        WHEN sale_status = 'bought'
+                        WHEN
+                            sale_status =
+                            'bought'
+
                         THEN 1
                         ELSE 0
                     END
-                ) AS bought,
+                )
+                    AS bought,
 
                 SUM(
                     CASE
-                        WHEN sale_status = 'not_bought'
+                        WHEN
+                            sale_status =
+                            'not_bought'
+
                         THEN 1
                         ELSE 0
                     END
-                ) AS not_bought
+                )
+                    AS not_bought
 
             FROM calls
 
             WHERE
                 start_time >= ?
-                AND start_time < ?
+
+                AND
+
+                start_time < ?
 
             GROUP BY manager
 
-            ORDER BY calls DESC
+            ORDER BY
+                calls DESC
             """,
             (
                 p["start_ts"],
@@ -3222,13 +3793,16 @@ def stats_managers(
     results = []
 
     for row in rows:
+
         incoming = (
             row["incoming"]
             or 0
         )
 
         incoming_answered = (
-            row["incoming_answered"]
+            row[
+                "incoming_answered"
+            ]
             or 0
         )
 
@@ -3257,7 +3831,9 @@ def stats_managers(
                     or 0,
 
                 "unique_clients":
-                    row["unique_clients"]
+                    row[
+                        "unique_clients"
+                    ]
                     or 0,
 
                 "incoming":
@@ -3272,17 +3848,25 @@ def stats_managers(
                     or 0,
 
                 "answer_rate":
-                    round(
-                        incoming_answered
-                        / incoming
-                        * 100,
-                        1,
-                    )
-                    if incoming
-                    else 0,
+                    (
+                        round(
+                            (
+                                incoming_answered
+                                / incoming
+                            )
+                            * 100,
+                            1,
+                        )
+
+                        if incoming
+
+                        else 0
+                    ),
 
                 "total_duration_seconds":
-                    row["total_duration"]
+                    row[
+                        "total_duration"
+                    ]
                     or 0,
 
                 "bought":
@@ -3292,14 +3876,20 @@ def stats_managers(
                     not_bought,
 
                 "sale_conversion":
-                    round(
-                        bought
-                        / marked
-                        * 100,
-                        1,
-                    )
-                    if marked
-                    else 0,
+                    (
+                        round(
+                            (
+                                bought
+                                / marked
+                            )
+                            * 100,
+                            1,
+                        )
+
+                        if marked
+
+                        else 0
+                    ),
             }
         )
 
@@ -3313,12 +3903,15 @@ def stats_managers(
 # SIM
 # =========================================================
 
-@app.get("/stats/sims")
+@app.get(
+    "/stats/sims"
+)
 def stats_sims(
     period: str = "today",
     date_from: str | None = None,
     date_to: str | None = None,
 ):
+
     p = get_period(
         period,
         date_from,
@@ -3326,28 +3919,41 @@ def stats_sims(
     )
 
     with connect_db() as conn:
+
         rows = conn.execute(
             """
             SELECT
+
                 COALESCE(
                     NULLIF(
                         src_number,
                         ''
                     ),
                     'Неизвестно'
-                ) AS sim,
+                )
+                    AS sim,
 
                 src_slot,
 
-                COUNT(*) AS calls,
+                COUNT(*)
+                    AS calls,
 
                 COUNT(
                     DISTINCT
+
                     CASE
-                        WHEN client_key != ''
+                        WHEN
+                            client_key
+                            IS NOT NULL
+
+                            AND
+
+                            client_key != ''
+
                         THEN client_key
                     END
-                ) AS unique_clients,
+                )
+                    AS unique_clients,
 
                 SUM(
                     CASE
@@ -3355,7 +3961,8 @@ def stats_sims(
                         THEN 1
                         ELSE 0
                     END
-                ) AS incoming,
+                )
+                    AS incoming,
 
                 SUM(
                     CASE
@@ -3363,16 +3970,21 @@ def stats_sims(
                         THEN 1
                         ELSE 0
                     END
-                ) AS outgoing,
+                )
+                    AS outgoing,
 
                 SUM(
                     CASE
-                        WHEN direction = 0
-                             AND answered = 0
+                        WHEN
+                            direction = 0
+                            AND
+                            answered = 0
+
                         THEN 1
                         ELSE 0
                     END
-                ) AS missed,
+                )
+                    AS missed,
 
                 SUM(
                     CASE
@@ -3380,19 +3992,24 @@ def stats_sims(
                         THEN duration
                         ELSE 0
                     END
-                ) AS total_duration
+                )
+                    AS total_duration
 
             FROM calls
 
             WHERE
                 start_time >= ?
-                AND start_time < ?
+
+                AND
+
+                start_time < ?
 
             GROUP BY
                 sim,
                 src_slot
 
-            ORDER BY calls DESC
+            ORDER BY
+                calls DESC
             """,
             (
                 p["start_ts"],
@@ -3401,7 +4018,9 @@ def stats_sims(
         ).fetchall()
 
     return {
+
         "results": [
+
             {
                 "sim":
                     row["sim"],
@@ -3414,7 +4033,9 @@ def stats_sims(
                     or 0,
 
                 "unique_clients":
-                    row["unique_clients"]
+                    row[
+                        "unique_clients"
+                    ]
                     or 0,
 
                 "incoming":
@@ -3430,7 +4051,9 @@ def stats_sims(
                     or 0,
 
                 "total_duration_seconds":
-                    row["total_duration"]
+                    row[
+                        "total_duration"
+                    ]
                     or 0,
             }
 
@@ -3440,16 +4063,19 @@ def stats_sims(
 
 
 # =========================================================
-# RECENT
+# RECENT CALLS
 # =========================================================
 
-@app.get("/stats/recent")
+@app.get(
+    "/stats/recent"
+)
 def stats_recent(
     period: str = "today",
     date_from: str | None = None,
     date_to: str | None = None,
     limit: int = 30,
 ):
+
     p = get_period(
         period,
         date_from,
@@ -3465,34 +4091,46 @@ def stats_recent(
     )
 
     with connect_db() as conn:
+
         rows = conn.execute(
             """
             SELECT
+
                 id,
+
                 db_call_id,
 
                 client_number,
+
                 client_name,
 
                 direction,
+
                 answered,
 
                 user_login,
+
                 src_number,
 
                 start_time,
+
                 duration,
 
                 sale_status,
+
                 no_sale_reason
 
             FROM calls
 
             WHERE
                 start_time >= ?
-                AND start_time < ?
 
-            ORDER BY start_time DESC
+                AND
+
+                start_time < ?
+
+            ORDER BY
+                start_time DESC
 
             LIMIT ?
             """,
@@ -3506,20 +4144,25 @@ def stats_recent(
     results = []
 
     for row in rows:
+
         start_time = (
             row["start_time"]
             or 0
         )
 
         local_time = (
-            datetime.fromtimestamp(
+
+            datetime
+            .fromtimestamp(
                 start_time,
                 UZ_TZ,
-            ).strftime(
+            )
+            .strftime(
                 "%d.%m.%Y %H:%M"
             )
 
             if start_time
+
             else "—"
         )
 
@@ -3532,11 +4175,15 @@ def stats_recent(
                     row["db_call_id"],
 
                 "client_number":
-                    row["client_number"]
+                    row[
+                        "client_number"
+                    ]
                     or "—",
 
                 "client_name":
-                    row["client_name"]
+                    row[
+                        "client_name"
+                    ]
                     or "",
 
                 "direction":
@@ -3547,11 +4194,15 @@ def stats_recent(
                     or 0,
 
                 "manager":
-                    row["user_login"]
+                    row[
+                        "user_login"
+                    ]
                     or "—",
 
                 "sim":
-                    row["src_number"]
+                    row[
+                        "src_number"
+                    ]
                     or "—",
 
                 "local_time":
@@ -3562,10 +4213,14 @@ def stats_recent(
                     or 0,
 
                 "sale_status":
-                    row["sale_status"],
+                    row[
+                        "sale_status"
+                    ],
 
                 "no_sale_reason":
-                    row["no_sale_reason"],
+                    row[
+                        "no_sale_reason"
+                    ],
             }
         )
 
@@ -3584,6 +4239,7 @@ def stats_recent(
     response_class=HTMLResponse,
 )
 def dashboard():
+
     return """
 <!DOCTYPE html>
 
@@ -3608,8 +4264,12 @@ def dashboard():
 
 body {
     margin: 0;
-    background: #111;
-    color: #fff;
+
+    background:
+        #111;
+
+    color:
+        #fff;
 
     font-family:
         -apple-system,
@@ -3620,87 +4280,162 @@ body {
 }
 
 .container {
+    width: 100%;
     max-width: 1800px;
-    margin: auto;
-    padding: 26px;
+
+    margin:
+        0 auto;
+
+    padding:
+        26px;
 }
 
 .header {
     display: flex;
-    justify-content: space-between;
-    gap: 20px;
-    margin-bottom: 28px;
+
+    align-items:
+        flex-start;
+
+    justify-content:
+        space-between;
+
+    gap:
+        20px;
+
+    margin-bottom:
+        28px;
 }
 
 .title {
-    margin: 0;
-    font-size: 34px;
+    margin:
+        0;
+
+    font-size:
+        34px;
 }
 
 .subtitle {
-    color: #888;
-    margin-top: 7px;
+    margin-top:
+        7px;
+
+    color:
+        #888;
+
+    font-size:
+        14px;
 }
 
 .periods {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
+    display:
+        flex;
+
+    flex-wrap:
+        wrap;
+
+    gap:
+        8px;
 }
 
 .period-btn,
 .chart-btn,
 .apply-btn {
-    border: 1px solid #333;
-    border-radius: 10px;
+    appearance:
+        none;
 
-    background: #1b1b1b;
-    color: #999;
+    border:
+        1px solid #333;
 
-    padding: 10px 14px;
+    border-radius:
+        10px;
 
-    cursor: pointer;
-    font-weight: 600;
+    background:
+        #1b1b1b;
+
+    color:
+        #999;
+
+    padding:
+        10px 14px;
+
+    cursor:
+        pointer;
+
+    font-weight:
+        600;
 }
 
 .period-btn.active,
 .chart-btn.active {
-    color: #111;
-    background: #d9b565;
-    border-color: #d9b565;
+    color:
+        #111;
+
+    background:
+        #d9b565;
+
+    border-color:
+        #d9b565;
 }
 
 .custom-panel {
-    display: none;
+    display:
+        none;
 
-    margin-bottom: 20px;
-    padding: 16px;
+    margin-bottom:
+        20px;
 
-    background: #1b1b1b;
-    border: 1px solid #333;
-    border-radius: 14px;
+    padding:
+        16px;
 
-    gap: 10px;
-    align-items: center;
+    background:
+        #1b1b1b;
+
+    border:
+        1px solid #333;
+
+    border-radius:
+        14px;
+
+    gap:
+        10px;
+
+    align-items:
+        center;
+
+    flex-wrap:
+        wrap;
 }
 
 .custom-panel.visible {
-    display: flex;
+    display:
+        flex;
 }
 
 .custom-panel input {
-    background: #111;
-    color: #fff;
+    border:
+        1px solid #3a3a3a;
 
-    border: 1px solid #333;
-    border-radius: 8px;
+    background:
+        #111;
 
-    padding: 9px;
+    color:
+        #fff;
+
+    border-radius:
+        8px;
+
+    padding:
+        9px 10px;
 }
 
 .apply-btn {
-    background: #d9b565;
-    color: #111;
+    color:
+        #111;
+
+    background:
+        #d9b565;
+
+    border-color:
+        #d9b565;
 }
 
 .section-title {
@@ -3709,49 +4444,58 @@ body {
         0
         14px;
 
-    font-size: 20px;
+    font-size:
+        20px;
 }
 
 .grid {
-    display: grid;
+    display:
+        grid;
 
     grid-template-columns:
         repeat(
             auto-fit,
-            minmax(205px, 1fr)
+            minmax(
+                205px,
+                1fr
+            )
         );
 
-    gap: 15px;
+    gap:
+        15px;
 }
 
 .card,
 .panel {
-    background: #1b1b1b;
+    background:
+        #1b1b1b;
 
     border:
-        1px
-        solid
-        #333;
+        1px solid #333;
 
-    border-radius: 16px;
+    border-radius:
+        16px;
 }
 
 .card {
-    padding: 20px;
-    min-height: 118px;
+    padding:
+        20px;
+
+    min-height:
+        118px;
 }
 
-.card.sale-good {
+.card.good {
     border-color:
         rgba(
-            112,
-            210,
-            130,
-            .3
+            120,
+            220,
+            145,
+            .25
         );
 }
 
-.card.sale-bad {
+.card.bad {
     border-color:
         rgba(
             255,
@@ -3762,52 +4506,86 @@ body {
 }
 
 .label {
-    color: #a5a5a5;
+    color:
+        #a5a5a5;
 
-    font-size: 14px;
+    font-size:
+        14px;
 
-    margin-bottom: 12px;
+    margin-bottom:
+        12px;
 }
 
 .value {
-    font-size: 32px;
-    font-weight: 750;
+    font-size:
+        32px;
+
+    line-height:
+        1.12;
+
+    font-weight:
+        750;
 }
 
 .panel {
-    margin-top: 24px;
-    padding: 22px;
+    margin-top:
+        24px;
+
+    padding:
+        22px;
 }
 
 .panel-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
+    display:
+        flex;
 
-    gap: 16px;
+    justify-content:
+        space-between;
 
-    margin-bottom: 18px;
+    align-items:
+        center;
+
+    gap:
+        16px;
+
+    flex-wrap:
+        wrap;
+
+    margin-bottom:
+        18px;
 }
 
 .panel h2 {
-    margin: 0;
+    margin:
+        0;
+
+    font-size:
+        24px;
 }
 
 .chart-buttons {
-    display: flex;
-    gap: 7px;
+    display:
+        flex;
+
+    gap:
+        7px;
 }
 
 .chart {
-    display: flex;
+    display:
+        flex;
 
-    align-items: flex-end;
+    align-items:
+        flex-end;
 
-    gap: 9px;
+    gap:
+        9px;
 
-    min-height: 280px;
+    min-height:
+        280px;
 
-    overflow-x: auto;
+    overflow-x:
+        auto;
 
     padding:
         30px
@@ -3816,29 +4594,42 @@ body {
 }
 
 .bar-wrap {
-    flex: 1;
+    flex:
+        1;
 
-    min-width: 44px;
+    min-width:
+        44px;
 
-    text-align: center;
+    text-align:
+        center;
 }
 
 .bar-value {
-    height: 22px;
+    height:
+        22px;
 
-    font-size: 12px;
+    font-size:
+        12px;
+
+    font-weight:
+        600;
 }
 
 .bar {
-    width: 70%;
+    width:
+        70%;
 
-    max-width: 58px;
+    max-width:
+        58px;
 
-    min-height: 2px;
+    min-height:
+        2px;
 
-    margin: auto;
+    margin:
+        0 auto;
 
-    background: #d9b565;
+    background:
+        #d9b565;
 
     border-radius:
         8px
@@ -3848,95 +4639,125 @@ body {
 }
 
 .bar.outgoing {
-    opacity: .5;
+    opacity:
+        .5;
 }
 
 .bar-label {
-    margin-top: 8px;
+    margin-top:
+        8px;
 
-    color: #999;
+    color:
+        #999;
 
-    font-size: 11px;
+    font-size:
+        11px;
 
-    white-space: nowrap;
+    white-space:
+        nowrap;
 }
 
 .tables {
-    display: grid;
+    display:
+        grid;
 
     grid-template-columns:
         repeat(
             2,
-            minmax(0, 1fr)
+            minmax(
+                0,
+                1fr
+            )
         );
 
-    gap: 24px;
+    gap:
+        24px;
 }
 
 .table-wrap {
-    overflow-x: auto;
+    overflow-x:
+        auto;
 }
 
 table {
-    width: 100%;
+    width:
+        100%;
 
     border-collapse:
         collapse;
 
-    min-width: 650px;
+    min-width:
+        650px;
 }
 
 th {
-    text-align: left;
+    text-align:
+        left;
 
-    color: #888;
+    color:
+        #888;
 
-    font-size: 12px;
+    font-size:
+        12px;
 
-    padding: 11px 10px;
+    font-weight:
+        600;
+
+    padding:
+        11px 10px;
 
     border-bottom:
-        1px
-        solid
-        #333;
+        1px solid #333;
 }
 
 td {
-    padding: 13px 10px;
+    padding:
+        13px 10px;
 
     border-bottom:
-        1px
-        solid
-        #292929;
+        1px solid #292929;
 
-    font-size: 13px;
+    font-size:
+        13px;
+}
+
+tbody tr:last-child td {
+    border-bottom:
+        0;
 }
 
 .phone {
     font-family:
         ui-monospace,
+        SFMono-Regular,
+        Menlo,
         monospace;
 }
 
-.sale-result {
-    white-space: nowrap;
-}
-
 .sale-bought {
-    color: #a9e5b3;
+    color:
+        #a9e5b3;
 }
 
 .sale-not-bought {
-    color: #ffabab;
+    color:
+        #ffabab;
 }
 
 .sale-unmarked {
-    color: #777;
+    color:
+        #777;
+}
+
+.empty {
+    color:
+        #777;
 }
 
 @media (
     max-width: 1000px
 ) {
+
     .header {
         flex-direction:
             column;
@@ -3951,30 +4772,47 @@ td {
 @media (
     max-width: 600px
 ) {
+
     .container {
-        padding: 14px;
+        padding:
+            14px;
     }
 
     .title {
-        font-size: 26px;
+        font-size:
+            26px;
     }
 
     .grid {
         grid-template-columns:
             repeat(
                 2,
-                minmax(0, 1fr)
+                minmax(
+                    0,
+                    1fr
+                )
             );
 
-        gap: 10px;
+        gap:
+            10px;
     }
 
     .card {
-        padding: 15px;
+        min-height:
+            105px;
+
+        padding:
+            15px;
     }
 
     .value {
-        font-size: 25px;
+        font-size:
+            25px;
+    }
+
+    .panel {
+        padding:
+            15px;
     }
 }
 
@@ -3986,526 +4824,353 @@ td {
 
 <div class="container">
 
-    <div class="header">
 
-        <div>
+<div class="header">
 
-            <h1 class="title">
-                Texnikach — статистика звонков
-            </h1>
+    <div>
 
-            <div
-                id="period_label"
-                class="subtitle"
-            >
-                Сегодня
-            </div>
+        <h1 class="title">
+            Texnikach — статистика звонков
+        </h1>
 
-        </div>
-
-        <div class="periods">
-
-            <button
-                class="period-btn active"
-                data-period="today"
-            >
-                Сегодня
-            </button>
-
-            <button
-                class="period-btn"
-                data-period="yesterday"
-            >
-                Вчера
-            </button>
-
-            <button
-                class="period-btn"
-                data-period="7d"
-            >
-                7 дней
-            </button>
-
-            <button
-                class="period-btn"
-                data-period="30d"
-            >
-                30 дней
-            </button>
-
-            <button
-                class="period-btn"
-                data-period="custom"
-            >
-                Свой период
-            </button>
-
+        <div
+            class="subtitle"
+            id="period_label"
+        >
+            Сегодня
         </div>
 
     </div>
 
 
-    <div
-        id="custom_panel"
-        class="custom-panel"
-    >
-
-        <span>С</span>
-
-        <input
-            id="date_from"
-            type="date"
-        >
-
-        <span>по</span>
-
-        <input
-            id="date_to"
-            type="date"
-        >
+    <div class="periods">
 
         <button
-            id="apply_custom"
-            class="apply-btn"
+            class="period-btn active"
+            data-period="today"
         >
-            Показать
+            Сегодня
+        </button>
+
+        <button
+            class="period-btn"
+            data-period="yesterday"
+        >
+            Вчера
+        </button>
+
+        <button
+            class="period-btn"
+            data-period="7d"
+        >
+            7 дней
+        </button>
+
+        <button
+            class="period-btn"
+            data-period="30d"
+        >
+            30 дней
+        </button>
+
+        <button
+            class="period-btn"
+            data-period="custom"
+        >
+            Свой период
         </button>
 
     </div>
 
-
-    <div class="grid">
-
-        <div class="card">
-            <div class="label">
-                Всего звонков
-            </div>
-            <div
-                class="value"
-                id="calls"
-            >—</div>
-        </div>
-
-        <div class="card">
-            <div class="label">
-                Уникальные клиенты
-            </div>
-            <div
-                class="value"
-                id="unique_clients"
-            >—</div>
-        </div>
-
-        <div class="card">
-            <div class="label">
-                Входящие
-            </div>
-            <div
-                class="value"
-                id="incoming"
-            >—</div>
-        </div>
-
-        <div class="card">
-            <div class="label">
-                Исходящие
-            </div>
-            <div
-                class="value"
-                id="outgoing"
-            >—</div>
-        </div>
-
-        <div class="card">
-            <div class="label">
-                Отвеченные
-            </div>
-            <div
-                class="value"
-                id="answered"
-            >—</div>
-        </div>
-
-        <div class="card">
-            <div class="label">
-                Пропущенные входящие
-            </div>
-            <div
-                class="value"
-                id="missed"
-            >—</div>
-        </div>
-
-        <div class="card">
-            <div class="label">
-                Ответили на входящие
-            </div>
-            <div
-                class="value"
-                id="answer_rate"
-            >—</div>
-        </div>
-
-        <div class="card">
-            <div class="label">
-                Новые клиенты
-            </div>
-            <div
-                class="value"
-                id="new_clients"
-            >—</div>
-        </div>
-
-        <div class="card">
-            <div class="label">
-                Повторные клиенты
-            </div>
-            <div
-                class="value"
-                id="repeat_clients"
-            >—</div>
-        </div>
-
-        <div class="card">
-            <div class="label">
-                Уникально пропущено
-            </div>
-            <div
-                class="value"
-                id="unique_missed_clients"
-            >—</div>
-        </div>
-
-        <div class="card">
-            <div class="label">
-                Перезвонили
-            </div>
-            <div
-                class="value"
-                id="missed_called_back"
-            >—</div>
-        </div>
-
-        <div class="card">
-            <div class="label">
-                Связались после пропущенного
-            </div>
-            <div
-                class="value"
-                id="missed_contacted"
-            >—</div>
-        </div>
-
-        <div class="card">
-            <div class="label">
-                Не обработано
-            </div>
-            <div
-                class="value"
-                id="missed_not_processed"
-            >—</div>
-        </div>
-
-        <div class="card">
-            <div class="label">
-                Средний разговор
-            </div>
-            <div
-                class="value"
-                id="average_duration"
-            >—</div>
-        </div>
-
-        <div class="card">
-            <div class="label">
-                Общее время разговоров
-            </div>
-            <div
-                class="value"
-                id="total_duration"
-            >—</div>
-        </div>
-
-        <div class="card">
-            <div class="label">
-                Среднее время ответа
-            </div>
-            <div
-                class="value"
-                id="average_answer_delay"
-            >—</div>
-        </div>
-
-    </div>
+</div>
 
 
-    <h2 class="section-title">
-        Продажи
-    </h2>
+<div
+    class="custom-panel"
+    id="custom_panel"
+>
 
-    <div class="grid">
+    <span>
+        С
+    </span>
 
-        <div class="card sale-good">
+    <input
+        id="date_from"
+        type="date"
+    >
 
-            <div class="label">
-                ✅ Купил
-            </div>
+    <span>
+        по
+    </span>
 
-            <div
-                class="value"
-                id="bought"
-            >
-                —
-            </div>
+    <input
+        id="date_to"
+        type="date"
+    >
 
-        </div>
+    <button
+        class="apply-btn"
+        id="apply_custom"
+    >
+        Показать
+    </button>
 
-
-        <div class="card sale-bad">
-
-            <div class="label">
-                ❌ Не купил
-            </div>
-
-            <div
-                class="value"
-                id="not_bought"
-            >
-                —
-            </div>
-
-        </div>
+</div>
 
 
-        <div class="card">
+<div class="grid">
 
-            <div class="label">
-                Не отмечено
-            </div>
+    <div class="card">
 
-            <div
-                class="value"
-                id="sale_unmarked"
-            >
-                —
-            </div>
-
-        </div>
-
-
-        <div class="card">
-
-            <div class="label">
-                Конверсия
-            </div>
-
-            <div
-                class="value"
-                id="sale_conversion"
-            >
-                —
-            </div>
-
-        </div>
-
-    </div>
-
-
-    <div class="panel">
-
-        <div class="panel-header">
-
-            <h2 id="chart_title">
-                Звонки по часам
-            </h2>
-
-            <div class="chart-buttons">
-
-                <button
-                    class="chart-btn active"
-                    data-chart="all"
-                >
-                    Все
-                </button>
-
-                <button
-                    class="chart-btn"
-                    data-chart="incoming"
-                >
-                    Входящие
-                </button>
-
-                <button
-                    class="chart-btn"
-                    data-chart="outgoing"
-                >
-                    Исходящие
-                </button>
-
-            </div>
-
+        <div class="label">
+            Всего звонков
         </div>
 
         <div
-            id="timeline_chart"
-            class="chart"
-        ></div>
-
-    </div>
-
-
-    <div class="panel">
-
-        <div class="panel-header">
-
-            <h2>
-                Почему не купили
-            </h2>
-
-        </div>
-
-        <div class="table-wrap">
-
-            <table>
-
-                <thead>
-
-                <tr>
-                    <th>Причина</th>
-                    <th>Количество</th>
-                </tr>
-
-                </thead>
-
-                <tbody
-                    id="reasons_body"
-                ></tbody>
-
-            </table>
-
+            class="value"
+            id="calls"
+        >
+            —
         </div>
 
     </div>
 
 
-    <div class="tables">
+    <div class="card">
 
-        <div class="panel">
-
-            <div class="panel-header">
-                <h2>
-                    Менеджеры
-                </h2>
-            </div>
-
-            <div class="table-wrap">
-
-                <table>
-
-                    <thead>
-
-                    <tr>
-                        <th>Менеджер</th>
-                        <th>Звонки</th>
-                        <th>Клиенты</th>
-                        <th>Вход.</th>
-                        <th>Исход.</th>
-                        <th>Пропущ.</th>
-                        <th>Ответ %</th>
-                        <th>Купил</th>
-                        <th>Не купил</th>
-                        <th>Конверсия</th>
-                        <th>Разговор</th>
-                    </tr>
-
-                    </thead>
-
-                    <tbody
-                        id="managers_body"
-                    ></tbody>
-
-                </table>
-
-            </div>
-
+        <div class="label">
+            Уникальные клиенты
         </div>
 
-
-        <div class="panel">
-
-            <div class="panel-header">
-                <h2>
-                    SIM-карты
-                </h2>
-            </div>
-
-            <div class="table-wrap">
-
-                <table>
-
-                    <thead>
-
-                    <tr>
-                        <th>SIM</th>
-                        <th>Слот</th>
-                        <th>Звонки</th>
-                        <th>Клиенты</th>
-                        <th>Вход.</th>
-                        <th>Исход.</th>
-                        <th>Пропущ.</th>
-                        <th>Разговор</th>
-                    </tr>
-
-                    </thead>
-
-                    <tbody
-                        id="sims_body"
-                    ></tbody>
-
-                </table>
-
-            </div>
-
+        <div
+            class="value"
+            id="unique_clients"
+        >
+            —
         </div>
 
     </div>
 
 
-    <div class="panel">
+    <div class="card">
 
-        <div class="panel-header">
-
-            <h2>
-                Последние звонки
-            </h2>
-
+        <div class="label">
+            Входящие
         </div>
 
-        <div class="table-wrap">
+        <div
+            class="value"
+            id="incoming"
+        >
+            —
+        </div>
 
-            <table>
+    </div>
 
-                <thead>
 
-                <tr>
-                    <th>Время</th>
-                    <th>Клиент</th>
-                    <th>Направление</th>
-                    <th>Статус</th>
-                    <th>Менеджер</th>
-                    <th>SIM</th>
-                    <th>Разговор</th>
-                    <th>Результат</th>
-                </tr>
+    <div class="card">
 
-                </thead>
+        <div class="label">
+            Исходящие
+        </div>
 
-                <tbody
-                    id="recent_body"
-                ></tbody>
+        <div
+            class="value"
+            id="outgoing"
+        >
+            —
+        </div>
 
-            </table>
+    </div>
 
+
+    <div class="card">
+
+        <div class="label">
+            Отвеченные
+        </div>
+
+        <div
+            class="value"
+            id="answered"
+        >
+            —
+        </div>
+
+    </div>
+
+
+    <div class="card">
+
+        <div class="label">
+            Пропущенные входящие
+        </div>
+
+        <div
+            class="value"
+            id="missed"
+        >
+            —
+        </div>
+
+    </div>
+
+
+    <div class="card">
+
+        <div class="label">
+            Ответили на входящие
+        </div>
+
+        <div
+            class="value"
+            id="answer_rate"
+        >
+            —
+        </div>
+
+    </div>
+
+
+    <div class="card">
+
+        <div class="label">
+            Новые клиенты
+        </div>
+
+        <div
+            class="value"
+            id="new_clients"
+        >
+            —
+        </div>
+
+    </div>
+
+
+    <div class="card">
+
+        <div class="label">
+            Повторные клиенты
+        </div>
+
+        <div
+            class="value"
+            id="repeat_clients"
+        >
+            —
+        </div>
+
+    </div>
+
+
+    <div class="card">
+
+        <div class="label">
+            Уникально пропущено
+        </div>
+
+        <div
+            class="value"
+            id="unique_missed_clients"
+        >
+            —
+        </div>
+
+    </div>
+
+
+    <div class="card">
+
+        <div class="label">
+            Были исходящие после пропущенного
+        </div>
+
+        <div
+            class="value"
+            id="missed_called_back"
+        >
+            —
+        </div>
+
+    </div>
+
+
+    <div class="card">
+
+        <div class="label">
+            Связались после пропущенного
+        </div>
+
+        <div
+            class="value"
+            id="missed_contacted"
+        >
+            —
+        </div>
+
+    </div>
+
+
+    <div class="card">
+
+        <div class="label">
+            Не обработано
+        </div>
+
+        <div
+            class="value"
+            id="missed_not_processed"
+        >
+            —
+        </div>
+
+    </div>
+
+
+    <div class="card">
+
+        <div class="label">
+            Средний разговор
+        </div>
+
+        <div
+            class="value"
+            id="average_duration"
+        >
+            —
+        </div>
+
+    </div>
+
+
+    <div class="card">
+
+        <div class="label">
+            Общее время разговоров
+        </div>
+
+        <div
+            class="value"
+            id="total_duration"
+        >
+            —
+        </div>
+
+    </div>
+
+
+    <div class="card">
+
+        <div class="label">
+            Среднее время ответа
+        </div>
+
+        <div
+            class="value"
+            id="average_answer_delay"
+        >
+            —
         </div>
 
     </div>
@@ -4513,7 +5178,379 @@ td {
 </div>
 
 
+<h2 class="section-title">
+    Продажи
+</h2>
+
+
+<div class="grid">
+
+    <div class="card good">
+
+        <div class="label">
+            ✅ Купил
+        </div>
+
+        <div
+            class="value"
+            id="bought"
+        >
+            —
+        </div>
+
+    </div>
+
+
+    <div class="card bad">
+
+        <div class="label">
+            ❌ Не купил
+        </div>
+
+        <div
+            class="value"
+            id="not_bought"
+        >
+            —
+        </div>
+
+    </div>
+
+
+    <div class="card">
+
+        <div class="label">
+            Не отмечено
+        </div>
+
+        <div
+            class="value"
+            id="sale_unmarked"
+        >
+            —
+        </div>
+
+    </div>
+
+
+    <div class="card good">
+
+        <div class="label">
+            Конверсия отмеченных
+        </div>
+
+        <div
+            class="value"
+            id="sale_conversion"
+        >
+            —
+        </div>
+
+    </div>
+
+</div>
+
+
+<div class="panel">
+
+    <div class="panel-header">
+
+        <h2 id="chart_title">
+            Звонки по часам
+        </h2>
+
+        <div class="chart-buttons">
+
+            <button
+                class="chart-btn active"
+                data-chart="all"
+            >
+                Все
+            </button>
+
+            <button
+                class="chart-btn"
+                data-chart="incoming"
+            >
+                Входящие
+            </button>
+
+            <button
+                class="chart-btn"
+                data-chart="outgoing"
+            >
+                Исходящие
+            </button>
+
+        </div>
+
+    </div>
+
+    <div
+        class="chart"
+        id="timeline_chart"
+    ></div>
+
+</div>
+
+
+<div class="panel">
+
+    <div class="panel-header">
+
+        <h2>
+            Почему не купили
+        </h2>
+
+    </div>
+
+    <div class="table-wrap">
+
+        <table>
+
+            <thead>
+
+            <tr>
+                <th>
+                    Причина
+                </th>
+
+                <th>
+                    Количество
+                </th>
+            </tr>
+
+            </thead>
+
+            <tbody
+                id="reasons_body"
+            ></tbody>
+
+        </table>
+
+    </div>
+
+</div>
+
+
+<div class="tables">
+
+
+<div class="panel">
+
+    <div class="panel-header">
+
+        <h2>
+            Менеджеры
+        </h2>
+
+    </div>
+
+    <div class="table-wrap">
+
+        <table>
+
+            <thead>
+
+            <tr>
+
+                <th>
+                    Менеджер
+                </th>
+
+                <th>
+                    Звонки
+                </th>
+
+                <th>
+                    Клиенты
+                </th>
+
+                <th>
+                    Вход.
+                </th>
+
+                <th>
+                    Исход.
+                </th>
+
+                <th>
+                    Пропущ.
+                </th>
+
+                <th>
+                    Ответ %
+                </th>
+
+                <th>
+                    Купил
+                </th>
+
+                <th>
+                    Не купил
+                </th>
+
+                <th>
+                    Конверсия
+                </th>
+
+                <th>
+                    Разговор
+                </th>
+
+            </tr>
+
+            </thead>
+
+            <tbody
+                id="managers_body"
+            ></tbody>
+
+        </table>
+
+    </div>
+
+</div>
+
+
+<div class="panel">
+
+    <div class="panel-header">
+
+        <h2>
+            SIM-карты
+        </h2>
+
+    </div>
+
+    <div class="table-wrap">
+
+        <table>
+
+            <thead>
+
+            <tr>
+
+                <th>
+                    SIM
+                </th>
+
+                <th>
+                    Слот
+                </th>
+
+                <th>
+                    Звонки
+                </th>
+
+                <th>
+                    Клиенты
+                </th>
+
+                <th>
+                    Вход.
+                </th>
+
+                <th>
+                    Исход.
+                </th>
+
+                <th>
+                    Пропущ.
+                </th>
+
+                <th>
+                    Разговор
+                </th>
+
+            </tr>
+
+            </thead>
+
+            <tbody
+                id="sims_body"
+            ></tbody>
+
+        </table>
+
+    </div>
+
+</div>
+
+
+</div>
+
+
+<div class="panel">
+
+    <div class="panel-header">
+
+        <h2>
+            Последние звонки
+        </h2>
+
+    </div>
+
+    <div class="table-wrap">
+
+        <table>
+
+            <thead>
+
+            <tr>
+
+                <th>
+                    Время
+                </th>
+
+                <th>
+                    Клиент
+                </th>
+
+                <th>
+                    Направление
+                </th>
+
+                <th>
+                    Статус
+                </th>
+
+                <th>
+                    Менеджер
+                </th>
+
+                <th>
+                    SIM
+                </th>
+
+                <th>
+                    Разговор
+                </th>
+
+                <th>
+                    Результат
+                </th>
+
+            </tr>
+
+            </thead>
+
+            <tbody
+                id="recent_body"
+            ></tbody>
+
+        </table>
+
+    </div>
+
+</div>
+
+
+</div>
+
+
 <script>
+
 
 let selectedPeriod =
     "today";
@@ -4535,46 +5572,76 @@ function formatDuration(
     seconds
 ) {
 
-    seconds =
-        Number(
-            seconds || 0
-        );
+    seconds = Number(
+        seconds
+        || 0
+    );
 
     const hours =
         Math.floor(
-            seconds / 3600
+            seconds
+            / 3600
         );
 
     const minutes =
         Math.floor(
             (
-                seconds % 3600
+                seconds
+                % 3600
             )
             / 60
         );
 
     const secs =
-        seconds % 60;
+        seconds
+        % 60;
 
-    if (hours > 0) {
+
+    if (
+        hours > 0
+    ) {
+
+        if (
+            minutes > 0
+        ) {
+
+            return (
+                hours
+                + " ч "
+                + minutes
+                + " мин"
+            );
+        }
 
         return (
             hours
-            + " ч "
-            + minutes
+            + " ч"
+        );
+    }
+
+
+    if (
+        minutes > 0
+    ) {
+
+        if (
+            secs > 0
+        ) {
+
+            return (
+                minutes
+                + " мин "
+                + secs
+                + " сек"
+            );
+        }
+
+        return (
+            minutes
             + " мин"
         );
     }
 
-    if (minutes > 0) {
-
-        return (
-            minutes
-            + " мин "
-            + secs
-            + " сек"
-        );
-    }
 
     return (
         secs
@@ -4588,10 +5655,12 @@ function queryString() {
     const params =
         new URLSearchParams();
 
+
     params.set(
         "period",
         selectedPeriod
     );
+
 
     if (
         selectedPeriod
@@ -4608,6 +5677,7 @@ function queryString() {
             customTo
         );
     }
+
 
     return (
         "?"
@@ -4626,12 +5696,16 @@ async function getJson(
             + queryString()
         );
 
-    if (!response.ok) {
+
+    if (
+        !response.ok
+    ) {
 
         throw new Error(
             await response.text()
         );
     }
+
 
     return (
         await response.json()
@@ -4656,7 +5730,8 @@ async function loadStats() {
         data.period.label;
 
 
-    const simpleValues = {
+    const fields = {
+
         calls:
             s.calls,
 
@@ -4718,7 +5793,7 @@ async function loadStats() {
             value
         ]
         of Object.entries(
-            simpleValues
+            fields
         )
     ) {
 
@@ -4731,28 +5806,34 @@ async function loadStats() {
     }
 
 
-    document.getElementById(
-        "average_duration"
-    ).textContent =
-        formatDuration(
-            s.average_duration_seconds
-        );
+    document
+        .getElementById(
+            "average_duration"
+        )
+        .textContent =
+            formatDuration(
+                s.average_duration_seconds
+            );
 
 
-    document.getElementById(
-        "total_duration"
-    ).textContent =
-        formatDuration(
-            s.total_duration_seconds
-        );
+    document
+        .getElementById(
+            "total_duration"
+        )
+        .textContent =
+            formatDuration(
+                s.total_duration_seconds
+            );
 
 
-    document.getElementById(
-        "average_answer_delay"
-    ).textContent =
-        formatDuration(
-            s.average_answer_delay_seconds
-        );
+    document
+        .getElementById(
+            "average_answer_delay"
+        )
+        .textContent =
+            formatDuration(
+                s.average_answer_delay_seconds
+            );
 }
 
 
@@ -4763,16 +5844,24 @@ async function loadTimeline() {
             "/stats/timeline"
         );
 
+
     timelineData =
         data.points;
 
-    document.getElementById(
-        "chart_title"
-    ).textContent =
-        data.granularity ===
-        "hour"
-            ? "Звонки по часам"
-            : "Звонки по дням";
+
+    document
+        .getElementById(
+            "chart_title"
+        )
+        .textContent =
+
+            data.granularity
+            === "hour"
+
+                ? "Звонки по часам"
+
+                : "Звонки по дням";
+
 
     renderTimeline();
 }
@@ -4784,6 +5873,7 @@ function renderTimeline() {
         document.getElementById(
             "timeline_chart"
         );
+
 
     chart.innerHTML =
         "";
@@ -4803,6 +5893,7 @@ function renderTimeline() {
                     );
                 }
 
+
                 if (
                     chartMode
                     === "outgoing"
@@ -4812,6 +5903,7 @@ function renderTimeline() {
                         item.outgoing
                     );
                 }
+
 
                 return (
                     item.calls
@@ -4833,6 +5925,7 @@ function renderTimeline() {
             index
         ) => {
 
+
             const value =
                 values[index];
 
@@ -4841,6 +5934,7 @@ function renderTimeline() {
                 document.createElement(
                     "div"
                 );
+
 
             wrap.className =
                 "bar-wrap";
@@ -4851,8 +5945,10 @@ function renderTimeline() {
                     "div"
                 );
 
+
             valueText.className =
                 "bar-value";
+
 
             valueText.textContent =
                 value > 0
@@ -4864,6 +5960,7 @@ function renderTimeline() {
                 document.createElement(
                     "div"
                 );
+
 
             bar.className =
                 "bar";
@@ -4881,6 +5978,7 @@ function renderTimeline() {
 
 
             bar.style.height =
+
                 Math.max(
                     2,
 
@@ -4892,6 +5990,7 @@ function renderTimeline() {
                         * 210
                     )
                 )
+
                 + "px";
 
 
@@ -4900,8 +5999,10 @@ function renderTimeline() {
                     "div"
                 );
 
+
             label.className =
                 "bar-label";
+
 
             label.textContent =
                 item.label;
@@ -4911,13 +6012,16 @@ function renderTimeline() {
                 valueText
             );
 
+
             wrap.appendChild(
                 bar
             );
 
+
             wrap.appendChild(
                 label
             );
+
 
             chart.appendChild(
                 wrap
@@ -4934,10 +6038,12 @@ async function loadReasons() {
             "/stats/sales/reasons"
         );
 
+
     const body =
         document.getElementById(
             "reasons_body"
         );
+
 
     body.innerHTML =
         "";
@@ -4953,27 +6059,34 @@ async function loadReasons() {
                 "tr"
             );
 
+
         const td =
             document.createElement(
                 "td"
             );
 
+
         td.colSpan =
             2;
+
+
+        td.className =
+            "empty";
+
 
         td.textContent =
             "Пока нет данных";
 
-        td.style.color =
-            "#777";
 
         tr.appendChild(
             td
         );
 
+
         body.appendChild(
             tr
         );
+
 
         return;
     }
@@ -4982,15 +6095,18 @@ async function loadReasons() {
     data.results.forEach(
         row => {
 
+
             const tr =
                 document.createElement(
                     "tr"
                 );
 
+
             const reason =
                 document.createElement(
                     "td"
                 );
+
 
             reason.textContent =
                 row.reason;
@@ -5001,6 +6117,7 @@ async function loadReasons() {
                     "td"
                 );
 
+
             count.textContent =
                 row.count;
 
@@ -5009,9 +6126,11 @@ async function loadReasons() {
                 reason
             );
 
+
             tr.appendChild(
                 count
             );
+
 
             body.appendChild(
                 tr
@@ -5028,10 +6147,12 @@ async function loadManagers() {
             "/stats/managers"
         );
 
+
     const body =
         document.getElementById(
             "managers_body"
         );
+
 
     body.innerHTML =
         "";
@@ -5040,6 +6161,7 @@ async function loadManagers() {
     data.results.forEach(
         row => {
 
+
             const tr =
                 document.createElement(
                     "tr"
@@ -5047,17 +6169,24 @@ async function loadManagers() {
 
 
             const values = [
+
                 row.manager,
+
                 row.calls,
+
                 row.unique_clients,
+
                 row.incoming,
+
                 row.outgoing,
+
                 row.missed,
 
                 row.answer_rate
                 + "%",
 
                 row.bought,
+
                 row.not_bought,
 
                 row.sale_conversion
@@ -5072,13 +6201,16 @@ async function loadManagers() {
             values.forEach(
                 value => {
 
+
                     const td =
                         document.createElement(
                             "td"
                         );
 
+
                     td.textContent =
                         value;
+
 
                     tr.appendChild(
                         td
@@ -5102,10 +6234,12 @@ async function loadSims() {
             "/stats/sims"
         );
 
+
     const body =
         document.getElementById(
             "sims_body"
         );
+
 
     body.innerHTML =
         "";
@@ -5114,6 +6248,7 @@ async function loadSims() {
     data.results.forEach(
         row => {
 
+
             const tr =
                 document.createElement(
                     "tr"
@@ -5121,16 +6256,23 @@ async function loadSims() {
 
 
             const values = [
+
                 row.sim,
 
                 row.slot === null
+
                     ? "—"
+
                     : row.slot + 1,
 
                 row.calls,
+
                 row.unique_clients,
+
                 row.incoming,
+
                 row.outgoing,
+
                 row.missed,
 
                 formatDuration(
@@ -5142,13 +6284,16 @@ async function loadSims() {
             values.forEach(
                 value => {
 
+
                     const td =
                         document.createElement(
                             "td"
                         );
 
+
                     td.textContent =
                         value;
+
 
                     tr.appendChild(
                         td
@@ -5172,10 +6317,12 @@ async function loadRecent() {
             "/stats/recent"
         );
 
+
     const body =
         document.getElementById(
             "recent_body"
         );
+
 
     body.innerHTML =
         "";
@@ -5183,6 +6330,7 @@ async function loadRecent() {
 
     data.results.forEach(
         row => {
+
 
             const tr =
                 document.createElement(
@@ -5195,6 +6343,7 @@ async function loadRecent() {
                     "td"
                 );
 
+
             time.textContent =
                 row.local_time;
 
@@ -5204,16 +6353,21 @@ async function loadRecent() {
                     "td"
                 );
 
+
             client.className =
                 "phone";
 
+
             client.textContent =
+
                 row.client_name
+
                     ? (
                         row.client_name
                         + " · "
                         + row.client_number
                     )
+
                     : row.client_number;
 
 
@@ -5222,9 +6376,14 @@ async function loadRecent() {
                     "td"
                 );
 
+
             direction.textContent =
-                row.direction === 0
+
+                row.direction
+                === 0
+
                     ? "Входящий"
+
                     : "Исходящий";
 
 
@@ -5233,9 +6392,13 @@ async function loadRecent() {
                     "td"
                 );
 
+
             status.textContent =
+
                 row.answered
+
                     ? "Отвечен"
+
                     : "Не отвечен";
 
 
@@ -5243,6 +6406,7 @@ async function loadRecent() {
                 document.createElement(
                     "td"
                 );
+
 
             manager.textContent =
                 row.manager;
@@ -5253,8 +6417,10 @@ async function loadRecent() {
                     "td"
                 );
 
+
             sim.className =
                 "phone";
+
 
             sim.textContent =
                 row.sim;
@@ -5264,6 +6430,7 @@ async function loadRecent() {
                 document.createElement(
                     "td"
                 );
+
 
             duration.textContent =
                 formatDuration(
@@ -5276,18 +6443,15 @@ async function loadRecent() {
                     "td"
                 );
 
-            sale.className =
-                "sale-result";
-
 
             if (
                 row.sale_status
                 === "bought"
             ) {
 
-                sale.classList.add(
-                    "sale-bought"
-                );
+                sale.className =
+                    "sale-bought";
+
 
                 sale.textContent =
                     "✅ Купил";
@@ -5297,21 +6461,21 @@ async function loadRecent() {
                 === "not_bought"
             ) {
 
-                sale.classList.add(
-                    "sale-not-bought"
-                );
+                sale.className =
+                    "sale-not-bought";
+
 
                 sale.textContent =
                     row.no_sale_reason
-                    || "❌ Не купил";
+                    || "Не купил";
 
             } else if (
                 row.answered
             ) {
 
-                sale.classList.add(
-                    "sale-unmarked"
-                );
+                sale.className =
+                    "sale-unmarked";
+
 
                 sale.textContent =
                     "Не отмечено";
@@ -5327,29 +6491,36 @@ async function loadRecent() {
                 time
             );
 
+
             tr.appendChild(
                 client
             );
+
 
             tr.appendChild(
                 direction
             );
 
+
             tr.appendChild(
                 status
             );
+
 
             tr.appendChild(
                 manager
             );
 
+
             tr.appendChild(
                 sim
             );
 
+
             tr.appendChild(
                 duration
             );
+
 
             tr.appendChild(
                 sale
@@ -5370,16 +6541,25 @@ async function loadAll() {
 
         await Promise.all(
             [
+
                 loadStats(),
+
                 loadTimeline(),
+
                 loadReasons(),
+
                 loadManagers(),
+
                 loadSims(),
+
                 loadRecent(),
+
             ]
         );
 
-    } catch (error) {
+    } catch (
+        error
+    ) {
 
         console.error(
             error
@@ -5403,14 +6583,17 @@ function selectPeriod(
         .forEach(
             button => {
 
+
                 button
                     .classList
                     .toggle(
+
                         "active",
 
                         button
                             .dataset
                             .period
+
                         === period
                     );
             }
@@ -5423,6 +6606,7 @@ function selectPeriod(
         )
         .classList
         .toggle(
+
             "visible",
 
             period
@@ -5447,10 +6631,13 @@ document
     .forEach(
         button => {
 
+
             button.addEventListener(
+
                 "click",
 
                 () => {
+
 
                     selectPeriod(
                         button
@@ -5470,10 +6657,13 @@ document
     .forEach(
         button => {
 
+
             button.addEventListener(
+
                 "click",
 
                 () => {
+
 
                     chartMode =
                         button
@@ -5488,14 +6678,17 @@ document
                         .forEach(
                             item => {
 
+
                                 item
                                     .classList
                                     .toggle(
+
                                         "active",
 
                                         item
                                             .dataset
                                             .chart
+
                                         === chartMode
                                     );
                             }
@@ -5514,9 +6707,11 @@ document
         "apply_custom"
     )
     .addEventListener(
+
         "click",
 
         () => {
+
 
             customFrom =
                 document
@@ -5536,12 +6731,14 @@ document
 
             if (
                 !customFrom
-                || !customTo
+                ||
+                !customTo
             ) {
 
                 alert(
                     "Выберите обе даты"
                 );
+
 
                 return;
             }
@@ -5559,6 +6756,7 @@ setInterval(
     loadAll,
     30000
 );
+
 
 </script>
 
@@ -5578,6 +6776,7 @@ setInterval(
 async def moizvonki_webhook(
     request: Request,
 ):
+
     data = await request.json()
 
     print(
@@ -5585,15 +6784,23 @@ async def moizvonki_webhook(
         data,
     )
 
-    webhook = data.get(
-        "webhook",
-        {},
+    webhook = (
+        data.get(
+            "webhook"
+        )
+        or {}
     )
 
-    event = data.get(
-        "event",
-        {},
+    event = (
+        data.get(
+            "event"
+        )
+        or {}
     )
+
+    # -----------------------------------------------------
+    # ONLY CALL FINISH
+    # -----------------------------------------------------
 
     if (
         webhook.get(
@@ -5601,6 +6808,7 @@ async def moizvonki_webhook(
         )
         != "call.finish"
     ):
+
         return {
             "ok": True
         }
@@ -5617,9 +6825,9 @@ async def moizvonki_webhook(
         "recording"
     )
 
-    # ---------------------------------------------
+    # -----------------------------------------------------
     # RECORDING
-    # ---------------------------------------------
+    # -----------------------------------------------------
 
     audio_duration = None
     voice_bytes = None
@@ -5628,6 +6836,7 @@ async def moizvonki_webhook(
         answered
         and recording
     ):
+
         (
             audio_duration,
             voice_bytes,
@@ -5635,9 +6844,9 @@ async def moizvonki_webhook(
             recording
         )
 
-    # ---------------------------------------------
+    # -----------------------------------------------------
     # TALK DURATION
-    # ---------------------------------------------
+    # -----------------------------------------------------
 
     (
         talk_duration,
@@ -5647,9 +6856,9 @@ async def moizvonki_webhook(
         audio_duration,
     )
 
-    # ---------------------------------------------
-    # SAVE DATABASE
-    # ---------------------------------------------
+    # -----------------------------------------------------
+    # SAVE
+    # -----------------------------------------------------
 
     save_result = save_call(
         webhook,
@@ -5658,19 +6867,24 @@ async def moizvonki_webhook(
         duration_source,
     )
 
-    call_id = save_result[
-        "call_id"
-    ]
+    call_id = (
+        save_result[
+            "call_id"
+        ]
+    )
 
-    already_sent = save_result[
-        "already_sent"
-    ]
+    already_sent = (
+        save_result[
+            "already_sent"
+        ]
+    )
 
-    # ---------------------------------------------
-    # DUPLICATE WEBHOOK
-    # ---------------------------------------------
+    # -----------------------------------------------------
+    # DUPLICATE
+    # -----------------------------------------------------
 
     if already_sent:
+
         print(
             "DUPLICATE CALL:",
             event.get(
@@ -5683,9 +6897,9 @@ async def moizvonki_webhook(
             "duplicate": True,
         }
 
-    # ---------------------------------------------
-    # TELEGRAM TEXT
-    # ---------------------------------------------
+    # -----------------------------------------------------
+    # MESSAGE
+    # -----------------------------------------------------
 
     text = build_telegram_message(
         event,
@@ -5693,39 +6907,48 @@ async def moizvonki_webhook(
         talk_duration,
     )
 
-    # Кнопки только если разговор состоялся
-    sale_keyboard = (
+    # -----------------------------------------------------
+    # RESULT BUTTONS
+    # -----------------------------------------------------
+
+    result_keyboard = (
+
         build_sale_keyboard(
             call_id
         )
+
         if answered
+
         else None
     )
 
-    # ---------------------------------------------
+    # -----------------------------------------------------
     # SEND TELEGRAM
-    # ---------------------------------------------
+    # -----------------------------------------------------
 
     try:
+
         if (
             answered
             and voice_bytes
         ):
+
             telegram_result = (
                 send_voice_bytes(
                     voice_bytes,
                     text,
                     reply_markup=
-                        sale_keyboard,
+                        result_keyboard,
                 )
             )
 
         else:
+
             telegram_result = (
                 send_text_message(
                     text,
                     reply_markup=
-                        sale_keyboard,
+                        result_keyboard,
                 )
             )
 
@@ -5735,15 +6958,20 @@ async def moizvonki_webhook(
         )
 
     except Exception as exc:
+
         print(
             "TELEGRAM ERROR:",
-            exc,
+            repr(
+                exc
+            ),
         )
 
         raise
 
     return {
-        "ok": True,
+
+        "ok":
+            True,
 
         "call_id":
             call_id,
