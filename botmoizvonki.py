@@ -7,7 +7,6 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
-from instagram_bot import router as instagram_router
 
 import requests
 
@@ -21,13 +20,19 @@ from fastapi import (
 
 from fastapi.responses import HTMLResponse
 
+from instagram_bot import router as instagram_router
+
 
 # =========================================================
 # APP
 # =========================================================
 
 app = FastAPI()
-app.include_router(instagram_router)
+
+app.include_router(
+    instagram_router
+)
+
 
 # =========================================================
 # CONFIG
@@ -106,6 +111,36 @@ print(
 
 
 # =========================================================
+# MANAGERS
+# =========================================================
+
+MANAGERS = {
+    "olmas": "Olmas",
+    "otabek": "Otabek",
+    "ali": "Ali",
+    "abbos": "Abbos",
+}
+
+
+# =========================================================
+# INTERNAL CONTACTS
+# =========================================================
+
+INTERNAL_CONTACTS = {
+    "998901333999": "Abbos",
+
+    "998998342889": "Muzrob (Курьер)",
+    "998948765070": "Muzrob (Курьер)",
+
+    "998909045502": "Ali",
+
+    "998900979898": "Olmas",
+
+    "998998137406": "Otabek",
+}
+
+
+# =========================================================
 # SALE RESULTS
 # =========================================================
 
@@ -159,9 +194,7 @@ def connect_db():
         timeout=30,
     )
 
-    conn.row_factory = (
-        sqlite3.Row
-    )
+    conn.row_factory = sqlite3.Row
 
     conn.execute(
         "PRAGMA busy_timeout = 30000"
@@ -181,6 +214,22 @@ def normalize_phone(
         char
         for char in str(phone)
         if char.isdigit()
+    )
+
+
+def get_internal_contact_name(
+    phone: str | None,
+):
+
+    phone_key = normalize_phone(
+        phone
+    )
+
+    if not phone_key:
+        return None
+
+    return INTERNAL_CONTACTS.get(
+        phone_key
     )
 
 
@@ -211,6 +260,11 @@ def init_db():
                 client_number TEXT,
                 client_key TEXT,
                 client_name TEXT,
+
+                is_internal_contact INTEGER
+                    DEFAULT 0,
+
+                internal_contact_name TEXT,
 
                 direction INTEGER,
                 answered INTEGER,
@@ -243,6 +297,13 @@ def init_db():
                 telegram_chat_id TEXT,
                 telegram_message_id INTEGER,
 
+                talk_manager_code TEXT,
+                talk_manager_name TEXT,
+
+                manager_marked_at INTEGER,
+                manager_marked_by INTEGER,
+                manager_marked_username TEXT,
+
                 sale_status TEXT,
 
                 no_sale_reason TEXT,
@@ -257,10 +318,6 @@ def init_db():
             )
             """
         )
-
-        # -------------------------------------------------
-        # MIGRATIONS
-        # -------------------------------------------------
 
         columns = {
             row["name"]
@@ -345,20 +402,61 @@ def init_db():
                 ALTER TABLE calls
                 ADD COLUMN sale_marked_username TEXT
                 """,
+
+            "is_internal_contact":
+                """
+                ALTER TABLE calls
+                ADD COLUMN is_internal_contact INTEGER
+                DEFAULT 0
+                """,
+
+            "internal_contact_name":
+                """
+                ALTER TABLE calls
+                ADD COLUMN internal_contact_name TEXT
+                """,
+
+            "talk_manager_code":
+                """
+                ALTER TABLE calls
+                ADD COLUMN talk_manager_code TEXT
+                """,
+
+            "talk_manager_name":
+                """
+                ALTER TABLE calls
+                ADD COLUMN talk_manager_name TEXT
+                """,
+
+            "manager_marked_at":
+                """
+                ALTER TABLE calls
+                ADD COLUMN manager_marked_at INTEGER
+                """,
+
+            "manager_marked_by":
+                """
+                ALTER TABLE calls
+                ADD COLUMN manager_marked_by INTEGER
+                """,
+
+            "manager_marked_username":
+                """
+                ALTER TABLE calls
+                ADD COLUMN manager_marked_username TEXT
+                """,
         }
 
-        for (
-            column,
-            sql,
-        ) in migrations.items():
+        for column, sql in migrations.items():
 
             if column not in columns:
+
                 conn.execute(
                     sql
                 )
 
         # -------------------------------------------------
-        # OLD CLIENT KEYS
+        # NORMALIZE OLD CLIENT NUMBERS
         # -------------------------------------------------
 
         old_rows = conn.execute(
@@ -390,14 +488,52 @@ def init_db():
                 """,
                 (
                     normalize_phone(
-                        row[
-                            "client_number"
-                        ]
+                        row["client_number"]
                     ),
 
                     row["id"],
                 ),
             )
+
+        # -------------------------------------------------
+        # MARK INTERNAL CONTACTS IN OLD CALLS
+        # -------------------------------------------------
+
+        all_rows = conn.execute(
+            """
+            SELECT
+                id,
+                client_number
+
+            FROM calls
+            """
+        ).fetchall()
+
+        for row in all_rows:
+
+            contact_name = (
+                get_internal_contact_name(
+                    row["client_number"]
+                )
+            )
+
+            if contact_name:
+
+                conn.execute(
+                    """
+                    UPDATE calls
+
+                    SET
+                        is_internal_contact = 1,
+                        internal_contact_name = ?
+
+                    WHERE id = ?
+                    """,
+                    (
+                        contact_name,
+                        row["id"],
+                    ),
+                )
 
         # -------------------------------------------------
         # OLD TELEGRAM RECORDS
@@ -421,6 +557,7 @@ def init_db():
             """
             CREATE INDEX IF NOT EXISTS
             idx_calls_start_time
+
             ON calls(start_time)
             """
         )
@@ -429,6 +566,7 @@ def init_db():
             """
             CREATE INDEX IF NOT EXISTS
             idx_calls_client_key
+
             ON calls(client_key)
             """
         )
@@ -437,6 +575,7 @@ def init_db():
             """
             CREATE INDEX IF NOT EXISTS
             idx_calls_user_login
+
             ON calls(user_login)
             """
         )
@@ -445,6 +584,7 @@ def init_db():
             """
             CREATE INDEX IF NOT EXISTS
             idx_calls_src_number
+
             ON calls(src_number)
             """
         )
@@ -453,6 +593,7 @@ def init_db():
             """
             CREATE INDEX IF NOT EXISTS
             idx_calls_sale_status
+
             ON calls(sale_status)
             """
         )
@@ -461,7 +602,26 @@ def init_db():
             """
             CREATE INDEX IF NOT EXISTS
             idx_calls_reason
+
             ON calls(no_sale_reason_code)
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_calls_talk_manager
+
+            ON calls(talk_manager_code)
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_calls_internal_contact
+
+            ON calls(is_internal_contact)
             """
         )
 
@@ -480,7 +640,11 @@ def prepare_recording(
 ):
 
     if not recording_url:
-        return None, None
+
+        return (
+            None,
+            None,
+        )
 
     try:
 
@@ -498,7 +662,10 @@ def prepare_recording(
             exc,
         )
 
-        return None, None
+        return (
+            None,
+            None,
+        )
 
     with tempfile.TemporaryDirectory() as tmpdir:
 
@@ -577,7 +744,7 @@ def prepare_recording(
             )
 
         # -------------------------------------------------
-        # CONVERT TO TELEGRAM VOICE
+        # TELEGRAM VOICE
         # -------------------------------------------------
 
         voice_bytes = None
@@ -657,13 +824,8 @@ def get_talk_duration(
             "none",
         )
 
-    # -------------------------------------------------
-    # AUDIO
-    # -------------------------------------------------
-
     if (
-        audio_duration
-        is not None
+        audio_duration is not None
 
         and
 
@@ -691,10 +853,6 @@ def get_talk_duration(
         or 0
     )
 
-    # -------------------------------------------------
-    # TIMESTAMPS
-    # -------------------------------------------------
-
     if (
         answer_time > 0
 
@@ -709,10 +867,6 @@ def get_talk_duration(
 
             "timestamps",
         )
-
-    # -------------------------------------------------
-    # API FALLBACK
-    # -------------------------------------------------
 
     api_duration = int(
         event.get(
@@ -747,6 +901,18 @@ def save_call(
         client_number
     )
 
+    internal_contact_name = (
+        get_internal_contact_name(
+            client_number
+        )
+    )
+
+    is_internal_contact = (
+        1
+        if internal_contact_name
+        else 0
+    )
+
     api_duration = int(
         event.get(
             "duration",
@@ -775,6 +941,9 @@ def save_call(
                 client_number,
                 client_key,
                 client_name,
+
+                is_internal_contact,
+                internal_contact_name,
 
                 direction,
                 answered,
@@ -814,6 +983,8 @@ def save_call(
 
                 ?, ?,
 
+                ?, ?,
+
                 ?, ?, ?,
 
                 ?,
@@ -844,6 +1015,12 @@ def save_call(
 
                 client_name =
                     excluded.client_name,
+
+                is_internal_contact =
+                    excluded.is_internal_contact,
+
+                internal_contact_name =
+                    excluded.internal_contact_name,
 
                 direction =
                     excluded.direction,
@@ -908,6 +1085,10 @@ def save_call(
                 event.get(
                     "client_name"
                 ),
+
+                is_internal_contact,
+
+                internal_contact_name,
 
                 event.get(
                     "direction"
@@ -981,7 +1162,9 @@ def save_call(
                 """
                 SELECT
                     id,
-                    telegram_sent
+                    telegram_sent,
+                    is_internal_contact,
+                    internal_contact_name
 
                 FROM calls
 
@@ -998,7 +1181,9 @@ def save_call(
                 """
                 SELECT
                     id,
-                    telegram_sent
+                    telegram_sent,
+                    is_internal_contact,
+                    internal_contact_name
 
                 FROM calls
 
@@ -1020,7 +1205,9 @@ def save_call(
                 """
                 SELECT
                     id,
-                    telegram_sent
+                    telegram_sent,
+                    is_internal_contact,
+                    internal_contact_name
 
                 FROM calls
 
@@ -1032,9 +1219,11 @@ def save_call(
 
     return {
         "call_id":
-            row["id"]
-            if row
-            else cursor.lastrowid,
+            (
+                row["id"]
+                if row
+                else cursor.lastrowid
+            ),
 
         "already_sent":
             bool(
@@ -1042,6 +1231,23 @@ def save_call(
                 and row[
                     "telegram_sent"
                 ]
+            ),
+
+        "is_internal_contact":
+            bool(
+                row
+                and row[
+                    "is_internal_contact"
+                ]
+            ),
+
+        "internal_contact_name":
+            (
+                row[
+                    "internal_contact_name"
+                ]
+                if row
+                else internal_contact_name
             ),
     }
 
@@ -1088,9 +1294,7 @@ def mark_telegram_sent(
 
             SET
                 telegram_sent = 1,
-
                 telegram_chat_id = ?,
-
                 telegram_message_id = ?
 
             WHERE id = ?
@@ -1130,8 +1334,6 @@ def get_client_history(
 
         return {
             "calls_count": 0,
-            "first_contact": None,
-            "last_contact": None,
         }
 
     with connect_db() as conn:
@@ -1139,18 +1341,19 @@ def get_client_history(
         row = conn.execute(
             """
             SELECT
-                COUNT(*)
-                    AS calls_count,
-
-                MIN(start_time)
-                    AS first_contact,
-
-                MAX(start_time)
-                    AS last_contact
+                COUNT(*) AS calls_count
 
             FROM calls
 
-            WHERE client_key = ?
+            WHERE
+                client_key = ?
+
+                AND
+
+                COALESCE(
+                    is_internal_contact,
+                    0
+                ) = 0
             """,
             (
                 client_key,
@@ -1163,16 +1366,6 @@ def get_client_history(
                 "calls_count"
             ]
             or 0,
-
-        "first_contact":
-            row[
-                "first_contact"
-            ],
-
-        "last_contact":
-            row[
-                "last_contact"
-            ],
     }
 
 
@@ -1287,11 +1480,10 @@ def build_telegram_message(
         or ""
     )
 
-    manager = (
-        webhook.get(
-            "user_login"
+    internal_contact_name = (
+        get_internal_contact_name(
+            client_number
         )
-        or ""
     )
 
     sim = (
@@ -1308,14 +1500,6 @@ def build_telegram_message(
     answer_time = event.get(
         "answer_time"
     )
-
-    history = get_client_history(
-        client_number
-    )
-
-    contacts = history[
-        "calls_count"
-    ]
 
     # -------------------------------------------------
     # TITLE
@@ -1360,38 +1544,59 @@ def build_telegram_message(
     ]
 
     # -------------------------------------------------
-    # CLIENT
+    # INTERNAL CONTACT
     # -------------------------------------------------
 
-    if client_name:
+    if internal_contact_name:
 
         lines.append(
-            "👤 "
-            f"<b>{escape(client_name)}</b>"
+            "👤 Контакт: "
+            f"<b>{escape(internal_contact_name)}</b>"
         )
-
-    # обычный номер — без <code>
-    lines.append(
-        "📞 "
-        f"{escape(client_number or '—')}"
-    )
-
-    # -------------------------------------------------
-    # HISTORY
-    # -------------------------------------------------
-
-    if contacts <= 1:
 
         lines.append(
-            "🆕 Новый клиент"
+            "📞 "
+            f"{escape(client_number or '—')}"
         )
+
+    # -------------------------------------------------
+    # NORMAL CLIENT
+    # -------------------------------------------------
 
     else:
 
+        if client_name:
+
+            lines.append(
+                "👤 "
+                f"<b>{escape(client_name)}</b>"
+            )
+
         lines.append(
-            "🔁 Контактов с номером: "
-            f"<b>{contacts}</b>"
+            "📞 "
+            f"{escape(client_number or '—')}"
         )
+
+        history = get_client_history(
+            client_number
+        )
+
+        contacts = history[
+            "calls_count"
+        ]
+
+        if contacts <= 1:
+
+            lines.append(
+                "🆕 Новый клиент"
+            )
+
+        else:
+
+            lines.append(
+                "🔁 Контактов с номером: "
+                f"<b>{contacts}</b>"
+            )
 
     lines.append(
         ""
@@ -1420,26 +1625,24 @@ def build_telegram_message(
             f"<b>{format_call_time(start_time)}</b>"
         )
 
-    # -------------------------------------------------
-    # MANAGER
-    # -------------------------------------------------
-
-    lines.append(
-        "👨‍💼 Менеджер: "
-        f"{escape(manager or '—')}"
-    )
-
     lines.append(
         "📲 SIM: "
         f"{escape(sim or '—')}"
     )
 
-    if answered:
+    # -------------------------------------------------
+    # BUTTON PROMPT
+    # -------------------------------------------------
+
+    if (
+        answered
+        and not internal_contact_name
+    ):
 
         lines.extend(
             [
                 "",
-                "<b>Результат разговора:</b>",
+                "<b>Кто разговаривал?</b>",
             ]
         )
 
@@ -1452,12 +1655,75 @@ def build_telegram_message(
 # TELEGRAM KEYBOARDS
 # =========================================================
 
-def build_sale_keyboard(
+def build_manager_keyboard(
     call_id: int,
 ):
 
     return {
         "inline_keyboard": [
+
+            [
+                {
+                    "text":
+                        "👤 Olmas",
+
+                    "callback_data":
+                        f"manager:olmas:{call_id}",
+                },
+
+                {
+                    "text":
+                        "👤 Otabek",
+
+                    "callback_data":
+                        f"manager:otabek:{call_id}",
+                },
+            ],
+
+            [
+                {
+                    "text":
+                        "👤 Ali",
+
+                    "callback_data":
+                        f"manager:ali:{call_id}",
+                },
+
+                {
+                    "text":
+                        "👤 Abbos",
+
+                    "callback_data":
+                        f"manager:abbos:{call_id}",
+                },
+            ],
+        ]
+    }
+
+
+def build_sale_keyboard(
+    call_id: int,
+    manager_name: str | None = None,
+):
+
+    keyboard = []
+
+    if manager_name:
+
+        keyboard.append(
+            [
+                {
+                    "text":
+                        f"👤 Менеджер: {manager_name}",
+
+                    "callback_data":
+                        f"manager_selected:{call_id}",
+                }
+            ]
+        )
+
+    keyboard.extend(
+        [
 
             [
                 {
@@ -1494,7 +1760,7 @@ def build_sale_keyboard(
 
                     "callback_data":
                         f"result:price_changed:{call_id}",
-                }
+                },
             ],
 
             [
@@ -1504,7 +1770,7 @@ def build_sale_keyboard(
 
                     "callback_data":
                         f"result:thinking:{call_id}",
-                }
+                },
             ],
 
             [
@@ -1514,7 +1780,7 @@ def build_sale_keyboard(
 
                     "callback_data":
                         f"result:other_product:{call_id}",
-                }
+                },
             ],
 
             [
@@ -1524,7 +1790,7 @@ def build_sale_keyboard(
 
                     "callback_data":
                         f"result:credit:{call_id}",
-                }
+                },
             ],
 
             [
@@ -1534,7 +1800,7 @@ def build_sale_keyboard(
 
                     "callback_data":
                         f"result:visit_store:{call_id}",
-                }
+                },
             ],
 
             [
@@ -1544,7 +1810,7 @@ def build_sale_keyboard(
 
                     "callback_data":
                         f"result:later:{call_id}",
-                }
+                },
             ],
 
             [
@@ -1554,7 +1820,7 @@ def build_sale_keyboard(
 
                     "callback_data":
                         f"result:bought_elsewhere:{call_id}",
-                }
+                },
             ],
 
             [
@@ -1564,7 +1830,7 @@ def build_sale_keyboard(
 
                     "callback_data":
                         f"result:conditions:{call_id}",
-                }
+                },
             ],
 
             [
@@ -1574,7 +1840,7 @@ def build_sale_keyboard(
 
                     "callback_data":
                         f"result:not_target:{call_id}",
-                }
+                },
             ],
 
             [
@@ -1584,19 +1850,45 @@ def build_sale_keyboard(
 
                     "callback_data":
                         f"result:other:{call_id}",
+                },
+            ],
+
+            [
+                {
+                    "text":
+                        "👤 Изменить менеджера",
+
+                    "callback_data":
+                        f"manager_back:{call_id}",
                 }
             ],
         ]
     }
 
+    return {
+        "inline_keyboard":
+            keyboard
+    }
+
 
 def build_selected_keyboard(
     call_id: int,
+    manager_name: str,
     selected_text: str,
 ):
 
     return {
         "inline_keyboard": [
+
+            [
+                {
+                    "text":
+                        f"👤 {manager_name}",
+
+                    "callback_data":
+                        f"manager_selected:{call_id}",
+                }
+            ],
 
             [
                 {
@@ -1615,6 +1907,16 @@ def build_selected_keyboard(
 
                     "callback_data":
                         f"result_back:{call_id}",
+                }
+            ],
+
+            [
+                {
+                    "text":
+                        "👤 Изменить менеджера",
+
+                    "callback_data":
+                        f"manager_back:{call_id}",
                 }
             ],
         ]
@@ -1764,9 +2066,7 @@ def answer_callback_query(
 
         if text:
 
-            data[
-                "text"
-            ] = text
+            data["text"] = text
 
         telegram_api(
             "answerCallbackQuery",
@@ -1810,7 +2110,7 @@ def edit_reply_markup(
 
 
 # =========================================================
-# SALE DATABASE
+# CALL DATABASE
 # =========================================================
 
 def get_call(
@@ -1860,6 +2160,77 @@ def get_telegram_user_name(
     )
 
 
+# =========================================================
+# MANAGER DATABASE
+# =========================================================
+
+def mark_talk_manager(
+    call_id: int,
+    manager_code: str,
+    telegram_user: dict,
+):
+
+    manager_name = MANAGERS.get(
+        manager_code
+    )
+
+    if not manager_name:
+
+        raise ValueError(
+            "Неизвестный менеджер"
+        )
+
+    now_ts = int(
+        datetime
+        .now(
+            UZ_TZ
+        )
+        .timestamp()
+    )
+
+    with connect_db() as conn:
+
+        conn.execute(
+            """
+            UPDATE calls
+
+            SET
+                talk_manager_code = ?,
+                talk_manager_name = ?,
+
+                manager_marked_at = ?,
+                manager_marked_by = ?,
+                manager_marked_username = ?
+
+            WHERE id = ?
+            """,
+            (
+                manager_code,
+                manager_name,
+
+                now_ts,
+
+                telegram_user.get(
+                    "id"
+                ),
+
+                get_telegram_user_name(
+                    telegram_user
+                ),
+
+                call_id,
+            ),
+        )
+
+        conn.commit()
+
+    return manager_name
+
+
+# =========================================================
+# SALE DATABASE
+# =========================================================
+
 def mark_sale_bought(
     call_id: int,
     telegram_user: dict,
@@ -1880,23 +2251,14 @@ def mark_sale_bought(
             UPDATE calls
 
             SET
-                sale_status =
-                    'bought',
+                sale_status = 'bought',
 
-                no_sale_reason =
-                    NULL,
+                no_sale_reason = NULL,
+                no_sale_reason_code = NULL,
 
-                no_sale_reason_code =
-                    NULL,
-
-                sale_marked_at =
-                    ?,
-
-                sale_marked_by =
-                    ?,
-
-                sale_marked_username =
-                    ?
+                sale_marked_at = ?,
+                sale_marked_by = ?,
+                sale_marked_username = ?
 
             WHERE id = ?
             """,
@@ -1949,29 +2311,19 @@ def mark_sale_not_bought(
             UPDATE calls
 
             SET
-                sale_status =
-                    'not_bought',
+                sale_status = 'not_bought',
 
-                no_sale_reason =
-                    ?,
+                no_sale_reason = ?,
+                no_sale_reason_code = ?,
 
-                no_sale_reason_code =
-                    ?,
-
-                sale_marked_at =
-                    ?,
-
-                sale_marked_by =
-                    ?,
-
-                sale_marked_username =
-                    ?
+                sale_marked_at = ?,
+                sale_marked_by = ?,
+                sale_marked_username = ?
 
             WHERE id = ?
             """,
             (
                 reason,
-
                 reason_code,
 
                 now_ts,
@@ -1991,28 +2343,41 @@ def mark_sale_not_bought(
         conn.commit()
 
 
+# =========================================================
+# PRICE PAGE
+# =========================================================
+
+PRICE_HTML_FILE = Path(
+    "/app/price/index.html"
+)
 
 
-
-PRICE_HTML_FILE = Path("/app/price/index.html")
-
-
-@app.get("/price", response_class=HTMLResponse)
+@app.get(
+    "/price",
+    response_class=HTMLResponse,
+)
 async def price_page():
+
     if not PRICE_HTML_FILE.exists():
+
         return HTMLResponse(
-            content="<h1>Price page not found</h1>",
+            content=(
+                "<h1>Price page not found</h1>"
+            ),
             status_code=404,
         )
 
-    html_content = PRICE_HTML_FILE.read_text(
-        encoding="utf-8"
+    html_content = (
+        PRICE_HTML_FILE.read_text(
+            encoding="utf-8"
+        )
     )
 
     return HTMLResponse(
         content=html_content,
         status_code=200,
     )
+
 
 # =========================================================
 # TELEGRAM WEBHOOK
@@ -2024,10 +2389,6 @@ async def price_page():
 async def telegram_webhook(
     request: Request,
 ):
-
-    # -----------------------------------------------------
-    # OPTIONAL SECRET
-    # -----------------------------------------------------
 
     if TELEGRAM_WEBHOOK_SECRET:
 
@@ -2117,86 +2478,18 @@ async def telegram_webhook(
     try:
 
         # =================================================
-        # НАЗАД / ИЗМЕНИТЬ
+        # MANAGER SELECTED
         # =================================================
 
         if callback_data.startswith(
-            "result_back:"
-        ):
-
-            call_id = int(
-                callback_data
-                .split(
-                    ":",
-                    1,
-                )[1]
-            )
-
-            call = get_call(
-                call_id
-            )
-
-            if not call:
-
-                answer_callback_query(
-                    callback_id,
-                    "Звонок не найден",
-                )
-
-                return {
-                    "ok": True
-                }
-
-            edit_reply_markup(
-                chat_id,
-                message_id,
-                build_sale_keyboard(
-                    call_id
-                ),
-            )
-
-            answer_callback_query(
-                callback_id,
-                "Выберите новый результат",
-            )
-
-            return {
-                "ok": True,
-                "edit_mode": True,
-            }
-
-        # =================================================
-        # УЖЕ ВЫБРАННЫЙ РЕЗУЛЬТАТ
-        # =================================================
-
-        if callback_data.startswith(
-            "selected:"
-        ):
-
-            answer_callback_query(
-                callback_id,
-                "Этот результат уже выбран",
-            )
-
-            return {
-                "ok": True
-            }
-
-        # =================================================
-        # RESULT
-        # =================================================
-
-        if callback_data.startswith(
-            "result:"
+            "manager:"
         ):
 
             parts = callback_data.split(
                 ":"
             )
 
-            if len(
-                parts
-            ) != 3:
+            if len(parts) != 3:
 
                 answer_callback_query(
                     callback_id,
@@ -2207,9 +2500,7 @@ async def telegram_webhook(
                     "ok": True
                 }
 
-            result_code = (
-                parts[1]
-            )
+            manager_code = parts[1]
 
             try:
 
@@ -2243,14 +2534,295 @@ async def telegram_webhook(
                     "ok": True
                 }
 
+            if call[
+                "is_internal_contact"
+            ]:
+
+                answer_callback_query(
+                    callback_id,
+                    "Это внутренний контакт",
+                )
+
+                return {
+                    "ok": True
+                }
+
+            manager_name = mark_talk_manager(
+                call_id,
+                manager_code,
+                telegram_user,
+            )
+
+            edit_reply_markup(
+                chat_id,
+                message_id,
+
+                build_sale_keyboard(
+                    call_id,
+                    manager_name,
+                ),
+            )
+
+            answer_callback_query(
+                callback_id,
+                f"👤 {manager_name}",
+            )
+
+            print(
+                "TALK MANAGER:",
+                call_id,
+                manager_name,
+            )
+
+            return {
+                "ok": True,
+
+                "call_id":
+                    call_id,
+
+                "manager":
+                    manager_name,
+            }
+
+        # =================================================
+        # CHANGE MANAGER
+        # =================================================
+
+        if callback_data.startswith(
+            "manager_back:"
+        ):
+
+            call_id = int(
+                callback_data.split(
+                    ":",
+                    1,
+                )[1]
+            )
+
+            call = get_call(
+                call_id
+            )
+
+            if not call:
+
+                answer_callback_query(
+                    callback_id,
+                    "Звонок не найден",
+                )
+
+                return {
+                    "ok": True
+                }
+
+            edit_reply_markup(
+                chat_id,
+                message_id,
+
+                build_manager_keyboard(
+                    call_id
+                ),
+            )
+
+            answer_callback_query(
+                callback_id,
+                "Выберите менеджера",
+            )
+
+            return {
+                "ok": True
+            }
+
+        # =================================================
+        # MANAGER DISPLAY BUTTON
+        # =================================================
+
+        if callback_data.startswith(
+            "manager_selected:"
+        ):
+
+            answer_callback_query(
+                callback_id,
+                "Менеджер уже выбран",
+            )
+
+            return {
+                "ok": True
+            }
+
+        # =================================================
+        # CHANGE RESULT
+        # =================================================
+
+        if callback_data.startswith(
+            "result_back:"
+        ):
+
+            call_id = int(
+                callback_data.split(
+                    ":",
+                    1,
+                )[1]
+            )
+
+            call = get_call(
+                call_id
+            )
+
+            if not call:
+
+                answer_callback_query(
+                    callback_id,
+                    "Звонок не найден",
+                )
+
+                return {
+                    "ok": True
+                }
+
+            manager_name = (
+                call[
+                    "talk_manager_name"
+                ]
+                or "Не указан"
+            )
+
+            edit_reply_markup(
+                chat_id,
+                message_id,
+
+                build_sale_keyboard(
+                    call_id,
+                    manager_name,
+                ),
+            )
+
+            answer_callback_query(
+                callback_id,
+                "Выберите новый результат",
+            )
+
+            return {
+                "ok": True
+            }
+
+        # =================================================
+        # SELECTED RESULT
+        # =================================================
+
+        if callback_data.startswith(
+            "selected:"
+        ):
+
+            answer_callback_query(
+                callback_id,
+                "Этот результат уже выбран",
+            )
+
+            return {
+                "ok": True
+            }
+
+        # =================================================
+        # SALE RESULT
+        # =================================================
+
+        if callback_data.startswith(
+            "result:"
+        ):
+
+            parts = callback_data.split(
+                ":"
+            )
+
+            if len(parts) != 3:
+
+                answer_callback_query(
+                    callback_id,
+                    "Ошибка кнопки",
+                )
+
+                return {
+                    "ok": True
+                }
+
+            result_code = parts[1]
+
+            try:
+
+                call_id = int(
+                    parts[2]
+                )
+
+            except ValueError:
+
+                answer_callback_query(
+                    callback_id,
+                    "Ошибка ID звонка",
+                )
+
+                return {
+                    "ok": True
+                }
+
+            call = get_call(
+                call_id
+            )
+
+            if not call:
+
+                answer_callback_query(
+                    callback_id,
+                    "Звонок не найден",
+                )
+
+                return {
+                    "ok": True
+                }
+
+            if call[
+                "is_internal_contact"
+            ]:
+
+                answer_callback_query(
+                    callback_id,
+                    "Для контактов результат не нужен",
+                )
+
+                return {
+                    "ok": True
+                }
+
+            manager_name = (
+                call[
+                    "talk_manager_name"
+                ]
+            )
+
+            if not manager_name:
+
+                edit_reply_markup(
+                    chat_id,
+                    message_id,
+
+                    build_manager_keyboard(
+                        call_id
+                    ),
+                )
+
+                answer_callback_query(
+                    callback_id,
+                    "Сначала выберите менеджера",
+                )
+
+                return {
+                    "ok": True
+                }
+
             # =============================================
-            # ✅ КУПИЛ
+            # BOUGHT
             # =============================================
 
-            if (
-                result_code
-                == "bought"
-            ):
+            if result_code == "bought":
 
                 mark_sale_bought(
                     call_id,
@@ -2263,6 +2835,7 @@ async def telegram_webhook(
 
                     build_selected_keyboard(
                         call_id,
+                        manager_name,
                         "✅ Купил",
                     ),
                 )
@@ -2270,12 +2843,6 @@ async def telegram_webhook(
                 answer_callback_query(
                     callback_id,
                     "✅ Сохранено",
-                )
-
-                print(
-                    "SALE RESULT:",
-                    call_id,
-                    "bought",
                 )
 
                 return {
@@ -2289,13 +2856,11 @@ async def telegram_webhook(
                 }
 
             # =============================================
-            # ПРИЧИНА
+            # NOT BOUGHT REASON
             # =============================================
 
-            reason = (
-                SALE_REASONS.get(
-                    result_code
-                )
+            reason = SALE_REASONS.get(
+                result_code
             )
 
             if not reason:
@@ -2321,6 +2886,7 @@ async def telegram_webhook(
 
                 build_selected_keyboard(
                     call_id,
+                    manager_name,
                     reason,
                 ),
             )
@@ -2328,13 +2894,6 @@ async def telegram_webhook(
             answer_callback_query(
                 callback_id,
                 "✅ Сохранено",
-            )
-
-            print(
-                "SALE RESULT:",
-                call_id,
-                result_code,
-                reason,
             )
 
             return {
@@ -2349,10 +2908,6 @@ async def telegram_webhook(
                 "reason":
                     reason,
             }
-
-        # =================================================
-        # UNKNOWN
-        # =================================================
 
         answer_callback_query(
             callback_id,
@@ -2390,19 +2945,15 @@ def parse_date(
 
     try:
 
-        return (
-            datetime.strptime(
-                value,
-                "%Y-%m-%d",
-            )
-            .date()
-        )
+        return datetime.strptime(
+            value,
+            "%Y-%m-%d",
+        ).date()
 
     except ValueError as exc:
 
         raise HTTPException(
             status_code=400,
-
             detail=(
                 "Дата должна быть "
                 "в формате YYYY-MM-DD"
@@ -2428,10 +2979,7 @@ def get_period(
 
         start_date = today
         end_date = today
-
-        label = (
-            "Сегодня"
-        )
+        label = "Сегодня"
 
     elif period == "yesterday":
 
@@ -2442,13 +2990,8 @@ def get_period(
             )
         )
 
-        end_date = (
-            start_date
-        )
-
-        label = (
-            "Вчера"
-        )
+        end_date = start_date
+        label = "Вчера"
 
     elif period == "7d":
 
@@ -2460,10 +3003,7 @@ def get_period(
         )
 
         end_date = today
-
-        label = (
-            "Последние 7 дней"
-        )
+        label = "Последние 7 дней"
 
     elif period == "30d":
 
@@ -2475,22 +3015,17 @@ def get_period(
         )
 
         end_date = today
-
-        label = (
-            "Последние 30 дней"
-        )
+        label = "Последние 30 дней"
 
     elif period == "custom":
 
         if (
             not date_from
-            or
-            not date_to
+            or not date_to
         ):
 
             raise HTTPException(
                 status_code=400,
-
                 detail=(
                     "Для custom нужны "
                     "date_from и date_to"
@@ -2505,14 +3040,10 @@ def get_period(
             date_to
         )
 
-        if (
-            end_date
-            < start_date
-        ):
+        if end_date < start_date:
 
             raise HTTPException(
                 status_code=400,
-
                 detail=(
                     "Конечная дата "
                     "меньше начальной"
@@ -2520,19 +3051,15 @@ def get_period(
             )
 
         if (
-            (
-                end_date
-                - start_date
-            ).days
-            > 366
-        ):
+            end_date
+            - start_date
+        ).days > 366:
 
             raise HTTPException(
                 status_code=400,
-
                 detail=(
-                    "Максимальный "
-                    "период 366 дней"
+                    "Максимальный период "
+                    "366 дней"
                 ),
             )
 
@@ -2571,7 +3098,6 @@ def get_period(
     )
 
     return {
-
         "period":
             period,
 
@@ -2619,9 +3145,7 @@ def root():
 # GENERAL STATS
 # =========================================================
 
-@app.get(
-    "/stats"
-)
+@app.get("/stats")
 def stats(
     period: str = "today",
     date_from: str | None = None,
@@ -2634,13 +3158,13 @@ def stats(
         date_to,
     )
 
-    start_ts = (
-        p["start_ts"]
-    )
+    start_ts = p[
+        "start_ts"
+    ]
 
-    end_ts = (
-        p["end_ts"]
-    )
+    end_ts = p[
+        "end_ts"
+    ]
 
     with connect_db() as conn:
 
@@ -2651,15 +3175,40 @@ def stats(
                 COUNT(*)
                     AS calls,
 
+                SUM(
+                    CASE
+                        WHEN COALESCE(
+                            is_internal_contact,
+                            0
+                        ) = 1
+
+                        THEN 1
+                        ELSE 0
+                    END
+                )
+                    AS internal_calls,
+
                 COUNT(
                     DISTINCT
+
                     CASE
+
                         WHEN
-                            client_key IS NOT NULL
+                            COALESCE(
+                                is_internal_contact,
+                                0
+                            ) = 0
+
                             AND
+
+                            client_key IS NOT NULL
+
+                            AND
+
                             client_key != ''
 
                         THEN client_key
+
                     END
                 )
                     AS unique_clients,
@@ -2697,25 +3246,17 @@ def stats(
                             direction = 0
                             AND
                             answered = 0
+                            AND
+                            COALESCE(
+                                is_internal_contact,
+                                0
+                            ) = 0
 
                         THEN 1
                         ELSE 0
                     END
                 )
                     AS missed,
-
-                SUM(
-                    CASE
-                        WHEN
-                            direction = 1
-                            AND
-                            answered = 0
-
-                        THEN 1
-                        ELSE 0
-                    END
-                )
-                    AS unanswered_outgoing,
 
                 SUM(
                     CASE
@@ -2767,7 +3308,9 @@ def stats(
 
             WHERE
                 start_time >= ?
+
                 AND
+
                 start_time < ?
             """,
             (
@@ -2777,7 +3320,7 @@ def stats(
         ).fetchone()
 
         # -------------------------------------------------
-        # NEW / REPEAT CLIENTS
+        # CLIENTS
         # -------------------------------------------------
 
         clients_row = conn.execute(
@@ -2791,13 +3334,24 @@ def stats(
 
                 WHERE
                     start_time >= ?
+
                     AND
+
                     start_time < ?
 
                     AND
+
+                    COALESCE(
+                        is_internal_contact,
+                        0
+                    ) = 0
+
+                    AND
+
                     client_key IS NOT NULL
 
                     AND
+
                     client_key != ''
             )
 
@@ -2810,12 +3364,18 @@ def stats(
 
                             SELECT 1
 
-                            FROM calls
-                                AS old_call
+                            FROM calls AS old_call
 
                             WHERE
                                 old_call.client_key =
                                     period_clients.client_key
+
+                                AND
+
+                                COALESCE(
+                                    old_call.is_internal_contact,
+                                    0
+                                ) = 0
 
                                 AND
 
@@ -2836,12 +3396,18 @@ def stats(
 
                             SELECT 1
 
-                            FROM calls
-                                AS old_call
+                            FROM calls AS old_call
 
                             WHERE
                                 old_call.client_key =
                                     period_clients.client_key
+
+                                AND
+
+                                COALESCE(
+                                    old_call.is_internal_contact,
+                                    0
+                                ) = 0
 
                                 AND
 
@@ -2860,19 +3426,14 @@ def stats(
             (
                 start_ts,
                 end_ts,
+
                 start_ts,
                 start_ts,
             ),
         ).fetchone()
 
         # -------------------------------------------------
-        # MISSED CLIENT PROCESSING
-        #
-        # resolved =
-        # после пропущенного был любой
-        # отвеченный разговор:
-        #
-        # входящий ИЛИ исходящий.
+        # MISSED
         # -------------------------------------------------
 
         missed_row = conn.execute(
@@ -2880,7 +3441,6 @@ def stats(
             WITH missed_clients AS (
 
                 SELECT
-
                     client_key,
 
                     MIN(start_time)
@@ -2894,6 +3454,13 @@ def stats(
                     AND
 
                     answered = 0
+
+                    AND
+
+                    COALESCE(
+                        is_internal_contact,
+                        0
+                    ) = 0
 
                     AND
 
@@ -2927,8 +3494,7 @@ def stats(
 
                             SELECT 1
 
-                            FROM calls
-                                AS callback
+                            FROM calls AS callback
 
                             WHERE
                                 callback.client_key =
@@ -2958,8 +3524,7 @@ def stats(
 
                             SELECT 1
 
-                            FROM calls
-                                AS contact
+                            FROM calls AS contact
 
                             WHERE
                                 contact.client_key =
@@ -2989,8 +3554,7 @@ def stats(
 
                             SELECT 1
 
-                            FROM calls
-                                AS contact
+                            FROM calls AS contact
 
                             WHERE
                                 contact.client_key =
@@ -3031,9 +3595,15 @@ def stats(
 
                 SUM(
                     CASE
-
                         WHEN
                             answered = 1
+
+                            AND
+
+                            COALESCE(
+                                is_internal_contact,
+                                0
+                            ) = 0
 
                             AND
 
@@ -3042,16 +3612,21 @@ def stats(
 
                         THEN 1
                         ELSE 0
-
                     END
                 )
                     AS bought,
 
                 SUM(
                     CASE
-
                         WHEN
                             answered = 1
+
+                            AND
+
+                            COALESCE(
+                                is_internal_contact,
+                                0
+                            ) = 0
 
                             AND
 
@@ -3060,16 +3635,21 @@ def stats(
 
                         THEN 1
                         ELSE 0
-
                     END
                 )
                     AS not_bought,
 
                 SUM(
                     CASE
-
                         WHEN
                             answered = 1
+
+                            AND
+
+                            COALESCE(
+                                is_internal_contact,
+                                0
+                            ) = 0
 
                             AND
 
@@ -3081,16 +3661,43 @@ def stats(
 
                         THEN 1
                         ELSE 0
-
                     END
                 )
-                    AS sale_unmarked
+                    AS sale_unmarked,
+
+                SUM(
+                    CASE
+                        WHEN
+                            answered = 1
+
+                            AND
+
+                            COALESCE(
+                                is_internal_contact,
+                                0
+                            ) = 0
+
+                            AND
+
+                            (
+                                talk_manager_code IS NULL
+                                OR
+                                talk_manager_code = ''
+                            )
+
+                        THEN 1
+                        ELSE 0
+                    END
+                )
+                    AS manager_unmarked
 
             FROM calls
 
             WHERE
                 start_time >= ?
+
                 AND
+
                 start_time < ?
             """,
             (
@@ -3105,14 +3712,11 @@ def stats(
     )
 
     incoming_answered = (
-        row[
-            "incoming_answered"
-        ]
+        row["incoming_answered"]
         or 0
     )
 
     answer_rate = (
-
         round(
             (
                 incoming_answered
@@ -3146,7 +3750,6 @@ def stats(
     )
 
     sale_conversion = (
-
         round(
             (
                 bought
@@ -3161,9 +3764,7 @@ def stats(
     )
 
     return {
-
         "period": {
-
             "type":
                 p["period"],
 
@@ -3181,9 +3782,14 @@ def stats(
         },
 
         "stats": {
-
             "calls":
                 row["calls"]
+                or 0,
+
+            "internal_calls":
+                row[
+                    "internal_calls"
+                ]
                 or 0,
 
             "unique_clients":
@@ -3205,12 +3811,6 @@ def stats(
 
             "missed":
                 row["missed"]
-                or 0,
-
-            "unanswered_outgoing":
-                row[
-                    "unanswered_outgoing"
-                ]
                 or 0,
 
             "answer_rate":
@@ -3286,6 +3886,12 @@ def stats(
                 ]
                 or 0,
 
+            "manager_unmarked":
+                sales_row[
+                    "manager_unmarked"
+                ]
+                or 0,
+
             "sale_conversion":
                 sale_conversion,
         },
@@ -3335,13 +3941,18 @@ def stats_sales_reasons(
 
                 AND
 
+                COALESCE(
+                    is_internal_contact,
+                    0
+                ) = 0
+
+                AND
+
                 sale_status =
                     'not_bought'
 
             GROUP BY
-
                 no_sale_reason_code,
-
                 no_sale_reason
 
             ORDER BY
@@ -3354,9 +3965,7 @@ def stats_sales_reasons(
         ).fetchall()
 
     return {
-
         "results": [
-
             {
                 "code":
                     row[
@@ -3399,10 +4008,6 @@ def stats_timeline(
     )
 
     with connect_db() as conn:
-
-        # -------------------------------------------------
-        # ONE DAY -> HOURS
-        # -------------------------------------------------
 
         if p["days"] == 1:
 
@@ -3462,7 +4067,6 @@ def stats_timeline(
             ).fetchall()
 
             by_hour = {
-
                 row["bucket"]:
                     row
 
@@ -3511,13 +4115,7 @@ def stats_timeline(
                     }
                 )
 
-            granularity = (
-                "hour"
-            )
-
-        # -------------------------------------------------
-        # MULTIPLE DAYS -> DAYS
-        # -------------------------------------------------
+            granularity = "hour"
 
         else:
 
@@ -3573,7 +4171,6 @@ def stats_timeline(
             ).fetchall()
 
             by_date = {
-
                 row["bucket"]:
                     row
 
@@ -3590,9 +4187,7 @@ def stats_timeline(
                 p["end_date"]
             )
 
-            while (
-                current <= last
-            ):
+            while current <= last:
 
                 key = (
                     current.isoformat()
@@ -3639,12 +4234,9 @@ def stats_timeline(
                     days=1
                 )
 
-            granularity = (
-                "day"
-            )
+            granularity = "day"
 
     return {
-
         "granularity":
             granularity,
 
@@ -3664,7 +4256,7 @@ def stats_hourly():
 
 
 # =========================================================
-# MANAGERS
+# MANAGER STATISTICS
 # =========================================================
 
 @app.get(
@@ -3690,10 +4282,10 @@ def stats_managers(
 
                 COALESCE(
                     NULLIF(
-                        user_login,
+                        talk_manager_name,
                         ''
                     ),
-                    'Неизвестно'
+                    'Не указан'
                 )
                     AS manager,
 
@@ -3705,8 +4297,14 @@ def stats_managers(
 
                     CASE
                         WHEN
-                            client_key
-                            IS NOT NULL
+                            COALESCE(
+                                is_internal_contact,
+                                0
+                            ) = 0
+
+                            AND
+
+                            client_key IS NOT NULL
 
                             AND
 
@@ -3739,8 +4337,17 @@ def stats_managers(
                     CASE
                         WHEN
                             direction = 0
+
                             AND
+
                             answered = 0
+
+                            AND
+
+                            COALESCE(
+                                is_internal_contact,
+                                0
+                            ) = 0
 
                         THEN 1
                         ELSE 0
@@ -3752,7 +4359,9 @@ def stats_managers(
                     CASE
                         WHEN
                             direction = 0
+
                             AND
+
                             answered = 1
 
                         THEN 1
@@ -3773,8 +4382,15 @@ def stats_managers(
                 SUM(
                     CASE
                         WHEN
+                            COALESCE(
+                                is_internal_contact,
+                                0
+                            ) = 0
+
+                            AND
+
                             sale_status =
-                            'bought'
+                                'bought'
 
                         THEN 1
                         ELSE 0
@@ -3785,14 +4401,35 @@ def stats_managers(
                 SUM(
                     CASE
                         WHEN
+                            COALESCE(
+                                is_internal_contact,
+                                0
+                            ) = 0
+
+                            AND
+
                             sale_status =
-                            'not_bought'
+                                'not_bought'
 
                         THEN 1
                         ELSE 0
                     END
                 )
-                    AS not_bought
+                    AS not_bought,
+
+                SUM(
+                    CASE
+                        WHEN
+                            COALESCE(
+                                is_internal_contact,
+                                0
+                            ) = 1
+
+                        THEN 1
+                        ELSE 0
+                    END
+                )
+                    AS internal_calls
 
             FROM calls
 
@@ -3803,7 +4440,8 @@ def stats_managers(
 
                 start_time < ?
 
-            GROUP BY manager
+            GROUP BY
+                manager
 
             ORDER BY
                 calls DESC
@@ -3869,6 +4507,12 @@ def stats_managers(
 
                 "missed":
                     row["missed"]
+                    or 0,
+
+                "internal_calls":
+                    row[
+                        "internal_calls"
+                    ]
                     or 0,
 
                 "answer_rate":
@@ -3967,8 +4611,14 @@ def stats_sims(
 
                     CASE
                         WHEN
-                            client_key
-                            IS NOT NULL
+                            COALESCE(
+                                is_internal_contact,
+                                0
+                            ) = 0
+
+                            AND
+
+                            client_key IS NOT NULL
 
                             AND
 
@@ -4001,8 +4651,17 @@ def stats_sims(
                     CASE
                         WHEN
                             direction = 0
+
                             AND
+
                             answered = 0
+
+                            AND
+
+                            COALESCE(
+                                is_internal_contact,
+                                0
+                            ) = 0
 
                         THEN 1
                         ELSE 0
@@ -4042,9 +4701,7 @@ def stats_sims(
         ).fetchall()
 
     return {
-
         "results": [
-
             {
                 "sim":
                     row["sim"],
@@ -4097,7 +4754,7 @@ def stats_recent(
     period: str = "today",
     date_from: str | None = None,
     date_to: str | None = None,
-    limit: int = 30,
+    limit: int = 50,
 ):
 
     p = get_period(
@@ -4121,18 +4778,18 @@ def stats_recent(
             SELECT
 
                 id,
-
                 db_call_id,
 
                 client_number,
-
                 client_name,
 
-                direction,
+                is_internal_contact,
+                internal_contact_name,
 
+                direction,
                 answered,
 
-                user_login,
+                talk_manager_name,
 
                 src_number,
 
@@ -4141,7 +4798,6 @@ def stats_recent(
                 duration,
 
                 sale_status,
-
                 no_sale_reason
 
             FROM calls
@@ -4175,7 +4831,6 @@ def stats_recent(
         )
 
         local_time = (
-
             datetime
             .fromtimestamp(
                 start_time,
@@ -4210,6 +4865,19 @@ def stats_recent(
                     ]
                     or "",
 
+                "is_internal_contact":
+                    bool(
+                        row[
+                            "is_internal_contact"
+                        ]
+                    ),
+
+                "internal_contact_name":
+                    row[
+                        "internal_contact_name"
+                    ]
+                    or "",
+
                 "direction":
                     row["direction"],
 
@@ -4219,7 +4887,7 @@ def stats_recent(
 
                 "manager":
                     row[
-                        "user_login"
+                        "talk_manager_name"
                     ]
                     or "—",
 
@@ -4266,7 +4934,6 @@ def dashboard():
 
     return """
 <!DOCTYPE html>
-
 <html lang="ru">
 
 <head>
@@ -4288,12 +4955,8 @@ def dashboard():
 
 body {
     margin: 0;
-
-    background:
-        #111;
-
-    color:
-        #fff;
+    background: #111;
+    color: #fff;
 
     font-family:
         -apple-system,
@@ -4307,174 +4970,106 @@ body {
     width: 100%;
     max-width: 1800px;
 
-    margin:
-        0 auto;
-
-    padding:
-        26px;
+    margin: 0 auto;
+    padding: 26px;
 }
 
 .header {
     display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
 
-    align-items:
-        flex-start;
-
-    justify-content:
-        space-between;
-
-    gap:
-        20px;
-
-    margin-bottom:
-        28px;
+    gap: 20px;
+    margin-bottom: 28px;
 }
 
 .title {
-    margin:
-        0;
-
-    font-size:
-        34px;
+    margin: 0;
+    font-size: 34px;
 }
 
 .subtitle {
-    margin-top:
-        7px;
-
-    color:
-        #888;
-
-    font-size:
-        14px;
+    margin-top: 7px;
+    color: #888;
+    font-size: 14px;
 }
 
 .periods {
-    display:
-        flex;
-
-    flex-wrap:
-        wrap;
-
-    gap:
-        8px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
 }
 
 .period-btn,
 .chart-btn,
 .apply-btn {
-    appearance:
-        none;
+    appearance: none;
 
-    border:
-        1px solid #333;
+    border: 1px solid #333;
+    border-radius: 10px;
 
-    border-radius:
-        10px;
+    background: #1b1b1b;
+    color: #999;
 
-    background:
-        #1b1b1b;
+    padding: 10px 14px;
 
-    color:
-        #999;
-
-    padding:
-        10px 14px;
-
-    cursor:
-        pointer;
-
-    font-weight:
-        600;
+    cursor: pointer;
+    font-weight: 600;
 }
 
 .period-btn.active,
 .chart-btn.active {
-    color:
-        #111;
-
-    background:
-        #d9b565;
-
-    border-color:
-        #d9b565;
+    color: #111;
+    background: #d9b565;
+    border-color: #d9b565;
 }
 
 .custom-panel {
-    display:
-        none;
+    display: none;
 
-    margin-bottom:
-        20px;
+    margin-bottom: 20px;
 
-    padding:
-        16px;
+    padding: 16px;
 
-    background:
-        #1b1b1b;
+    background: #1b1b1b;
 
-    border:
-        1px solid #333;
+    border: 1px solid #333;
+    border-radius: 14px;
 
-    border-radius:
-        14px;
+    gap: 10px;
 
-    gap:
-        10px;
-
-    align-items:
-        center;
-
-    flex-wrap:
-        wrap;
+    align-items: center;
+    flex-wrap: wrap;
 }
 
 .custom-panel.visible {
-    display:
-        flex;
+    display: flex;
 }
 
 .custom-panel input {
-    border:
-        1px solid #3a3a3a;
+    border: 1px solid #3a3a3a;
 
-    background:
-        #111;
+    background: #111;
+    color: #fff;
 
-    color:
-        #fff;
+    border-radius: 8px;
 
-    border-radius:
-        8px;
-
-    padding:
-        9px 10px;
+    padding: 9px 10px;
 }
 
 .apply-btn {
-    color:
-        #111;
-
-    background:
-        #d9b565;
-
-    border-color:
-        #d9b565;
+    color: #111;
+    background: #d9b565;
+    border-color: #d9b565;
 }
 
 .section-title {
-    margin:
-        30px
-        0
-        14px;
-
-    font-size:
-        20px;
+    margin: 30px 0 14px;
+    font-size: 20px;
 }
 
 .grid {
-    display:
-        grid;
+    display: grid;
 
     grid-template-columns:
         repeat(
@@ -4485,28 +5080,20 @@ body {
             )
         );
 
-    gap:
-        15px;
+    gap: 15px;
 }
 
 .card,
 .panel {
-    background:
-        #1b1b1b;
+    background: #1b1b1b;
 
-    border:
-        1px solid #333;
-
-    border-radius:
-        16px;
+    border: 1px solid #333;
+    border-radius: 16px;
 }
 
 .card {
-    padding:
-        20px;
-
-    min-height:
-        118px;
+    padding: 20px;
+    min-height: 118px;
 }
 
 .card.good {
@@ -4529,131 +5116,89 @@ body {
         );
 }
 
+.card.warn {
+    border-color:
+        rgba(
+            217,
+            181,
+            101,
+            .35
+        );
+}
+
 .label {
-    color:
-        #a5a5a5;
-
-    font-size:
-        14px;
-
-    margin-bottom:
-        12px;
+    color: #a5a5a5;
+    font-size: 14px;
+    margin-bottom: 12px;
 }
 
 .value {
-    font-size:
-        32px;
-
-    line-height:
-        1.12;
-
-    font-weight:
-        750;
+    font-size: 32px;
+    line-height: 1.12;
+    font-weight: 750;
 }
 
 .panel {
-    margin-top:
-        24px;
-
-    padding:
-        22px;
+    margin-top: 24px;
+    padding: 22px;
 }
 
 .panel-header {
-    display:
-        flex;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
 
-    justify-content:
-        space-between;
+    gap: 16px;
 
-    align-items:
-        center;
+    flex-wrap: wrap;
 
-    gap:
-        16px;
-
-    flex-wrap:
-        wrap;
-
-    margin-bottom:
-        18px;
+    margin-bottom: 18px;
 }
 
 .panel h2 {
-    margin:
-        0;
-
-    font-size:
-        24px;
+    margin: 0;
+    font-size: 24px;
 }
 
 .chart-buttons {
-    display:
-        flex;
-
-    gap:
-        7px;
+    display: flex;
+    gap: 7px;
 }
 
 .chart {
-    display:
-        flex;
+    display: flex;
+    align-items: flex-end;
 
-    align-items:
-        flex-end;
+    gap: 9px;
 
-    gap:
-        9px;
+    min-height: 280px;
 
-    min-height:
-        280px;
+    overflow-x: auto;
 
-    overflow-x:
-        auto;
-
-    padding:
-        30px
-        4px
-        0;
+    padding: 30px 4px 0;
 }
 
 .bar-wrap {
-    flex:
-        1;
-
-    min-width:
-        44px;
-
-    text-align:
-        center;
+    flex: 1;
+    min-width: 44px;
+    text-align: center;
 }
 
 .bar-value {
-    height:
-        22px;
-
-    font-size:
-        12px;
-
-    font-weight:
-        600;
+    height: 22px;
+    font-size: 12px;
+    font-weight: 600;
 }
 
 .bar {
-    width:
-        70%;
+    width: 70%;
 
-    max-width:
-        58px;
+    max-width: 58px;
+    min-height: 2px;
 
-    min-height:
-        2px;
+    margin: 0 auto;
 
-    margin:
-        0 auto;
-
-    background:
-        #d9b565;
+    background: #d9b565;
 
     border-radius:
         8px
@@ -4663,27 +5208,21 @@ body {
 }
 
 .bar.outgoing {
-    opacity:
-        .5;
+    opacity: .5;
 }
 
 .bar-label {
-    margin-top:
-        8px;
+    margin-top: 8px;
 
-    color:
-        #999;
+    color: #999;
 
-    font-size:
-        11px;
+    font-size: 11px;
 
-    white-space:
-        nowrap;
+    white-space: nowrap;
 }
 
 .tables {
-    display:
-        grid;
+    display: grid;
 
     grid-template-columns:
         repeat(
@@ -4694,60 +5233,46 @@ body {
             )
         );
 
-    gap:
-        24px;
+    gap: 24px;
 }
 
 .table-wrap {
-    overflow-x:
-        auto;
+    overflow-x: auto;
 }
 
 table {
-    width:
-        100%;
+    width: 100%;
 
-    border-collapse:
-        collapse;
+    border-collapse: collapse;
 
-    min-width:
-        650px;
+    min-width: 650px;
 }
 
 th {
-    text-align:
-        left;
+    text-align: left;
 
-    color:
-        #888;
+    color: #888;
 
-    font-size:
-        12px;
+    font-size: 12px;
+    font-weight: 600;
 
-    font-weight:
-        600;
-
-    padding:
-        11px 10px;
+    padding: 11px 10px;
 
     border-bottom:
         1px solid #333;
 }
 
 td {
-    padding:
-        13px 10px;
+    padding: 13px 10px;
 
     border-bottom:
         1px solid #292929;
 
-    font-size:
-        13px;
+    font-size: 13px;
 }
 
 tbody tr:last-child td {
-    border-bottom:
-        0;
+    border-bottom: 0;
 }
 
 .phone {
@@ -4759,23 +5284,23 @@ tbody tr:last-child td {
 }
 
 .sale-bought {
-    color:
-        #a9e5b3;
+    color: #a9e5b3;
 }
 
 .sale-not-bought {
-    color:
-        #ffabab;
+    color: #ffabab;
 }
 
 .sale-unmarked {
-    color:
-        #777;
+    color: #777;
+}
+
+.contact {
+    color: #d9b565;
 }
 
 .empty {
-    color:
-        #777;
+    color: #777;
 }
 
 @media (
@@ -4783,13 +5308,11 @@ tbody tr:last-child td {
 ) {
 
     .header {
-        flex-direction:
-            column;
+        flex-direction: column;
     }
 
     .tables {
-        grid-template-columns:
-            1fr;
+        grid-template-columns: 1fr;
     }
 }
 
@@ -4798,13 +5321,11 @@ tbody tr:last-child td {
 ) {
 
     .container {
-        padding:
-            14px;
+        padding: 14px;
     }
 
     .title {
-        font-size:
-            26px;
+        font-size: 26px;
     }
 
     .grid {
@@ -4817,26 +5338,20 @@ tbody tr:last-child td {
                 )
             );
 
-        gap:
-            10px;
+        gap: 10px;
     }
 
     .card {
-        min-height:
-            105px;
-
-        padding:
-            15px;
+        min-height: 105px;
+        padding: 15px;
     }
 
     .value {
-        font-size:
-            25px;
+        font-size: 25px;
     }
 
     .panel {
-        padding:
-            15px;
+        padding: 15px;
     }
 }
 
@@ -4847,7 +5362,6 @@ tbody tr:last-child td {
 <body>
 
 <div class="container">
-
 
 <div class="header">
 
@@ -4865,7 +5379,6 @@ tbody tr:last-child td {
         </div>
 
     </div>
-
 
     <div class="periods">
 
@@ -4914,18 +5427,14 @@ tbody tr:last-child td {
     id="custom_panel"
 >
 
-    <span>
-        С
-    </span>
+    <span>С</span>
 
     <input
         id="date_from"
         type="date"
     >
 
-    <span>
-        по
-    </span>
+    <span>по</span>
 
     <input
         id="date_to"
@@ -4945,7 +5454,6 @@ tbody tr:last-child td {
 <div class="grid">
 
     <div class="card">
-
         <div class="label">
             Всего звонков
         </div>
@@ -4953,15 +5461,11 @@ tbody tr:last-child td {
         <div
             class="value"
             id="calls"
-        >
-            —
-        </div>
-
+        >—</div>
     </div>
 
 
     <div class="card">
-
         <div class="label">
             Уникальные клиенты
         </div>
@@ -4969,15 +5473,23 @@ tbody tr:last-child td {
         <div
             class="value"
             id="unique_clients"
-        >
-            —
-        </div>
-
+        >—</div>
     </div>
 
 
     <div class="card">
+        <div class="label">
+            Внутренние контакты
+        </div>
 
+        <div
+            class="value"
+            id="internal_calls"
+        >—</div>
+    </div>
+
+
+    <div class="card">
         <div class="label">
             Входящие
         </div>
@@ -4985,15 +5497,11 @@ tbody tr:last-child td {
         <div
             class="value"
             id="incoming"
-        >
-            —
-        </div>
-
+        >—</div>
     </div>
 
 
     <div class="card">
-
         <div class="label">
             Исходящие
         </div>
@@ -5001,15 +5509,11 @@ tbody tr:last-child td {
         <div
             class="value"
             id="outgoing"
-        >
-            —
-        </div>
-
+        >—</div>
     </div>
 
 
     <div class="card">
-
         <div class="label">
             Отвеченные
         </div>
@@ -5017,15 +5521,11 @@ tbody tr:last-child td {
         <div
             class="value"
             id="answered"
-        >
-            —
-        </div>
-
+        >—</div>
     </div>
 
 
     <div class="card">
-
         <div class="label">
             Пропущенные входящие
         </div>
@@ -5033,15 +5533,11 @@ tbody tr:last-child td {
         <div
             class="value"
             id="missed"
-        >
-            —
-        </div>
-
+        >—</div>
     </div>
 
 
     <div class="card">
-
         <div class="label">
             Ответили на входящие
         </div>
@@ -5049,15 +5545,11 @@ tbody tr:last-child td {
         <div
             class="value"
             id="answer_rate"
-        >
-            —
-        </div>
-
+        >—</div>
     </div>
 
 
     <div class="card">
-
         <div class="label">
             Новые клиенты
         </div>
@@ -5065,15 +5557,11 @@ tbody tr:last-child td {
         <div
             class="value"
             id="new_clients"
-        >
-            —
-        </div>
-
+        >—</div>
     </div>
 
 
     <div class="card">
-
         <div class="label">
             Повторные клиенты
         </div>
@@ -5081,15 +5569,11 @@ tbody tr:last-child td {
         <div
             class="value"
             id="repeat_clients"
-        >
-            —
-        </div>
-
+        >—</div>
     </div>
 
 
     <div class="card">
-
         <div class="label">
             Уникально пропущено
         </div>
@@ -5097,15 +5581,11 @@ tbody tr:last-child td {
         <div
             class="value"
             id="unique_missed_clients"
-        >
-            —
-        </div>
-
+        >—</div>
     </div>
 
 
     <div class="card">
-
         <div class="label">
             Были исходящие после пропущенного
         </div>
@@ -5113,15 +5593,11 @@ tbody tr:last-child td {
         <div
             class="value"
             id="missed_called_back"
-        >
-            —
-        </div>
-
+        >—</div>
     </div>
 
 
     <div class="card">
-
         <div class="label">
             Связались после пропущенного
         </div>
@@ -5129,15 +5605,11 @@ tbody tr:last-child td {
         <div
             class="value"
             id="missed_contacted"
-        >
-            —
-        </div>
-
+        >—</div>
     </div>
 
 
     <div class="card">
-
         <div class="label">
             Не обработано
         </div>
@@ -5145,15 +5617,11 @@ tbody tr:last-child td {
         <div
             class="value"
             id="missed_not_processed"
-        >
-            —
-        </div>
-
+        >—</div>
     </div>
 
 
     <div class="card">
-
         <div class="label">
             Средний разговор
         </div>
@@ -5161,15 +5629,11 @@ tbody tr:last-child td {
         <div
             class="value"
             id="average_duration"
-        >
-            —
-        </div>
-
+        >—</div>
     </div>
 
 
     <div class="card">
-
         <div class="label">
             Общее время разговоров
         </div>
@@ -5177,15 +5641,11 @@ tbody tr:last-child td {
         <div
             class="value"
             id="total_duration"
-        >
-            —
-        </div>
-
+        >—</div>
     </div>
 
 
     <div class="card">
-
         <div class="label">
             Среднее время ответа
         </div>
@@ -5193,10 +5653,7 @@ tbody tr:last-child td {
         <div
             class="value"
             id="average_answer_delay"
-        >
-            —
-        </div>
-
+        >—</div>
     </div>
 
 </div>
@@ -5218,9 +5675,7 @@ tbody tr:last-child td {
         <div
             class="value"
             id="bought"
-        >
-            —
-        </div>
+        >—</div>
 
     </div>
 
@@ -5234,25 +5689,35 @@ tbody tr:last-child td {
         <div
             class="value"
             id="not_bought"
-        >
-            —
-        </div>
+        >—</div>
 
     </div>
 
 
-    <div class="card">
+    <div class="card warn">
 
         <div class="label">
-            Не отмечено
+            Результат не отмечен
         </div>
 
         <div
             class="value"
             id="sale_unmarked"
-        >
-            —
+        >—</div>
+
+    </div>
+
+
+    <div class="card warn">
+
+        <div class="label">
+            Менеджер не указан
         </div>
+
+        <div
+            class="value"
+            id="manager_unmarked"
+        >—</div>
 
     </div>
 
@@ -5266,9 +5731,7 @@ tbody tr:last-child td {
         <div
             class="value"
             id="sale_conversion"
-        >
-            —
-        </div>
+        >—</div>
 
     </div>
 
@@ -5357,9 +5820,6 @@ tbody tr:last-child td {
 </div>
 
 
-<div class="tables">
-
-
 <div class="panel">
 
     <div class="panel-header">
@@ -5378,49 +5838,17 @@ tbody tr:last-child td {
 
             <tr>
 
-                <th>
-                    Менеджер
-                </th>
-
-                <th>
-                    Звонки
-                </th>
-
-                <th>
-                    Клиенты
-                </th>
-
-                <th>
-                    Вход.
-                </th>
-
-                <th>
-                    Исход.
-                </th>
-
-                <th>
-                    Пропущ.
-                </th>
-
-                <th>
-                    Ответ %
-                </th>
-
-                <th>
-                    Купил
-                </th>
-
-                <th>
-                    Не купил
-                </th>
-
-                <th>
-                    Конверсия
-                </th>
-
-                <th>
-                    Разговор
-                </th>
+                <th>Менеджер</th>
+                <th>Звонки</th>
+                <th>Клиенты</th>
+                <th>Вход.</th>
+                <th>Исход.</th>
+                <th>Пропущ.</th>
+                <th>Ответ %</th>
+                <th>Купил</th>
+                <th>Не купил</th>
+                <th>Конверсия</th>
+                <th>Разговор</th>
 
             </tr>
 
@@ -5455,37 +5883,14 @@ tbody tr:last-child td {
 
             <tr>
 
-                <th>
-                    SIM
-                </th>
-
-                <th>
-                    Слот
-                </th>
-
-                <th>
-                    Звонки
-                </th>
-
-                <th>
-                    Клиенты
-                </th>
-
-                <th>
-                    Вход.
-                </th>
-
-                <th>
-                    Исход.
-                </th>
-
-                <th>
-                    Пропущ.
-                </th>
-
-                <th>
-                    Разговор
-                </th>
+                <th>SIM</th>
+                <th>Слот</th>
+                <th>Звонки</th>
+                <th>Клиенты</th>
+                <th>Вход.</th>
+                <th>Исход.</th>
+                <th>Пропущ.</th>
+                <th>Разговор</th>
 
             </tr>
 
@@ -5498,9 +5903,6 @@ tbody tr:last-child td {
         </table>
 
     </div>
-
-</div>
-
 
 </div>
 
@@ -5523,37 +5925,14 @@ tbody tr:last-child td {
 
             <tr>
 
-                <th>
-                    Время
-                </th>
-
-                <th>
-                    Клиент
-                </th>
-
-                <th>
-                    Направление
-                </th>
-
-                <th>
-                    Статус
-                </th>
-
-                <th>
-                    Менеджер
-                </th>
-
-                <th>
-                    SIM
-                </th>
-
-                <th>
-                    Разговор
-                </th>
-
-                <th>
-                    Результат
-                </th>
+                <th>Время</th>
+                <th>Клиент / контакт</th>
+                <th>Направление</th>
+                <th>Статус</th>
+                <th>Менеджер</th>
+                <th>SIM</th>
+                <th>Разговор</th>
+                <th>Результат</th>
 
             </tr>
 
@@ -5574,7 +5953,6 @@ tbody tr:last-child td {
 
 
 <script>
-
 
 let selectedPeriod =
     "today";
@@ -5748,16 +6126,21 @@ async function loadStats() {
         data.stats;
 
 
-    document.getElementById(
-        "period_label"
-    ).textContent =
-        data.period.label;
+    document
+        .getElementById(
+            "period_label"
+        )
+        .textContent =
+            data.period.label;
 
 
     const fields = {
 
         calls:
             s.calls,
+
+        internal_calls:
+            s.internal_calls,
 
         unique_clients:
             s.unique_clients,
@@ -5804,6 +6187,9 @@ async function loadStats() {
 
         sale_unmarked:
             s.sale_unmarked,
+
+        manager_unmarked:
+            s.manager_unmarked,
 
         sale_conversion:
             s.sale_conversion
@@ -5948,7 +6334,6 @@ function renderTimeline() {
             item,
             index
         ) => {
-
 
             const value =
                 values[index];
@@ -6119,7 +6504,6 @@ async function loadReasons() {
     data.results.forEach(
         row => {
 
-
             const tr =
                 document.createElement(
                     "tr"
@@ -6185,7 +6569,6 @@ async function loadManagers() {
     data.results.forEach(
         row => {
 
-
             const tr =
                 document.createElement(
                     "tr"
@@ -6224,7 +6607,6 @@ async function loadManagers() {
 
             values.forEach(
                 value => {
-
 
                     const td =
                         document.createElement(
@@ -6272,7 +6654,6 @@ async function loadSims() {
     data.results.forEach(
         row => {
 
-
             const tr =
                 document.createElement(
                     "tr"
@@ -6284,9 +6665,7 @@ async function loadSims() {
                 row.sim,
 
                 row.slot === null
-
                     ? "—"
-
                     : row.slot + 1,
 
                 row.calls,
@@ -6307,7 +6686,6 @@ async function loadSims() {
 
             values.forEach(
                 value => {
-
 
                     const td =
                         document.createElement(
@@ -6355,7 +6733,6 @@ async function loadRecent() {
     data.results.forEach(
         row => {
 
-
             const tr =
                 document.createElement(
                     "tr"
@@ -6382,17 +6759,34 @@ async function loadRecent() {
                 "phone";
 
 
-            client.textContent =
+            if (
+                row.is_internal_contact
+            ) {
 
-                row.client_name
+                client.classList.add(
+                    "contact"
+                );
 
-                    ? (
-                        row.client_name
-                        + " · "
-                        + row.client_number
-                    )
 
-                    : row.client_number;
+                client.textContent =
+                    row.internal_contact_name
+                    + " · "
+                    + row.client_number;
+
+            } else {
+
+                client.textContent =
+
+                    row.client_name
+
+                        ? (
+                            row.client_name
+                            + " · "
+                            + row.client_number
+                        )
+
+                        : row.client_number;
+            }
 
 
             const direction =
@@ -6469,6 +6863,17 @@ async function loadRecent() {
 
 
             if (
+                row.is_internal_contact
+            ) {
+
+                sale.className =
+                    "contact";
+
+
+                sale.textContent =
+                    "Контакт";
+
+            } else if (
                 row.sale_status
                 === "bought"
             ) {
@@ -6607,7 +7012,6 @@ function selectPeriod(
         .forEach(
             button => {
 
-
                 button
                     .classList
                     .toggle(
@@ -6655,13 +7059,11 @@ document
     .forEach(
         button => {
 
-
             button.addEventListener(
 
                 "click",
 
                 () => {
-
 
                     selectPeriod(
                         button
@@ -6681,13 +7083,11 @@ document
     .forEach(
         button => {
 
-
             button.addEventListener(
 
                 "click",
 
                 () => {
-
 
                     chartMode =
                         button
@@ -6701,7 +7101,6 @@ document
                         )
                         .forEach(
                             item => {
-
 
                                 item
                                     .classList
@@ -6735,7 +7134,6 @@ document
         "click",
 
         () => {
-
 
             customFrom =
                 document
@@ -6781,11 +7179,9 @@ setInterval(
     30000
 );
 
-
 </script>
 
 </body>
-
 </html>
     """
 
@@ -6821,10 +7217,6 @@ async def moizvonki_webhook(
         )
         or {}
     )
-
-    # -----------------------------------------------------
-    # ONLY CALL FINISH
-    # -----------------------------------------------------
 
     if (
         webhook.get(
@@ -6869,7 +7261,7 @@ async def moizvonki_webhook(
         )
 
     # -----------------------------------------------------
-    # TALK DURATION
+    # DURATION
     # -----------------------------------------------------
 
     (
@@ -6903,6 +7295,12 @@ async def moizvonki_webhook(
         ]
     )
 
+    is_internal_contact = (
+        save_result[
+            "is_internal_contact"
+        ]
+    )
+
     # -----------------------------------------------------
     # DUPLICATE
     # -----------------------------------------------------
@@ -6932,22 +7330,31 @@ async def moizvonki_webhook(
     )
 
     # -----------------------------------------------------
-    # RESULT BUTTONS
+    # BUTTONS
+    #
+    # Только:
+    # отвеченный звонок
+    # НЕ внутренний контакт
     # -----------------------------------------------------
 
-    result_keyboard = (
+    result_keyboard = None
 
-        build_sale_keyboard(
-            call_id
+    if (
+        answered
+
+        and
+
+        not is_internal_contact
+    ):
+
+        result_keyboard = (
+            build_manager_keyboard(
+                call_id
+            )
         )
 
-        if answered
-
-        else None
-    )
-
     # -----------------------------------------------------
-    # SEND TELEGRAM
+    # TELEGRAM
     # -----------------------------------------------------
 
     try:
@@ -6993,12 +7400,14 @@ async def moizvonki_webhook(
         raise
 
     return {
-
         "ok":
             True,
 
         "call_id":
             call_id,
+
+        "internal_contact":
+            is_internal_contact,
 
         "duration":
             talk_duration,
