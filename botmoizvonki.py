@@ -1863,7 +1863,8 @@ def build_sale_keyboard(
                 }
             ],
         ]
-    }
+    )
+
 
     return {
         "inline_keyboard":
