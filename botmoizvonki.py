@@ -7725,7 +7725,7 @@ async def moizvonki_webhook(
         ]
     )
 
-    already_sent = (
+    telegram_already_sent = (
         save_result[
             "already_sent"
         ]
@@ -7737,12 +7737,160 @@ async def moizvonki_webhook(
         ]
     )
 
+    client_number = (
+        event.get(
+            "client_number"
+        )
+        or ""
+    )
+
     # -----------------------------------------------------
-    # DUPLICATE
+    # AUTO SMS
     # -----------------------------------------------------
 
-    if already_sent:
+    sms_status = "not_sent"
 
+    if is_internal_contact:
+        sms_status = "internal_contact"
+
+    else:
+
+        reservation = reserve_client_sms(
+            call_id,
+            client_number,
+        )
+
+        if reservation["reserved"]:
+
+            history_id = reservation[
+                "history_id"
+            ]
+
+            try:
+
+                sms_result = send_client_sms(
+                    client_number
+                )
+
+                mark_sms_sent(
+                    call_id,
+                    history_id,
+                    sms_result,
+                )
+
+                sms_status = "sent"
+
+                print(
+                    "AUTO SMS SENT:",
+                    call_id,
+                    client_number,
+                )
+
+            except Exception as exc:
+
+                mark_sms_error(
+                    call_id,
+                    history_id,
+                    repr(exc),
+                )
+
+                sms_status = "error"
+
+                print(
+                    "AUTO SMS ERROR:",
+                    call_id,
+                    client_number,
+                    repr(exc),
+                )
+
+        else:
+            sms_status = reservation[
+                "reason"
+            ]
+
+    # -----------------------------------------------------
+    # TELEGRAM
+    # -----------------------------------------------------
+
+    telegram_status = (
+        "already_sent"
+        if telegram_already_sent
+        else "not_sent"
+    )
+
+    if not telegram_already_sent:
+
+        text = build_telegram_message(
+            event,
+            webhook,
+            talk_duration,
+        )
+
+        result_keyboard = None
+
+        if (
+            answered
+
+            and
+
+            not is_internal_contact
+        ):
+            result_keyboard = (
+                build_manager_keyboard(
+                    call_id
+                )
+            )
+
+        try:
+
+            if (
+                answered
+                and voice_bytes
+            ):
+                telegram_result = (
+                    send_voice_bytes(
+                        voice_bytes,
+                        text,
+                        reply_markup=
+                            result_keyboard,
+                    )
+                )
+
+            else:
+                telegram_result = (
+                    send_text_message(
+                        text,
+                        reply_markup=
+                            result_keyboard,
+                    )
+                )
+
+            mark_telegram_sent(
+                call_id,
+                telegram_result,
+            )
+
+            telegram_status = "sent"
+
+        except Exception as exc:
+
+            telegram_status = "error"
+
+            print(
+                "TELEGRAM ERROR:",
+                repr(exc),
+            )
+
+    duplicate = (
+        telegram_already_sent
+        and sms_status in {
+            "cooldown",
+            "internal_contact",
+            "empty_number",
+        }
+    )
+
+    if duplicate:
         print(
             "DUPLICATE CALL:",
             event.get(
@@ -7750,97 +7898,15 @@ async def moizvonki_webhook(
             ),
         )
 
-        return {
-            "ok": True,
-            "duplicate": True,
-        }
-
-    # -----------------------------------------------------
-    # MESSAGE
-    # -----------------------------------------------------
-
-    text = build_telegram_message(
-        event,
-        webhook,
-        talk_duration,
-    )
-
-    # -----------------------------------------------------
-    # BUTTONS
-    #
-    # Только:
-    # отвеченный звонок
-    # НЕ внутренний контакт
-    # -----------------------------------------------------
-
-    result_keyboard = None
-
-    if (
-        answered
-
-        and
-
-        not is_internal_contact
-    ):
-
-        result_keyboard = (
-            build_manager_keyboard(
-                call_id
-            )
-        )
-
-    # -----------------------------------------------------
-    # TELEGRAM
-    # -----------------------------------------------------
-
-    try:
-
-        if (
-            answered
-            and voice_bytes
-        ):
-
-            telegram_result = (
-                send_voice_bytes(
-                    voice_bytes,
-                    text,
-                    reply_markup=
-                        result_keyboard,
-                )
-            )
-
-        else:
-
-            telegram_result = (
-                send_text_message(
-                    text,
-                    reply_markup=
-                        result_keyboard,
-                )
-            )
-
-        mark_telegram_sent(
-            call_id,
-            telegram_result,
-        )
-
-    except Exception as exc:
-
-        print(
-            "TELEGRAM ERROR:",
-            repr(
-                exc
-            ),
-        )
-
-        raise
-
     return {
         "ok":
             True,
 
         "call_id":
             call_id,
+
+        "duplicate":
+            duplicate,
 
         "internal_contact":
             is_internal_contact,
@@ -7850,4 +7916,10 @@ async def moizvonki_webhook(
 
         "duration_source":
             duration_source,
+
+        "telegram":
+            telegram_status,
+
+        "sms":
+            sms_status,
     }
