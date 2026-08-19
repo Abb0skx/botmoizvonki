@@ -95,13 +95,19 @@ https://t.me/texnikach
 Для заказа напишите менеджеру:
 https://t.me/texnikach_admin
 
-⸻
+Полная информация о нас:
+https://texnikach.uz/go
 
-Barcha amaldagi narxlar, modellar va katalog:
+------------------------
+
+Barcha aktual narxlar, modellar va katalog:
 https://t.me/texnikach
 
 Buyurtma berish uchun menejerga yozing:
-https://t.me/texnikach_admin"""
+https://t.me/texnikach_admin
+
+Biz haqimizda to‘liq ma’lumot:
+https://texnikach.uz/go"""
 
 DB_PATH = Path(
     os.getenv(
