@@ -70,6 +70,39 @@ TELEGRAM_WEBHOOK_SECRET = os.getenv(
     "",
 )
 
+MOIZVONKI_API_URL = os.getenv(
+    "MOIZVONKI_API_URL",
+    "",
+).rstrip("/")
+
+MOIZVONKI_USER_NAME = os.getenv(
+    "MOIZVONKI_USER_NAME",
+    "",
+)
+
+MOIZVONKI_API_KEY = os.getenv(
+    "MOIZVONKI_API_KEY",
+    "",
+)
+
+SMS_COOLDOWN_DAYS = 30
+
+SMS_TEXT = """TEXNIKACH
+
+Все актуальные цены, модели и каталог:
+https://t.me/texnikach
+
+Для заказа напишите менеджеру:
+https://t.me/texnikach_admin
+
+⸻
+
+Barcha amaldagi narxlar, modellar va katalog:
+https://t.me/texnikach
+
+Buyurtma berish uchun menejerga yozing:
+https://t.me/texnikach_admin"""
+
 DB_PATH = Path(
     os.getenv(
         "DB_PATH",
@@ -297,6 +330,12 @@ def init_db():
                 telegram_chat_id TEXT,
                 telegram_message_id INTEGER,
 
+                sms_sent INTEGER
+                    DEFAULT 0,
+
+                sms_sent_at INTEGER,
+                sms_error TEXT,
+
                 talk_manager_code TEXT,
                 talk_manager_name TEXT,
 
@@ -365,6 +404,25 @@ def init_db():
                 """
                 ALTER TABLE calls
                 ADD COLUMN telegram_message_id INTEGER
+                """,
+
+            "sms_sent":
+                """
+                ALTER TABLE calls
+                ADD COLUMN sms_sent INTEGER
+                DEFAULT 0
+                """,
+
+            "sms_sent_at":
+                """
+                ALTER TABLE calls
+                ADD COLUMN sms_sent_at INTEGER
+                """,
+
+            "sms_error":
+                """
+                ALTER TABLE calls
+                ADD COLUMN sms_error TEXT
                 """,
 
             "sale_status":
@@ -454,6 +512,41 @@ def init_db():
                 conn.execute(
                     sql
                 )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sms_history (
+
+                id INTEGER
+                    PRIMARY KEY
+                    AUTOINCREMENT,
+
+                call_id INTEGER,
+
+                client_number TEXT
+                    NOT NULL,
+
+                client_key TEXT
+                    NOT NULL,
+
+                status TEXT
+                    NOT NULL,
+
+                reserved_at INTEGER
+                    NOT NULL,
+
+                sent_at INTEGER,
+                error TEXT,
+                provider_response TEXT,
+
+                created_at TIMESTAMP
+                    DEFAULT CURRENT_TIMESTAMP,
+
+                FOREIGN KEY(call_id)
+                    REFERENCES calls(id)
+            )
+            """
+        )
 
         # -------------------------------------------------
         # NORMALIZE OLD CLIENT NUMBERS
@@ -625,10 +718,352 @@ def init_db():
             """
         )
 
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_calls_sms_sent
+
+            ON calls(sms_sent)
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_sms_history_client_status_time
+
+            ON sms_history(
+                client_key,
+                status,
+                sent_at,
+                reserved_at
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_sms_history_call_id
+
+            ON sms_history(call_id)
+            """
+        )
+
         conn.commit()
 
 
 init_db()
+
+
+# =========================================================
+# SMS
+# =========================================================
+
+def reserve_client_sms(
+    call_id: int,
+    client_number: str,
+):
+
+    client_key = normalize_phone(
+        client_number
+    )
+
+    if not client_key:
+        return {
+            "reserved": False,
+            "reason": "empty_number",
+            "history_id": None,
+        }
+
+    if get_internal_contact_name(
+        client_key
+    ):
+        return {
+            "reserved": False,
+            "reason": "internal_contact",
+            "history_id": None,
+        }
+
+    now_ts = int(
+        datetime.now(
+            timezone.utc
+        ).timestamp()
+    )
+
+    cutoff_ts = (
+        now_ts
+        - SMS_COOLDOWN_DAYS
+        * 24
+        * 60
+        * 60
+    )
+
+    with connect_db() as conn:
+
+        conn.execute(
+            "BEGIN IMMEDIATE"
+        )
+
+        previous = conn.execute(
+            """
+            SELECT
+                id,
+                status,
+                reserved_at,
+                sent_at
+
+            FROM sms_history
+
+            WHERE
+                client_key = ?
+
+                AND
+
+                (
+                    (
+                        status = 'sent'
+                        AND sent_at >= ?
+                    )
+
+                    OR
+
+                    (
+                        status = 'reserved'
+                        AND reserved_at >= ?
+                    )
+                )
+
+            ORDER BY
+                COALESCE(
+                    sent_at,
+                    reserved_at
+                ) DESC
+
+            LIMIT 1
+            """,
+            (
+                client_key,
+                cutoff_ts,
+                cutoff_ts,
+            ),
+        ).fetchone()
+
+        if previous:
+
+            conn.commit()
+
+            return {
+                "reserved": False,
+                "reason": "cooldown",
+                "history_id": previous["id"],
+                "previous_status": previous["status"],
+                "previous_sent_at": previous["sent_at"],
+                "previous_reserved_at": previous["reserved_at"],
+            }
+
+        cursor = conn.execute(
+            """
+            INSERT INTO sms_history (
+                call_id,
+                client_number,
+                client_key,
+                status,
+                reserved_at
+            )
+
+            VALUES (?, ?, ?, 'reserved', ?)
+            """,
+            (
+                call_id,
+                client_number,
+                client_key,
+                now_ts,
+            ),
+        )
+
+        conn.commit()
+
+        return {
+            "reserved": True,
+            "reason": "reserved",
+            "history_id": cursor.lastrowid,
+        }
+
+
+def send_client_sms(
+    client_number: str,
+):
+
+    if not MOIZVONKI_API_URL:
+        raise RuntimeError(
+            "MOIZVONKI_API_URL не указан"
+        )
+
+    if not MOIZVONKI_USER_NAME:
+        raise RuntimeError(
+            "MOIZVONKI_USER_NAME не указан"
+        )
+
+    if not MOIZVONKI_API_KEY:
+        raise RuntimeError(
+            "MOIZVONKI_API_KEY не указан"
+        )
+
+    phone = normalize_phone(
+        client_number
+    )
+
+    if not phone:
+        raise ValueError(
+            "Пустой номер клиента"
+        )
+
+    payload = {
+        "user_name": MOIZVONKI_USER_NAME,
+        "api_key": MOIZVONKI_API_KEY,
+        "action": "calls.send_sms",
+        "to": "+" + phone,
+        "text": SMS_TEXT,
+    }
+
+    response = HTTP.post(
+        MOIZVONKI_API_URL,
+        json=payload,
+        timeout=30,
+    )
+
+    response.raise_for_status()
+
+    try:
+        result = response.json()
+
+    except ValueError as exc:
+        raise RuntimeError(
+            "Мои Звонки вернул не JSON: "
+            + response.text[:500]
+        ) from exc
+
+    if (
+        isinstance(result, dict)
+
+        and
+
+        (
+            result.get("error")
+            or result.get("success") is False
+            or result.get("ok") is False
+        )
+    ):
+        raise RuntimeError(
+            str(result)
+        )
+
+    return result
+
+
+def mark_sms_sent(
+    call_id: int,
+    history_id: int,
+    provider_result,
+):
+
+    now_ts = int(
+        datetime.now(
+            timezone.utc
+        ).timestamp()
+    )
+
+    provider_response = json.dumps(
+        provider_result,
+        ensure_ascii=False,
+        default=str,
+    )[:10000]
+
+    with connect_db() as conn:
+
+        conn.execute(
+            """
+            UPDATE sms_history
+
+            SET
+                status = 'sent',
+                sent_at = ?,
+                error = NULL,
+                provider_response = ?
+
+            WHERE id = ?
+            """,
+            (
+                now_ts,
+                provider_response,
+                history_id,
+            ),
+        )
+
+        conn.execute(
+            """
+            UPDATE calls
+
+            SET
+                sms_sent = 1,
+                sms_sent_at = ?,
+                sms_error = NULL
+
+            WHERE id = ?
+            """,
+            (
+                now_ts,
+                call_id,
+            ),
+        )
+
+        conn.commit()
+
+
+def mark_sms_error(
+    call_id: int,
+    history_id: int,
+    error,
+):
+
+    error_text = str(
+        error
+    )[:2000]
+
+    with connect_db() as conn:
+
+        conn.execute(
+            """
+            UPDATE sms_history
+
+            SET
+                status = 'error',
+                error = ?
+
+            WHERE id = ?
+            """,
+            (
+                error_text,
+                history_id,
+            ),
+        )
+
+        conn.execute(
+            """
+            UPDATE calls
+
+            SET sms_error = ?
+
+            WHERE id = ?
+            """,
+            (
+                error_text,
+                call_id,
+            ),
+        )
+
+        conn.commit()
 
 
 # =========================================================
