@@ -535,6 +535,8 @@ def init_db():
                 client_key TEXT
                     NOT NULL,
 
+                sender_user_login TEXT,
+
                 status TEXT
                     NOT NULL,
 
@@ -553,6 +555,26 @@ def init_db():
             )
             """
         )
+
+        sms_history_columns = {
+            row["name"]
+            for row in conn.execute(
+                """
+                PRAGMA table_info(sms_history)
+                """
+            ).fetchall()
+        }
+
+        if (
+            "sender_user_login"
+            not in sms_history_columns
+        ):
+            conn.execute(
+                """
+                ALTER TABLE sms_history
+                ADD COLUMN sender_user_login TEXT
+                """
+            )
 
         # -------------------------------------------------
         # NORMALIZE OLD CLIENT NUMBERS
@@ -769,6 +791,7 @@ init_db()
 def reserve_client_sms(
     call_id: int,
     client_number: str,
+    sender_user_login: str | None,
 ):
 
     client_key = normalize_phone(
@@ -874,16 +897,18 @@ def reserve_client_sms(
                 call_id,
                 client_number,
                 client_key,
+                sender_user_login,
                 status,
                 reserved_at
             )
 
-            VALUES (?, ?, ?, 'reserved', ?)
+            VALUES (?, ?, ?, ?, 'reserved', ?)
             """,
             (
                 call_id,
                 client_number,
                 client_key,
+                sender_user_login,
                 now_ts,
             ),
         )
@@ -899,6 +924,7 @@ def reserve_client_sms(
 
 def send_client_sms(
     client_number: str,
+    sender_user_login: str | None,
 ):
 
     if not MOIZVONKI_API_URL:
@@ -906,9 +932,15 @@ def send_client_sms(
             "MOIZVONKI_API_URL не указан"
         )
 
-    if not MOIZVONKI_USER_NAME:
+    user_name = (
+        sender_user_login
+        or MOIZVONKI_USER_NAME
+    )
+
+    if not user_name:
         raise RuntimeError(
-            "MOIZVONKI_USER_NAME не указан"
+            "Не указан user_login телефона "
+            "или MOIZVONKI_USER_NAME"
         )
 
     if not MOIZVONKI_API_KEY:
@@ -926,12 +958,17 @@ def send_client_sms(
         )
 
     payload = {
-        "user_name": MOIZVONKI_USER_NAME,
+        "user_name": user_name,
         "api_key": MOIZVONKI_API_KEY,
         "action": "calls.send_sms",
         "to": "+" + phone,
         "text": SMS_TEXT,
     }
+
+    print(
+        "MOIZVONKI SMS PHONE:",
+        user_name,
+    )
 
     response = HTTP.post(
         MOIZVONKI_API_URL,
@@ -7750,6 +7787,13 @@ async def moizvonki_webhook(
         or ""
     )
 
+    sender_user_login = (
+        webhook.get(
+            "user_login"
+        )
+        or MOIZVONKI_USER_NAME
+    )
+
     # -----------------------------------------------------
     # AUTO SMS
     # -----------------------------------------------------
@@ -7764,6 +7808,7 @@ async def moizvonki_webhook(
         reservation = reserve_client_sms(
             call_id,
             client_number,
+            sender_user_login,
         )
 
         if reservation["reserved"]:
@@ -7775,7 +7820,8 @@ async def moizvonki_webhook(
             try:
 
                 sms_result = send_client_sms(
-                    client_number
+                    client_number,
+                    sender_user_login,
                 )
 
                 mark_sms_sent(
@@ -7790,6 +7836,7 @@ async def moizvonki_webhook(
                     "AUTO SMS SENT:",
                     call_id,
                     client_number,
+                    sender_user_login,
                 )
 
             except Exception as exc:
