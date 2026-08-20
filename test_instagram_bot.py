@@ -39,6 +39,12 @@ SETTINGS_CSV = '''setting,value,updated_at
 kurs,11900,2026-08-20
 '''
 
+POST_MODELS_CSV = '''enabled,media_id,permalink,models,caption,published_at,updated_at
+TRUE,media-one,https://instagram.com/reel/one,"Samsung Galaxy S25, Samsung Galaxy S25 Ultra",Post one,2026-08-20,2026-08-20
+FALSE,media-disabled,https://instagram.com/reel/two,Samsung Galaxy S25,Post two,2026-08-20,2026-08-20
+TRUE,media-empty,https://instagram.com/reel/three,,Post three,2026-08-20,2026-08-20
+'''
+
 
 class TriggerDetectionTests(unittest.TestCase):
 
@@ -96,6 +102,49 @@ class TriggerDetectionTests(unittest.TestCase):
 
         self.assertEqual(result["rule"]["private_reply"], "Общий ответ")
         self.assertEqual(result["source"], "google_sheet_default")
+
+    def test_post_model_mappings_are_loaded_by_media_id(self):
+        mappings = instagram_bot.parse_post_models_csv(
+            POST_MODELS_CSV
+        )
+
+        self.assertEqual(
+            mappings["media-one"],
+            [
+                "Samsung Galaxy S25",
+                "Samsung Galaxy S25 Ultra",
+            ],
+        )
+        self.assertNotIn("media-disabled", mappings)
+        self.assertNotIn("media-empty", mappings)
+
+    def test_post_mapping_resolves_multiple_real_models(self):
+        mappings = instagram_bot.parse_post_models_csv(
+            POST_MODELS_CSV
+        )
+        result = instagram_bot.resolve_post_model_families(
+            "media-one",
+            catalog=self.product_catalog,
+            mappings=mappings,
+        )
+
+        self.assertEqual(
+            [family["name"] for family in result["families"]],
+            [
+                "Samsung Galaxy S25",
+                "Samsung Galaxy S25 Ultra",
+            ],
+        )
+
+        message = instagram_bot.build_post_models_message(
+            result["families"],
+            self.product_catalog["kurs"],
+        )
+
+        self.assertIn("Samsung Galaxy S25", message)
+        self.assertIn("Samsung Galaxy S25 Ultra", message)
+        self.assertIn("So'm", message)
+        self.assertNotIn("$", message)
 
     def test_base_model_does_not_fall_through_to_ultra(self):
         result = instagram_bot.find_price_model_in_text(
@@ -157,7 +206,8 @@ class TriggerDetectionTests(unittest.TestCase):
 
         self.assertIn("Samsung Galaxy S25", message)
         self.assertIn("12/128Gb", message)
-        self.assertIn("8 152 000 So'm ($685)", message)
+        self.assertIn("8 152 000 So'm", message)
+        self.assertNotIn("$", message)
         self.assertLessEqual(
             len(message),
             instagram_bot.INSTAGRAM_PRICE_MESSAGE_LIMIT,
@@ -192,11 +242,23 @@ class TriggerDetectionTests(unittest.TestCase):
 
         with patch.object(
             instagram_bot,
+            "get_product_catalog",
+            return_value=self.product_catalog,
+        ), patch.object(
+            instagram_bot,
             "find_price_model_in_text",
             return_value={
                 "status": "not_found",
                 "family": None,
                 "alias": None,
+            },
+        ), patch.object(
+            instagram_bot,
+            "resolve_post_model_families",
+            return_value={
+                "families": [],
+                "invalid_models": [],
+                "configured_models": [],
             },
         ), patch.object(
             instagram_bot,
@@ -240,11 +302,23 @@ class TriggerDetectionTests(unittest.TestCase):
     def test_public_reply_is_not_sent_when_direct_fails(self):
         with patch.object(
             instagram_bot,
+            "get_product_catalog",
+            return_value=self.product_catalog,
+        ), patch.object(
+            instagram_bot,
             "find_price_model_in_text",
             return_value={
                 "status": "not_found",
                 "family": None,
                 "alias": None,
+            },
+        ), patch.object(
+            instagram_bot,
+            "resolve_post_model_families",
+            return_value={
+                "families": [],
+                "invalid_models": [],
+                "configured_models": [],
             },
         ), patch.object(
             instagram_bot,
@@ -290,8 +364,75 @@ class TriggerDetectionTests(unittest.TestCase):
 
         with patch.object(
             instagram_bot,
+            "get_product_catalog",
+            return_value=self.product_catalog,
+        ), patch.object(
+            instagram_bot,
             "find_price_model_in_text",
             return_value=model_result,
+        ), patch.object(
+            instagram_bot,
+            "resolve_post_model_families",
+        ) as post_models, patch.object(
+            instagram_bot,
+            "resolve_response_rule",
+        ) as sheet_rules, patch.object(
+            instagram_bot,
+            "send_private_reply",
+            side_effect=lambda *args: sent_messages.append(args[2]),
+        ) as private_reply, patch.object(
+            instagram_bot,
+            "send_public_comment_reply",
+        ), patch.object(
+            instagram_bot,
+            "update_comment_status",
+        ):
+            instagram_bot.process_instagram_comment(
+                instagram_account_id="account-id",
+                commenter_id="customer-id",
+                username="customer",
+                media_id="media-id",
+                comment_id="comment-id",
+                comment_text="S25 narx",
+            )
+
+        post_models.assert_not_called()
+        sheet_rules.assert_not_called()
+        private_reply.assert_called_once()
+        self.assertIn("Samsung Galaxy S25", sent_messages[0])
+        self.assertNotIn("$", sent_messages[0])
+
+    def test_post_mapping_precedes_response_rules(self):
+        base_family = instagram_bot.find_price_model_in_text(
+            "S25",
+            catalog=self.product_catalog,
+        )["family"]
+        ultra_family = instagram_bot.find_price_model_in_text(
+            "S25 Ultra",
+            catalog=self.product_catalog,
+        )["family"]
+        sent_messages = []
+
+        with patch.object(
+            instagram_bot,
+            "get_product_catalog",
+            return_value=self.product_catalog,
+        ), patch.object(
+            instagram_bot,
+            "find_price_model_in_text",
+            return_value={
+                "status": "not_found",
+                "family": None,
+                "alias": None,
+            },
+        ), patch.object(
+            instagram_bot,
+            "resolve_post_model_families",
+            return_value={
+                "families": [base_family, ultra_family],
+                "invalid_models": [],
+                "configured_models": ["S25", "S25 Ultra"],
+            },
         ), patch.object(
             instagram_bot,
             "resolve_response_rule",
@@ -312,11 +453,92 @@ class TriggerDetectionTests(unittest.TestCase):
                 username="customer",
                 media_id="media-id",
                 comment_id="comment-id",
-                comment_text="S25 narx",
+                comment_text="Narx",
             )
 
         sheet_rules.assert_not_called()
         self.assertIn("Samsung Galaxy S25", sent_messages[0])
+        self.assertIn("Samsung Galaxy S25 Ultra", sent_messages[0])
+        self.assertNotIn("$", sent_messages[0])
+
+    def test_automatic_post_sync_appends_only_new_media(self):
+        headers = [
+            "enabled",
+            "media_id",
+            "permalink",
+            "models",
+            "caption",
+            "published_at",
+            "updated_at",
+        ]
+
+        class FakeWorksheet:
+            def __init__(self):
+                self.appended = []
+
+            def get_all_values(self):
+                return [
+                    headers,
+                    [
+                        "TRUE",
+                        "existing-media",
+                        "https://instagram.com/reel/existing",
+                        "",
+                        "Existing",
+                        "2026-08-19",
+                        "2026-08-19",
+                    ],
+                ]
+
+            def append_rows(self, rows, value_input_option):
+                self.appended.extend(rows)
+                self.value_input_option = value_input_option
+
+        worksheet = FakeWorksheet()
+
+        class FakeSpreadsheet:
+            def worksheet(self, name):
+                self.requested_sheet = name
+                return worksheet
+
+        spreadsheet = FakeSpreadsheet()
+
+        class FakeClient:
+            def open_by_key(self, spreadsheet_id):
+                self.requested_id = spreadsheet_id
+                return spreadsheet
+
+        media = [
+            {
+                "id": "new-media",
+                "permalink": "https://instagram.com/reel/new",
+                "caption": "New post",
+                "timestamp": "2026-08-20T10:00:00+0000",
+            },
+            {
+                "id": "existing-media",
+                "permalink": "https://instagram.com/reel/existing",
+                "caption": "Existing",
+                "timestamp": "2026-08-19T10:00:00+0000",
+            },
+        ]
+
+        with patch.object(
+            instagram_bot,
+            "get_google_write_client",
+            return_value=FakeClient(),
+        ), patch.object(
+            instagram_bot,
+            "fetch_recent_instagram_media",
+            return_value=media,
+        ):
+            result = instagram_bot.sync_instagram_posts_to_sheet()
+
+        self.assertEqual(result["added"], 1)
+        self.assertEqual(len(worksheet.appended), 1)
+        self.assertEqual(worksheet.appended[0][1], "new-media")
+        self.assertEqual(worksheet.appended[0][3], "")
+        self.assertEqual(worksheet.value_input_option, "RAW")
 
 
 if __name__ == "__main__":

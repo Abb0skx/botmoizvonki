@@ -1,7 +1,9 @@
+import asyncio
 import csv
 import hashlib
 import hmac
 import io
+import json
 import os
 import re
 import sqlite3
@@ -12,6 +14,10 @@ from decimal import (
     Decimal,
     InvalidOperation,
     ROUND_HALF_UP,
+)
+from datetime import (
+    datetime,
+    timezone,
 )
 from pathlib import Path
 
@@ -113,6 +119,60 @@ INSTAGRAM_SETTINGS_SHEET_NAME = os.getenv(
     "bot_settings",
 ).strip()
 
+INSTAGRAM_POST_MODELS_SHEET_NAME = os.getenv(
+    "INSTAGRAM_POST_MODELS_SHEET_NAME",
+    "post_models",
+).strip()
+
+INSTAGRAM_ACCOUNT_ID = os.getenv(
+    "INSTAGRAM_ACCOUNT_ID",
+    "17841444196466655",
+).strip()
+
+INSTAGRAM_POST_SYNC_ENABLED = (
+    os.getenv(
+        "INSTAGRAM_POST_SYNC_ENABLED",
+        "true",
+    )
+    .strip()
+    .lower()
+    in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+)
+
+try:
+    INSTAGRAM_POST_SYNC_INTERVAL = max(
+        60,
+        int(
+            os.getenv(
+                "INSTAGRAM_POST_SYNC_INTERVAL",
+                "300",
+            )
+        ),
+    )
+except ValueError:
+    INSTAGRAM_POST_SYNC_INTERVAL = 300
+
+try:
+    INSTAGRAM_POST_SYNC_LIMIT = min(
+        100,
+        max(
+            1,
+            int(
+                os.getenv(
+                    "INSTAGRAM_POST_SYNC_LIMIT",
+                    "50",
+                )
+            ),
+        ),
+    )
+except ValueError:
+    INSTAGRAM_POST_SYNC_LIMIT = 50
+
 try:
     INSTAGRAM_RULES_CACHE_TTL = max(
         30,
@@ -160,6 +220,7 @@ INSTAGRAM_DB_PATH.parent.mkdir(
 HTTP = requests.Session()
 RULES_HTTP = requests.Session()
 PRODUCTS_HTTP = requests.Session()
+POSTS_HTTP = requests.Session()
 
 RULES_CACHE_LOCK = threading.Lock()
 RULES_CACHE = {
@@ -174,6 +235,17 @@ PRODUCTS_CACHE = {
     "loaded_at": 0.0,
     "source": "not_loaded",
 }
+
+POST_MODELS_CACHE_LOCK = threading.Lock()
+POST_MODELS_CACHE = {
+    "mappings": {},
+    "loaded_at": 0.0,
+    "source": "not_loaded",
+}
+
+GOOGLE_WRITE_CLIENT = None
+GOOGLE_WRITE_CLIENT_LOCK = threading.Lock()
+POST_SYNC_TASK = None
 
 
 # =========================================================
@@ -1981,23 +2053,6 @@ def find_price_model_in_text(
     }
 
 
-def format_decimal_compact(
-    value: Decimal,
-) -> str:
-
-    if value == value.to_integral_value():
-        return str(
-            int(
-                value
-            )
-        )
-
-    return format(
-        value.normalize(),
-        "f",
-    )
-
-
 def format_live_price(
     price: Decimal,
     kurs: Decimal,
@@ -2035,10 +2090,7 @@ def format_live_price(
         " ",
     )
 
-    return (
-        f"{uzs_text} So'm "
-        f"(${format_decimal_compact(price)})"
-    )
+    return f"{uzs_text} So'm"
 
 
 def memory_sort_key(
@@ -2294,6 +2346,816 @@ def build_live_product_message(
             *footer_lines,
         ]
     )
+
+
+# =========================================================
+# INSTAGRAM POST -> PRODUCT MODELS
+# =========================================================
+
+POST_MODELS_REQUIRED_HEADERS = {
+    "enabled",
+    "media_id",
+    "permalink",
+    "models",
+    "caption",
+    "published_at",
+    "updated_at",
+}
+
+
+def split_post_model_names(
+    value: str | None,
+) -> list[str]:
+
+    result = []
+
+    for item in re.split(
+        r"[,;\n]+",
+        str(
+            value
+            or ""
+        ),
+    ):
+
+        model_name = item.strip()
+
+        if (
+            model_name
+            and
+            model_name not in result
+        ):
+
+            result.append(
+                model_name
+            )
+
+    return result
+
+
+def parse_post_models_csv(
+    csv_text: str,
+) -> dict[str, list[str]]:
+
+    rows = read_csv_rows(
+        csv_text,
+        required_headers=
+            POST_MODELS_REQUIRED_HEADERS,
+    )
+
+    mappings = {}
+
+    for row in rows:
+
+        if not parse_enabled(
+            row.get(
+                "enabled"
+            )
+        ):
+
+            continue
+
+        media_id = str(
+            row.get(
+                "media_id"
+            )
+            or ""
+        ).strip()
+
+        if not media_id:
+            continue
+
+        model_names = split_post_model_names(
+            row.get(
+                "models"
+            )
+        )
+
+        if not model_names:
+            continue
+
+        target = mappings.setdefault(
+            media_id,
+            [],
+        )
+
+        for model_name in model_names:
+
+            if model_name not in target:
+                target.append(
+                    model_name
+                )
+
+    return mappings
+
+
+def fetch_post_model_mappings() -> dict[str, list[str]]:
+
+    url = (
+        "https://docs.google.com/spreadsheets/d/"
+        f"{INSTAGRAM_RULES_SHEET_ID}/gviz/tq"
+    )
+
+    response = POSTS_HTTP.get(
+        url,
+        params={
+            "tqx": "out:csv",
+            "sheet": INSTAGRAM_POST_MODELS_SHEET_NAME,
+        },
+        timeout=INSTAGRAM_RULES_HTTP_TIMEOUT,
+    )
+
+    if not response.ok:
+
+        print(
+            "INSTAGRAM POST MODELS DOWNLOAD ERROR:",
+            response.status_code,
+            response.text[
+                :500
+            ],
+        )
+
+        response.raise_for_status()
+
+    return parse_post_models_csv(
+        response.content.decode(
+            "utf-8-sig"
+        )
+    )
+
+
+def get_post_model_mappings(
+    *,
+    force_refresh: bool = False,
+) -> dict[str, list[str]]:
+
+    now = time.monotonic()
+
+    cached_mappings = POST_MODELS_CACHE[
+        "mappings"
+    ]
+
+    if (
+        not force_refresh
+        and
+        POST_MODELS_CACHE[
+            "loaded_at"
+        ]
+        and
+        now
+        - POST_MODELS_CACHE[
+            "loaded_at"
+        ]
+        < INSTAGRAM_RULES_CACHE_TTL
+    ):
+
+        return cached_mappings
+
+    with POST_MODELS_CACHE_LOCK:
+
+        now = time.monotonic()
+
+        if (
+            not force_refresh
+            and
+            POST_MODELS_CACHE[
+                "loaded_at"
+            ]
+            and
+            now
+            - POST_MODELS_CACHE[
+                "loaded_at"
+            ]
+            < INSTAGRAM_RULES_CACHE_TTL
+        ):
+
+            return POST_MODELS_CACHE[
+                "mappings"
+            ]
+
+        try:
+
+            mappings = fetch_post_model_mappings()
+
+            POST_MODELS_CACHE.update(
+                {
+                    "mappings": mappings,
+                    "loaded_at": now,
+                    "source": "google_sheets",
+                }
+            )
+
+            print(
+                "INSTAGRAM POST MODELS LOADED:",
+                {
+                    "mapped_posts": len(
+                        mappings
+                    ),
+                    "sheet": INSTAGRAM_POST_MODELS_SHEET_NAME,
+                },
+            )
+
+            return mappings
+
+        except Exception as exc:
+
+            print(
+                "INSTAGRAM POST MODELS LOAD FAILED:",
+                repr(
+                    exc
+                )[
+                    :1000
+                ],
+            )
+
+            if cached_mappings:
+
+                POST_MODELS_CACHE.update(
+                    {
+                        "loaded_at": now,
+                        "source": "stale_cache",
+                    }
+                )
+
+                return cached_mappings
+
+            POST_MODELS_CACHE.update(
+                {
+                    "mappings": {},
+                    "loaded_at": now,
+                    "source": "unavailable",
+                }
+            )
+
+            return {}
+
+
+def resolve_post_model_families(
+    media_id: str,
+    *,
+    catalog: dict,
+    mappings: dict[str, list[str]] | None = None,
+) -> dict:
+
+    active_mappings = (
+        mappings
+        if mappings is not None
+        else get_post_model_mappings()
+    )
+
+    configured_models = active_mappings.get(
+        str(
+            media_id
+            or ""
+        ),
+        [],
+    )
+
+    families = []
+    family_keys = set()
+    invalid_models = []
+
+    for configured_model in configured_models:
+
+        resolution = find_price_model_in_text(
+            configured_model,
+            catalog=catalog,
+        )
+
+        if (
+            resolution[
+                "status"
+            ]
+            != "found"
+        ):
+
+            invalid_models.append(
+                configured_model
+            )
+
+            continue
+
+        family = resolution[
+            "family"
+        ]
+
+        family_key = family[
+            "key"
+        ]
+
+        if family_key in family_keys:
+            continue
+
+        family_keys.add(
+            family_key
+        )
+
+        families.append(
+            family
+        )
+
+    return {
+        "families": families,
+        "invalid_models": invalid_models,
+        "configured_models": configured_models,
+    }
+
+
+def build_post_models_message(
+    families: list[dict],
+    kurs: Decimal,
+) -> str:
+
+    if len(
+        families
+    ) == 1:
+
+        return build_live_product_message(
+            families[
+                0
+            ],
+            kurs,
+        )
+
+    price_lines = []
+
+    for family in families:
+
+        prices = sorted(
+            {
+                row[
+                    "price"
+                ]
+                for row in family[
+                    "rows"
+                ]
+            }
+        )
+
+        if not prices:
+            continue
+
+        price_text = format_live_price(
+            prices[
+                0
+            ],
+            kurs,
+        )
+
+        if len(
+            prices
+        ) > 1:
+            price_text = (
+                "от "
+                + price_text
+            )
+
+        price_lines.append(
+            f"• {family['name']} — {price_text}"
+        )
+
+    footer_lines = [
+        "",
+        "Цвета, память и точное наличие уточняйте у менеджера:",
+        "https://t.me/texnikach_admin",
+    ]
+
+    selected_lines = []
+    omitted = False
+
+    for line in price_lines:
+
+        candidate = "\n".join(
+            [
+                "Актуальные цены моделей:",
+                "",
+                *selected_lines,
+                line,
+                *footer_lines,
+            ]
+        )
+
+        if len(
+            candidate
+        ) > INSTAGRAM_PRICE_MESSAGE_LIMIT:
+
+            omitted = True
+            break
+
+        selected_lines.append(
+            line
+        )
+
+    if omitted:
+        selected_lines.append(
+            "• Другие модели — у менеджера"
+        )
+
+    return "\n".join(
+        [
+            "Актуальные цены моделей:",
+            "",
+            *selected_lines,
+            *footer_lines,
+        ]
+    )
+
+
+# =========================================================
+# AUTOMATIC INSTAGRAM POSTS -> GOOGLE SHEETS SYNC
+# =========================================================
+
+def get_google_write_client():
+
+    global GOOGLE_WRITE_CLIENT
+
+    if GOOGLE_WRITE_CLIENT is not None:
+        return GOOGLE_WRITE_CLIENT
+
+    with GOOGLE_WRITE_CLIENT_LOCK:
+
+        if GOOGLE_WRITE_CLIENT is not None:
+            return GOOGLE_WRITE_CLIENT
+
+        google_json = os.getenv(
+            "GOOGLE_SA_JSON_CONTENT",
+            "",
+        ).strip()
+
+        google_json_path = os.getenv(
+            "GOOGLE_SA_JSON",
+            "Data/sheets-auto-update-484813-fe0f96f83d38.json",
+        ).strip()
+
+        try:
+
+            import gspread
+
+            from google.oauth2.service_account import Credentials
+
+            scopes = [
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive",
+            ]
+
+            if google_json:
+
+                credentials = Credentials.from_service_account_info(
+                    json.loads(
+                        google_json
+                    ),
+                    scopes=scopes,
+                )
+
+            elif (
+                google_json_path
+                and
+                os.path.exists(
+                    google_json_path
+                )
+            ):
+
+                credentials = Credentials.from_service_account_file(
+                    google_json_path,
+                    scopes=scopes,
+                )
+
+            else:
+
+                return None
+
+            GOOGLE_WRITE_CLIENT = gspread.authorize(
+                credentials
+            )
+
+            return GOOGLE_WRITE_CLIENT
+
+        except Exception as exc:
+
+            print(
+                "INSTAGRAM POST SYNC GOOGLE AUTH FAILED:",
+                repr(
+                    exc
+                )[
+                    :1000
+                ],
+            )
+
+            return None
+
+
+def fetch_recent_instagram_media() -> list[dict]:
+
+    if not INSTAGRAM_ACCOUNT_ID:
+
+        raise RuntimeError(
+            "INSTAGRAM_ACCOUNT_ID is not configured"
+        )
+
+    url = (
+        f"{GRAPH_BASE_URL}/"
+        f"{INSTAGRAM_ACCOUNT_ID}/media"
+    )
+
+    response = POSTS_HTTP.get(
+        url,
+        headers=instagram_headers(),
+        params={
+            "fields": (
+                "id,permalink,caption,"
+                "media_type,media_product_type,timestamp"
+            ),
+            "limit": INSTAGRAM_POST_SYNC_LIMIT,
+        },
+        timeout=30,
+    )
+
+    if not response.ok:
+
+        print(
+            "INSTAGRAM POST SYNC META ERROR:",
+            response.status_code,
+            response.text[
+                :1000
+            ],
+        )
+
+        response.raise_for_status()
+
+    data = response.json()
+
+    return (
+        data.get(
+            "data"
+        )
+        or []
+    )
+
+
+def sync_instagram_posts_to_sheet() -> dict:
+
+    google_client = get_google_write_client()
+
+    if google_client is None:
+
+        return {
+            "status": "disabled",
+            "added": 0,
+            "reason": "google_write_credentials_missing",
+        }
+
+    spreadsheet = google_client.open_by_key(
+        INSTAGRAM_RULES_SHEET_ID
+    )
+
+    worksheet = spreadsheet.worksheet(
+        INSTAGRAM_POST_MODELS_SHEET_NAME
+    )
+
+    values = worksheet.get_all_values()
+
+    if not values:
+
+        raise ValueError(
+            "post_models sheet has no header row"
+        )
+
+    headers = [
+        str(
+            value
+        ).strip().lower()
+        for value in values[
+            0
+        ]
+    ]
+
+    missing_headers = (
+        POST_MODELS_REQUIRED_HEADERS
+        - set(
+            headers
+        )
+    )
+
+    if missing_headers:
+
+        raise ValueError(
+            "post_models is missing columns: "
+            + ", ".join(
+                sorted(
+                    missing_headers
+                )
+            )
+        )
+
+    media_id_index = headers.index(
+        "media_id"
+    )
+
+    existing_media_ids = {
+        row[
+            media_id_index
+        ].strip()
+        for row in values[
+            1:
+        ]
+        if (
+            media_id_index
+            < len(
+                row
+            )
+            and
+            row[
+                media_id_index
+            ].strip()
+        )
+    }
+
+    media_items = fetch_recent_instagram_media()
+
+    now_text = datetime.now(
+        timezone.utc
+    ).isoformat()
+
+    new_rows = []
+
+    for media in reversed(
+        media_items
+    ):
+
+        media_id = str(
+            media.get(
+                "id"
+            )
+            or ""
+        ).strip()
+
+        if (
+            not media_id
+            or
+            media_id in existing_media_ids
+        ):
+
+            continue
+
+        row_by_header = {
+            "enabled": "TRUE",
+            "media_id": media_id,
+            "permalink": str(
+                media.get(
+                    "permalink"
+                )
+                or ""
+            ).strip(),
+            "models": "",
+            "caption": str(
+                media.get(
+                    "caption"
+                )
+                or ""
+            ).strip()[
+                :5000
+            ],
+            "published_at": str(
+                media.get(
+                    "timestamp"
+                )
+                or ""
+            ).strip(),
+            "updated_at": now_text,
+        }
+
+        new_rows.append(
+            [
+                row_by_header.get(
+                    header,
+                    "",
+                )
+                for header in headers
+            ]
+        )
+
+        existing_media_ids.add(
+            media_id
+        )
+
+    if new_rows:
+
+        worksheet.append_rows(
+            new_rows,
+            value_input_option="RAW",
+        )
+
+        POST_MODELS_CACHE[
+            "loaded_at"
+        ] = 0.0
+
+    result = {
+        "status": "ok",
+        "added": len(
+            new_rows
+        ),
+        "received": len(
+            media_items
+        ),
+    }
+
+    print(
+        "INSTAGRAM POST SYNC DONE:",
+        result,
+    )
+
+    return result
+
+
+async def instagram_post_sync_loop():
+
+    await asyncio.sleep(
+        5
+    )
+
+    while True:
+
+        try:
+
+            result = await asyncio.to_thread(
+                sync_instagram_posts_to_sheet
+            )
+
+            if result.get(
+                "status"
+            ) == "disabled":
+
+                print(
+                    "INSTAGRAM POST SYNC DISABLED:",
+                    result.get(
+                        "reason"
+                    ),
+                )
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception as exc:
+
+            print(
+                "INSTAGRAM POST SYNC FAILED:",
+                repr(
+                    exc
+                )[
+                    :1000
+                ],
+            )
+
+        await asyncio.sleep(
+            INSTAGRAM_POST_SYNC_INTERVAL
+        )
+
+
+@router.on_event(
+    "startup"
+)
+async def start_instagram_post_sync():
+
+    global POST_SYNC_TASK
+
+    if (
+        not INSTAGRAM_POST_SYNC_ENABLED
+        or
+        not INSTAGRAM_ACCESS_TOKEN
+        or
+        not INSTAGRAM_ACCOUNT_ID
+    ):
+
+        return
+
+    if (
+        POST_SYNC_TASK is None
+        or
+        POST_SYNC_TASK.done()
+    ):
+
+        POST_SYNC_TASK = asyncio.create_task(
+            instagram_post_sync_loop()
+        )
+
+
+@router.on_event(
+    "shutdown"
+)
+async def stop_instagram_post_sync():
+
+    global POST_SYNC_TASK
+
+    if POST_SYNC_TASK is None:
+        return
+
+    POST_SYNC_TASK.cancel()
+
+    try:
+        await POST_SYNC_TASK
+    except asyncio.CancelledError:
+        pass
+
+    POST_SYNC_TASK = None
 
 
 # =========================================================
@@ -3388,9 +4250,22 @@ def process_instagram_comment(
         # PRODUCT MODEL HAS FIRST PRIORITY
         # -------------------------------------------------
 
-        model_resolution = find_price_model_in_text(
-            comment_text
-        )
+        catalog = get_product_catalog()
+
+        if catalog is None:
+
+            model_resolution = {
+                "status": "unavailable",
+                "family": None,
+                "alias": None,
+            }
+
+        else:
+
+            model_resolution = find_price_model_in_text(
+                comment_text,
+                catalog=catalog,
+            )
 
         if (
             model_resolution[
@@ -3436,6 +4311,8 @@ def process_instagram_comment(
 
         else:
 
+            response_selected = False
+
             if (
                 model_resolution[
                     "status"
@@ -3452,50 +4329,125 @@ def process_instagram_comment(
                     },
                 )
 
-            # ---------------------------------------------
-            # NO RELIABLE MODEL: USE GOOGLE SHEETS RULES
-            # ---------------------------------------------
-
-            resolution = resolve_response_rule(
-                comment_text
-            )
-
-            rule = resolution[
-                "rule"
-            ]
-
-            source = resolution[
-                "source"
-            ]
-
-            private_message = rule[
-                "private_reply"
-            ]
-
-            public_message = (
-                rule.get(
-                    "public_reply"
-                )
-                or LOCAL_DEFAULT_RULE[
-                    "public_reply"
+            comment_has_model_request = (
+                model_resolution[
+                    "status"
                 ]
+                == "ambiguous"
+                or looks_like_model_request(
+                    comment_text
+                )
             )
 
-            print(
-                "INSTAGRAM RULE MATCH:",
-                {
-                    "source": source,
-                    "row": rule.get(
-                        "row_number"
-                    ),
-                    "priority": rule.get(
-                        "priority"
-                    ),
-                    "match_type": rule.get(
-                        "match_type"
-                    ),
-                },
-            )
+            # ---------------------------------------------
+            # NO MODEL IN COMMENT: USE POST MAPPING
+            # ---------------------------------------------
+
+            if (
+                not comment_has_model_request
+                and
+                catalog is not None
+            ):
+
+                post_resolution = resolve_post_model_families(
+                    media_id,
+                    catalog=catalog,
+                )
+
+                post_families = post_resolution[
+                    "families"
+                ]
+
+                if post_resolution[
+                    "invalid_models"
+                ]:
+
+                    print(
+                        "INSTAGRAM POST MODELS INVALID:",
+                        {
+                            "media_id": media_id,
+                            "models": post_resolution[
+                                "invalid_models"
+                            ],
+                        },
+                    )
+
+                if post_families:
+
+                    private_message = build_post_models_message(
+                        post_families,
+                        catalog[
+                            "kurs"
+                        ],
+                    )
+
+                    public_message = LOCAL_DEFAULT_RULE[
+                        "public_reply"
+                    ]
+
+                    source = "post_sheet_models"
+                    response_selected = True
+
+                    print(
+                        "INSTAGRAM POST MODELS MATCH:",
+                        {
+                            "source": source,
+                            "media_id": media_id,
+                            "models": [
+                                family[
+                                    "name"
+                                ]
+                                for family in post_families
+                            ],
+                        },
+                    )
+
+            # ---------------------------------------------
+            # NO POST MODEL: USE GOOGLE SHEETS RULES
+            # ---------------------------------------------
+
+            if not response_selected:
+
+                resolution = resolve_response_rule(
+                    comment_text
+                )
+
+                rule = resolution[
+                    "rule"
+                ]
+
+                source = resolution[
+                    "source"
+                ]
+
+                private_message = rule[
+                    "private_reply"
+                ]
+
+                public_message = (
+                    rule.get(
+                        "public_reply"
+                    )
+                    or LOCAL_DEFAULT_RULE[
+                        "public_reply"
+                    ]
+                )
+
+                print(
+                    "INSTAGRAM RULE MATCH:",
+                    {
+                        "source": source,
+                        "row": rule.get(
+                            "row_number"
+                        ),
+                        "priority": rule.get(
+                            "priority"
+                        ),
+                        "match_type": rule.get(
+                            "match_type"
+                        ),
+                    },
+                )
 
         # -------------------------------------------------
         # PRIVATE REPLY FIRST
@@ -3940,9 +4892,43 @@ async def instagram_status():
         else None
     )
 
+    post_models_loaded_at = POST_MODELS_CACHE[
+        "loaded_at"
+    ]
+
+    post_models_cache_age_seconds = (
+        int(
+            max(
+                0,
+                time.monotonic()
+                - post_models_loaded_at,
+            )
+        )
+        if post_models_loaded_at
+        else None
+    )
+
     live_catalog = PRODUCTS_CACHE[
         "catalog"
     ]
+
+    google_json_path = os.getenv(
+        "GOOGLE_SA_JSON",
+        "Data/sheets-auto-update-484813-fe0f96f83d38.json",
+    ).strip()
+
+    google_write_credentials_configured = bool(
+        os.getenv(
+            "GOOGLE_SA_JSON_CONTENT",
+            "",
+        ).strip()
+        or (
+            google_json_path
+            and os.path.exists(
+                google_json_path
+            )
+        )
+    )
 
     with connect_instagram_db() as conn:
 
@@ -4039,6 +5025,36 @@ async def instagram_status():
 
         "products_cache_age_seconds":
             products_cache_age_seconds,
+
+        "post_models_sheet_name":
+            INSTAGRAM_POST_MODELS_SHEET_NAME,
+
+        "post_models_cache_source":
+            POST_MODELS_CACHE[
+                "source"
+            ],
+
+        "post_models_cache_count":
+            len(
+                POST_MODELS_CACHE[
+                    "mappings"
+                ]
+            ),
+
+        "post_models_cache_age_seconds":
+            post_models_cache_age_seconds,
+
+        "post_sync_enabled":
+            INSTAGRAM_POST_SYNC_ENABLED,
+
+        "post_sync_interval_seconds":
+            INSTAGRAM_POST_SYNC_INTERVAL,
+
+        "post_sync_limit":
+            INSTAGRAM_POST_SYNC_LIMIT,
+
+        "post_sync_write_credentials":
+            google_write_credentials_configured,
 
         "live_price_rows":
             (
