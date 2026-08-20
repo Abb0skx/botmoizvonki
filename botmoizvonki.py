@@ -89,7 +89,7 @@ MOIZVONKI_API_KEY = os.getenv(
 
 PUBLIC_BASE_URL = os.getenv(
     "PUBLIC_BASE_URL",
-    "",
+    "https://bot.texnikach.uz",
 ).rstrip("/")
 
 SMS_COOLDOWN_DAYS = 30
@@ -206,6 +206,9 @@ INTERNAL_CONTACTS = {
 # =========================================================
 
 SALE_REASONS = {
+    "pending":
+        "🕓 В работе / ожидает",
+
     "no_stock":
         "📦 Нет товара",
 
@@ -242,6 +245,41 @@ SALE_REASONS = {
     "other":
         "📝 Другая причина",
 }
+
+RESULT_CATEGORIES = {
+    "pending": "pending",
+    "thinking": "pending",
+    "other_product": "pending",
+    "credit": "pending",
+    "visit_store": "pending",
+    "later": "pending",
+
+    "not_target": "non_target",
+
+    "no_stock": "lost",
+    "price": "lost",
+    "price_changed": "lost",
+    "bought_elsewhere": "lost",
+    "conditions": "lost",
+    "other": "lost",
+}
+
+
+def get_result_category(
+    sale_status: str | None,
+    reason_code: str | None,
+):
+
+    if sale_status == "bought":
+        return "bought"
+
+    if sale_status == "not_bought":
+        return RESULT_CATEGORIES.get(
+            reason_code,
+            "lost",
+        )
+
+    return None
 
 
 # =========================================================
@@ -322,6 +360,10 @@ def init_db():
                 client_key TEXT,
                 client_name TEXT,
 
+                client_window_id INTEGER,
+                webhook_dedup_key TEXT,
+                duplicate_of_call_id INTEGER,
+
                 is_internal_contact INTEGER
                     DEFAULT 0,
 
@@ -355,6 +397,8 @@ def init_db():
                 telegram_sent INTEGER
                     DEFAULT 0,
 
+                telegram_reserved_at INTEGER,
+
                 telegram_chat_id TEXT,
                 telegram_message_id INTEGER,
 
@@ -377,6 +421,7 @@ def init_db():
                 no_sale_reason_code TEXT,
 
                 sale_marked_at INTEGER,
+                result_revision INTEGER,
                 sale_marked_by INTEGER,
                 sale_marked_username TEXT,
 
@@ -395,12 +440,35 @@ def init_db():
             ).fetchall()
         }
 
+        result_revision_was_missing = (
+            "result_revision"
+            not in columns
+        )
+
         migrations = {
 
             "client_key":
                 """
                 ALTER TABLE calls
                 ADD COLUMN client_key TEXT
+                """,
+
+            "client_window_id":
+                """
+                ALTER TABLE calls
+                ADD COLUMN client_window_id INTEGER
+                """,
+
+            "webhook_dedup_key":
+                """
+                ALTER TABLE calls
+                ADD COLUMN webhook_dedup_key TEXT
+                """,
+
+            "duplicate_of_call_id":
+                """
+                ALTER TABLE calls
+                ADD COLUMN duplicate_of_call_id INTEGER
                 """,
 
             "api_duration":
@@ -420,6 +488,12 @@ def init_db():
                 ALTER TABLE calls
                 ADD COLUMN telegram_sent INTEGER
                 DEFAULT 0
+                """,
+
+            "telegram_reserved_at":
+                """
+                ALTER TABLE calls
+                ADD COLUMN telegram_reserved_at INTEGER
                 """,
 
             "telegram_chat_id":
@@ -475,6 +549,12 @@ def init_db():
                 """
                 ALTER TABLE calls
                 ADD COLUMN sale_marked_at INTEGER
+                """,
+
+            "result_revision":
+                """
+                ALTER TABLE calls
+                ADD COLUMN result_revision INTEGER
                 """,
 
             "sale_marked_by":
@@ -673,6 +753,8 @@ def init_db():
                     NOT NULL
                     UNIQUE,
 
+                client_window_id INTEGER,
+
                 token_hash TEXT
                     NOT NULL
                     UNIQUE,
@@ -739,6 +821,12 @@ def init_db():
                 """
                 ALTER TABLE call_ratings
                 ADD COLUMN first_opened_at INTEGER
+                """,
+
+            "client_window_id":
+                """
+                ALTER TABLE call_ratings
+                ADD COLUMN client_window_id INTEGER
                 """,
 
             "last_opened_at":
@@ -818,6 +906,49 @@ def init_db():
 
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS client_windows (
+
+                id INTEGER
+                    PRIMARY KEY
+                    AUTOINCREMENT,
+
+                client_key TEXT
+                    NOT NULL,
+
+                started_at INTEGER
+                    NOT NULL,
+
+                ends_at INTEGER
+                    NOT NULL,
+
+                first_call_id INTEGER
+                    NOT NULL,
+
+                latest_call_id INTEGER
+                    NOT NULL,
+
+                created_at TIMESTAMP
+                    DEFAULT CURRENT_TIMESTAMP,
+
+                updated_at TIMESTAMP
+                    DEFAULT CURRENT_TIMESTAMP,
+
+                UNIQUE(
+                    client_key,
+                    started_at
+                ),
+
+                FOREIGN KEY(first_call_id)
+                    REFERENCES calls(id),
+
+                FOREIGN KEY(latest_call_id)
+                    REFERENCES calls(id)
+            )
+            """
+        )
+
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS client_results (
 
                 id INTEGER
@@ -826,6 +957,8 @@ def init_db():
 
                 client_key TEXT
                     NOT NULL,
+
+                client_window_id INTEGER,
 
                 window_started_at INTEGER
                     NOT NULL,
@@ -847,6 +980,8 @@ def init_db():
                             'not_bought'
                         )
                     ),
+
+                result_category TEXT,
 
                 no_sale_reason TEXT,
                 no_sale_reason_code TEXT,
@@ -872,10 +1007,101 @@ def init_db():
                 ),
 
                 FOREIGN KEY(source_call_id)
-                    REFERENCES calls(id)
+                    REFERENCES calls(id),
+
+                FOREIGN KEY(client_window_id)
+                    REFERENCES client_windows(id)
             )
             """
         )
+
+        client_result_columns = {
+            row["name"]
+            for row in conn.execute(
+                """
+                PRAGMA table_info(client_results)
+                """
+            ).fetchall()
+        }
+
+        if (
+            "client_window_id"
+            not in client_result_columns
+        ):
+            conn.execute(
+                """
+                ALTER TABLE client_results
+                ADD COLUMN client_window_id INTEGER
+                """
+            )
+
+        if (
+            "result_category"
+            not in client_result_columns
+        ):
+            conn.execute(
+                """
+                ALTER TABLE client_results
+                ADD COLUMN result_category TEXT
+                """
+            )
+
+        # `sale_marked_at` has only one-second precision.  Give
+        # legacy result clicks a stable monotonic order so a rebuild
+        # cannot change the last selected result when two clicks
+        # happened during the same second.  The current canonical
+        # client_result wins a timestamp tie.
+        if result_revision_was_missing:
+
+            revision_rows = conn.execute(
+                """
+                SELECT
+                    call.id,
+                    COALESCE(
+                        call.sale_marked_at,
+                        call.start_time,
+                        call.id
+                    ) AS ordering_time,
+                    CASE
+                        WHEN EXISTS (
+                            SELECT 1
+                            FROM client_results AS result
+                            WHERE result.source_call_id = call.id
+                        )
+                        THEN 1
+                        ELSE 0
+                    END AS is_current_result
+
+                FROM calls AS call
+
+                WHERE call.sale_status IN (
+                    'bought',
+                    'not_bought'
+                )
+
+                ORDER BY
+                    ordering_time,
+                    is_current_result,
+                    call.id
+                """
+            ).fetchall()
+
+            for revision, revision_row in enumerate(
+                revision_rows,
+                start=1,
+            ):
+
+                conn.execute(
+                    """
+                    UPDATE calls
+                    SET result_revision = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        revision,
+                        revision_row["id"],
+                    ),
+                )
 
         # -------------------------------------------------
         # NORMALIZE OLD CLIENT NUMBERS
@@ -958,193 +1184,932 @@ def init_db():
                 )
 
         # -------------------------------------------------
-        # BACKFILL 30-HOUR CLIENT RESULTS
+        # ROLLING 30-HOUR CLIENT WINDOWS FROM CALL STARTS
         # -------------------------------------------------
 
-        existing_client_results = conn.execute(
+        conn.execute(
             """
-            SELECT COUNT(*) AS count
-            FROM client_results
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                name TEXT PRIMARY KEY,
+                applied_at INTEGER NOT NULL
+            )
             """
-        ).fetchone()["count"]
+        )
 
-        if not existing_client_results:
+        # Preserve old raw rows, but canonicalize webhook duplicates
+        # created by older versions (for example PBX-only -> DB+PBX).
+        # Only the canonical row participates in windows and reports.
+        duplicate_migration_done = bool(
+            conn.execute(
+                """
+                SELECT 1
+                FROM schema_migrations
+                WHERE name =
+                    'canonical_webhook_duplicates_v1'
+                LIMIT 1
+                """
+            ).fetchone()
+        )
 
-            legacy_results = conn.execute(
+        if not duplicate_migration_done:
+
+            duplicate_rows = conn.execute(
                 """
                 SELECT
-                    id,
+                    call.*,
+
+                    EXISTS (
+                        SELECT 1
+                        FROM call_ratings AS rating
+                        WHERE
+                            rating.call_id = call.id
+                            AND rating.score IS NOT NULL
+                    ) AS has_score,
+
+                    EXISTS (
+                        SELECT 1
+                        FROM call_ratings AS rating
+                        WHERE rating.call_id = call.id
+                    ) AS has_rating,
+
+                    EXISTS (
+                        SELECT 1
+                        FROM client_results AS result
+                        WHERE result.source_call_id = call.id
+                    ) AS has_result
+
+                FROM calls AS call
+
+                ORDER BY call.id
+                """
+            ).fetchall()
+
+            parents = {
+                row["id"]: row["id"]
+                for row in duplicate_rows
+            }
+
+            root_db_ids = {
+                row["id"]: (
+                    {
+                        str(row["db_call_id"])
+                    }
+                    if row["db_call_id"]
+                        is not None
+                    else set()
+                )
+                for row in duplicate_rows
+            }
+
+            def find_parent(call_id):
+                while parents[call_id] != call_id:
+                    parents[call_id] = parents[
+                        parents[call_id]
+                    ]
+                    call_id = parents[call_id]
+                return call_id
+
+            def union_calls(left_id, right_id):
+                left_root = find_parent(left_id)
+                right_root = find_parent(right_id)
+
+                if (
+                    root_db_ids[left_root]
+                    and root_db_ids[right_root]
+                    and root_db_ids[left_root]
+                        != root_db_ids[right_root]
+                ):
+                    return
+
+                if left_root != right_root:
+                    parents[right_root] = left_root
+                    root_db_ids[left_root].update(
+                        root_db_ids[right_root]
+                    )
+
+            alias_owner = {}
+
+            for duplicate_row in duplicate_rows:
+
+                identity_aliases = []
+
+                if duplicate_row[
+                    "event_pbx_call_id"
+                ]:
+                    identity_aliases.append(
+                        "pbx:"
+                        + str(
+                            duplicate_row[
+                                "account_id"
+                            ]
+                            or ""
+                        )
+                        + ":"
+                        + str(
+                            duplicate_row[
+                                "event_pbx_call_id"
+                            ]
+                        )
+                    )
+
+                duplicate_src_key = (
+                    normalize_phone(
+                        duplicate_row[
+                            "src_number"
+                        ]
+                    )
+                )
+
+                duplicate_start_time = int(
+                    duplicate_row["start_time"]
+                    or 0
+                )
+
+                if (
+                    duplicate_start_time > 0
+                    and bool(
+                        duplicate_row["client_key"]
+                        or duplicate_src_key
+                    )
+                    and duplicate_row["direction"]
+                        is not None
+                ):
+                    identity_payload = json.dumps(
+                        {
+                            "account_id": str(
+                                duplicate_row[
+                                    "account_id"
+                                ]
+                                or ""
+                            ),
+                            "client_key": (
+                                duplicate_row[
+                                    "client_key"
+                                ]
+                                or ""
+                            ),
+                            "src_key": duplicate_src_key,
+                            "direction": duplicate_row[
+                                "direction"
+                            ],
+                            "start_time": (
+                                duplicate_start_time
+                            ),
+                            "answer_time": duplicate_row[
+                                "answer_time"
+                            ],
+                            "end_time": duplicate_row[
+                                "end_time"
+                            ],
+                            "src_id": duplicate_row[
+                                "src_id"
+                            ],
+                            "src_slot": duplicate_row[
+                                "src_slot"
+                            ],
+                            "event_created": duplicate_row[
+                                "event_created"
+                            ],
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+
+                    identity_aliases.append(
+                        "fp:"
+                        + hashlib.sha256(
+                            identity_payload.encode(
+                                "utf-8"
+                            )
+                        ).hexdigest()
+                    )
+
+                for identity_alias in identity_aliases:
+
+                    owner_id = alias_owner.get(
+                        identity_alias
+                    )
+
+                    if owner_id is None:
+                        alias_owner[
+                            identity_alias
+                        ] = duplicate_row["id"]
+                    else:
+                        union_calls(
+                            owner_id,
+                            duplicate_row["id"],
+                        )
+
+            duplicate_groups = {}
+
+            for duplicate_row in duplicate_rows:
+                duplicate_groups.setdefault(
+                    find_parent(
+                        duplicate_row["id"]
+                    ),
+                    [],
+                ).append(duplicate_row)
+
+            def canonical_rank(row):
+                completeness = sum(
+                    1
+                    for column in (
+                        "client_number",
+                        "start_time",
+                        "end_time",
+                        "answered",
+                        "src_number",
+                        "recording",
+                    )
+                    if row[column] not in (
+                        None,
+                        "",
+                    )
+                )
+
+                return (
+                    int(row["has_score"] or 0),
+                    int(row["has_rating"] or 0),
+                    int(row["has_result"] or 0),
+                    int(
+                        row["sale_status"]
+                        is not None
+                    ),
+                    int(row["telegram_sent"] or 0),
+                    int(row["sms_sent"] or 0),
+                    completeness,
+                    int(
+                        row["db_call_id"]
+                        is not None
+                    ),
+                    -int(row["id"]),
+                )
+
+            conn.execute(
+                """
+                UPDATE calls
+                SET duplicate_of_call_id = NULL
+                """
+            )
+
+            for group_rows in duplicate_groups.values():
+
+                if len(group_rows) < 2:
+                    continue
+
+                canonical = max(
+                    group_rows,
+                    key=canonical_rank,
+                )
+
+                for duplicate_row in group_rows:
+
+                    if duplicate_row["id"] == canonical["id"]:
+                        continue
+
+                    conn.execute(
+                        """
+                        UPDATE calls
+                        SET duplicate_of_call_id = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            canonical["id"],
+                            duplicate_row["id"],
+                        ),
+                    )
+
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO schema_migrations (
+                    name,
+                    applied_at
+                )
+                VALUES (?, ?)
+                """,
+                (
+                    "canonical_webhook_duplicates_v1",
+                    int(
+                        datetime.now(
+                            timezone.utc
+                        ).timestamp()
+                    ),
+                ),
+            )
+
+        conn.execute(
+            """
+            CREATE VIEW IF NOT EXISTS reporting_calls AS
+            SELECT *
+            FROM calls
+            WHERE duplicate_of_call_id IS NULL
+            """
+        )
+
+        windows_migration_done = bool(
+            conn.execute(
+                """
+                SELECT 1
+
+                FROM schema_migrations
+
+                WHERE name =
+                    'client_windows_rolling_30h_v4'
+
+                LIMIT 1
+                """
+            ).fetchone()
+        )
+
+        if not windows_migration_done:
+
+            conn.execute(
+                "DELETE FROM client_results"
+            )
+
+            conn.execute(
+                "UPDATE call_ratings SET client_window_id = NULL"
+            )
+
+            conn.execute(
+                "UPDATE calls SET client_window_id = NULL"
+            )
+
+            conn.execute(
+                "DELETE FROM client_windows"
+            )
+
+        cooldown_seconds = (
+            RESULT_COOLDOWN_HOURS
+            * 60
+            * 60
+        )
+
+        window_calls = (
+            conn.execute(
+            """
+            SELECT
+                id,
+                client_key,
+                start_time
+
+            FROM reporting_calls
+
+            WHERE
+                COALESCE(
+                    is_internal_contact,
+                    0
+                ) = 0
+
+                AND
+
+                client_key IS NOT NULL
+
+                AND
+
+                client_key != ''
+
+                AND
+
+                start_time IS NOT NULL
+
+                AND
+
+                start_time > 0
+
+            ORDER BY
+                client_key,
+                start_time,
+                id
+            """
+            ).fetchall()
+            if not windows_migration_done
+            else []
+        )
+
+        active_windows = {}
+
+        for call in window_calls:
+
+            client_key = call[
+                "client_key"
+            ]
+
+            start_time = int(
+                call["start_time"]
+            )
+
+            active = active_windows.get(
+                client_key
+            )
+
+            if (
+                not active
+                or start_time
+                >= active["last_start_time"]
+                + cooldown_seconds
+            ):
+
+                cursor = conn.execute(
+                    """
+                    INSERT INTO client_windows (
+                        client_key,
+                        started_at,
+                        ends_at,
+                        first_call_id,
+                        latest_call_id
+                    )
+
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        client_key,
+                        start_time,
+                        start_time
+                        + cooldown_seconds,
+                        call["id"],
+                        call["id"],
+                    ),
+                )
+
+                active = {
+                    "id": cursor.lastrowid,
+                    "last_start_time": start_time,
+                }
+
+                active_windows[client_key] = (
+                    active
+                )
+
+            else:
+
+                conn.execute(
+                    """
+                    UPDATE client_windows
+
+                    SET
+                        latest_call_id = ?,
+                        ends_at = ?,
+                        updated_at = CURRENT_TIMESTAMP
+
+                    WHERE id = ?
+                    """,
+                    (
+                        call["id"],
+                        start_time
+                        + cooldown_seconds,
+                        active["id"],
+                    ),
+                )
+
+                active[
+                    "last_start_time"
+                ] = start_time
+
+            conn.execute(
+                """
+                UPDATE calls
+
+                SET client_window_id = ?
+
+                WHERE id = ?
+                """,
+                (
+                    active["id"],
+                    call["id"],
+                ),
+            )
+
+        conn.execute(
+            """
+            UPDATE call_ratings
+
+            SET client_window_id = (
+                SELECT calls.client_window_id
+
+                FROM calls
+
+                WHERE calls.id =
+                    call_ratings.call_id
+            )
+            """
+        )
+
+        legacy_results = (
+            conn.execute(
+            """
+            SELECT
+                call.id,
+                call.client_key,
+                call.client_window_id,
+                window.started_at,
+                window.ends_at,
+                call.start_time,
+                call.sale_status,
+                call.no_sale_reason,
+                call.no_sale_reason_code,
+                call.talk_manager_code,
+                call.talk_manager_name,
+                call.sale_marked_at,
+                call.result_revision,
+                call.sale_marked_by,
+                call.sale_marked_username
+
+            FROM reporting_calls AS call
+
+            JOIN client_windows AS window
+                ON window.id =
+                    call.client_window_id
+
+            WHERE
+                call.sale_status IN (
+                    'bought',
+                    'not_bought'
+                )
+
+            ORDER BY
+                call.client_window_id,
+                COALESCE(
+                    call.result_revision,
+                    0
+                ),
+                COALESCE(
+                    call.sale_marked_at,
+                    call.start_time,
+                    call.id
+                ),
+                call.id
+            """
+            ).fetchall()
+            if not windows_migration_done
+            else []
+        )
+
+        latest_results = {}
+
+        for result in legacy_results:
+            latest_results[
+                result["client_window_id"]
+            ] = result
+
+        for result in latest_results.values():
+
+            marked_at = int(
+                result["sale_marked_at"]
+                or result["started_at"]
+            )
+
+            conn.execute(
+                """
+                INSERT INTO client_results (
                     client_key,
-                    start_time,
+                    client_window_id,
+                    window_started_at,
+                    window_ends_at,
+                    source_call_id,
+                    attribution_time,
                     sale_status,
+                    result_category,
                     no_sale_reason,
                     no_sale_reason_code,
                     talk_manager_code,
                     talk_manager_name,
-                    sale_marked_at,
-                    sale_marked_by,
-                    sale_marked_username
-
-                FROM calls
-
-                WHERE
-                    COALESCE(
-                        is_internal_contact,
-                        0
-                    ) = 0
-
-                    AND
-
-                    client_key IS NOT NULL
-
-                    AND
-
-                    client_key != ''
-
-                    AND
-
-                    sale_status IN (
-                        'bought',
-                        'not_bought'
-                    )
-
-                ORDER BY
-                    client_key,
-                    COALESCE(
-                        sale_marked_at,
-                        start_time,
-                        id
-                    ),
-                    id
-                """
-            ).fetchall()
-
-            active_windows = {}
-            cooldown_seconds = (
-                RESULT_COOLDOWN_HOURS
-                * 60
-                * 60
-            )
-
-            for result in legacy_results:
-
-                action_time = int(
-                    result["sale_marked_at"]
-                    or result["start_time"]
-                    or 0
+                    marked_at,
+                    marked_by,
+                    marked_username
                 )
 
-                if action_time <= 0:
-                    continue
-
-                client_key = result[
-                    "client_key"
-                ]
-
-                active = active_windows.get(
-                    client_key
+                VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?
                 )
-
-                values = (
+                """,
+                (
+                    result["client_key"],
+                    result["client_window_id"],
+                    result["started_at"],
+                    result["ends_at"],
                     result["id"],
-                    int(
-                        result["start_time"]
-                        or action_time
-                    ),
+                    result["start_time"]
+                    or result["started_at"],
                     result["sale_status"],
+                    get_result_category(
+                        result["sale_status"],
+                        result[
+                            "no_sale_reason_code"
+                        ],
+                    ),
                     result["no_sale_reason"],
                     result["no_sale_reason_code"],
                     result["talk_manager_code"],
                     result["talk_manager_name"],
-                    action_time,
+                    marked_at,
                     result["sale_marked_by"],
-                    result["sale_marked_username"],
+                    result[
+                        "sale_marked_username"
+                    ],
+                ),
+            )
+
+        if not windows_migration_done:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO schema_migrations (
+                    name,
+                    applied_at
                 )
 
-                if (
-                    active
-                    and action_time
-                    < active["window_ends_at"]
-                ):
+                VALUES (?, ?)
+                """,
+                (
+                    "client_windows_rolling_30h_v4",
+                    int(
+                        datetime.now(
+                            timezone.utc
+                        ).timestamp()
+                    ),
+                ),
+            )
+
+        conn.execute(
+            """
+            UPDATE client_results
+
+            SET result_category = CASE
+                WHEN sale_status = 'bought'
+                THEN 'bought'
+
+                WHEN no_sale_reason_code IN (
+                    'pending',
+                    'thinking',
+                    'other_product',
+                    'credit',
+                    'visit_store',
+                    'later'
+                )
+                THEN 'pending'
+
+                WHEN no_sale_reason_code =
+                    'not_target'
+                THEN 'non_target'
+
+                ELSE 'lost'
+            END
+
+            WHERE result_category IS NULL
+            """
+        )
+
+        # -------------------------------------------------
+        # WEBHOOK DEDUP KEYS FOR OLD CALLS
+        # -------------------------------------------------
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS call_webhook_keys (
+                dedup_key TEXT PRIMARY KEY,
+                call_id INTEGER NOT NULL,
+                created_at TIMESTAMP
+                    DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(call_id)
+                    REFERENCES calls(id)
+            )
+            """
+        )
+
+        dedup_rows = conn.execute(
+            """
+            SELECT
+                id,
+                webhook_dedup_key,
+                duplicate_of_call_id,
+                db_call_id,
+                event_pbx_call_id,
+                account_id,
+                client_key,
+                src_number,
+                start_time,
+                answer_time,
+                end_time,
+                direction,
+                src_id,
+                src_slot,
+                event_created
+
+            FROM calls
+
+            ORDER BY id
+            """
+        ).fetchall()
+
+        seen_dedup_keys = set()
+
+        for dedup_row in dedup_rows:
+
+            dedup_keys = []
+
+            canonical_call_id = (
+                dedup_row[
+                    "duplicate_of_call_id"
+                ]
+                or dedup_row["id"]
+            )
+
+            legacy_src_key = normalize_phone(
+                dedup_row["src_number"]
+            )
+
+            legacy_start_time = int(
+                dedup_row["start_time"]
+                or 0
+            )
+
+            legacy_fingerprint_is_strong = (
+                legacy_start_time > 0
+                and bool(
+                    dedup_row["client_key"]
+                    or legacy_src_key
+                )
+                and dedup_row["direction"]
+                    is not None
+            )
+
+            if (
+                dedup_row["webhook_dedup_key"]
+                and (
+                    not str(
+                        dedup_row[
+                            "webhook_dedup_key"
+                        ]
+                    ).startswith("fp:")
+                    or legacy_fingerprint_is_strong
+                )
+            ):
+                dedup_keys.append(
+                    dedup_row[
+                        "webhook_dedup_key"
+                    ]
+                )
+
+            if dedup_row["db_call_id"] is not None:
+                dedup_keys.append(
+                    "db:"
+                    + str(
+                        dedup_row["db_call_id"]
+                    )
+                )
+
+            if dedup_row["event_pbx_call_id"]:
+                dedup_keys.append(
+                    "pbx:"
+                    + str(
+                        dedup_row["account_id"]
+                        or ""
+                    )
+                    + ":"
+                    + str(
+                        dedup_row[
+                            "event_pbx_call_id"
+                        ]
+                    )
+                )
+
+            if legacy_fingerprint_is_strong:
+
+                fingerprint = json.dumps(
+                    {
+                        "account_id": str(
+                            dedup_row["account_id"]
+                            or ""
+                        ),
+                        "client_key": (
+                            dedup_row["client_key"]
+                            or ""
+                        ),
+                        "src_key": legacy_src_key,
+                        "direction": dedup_row[
+                            "direction"
+                        ],
+                        "start_time": legacy_start_time,
+                        "answer_time": dedup_row[
+                            "answer_time"
+                        ],
+                        "end_time": dedup_row[
+                            "end_time"
+                        ],
+                        "src_id": dedup_row[
+                            "src_id"
+                        ],
+                        "src_slot": dedup_row[
+                            "src_slot"
+                        ],
+                        "event_created": dedup_row[
+                            "event_created"
+                        ],
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+
+                dedup_keys.append(
+                    "fp:"
+                    + hashlib.sha256(
+                        fingerprint.encode(
+                            "utf-8"
+                        )
+                    ).hexdigest()
+                )
+
+            if not dedup_keys:
+                dedup_keys.append(
+                    "legacy:"
+                    + str(dedup_row["id"])
+                )
+
+            dedup_keys = list(
+                dict.fromkeys(
+                    dedup_keys
+                )
+            )
+
+            for dedup_key in dedup_keys:
+
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO
+                        call_webhook_keys (
+                            dedup_key,
+                            call_id
+                        )
+                    VALUES (?, ?)
+                    """,
+                    (
+                        dedup_key,
+                        canonical_call_id,
+                    ),
+                )
+
+                if dedup_row[
+                    "duplicate_of_call_id"
+                ] is not None:
 
                     conn.execute(
                         """
-                        UPDATE client_results
-
-                        SET
-                            source_call_id = ?,
-                            attribution_time = ?,
-                            sale_status = ?,
-                            no_sale_reason = ?,
-                            no_sale_reason_code = ?,
-                            talk_manager_code = ?,
-                            talk_manager_name = ?,
-                            marked_at = ?,
-                            marked_by = ?,
-                            marked_username = ?,
-                            window_ends_at = ?,
-                            updated_at = CURRENT_TIMESTAMP
-
-                        WHERE id = ?
+                        UPDATE call_webhook_keys
+                        SET call_id = ?
+                        WHERE dedup_key = ?
                         """,
-                        values
-                        + (
-                            action_time
-                            + cooldown_seconds,
-                            active["id"],
+                        (
+                            canonical_call_id,
+                            dedup_key,
                         ),
                     )
 
-                    active[
-                        "window_ends_at"
-                    ] = (
-                        action_time
-                        + cooldown_seconds
-                    )
+            primary_key = (
+                next(
+                    (
+                        key
+                        for key in dedup_keys
+                        if key.startswith("db:")
+                    ),
+                    None,
+                )
+                or next(
+                    (
+                        key
+                        for key in dedup_keys
+                        if key.startswith("pbx:")
+                    ),
+                    None,
+                )
+                or dedup_keys[-1]
+            )
 
-                else:
+            if (
+                dedup_row[
+                    "duplicate_of_call_id"
+                ] is None
+                and primary_key
+                    not in seen_dedup_keys
+            ):
 
-                    window_ends_at = (
-                        action_time
-                        + cooldown_seconds
-                    )
+                seen_dedup_keys.add(
+                    primary_key
+                )
 
-                    cursor = conn.execute(
-                        """
-                        INSERT INTO client_results (
-                            client_key,
-                            window_started_at,
-                            window_ends_at,
-                            source_call_id,
-                            attribution_time,
-                            sale_status,
-                            no_sale_reason,
-                            no_sale_reason_code,
-                            talk_manager_code,
-                            talk_manager_name,
-                            marked_at,
-                            marked_by,
-                            marked_username
-                        )
-
-                        VALUES (
-                            ?, ?, ?, ?, ?, ?, ?,
-                            ?, ?, ?, ?, ?, ?
-                        )
-                        """,
-                        (
-                            client_key,
-                            action_time,
-                            window_ends_at,
-                        )
-                        + values,
-                    )
-
-                    active_windows[client_key] = {
-                        "id": cursor.lastrowid,
-                        "window_ends_at":
-                            window_ends_at,
-                    }
+                conn.execute(
+                    """
+                    UPDATE calls
+                    SET webhook_dedup_key = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        primary_key,
+                        dedup_row["id"],
+                    ),
+                )
 
         # -------------------------------------------------
         # OLD TELEGRAM RECORDS
@@ -1179,6 +2144,46 @@ def init_db():
             idx_calls_client_key
 
             ON calls(client_key)
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_calls_client_window
+
+            ON calls(client_window_id)
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_calls_duplicate_of
+
+            ON calls(duplicate_of_call_id)
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_call_webhook_keys_call_id
+
+            ON call_webhook_keys(call_id)
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS
+            idx_calls_webhook_dedup_key
+
+            ON calls(webhook_dedup_key)
+
+            WHERE
+                webhook_dedup_key IS NOT NULL
+                AND webhook_dedup_key != ''
             """
         )
 
@@ -1295,6 +2300,37 @@ def init_db():
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS
+            idx_call_ratings_client_window
+
+            ON call_ratings(client_window_id)
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_client_windows_period
+
+            ON client_windows(started_at)
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_client_windows_client_time
+
+            ON client_windows(
+                client_key,
+                started_at,
+                ends_at
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
             idx_client_results_client_window
 
             ON client_results(
@@ -1322,6 +2358,17 @@ def init_db():
             idx_client_results_source_call
 
             ON client_results(source_call_id)
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS
+            idx_client_results_window_unique
+
+            ON client_results(client_window_id)
+
+            WHERE client_window_id IS NOT NULL
             """
         )
 
@@ -1405,7 +2452,10 @@ def reserve_client_sms(
                     OR
 
                     (
-                        status = 'reserved'
+                        status IN (
+                            'reserved',
+                            'error'
+                        )
                         AND reserved_at >= ?
                     )
                 )
@@ -1773,6 +2823,41 @@ def reserve_call_rating(
             "BEGIN IMMEDIATE"
         )
 
+        call = conn.execute(
+            """
+            SELECT
+                client_window_id,
+                is_internal_contact,
+                answered
+
+            FROM calls
+
+            WHERE id = ?
+
+            LIMIT 1
+            """,
+            (
+                call_id,
+            ),
+        ).fetchone()
+
+        if (
+            not call
+            or call["is_internal_contact"]
+            or not call["answered"]
+            or not call["client_window_id"]
+        ):
+            conn.commit()
+
+            return {
+                "reserved": False,
+                "reason": "invalid_client_window",
+            }
+
+        client_window_id = call[
+            "client_window_id"
+        ]
+
         previous = conn.execute(
             """
             SELECT
@@ -1782,12 +2867,25 @@ def reserve_call_rating(
 
             FROM call_ratings
 
-            WHERE call_id = ?
+            WHERE client_window_id = ?
+
+            ORDER BY
+                CASE
+                    WHEN score IS NOT NULL
+                    THEN 0
+                    ELSE 1
+                END,
+                COALESCE(
+                    rated_at,
+                    sms_sent_at,
+                    sms_reserved_at
+                ),
+                id
 
             LIMIT 1
             """,
             (
-                call_id,
+                client_window_id,
             ),
         ).fetchone()
 
@@ -1797,7 +2895,7 @@ def reserve_call_rating(
 
             return {
                 "reserved": False,
-                "reason": "already_created",
+                "reason": "client_window_cooldown",
                 "rating_id": previous["id"],
                 "sms_status": previous["sms_status"],
                 "score": previous["score"],
@@ -1807,6 +2905,7 @@ def reserve_call_rating(
             """
             INSERT INTO call_ratings (
                 call_id,
+                client_window_id,
                 token_hash,
                 client_key,
                 sender_user_login,
@@ -1815,10 +2914,11 @@ def reserve_call_rating(
                 expires_at
             )
 
-            VALUES (?, ?, ?, ?, 'reserved', ?, ?)
+            VALUES (?, ?, ?, ?, ?, 'reserved', ?, ?)
             """,
             (
                 call_id,
+                client_window_id,
                 token_hash,
                 client_key,
                 sender_user_login,
@@ -2163,6 +3263,483 @@ def get_talk_duration(
 # SAVE CALL
 # =========================================================
 
+def build_webhook_dedup_keys(
+    webhook: dict,
+    event: dict,
+    client_key: str,
+):
+
+    keys = []
+
+    db_call_id = event.get(
+        "db_call_id"
+    )
+
+    if db_call_id is not None:
+        keys.append(
+            "db:" + str(
+                db_call_id
+            )
+        )
+
+    event_pbx_call_id = event.get(
+        "event_pbx_call_id"
+    )
+
+    account_id = webhook.get(
+        "account_id"
+    )
+
+    if event_pbx_call_id:
+        keys.append(
+            (
+                "pbx:"
+                + str(account_id or "")
+                + ":"
+                + str(event_pbx_call_id)
+            )
+        )
+
+    src_key = normalize_phone(
+        event.get("src_number")
+    )
+
+    start_time = int(
+        event.get("start_time")
+        or 0
+    )
+
+    # A fingerprint is only authoritative when it describes an
+    # actual call.  Hashing an almost empty payload would make
+    # unrelated DB/PBX ids look like the same webhook.
+    fingerprint_is_strong = (
+        start_time > 0
+        and bool(client_key or src_key)
+        and event.get("direction")
+            is not None
+    )
+
+    if fingerprint_is_strong:
+
+        fingerprint = json.dumps(
+            {
+                "account_id": str(
+                    account_id or ""
+                ),
+                "client_key": client_key,
+                "src_key": src_key,
+                "direction": event.get(
+                    "direction"
+                ),
+                "start_time": start_time,
+                "answer_time": event.get(
+                    "answer_time"
+                ),
+                "end_time": event.get(
+                    "end_time"
+                ),
+                "src_id": event.get(
+                    "src_id"
+                ),
+                "src_slot": event.get(
+                    "src_slot"
+                ),
+                "event_created": (
+                    event.get("event_created")
+                    or event.get("upload_time")
+                ),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+        keys.append(
+            (
+                "fp:"
+                + hashlib.sha256(
+                    fingerprint.encode(
+                        "utf-8"
+                    )
+                ).hexdigest()
+            )
+        )
+
+    if not keys:
+        keys.append(
+            "weak:"
+            + secrets.token_hex(16)
+        )
+
+    return list(
+        dict.fromkeys(
+            keys
+        )
+    )
+
+
+def build_webhook_dedup_key(
+    webhook: dict,
+    event: dict,
+    client_key: str,
+):
+
+    return build_webhook_dedup_keys(
+        webhook,
+        event,
+        client_key,
+    )[0]
+
+
+def rebuild_client_windows_for_client(
+    conn,
+    client_key: str,
+):
+
+    if not client_key:
+        return
+
+    calls = conn.execute(
+        """
+        SELECT
+            id,
+            start_time
+
+        FROM reporting_calls
+
+        WHERE
+            client_key = ?
+            AND COALESCE(
+                is_internal_contact,
+                0
+            ) = 0
+            AND start_time IS NOT NULL
+            AND start_time > 0
+
+        ORDER BY start_time, id
+        """,
+        (
+            client_key,
+        ),
+    ).fetchall()
+
+    # These tables are derived from calls. Rebuilding one
+    # client atomically also handles late/out-of-order webhooks.
+    conn.execute(
+        """
+        DELETE FROM client_results
+        WHERE client_key = ?
+        """,
+        (
+            client_key,
+        ),
+    )
+
+    conn.execute(
+        """
+        UPDATE call_ratings
+
+        SET client_window_id = NULL
+
+        WHERE call_id IN (
+            SELECT id
+            FROM calls
+            WHERE client_key = ?
+        )
+        """,
+        (
+            client_key,
+        ),
+    )
+
+    conn.execute(
+        """
+        UPDATE calls
+        SET client_window_id = NULL
+        WHERE client_key = ?
+        """,
+        (
+            client_key,
+        ),
+    )
+
+    conn.execute(
+        """
+        DELETE FROM client_windows
+        WHERE client_key = ?
+        """,
+        (
+            client_key,
+        ),
+    )
+
+    if not calls:
+        return
+
+    cooldown_seconds = (
+        RESULT_COOLDOWN_HOURS
+        * 60
+        * 60
+    )
+
+    active_window_id = None
+    previous_call_start = None
+
+    for call in calls:
+
+        call_start = int(
+            call["start_time"]
+        )
+
+        if (
+            active_window_id is None
+            or call_start >= (
+                previous_call_start
+                + cooldown_seconds
+            )
+        ):
+
+            cursor = conn.execute(
+                """
+                INSERT INTO client_windows (
+                    client_key,
+                    started_at,
+                    ends_at,
+                    first_call_id,
+                    latest_call_id
+                )
+
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    client_key,
+                    call_start,
+                    call_start
+                    + cooldown_seconds,
+                    call["id"],
+                    call["id"],
+                ),
+            )
+
+            active_window_id = (
+                cursor.lastrowid
+            )
+
+        else:
+
+            conn.execute(
+                """
+                UPDATE client_windows
+
+                SET
+                    latest_call_id = ?,
+                    ends_at = ?,
+                    updated_at = CURRENT_TIMESTAMP
+
+                WHERE id = ?
+                """,
+                (
+                    call["id"],
+                    call_start
+                    + cooldown_seconds,
+                    active_window_id,
+                ),
+            )
+
+        previous_call_start = call_start
+
+        conn.execute(
+            """
+            UPDATE calls
+
+            SET client_window_id = ?
+
+            WHERE id = ?
+            """,
+            (
+                active_window_id,
+                call["id"],
+            ),
+        )
+
+    conn.execute(
+        """
+        UPDATE call_ratings
+
+        SET client_window_id = (
+            SELECT call.client_window_id
+            FROM calls AS call
+            WHERE call.id = call_ratings.call_id
+        )
+
+        WHERE call_id IN (
+            SELECT id
+            FROM calls
+            WHERE client_key = ?
+        )
+        """,
+        (
+            client_key,
+        ),
+    )
+
+    raw_results = conn.execute(
+        """
+        SELECT
+            call.id,
+            call.client_key,
+            call.client_window_id,
+            call.start_time,
+            call.sale_status,
+            call.no_sale_reason,
+            call.no_sale_reason_code,
+            call.talk_manager_code,
+            call.talk_manager_name,
+            call.sale_marked_at,
+            call.result_revision,
+            call.sale_marked_by,
+            call.sale_marked_username,
+            window.started_at,
+            window.ends_at
+
+        FROM reporting_calls AS call
+
+        JOIN client_windows AS window
+            ON window.id =
+                call.client_window_id
+
+        WHERE
+            call.client_key = ?
+            AND call.sale_status IN (
+                'bought',
+                'not_bought'
+            )
+
+        ORDER BY
+            COALESCE(
+                call.result_revision,
+                0
+            ),
+            COALESCE(
+                call.sale_marked_at,
+                call.start_time,
+                call.id
+            ),
+            call.id
+        """,
+        (
+            client_key,
+        ),
+    ).fetchall()
+
+    latest_results = {}
+
+    for result in raw_results:
+        latest_results[
+            result["client_window_id"]
+        ] = result
+
+    for result in latest_results.values():
+
+        conn.execute(
+            """
+            INSERT INTO client_results (
+                client_key,
+                client_window_id,
+                window_started_at,
+                window_ends_at,
+                source_call_id,
+                attribution_time,
+                sale_status,
+                result_category,
+                no_sale_reason,
+                no_sale_reason_code,
+                talk_manager_code,
+                talk_manager_name,
+                marked_at,
+                marked_by,
+                marked_username
+            )
+
+            VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?
+            )
+            """,
+            (
+                result["client_key"],
+                result["client_window_id"],
+                result["started_at"],
+                result["ends_at"],
+                result["id"],
+                result["start_time"],
+                result["sale_status"],
+                get_result_category(
+                    result["sale_status"],
+                    result[
+                        "no_sale_reason_code"
+                    ],
+                ),
+                result["no_sale_reason"],
+                result["no_sale_reason_code"],
+                result["talk_manager_code"],
+                result["talk_manager_name"],
+                int(
+                    result["sale_marked_at"]
+                    or result["start_time"]
+                ),
+                result["sale_marked_by"],
+                result[
+                    "sale_marked_username"
+                ],
+            ),
+        )
+
+
+def assign_call_client_window(
+    conn,
+    call_id: int,
+    client_key: str,
+    start_time,
+    is_internal_contact: int,
+):
+
+    start_time = int(
+        start_time
+        or 0
+    )
+
+    if (
+        not call_id
+        or not client_key
+        or start_time <= 0
+        or is_internal_contact
+    ):
+        return None
+
+    rebuild_client_windows_for_client(
+        conn,
+        client_key,
+    )
+
+    row = conn.execute(
+        """
+        SELECT client_window_id
+        FROM calls
+        WHERE id = ?
+        LIMIT 1
+        """,
+        (
+            call_id,
+        ),
+    ).fetchone()
+
+    return (
+        row["client_window_id"]
+        if row
+        else None
+    )
+
 def save_call(
     webhook: dict,
     event: dict,
@@ -2206,14 +3783,477 @@ def save_call(
         "event_pbx_call_id"
     )
 
+    webhook_dedup_keys = (
+        build_webhook_dedup_keys(
+            webhook,
+            event,
+            client_key,
+        )
+    )
+
+    webhook_dedup_key = (
+        webhook_dedup_keys[0]
+    )
+
     with connect_db() as conn:
 
-        cursor = conn.execute(
-            """
-            INSERT INTO calls (
+        conn.execute(
+            "BEGIN IMMEDIATE"
+        )
+
+        existing = None
+
+        def identity_conflicts(
+            candidate,
+        ):
+            if not candidate:
+                return False
+
+            candidate_db_id = candidate[
+                "db_call_id"
+            ]
+
+            if (
+                db_call_id is not None
+                and candidate_db_id is not None
+                and str(db_call_id)
+                    != str(candidate_db_id)
+            ):
+                return True
+
+            candidate_pbx_id = candidate[
+                "event_pbx_call_id"
+            ]
+
+            if (
+                event_pbx_call_id
+                and candidate_pbx_id
+                and str(event_pbx_call_id)
+                    != str(candidate_pbx_id)
+            ):
+                return True
+
+            return False
+
+        if db_call_id is not None:
+            existing = conn.execute(
+                """
+                SELECT *
+                FROM calls
+                WHERE db_call_id = ?
+                LIMIT 1
+                """,
+                (
+                    db_call_id,
+                ),
+            ).fetchone()
+
+        if not existing:
+
+            for dedup_key in webhook_dedup_keys:
+
+                existing = conn.execute(
+                    """
+                    SELECT call.*
+
+                    FROM call_webhook_keys AS alias
+
+                    JOIN calls AS call
+                        ON call.id = alias.call_id
+
+                    WHERE alias.dedup_key = ?
+
+                    LIMIT 1
+                    """,
+                    (
+                        dedup_key,
+                    ),
+                ).fetchone()
+
+                if identity_conflicts(
+                    existing
+                ):
+                    existing = None
+
+                if existing:
+                    break
+
+        if (
+            existing
+            and existing[
+                "duplicate_of_call_id"
+            ]
+        ):
+
+            duplicate_row_id = existing["id"]
+            canonical_row_id = existing[
+                "duplicate_of_call_id"
+            ]
+
+            if db_call_id is not None:
+                conn.execute(
+                    """
+                    UPDATE calls
+                    SET db_call_id = NULL
+                    WHERE
+                        id = ?
+                        AND duplicate_of_call_id = ?
+                        AND db_call_id = ?
+                    """,
+                    (
+                        duplicate_row_id,
+                        canonical_row_id,
+                        db_call_id,
+                    ),
+                )
+
+            existing = conn.execute(
+                """
+                SELECT *
+                FROM calls
+                WHERE id = ?
+                LIMIT 1
+                """,
+                (
+                    canonical_row_id,
+                ),
+            ).fetchone()
+
+        # An account id can be absent in one delivery and appear in
+        # another.  PBX id is still a useful alias when it identifies
+        # exactly one stored call.
+        if (
+            not existing
+            and event_pbx_call_id
+        ):
+
+            account_matches = conn.execute(
+                """
+                SELECT *
+
+                FROM calls
+
+                WHERE
+                    event_pbx_call_id = ?
+                    AND COALESCE(
+                        CAST(account_id AS TEXT),
+                        ''
+                    ) = ?
+
+                ORDER BY id
+
+                LIMIT 1
+                """,
+                (
+                    event_pbx_call_id,
+                    str(
+                        webhook.get(
+                            "account_id"
+                        )
+                        or ""
+                    ),
+                ),
+            ).fetchone()
+
+            if (
+                account_matches
+                and not identity_conflicts(
+                    account_matches
+                )
+            ):
+                existing = account_matches
+
+            else:
+                pbx_matches = conn.execute(
+                    """
+                    SELECT *
+                    FROM calls
+                    WHERE event_pbx_call_id = ?
+                    ORDER BY id
+                    LIMIT 2
+                    """,
+                    (
+                        event_pbx_call_id,
+                    ),
+                ).fetchall()
+
+                if (
+                    len(pbx_matches) == 1
+                    and not identity_conflicts(
+                        pbx_matches[0]
+                    )
+                ):
+                    existing = pbx_matches[0]
+
+        if not existing:
+
+            for dedup_key in webhook_dedup_keys:
+
+                existing = conn.execute(
+                    """
+                    SELECT *
+                    FROM calls
+                    WHERE webhook_dedup_key = ?
+                    LIMIT 1
+                    """,
+                    (
+                        dedup_key,
+                    ),
+                ).fetchone()
+
+                if identity_conflicts(
+                    existing
+                ):
+                    existing = None
+
+                if existing:
+                    break
+
+        def supplied(value):
+            return (
+                value is not None
+                and not (
+                    isinstance(value, str)
+                    and not value.strip()
+                )
+            )
+
+        def old_value(
+            column: str,
+            default=None,
+        ):
+            return (
+                existing[column]
+                if existing
+                else default
+            )
+
+        def event_value(
+            key: str,
+            column: str | None = None,
+            default=None,
+        ):
+            value = event.get(key)
+
+            if key in event and supplied(value):
+                return value
+
+            return old_value(
+                column or key,
+                default,
+            )
+
+        def webhook_value(
+            key: str,
+            column: str | None = None,
+            default=None,
+        ):
+            value = webhook.get(key)
+
+            if key in webhook and supplied(value):
+                return value
+
+            return old_value(
+                column or key,
+                default,
+            )
+
+        client_number = event_value(
+            "client_number"
+        )
+
+        client_key = (
+            normalize_phone(
+                client_number
+            )
+            or old_value(
+                "client_key",
+                "",
+            )
+        )
+
+        internal_contact_name = (
+            get_internal_contact_name(
+                client_number
+            )
+            if client_number
+            else old_value(
+                "internal_contact_name"
+            )
+        )
+
+        is_internal_contact = (
+            1
+            if internal_contact_name
+            else 0
+        )
+
+        db_call_id = (
+            old_value("db_call_id")
+            if old_value("db_call_id")
+                is not None
+            else event_value(
+                "db_call_id"
+            )
+        )
+
+        event_pbx_call_id = event_value(
+            "event_pbx_call_id"
+        )
+
+        event_created = (
+            event.get("event_created")
+            or event.get("upload_time")
+            or old_value("event_created")
+        )
+
+        duration_payload_present = any(
+            key in event
+            and event.get(key) is not None
+            for key in (
+                "duration",
+                "answer_time",
+                "end_time",
+                "recording",
+            )
+        )
+
+        old_duration = int(
+            old_value(
+                "duration",
+                0,
+            )
+            or 0
+        )
+
+        duration_update_reliable = (
+            not existing
+            or int(talk_duration or 0) > 0
+            or (
+                old_duration <= 0
+                and duration_payload_present
+            )
+        )
+
+        if (
+            "duration" in event
+            and event.get("duration")
+                is not None
+        ):
+            api_duration = int(
+                event.get("duration")
+                or 0
+            )
+        else:
+            api_duration = int(
+                old_value(
+                    "api_duration",
+                    0,
+                )
+                or 0
+            )
+
+        merged_duration = (
+            talk_duration
+            if duration_update_reliable
+            else old_duration
+        )
+
+        merged_duration_source = (
+            duration_source
+            if duration_update_reliable
+            else old_value(
+                "duration_source"
+            )
+        )
+
+        webhook_dedup_key = (
+            old_value(
+                "webhook_dedup_key"
+            )
+            or webhook_dedup_key
+        )
+
+        values = (
+            db_call_id,
+            event_pbx_call_id,
+            webhook_dedup_key,
+            client_number,
+            client_key,
+            event_value("client_name"),
+            is_internal_contact,
+            internal_contact_name,
+            event_value("direction"),
+            event_value("answered"),
+            webhook_value("user_id"),
+            webhook_value("user_login"),
+            event_value("src_number"),
+            event_value("src_id"),
+            event_value("src_slot"),
+            event_created,
+            event_value("start_time"),
+            event_value("answer_time"),
+            event_value("end_time"),
+            merged_duration,
+            api_duration,
+            merged_duration_source,
+            event_value("recording"),
+            webhook_value("account_id"),
+            webhook_value("account_name"),
+        )
+
+        if existing:
+
+            call_id = existing["id"]
+
+            conn.execute(
+                """
+                UPDATE calls
+
+                SET
+                    db_call_id = ?,
+                    event_pbx_call_id = ?,
+                    webhook_dedup_key = ?,
+                    client_number = ?,
+                    client_key = ?,
+                    client_name = ?,
+                    is_internal_contact = ?,
+                    internal_contact_name = ?,
+                    direction = ?,
+                    answered = ?,
+                    user_id = ?,
+                    user_login = ?,
+                    src_number = ?,
+                    src_id = ?,
+                    src_slot = ?,
+                    event_created = ?,
+                    start_time = ?,
+                    answer_time = ?,
+                    end_time = ?,
+                    duration = ?,
+                    api_duration = ?,
+                    duration_source = ?,
+                    recording = ?,
+                    account_id = ?,
+                    account_name = ?
+
+                WHERE id = ?
+                """,
+                values
+                + (
+                    call_id,
+                ),
+            )
+
+        else:
+
+            cursor = conn.execute(
+                """
+                INSERT INTO calls (
 
                 db_call_id,
                 event_pbx_call_id,
+                webhook_dedup_key,
 
                 client_number,
                 client_key,
@@ -2252,7 +4292,7 @@ def save_call(
 
             VALUES (
 
-                ?, ?,
+                ?, ?, ?,
 
                 ?, ?, ?,
 
@@ -2277,229 +4317,155 @@ def save_call(
                 0
             )
 
-            ON CONFLICT(db_call_id)
+                """,
+                values,
+            )
 
-            DO UPDATE SET
+            call_id = cursor.lastrowid
 
-                event_pbx_call_id =
-                    excluded.event_pbx_call_id,
+        merged_identity_event = {
+            "db_call_id": db_call_id,
+            "event_pbx_call_id": (
+                event_pbx_call_id
+            ),
+            "client_number": client_number,
+            "src_number": event_value(
+                "src_number"
+            ),
+            "direction": event_value(
+                "direction"
+            ),
+            "start_time": event_value(
+                "start_time"
+            ),
+            "answer_time": event_value(
+                "answer_time"
+            ),
+            "end_time": event_value(
+                "end_time"
+            ),
+            "src_id": event_value(
+                "src_id"
+            ),
+            "src_slot": event_value(
+                "src_slot"
+            ),
+            "event_created": event_created,
+        }
 
-                client_number =
-                    excluded.client_number,
+        merged_identity_webhook = {
+            "account_id": webhook_value(
+                "account_id"
+            ),
+        }
 
-                client_key =
-                    excluded.client_key,
+        all_dedup_keys = list(
+            dict.fromkeys(
+                webhook_dedup_keys
+                + build_webhook_dedup_keys(
+                    merged_identity_webhook,
+                    merged_identity_event,
+                    client_key,
+                )
+            )
+        )
 
-                client_name =
-                    excluded.client_name,
+        for dedup_key in all_dedup_keys:
 
-                is_internal_contact =
-                    excluded.is_internal_contact,
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO
+                    call_webhook_keys (
+                        dedup_key,
+                        call_id
+                    )
+                VALUES (?, ?)
+                """,
+                (
+                    dedup_key,
+                    call_id,
+                ),
+            )
 
-                internal_contact_name =
-                    excluded.internal_contact_name,
+        old_client_key = (
+            existing["client_key"]
+            if existing
+            else None
+        )
 
-                direction =
-                    excluded.direction,
+        if (
+            old_client_key
+            and old_client_key != client_key
+        ):
+            rebuild_client_windows_for_client(
+                conn,
+                old_client_key,
+            )
 
-                answered =
-                    excluded.answered,
+        if client_key:
+            rebuild_client_windows_for_client(
+                conn,
+                client_key,
+            )
 
-                user_id =
-                    excluded.user_id,
+        now_ts = int(
+            datetime.now(
+                timezone.utc
+            ).timestamp()
+        )
 
-                user_login =
-                    excluded.user_login,
+        claim = conn.execute(
+            """
+            UPDATE calls
 
-                src_number =
-                    excluded.src_number,
+            SET telegram_reserved_at = ?
 
-                src_id =
-                    excluded.src_id,
-
-                src_slot =
-                    excluded.src_slot,
-
-                event_created =
-                    excluded.event_created,
-
-                start_time =
-                    excluded.start_time,
-
-                answer_time =
-                    excluded.answer_time,
-
-                end_time =
-                    excluded.end_time,
-
-                duration =
-                    excluded.duration,
-
-                api_duration =
-                    excluded.api_duration,
-
-                duration_source =
-                    excluded.duration_source,
-
-                recording =
-                    excluded.recording,
-
-                account_id =
-                    excluded.account_id,
-
-                account_name =
-                    excluded.account_name
+            WHERE
+                id = ?
+                AND COALESCE(
+                    telegram_sent,
+                    0
+                ) = 0
+                AND (
+                    telegram_reserved_at IS NULL
+                    OR telegram_reserved_at < ?
+                )
             """,
             (
-                db_call_id,
-
-                event_pbx_call_id,
-
-                client_number,
-
-                client_key,
-
-                event.get(
-                    "client_name"
-                ),
-
-                is_internal_contact,
-
-                internal_contact_name,
-
-                event.get(
-                    "direction"
-                ),
-
-                event.get(
-                    "answered"
-                ),
-
-                webhook.get(
-                    "user_id"
-                ),
-
-                webhook.get(
-                    "user_login"
-                ),
-
-                event.get(
-                    "src_number"
-                ),
-
-                event.get(
-                    "src_id"
-                ),
-
-                event.get(
-                    "src_slot"
-                ),
-
-                event.get(
-                    "event_created"
-                ),
-
-                event.get(
-                    "start_time"
-                ),
-
-                event.get(
-                    "answer_time"
-                ),
-
-                event.get(
-                    "end_time"
-                ),
-
-                talk_duration,
-
-                api_duration,
-
-                duration_source,
-
-                event.get(
-                    "recording"
-                ),
-
-                webhook.get(
-                    "account_id"
-                ),
-
-                webhook.get(
-                    "account_name"
-                ),
+                now_ts,
+                call_id,
+                now_ts - 300,
             ),
         )
 
+        row = conn.execute(
+            """
+            SELECT
+                id,
+                telegram_sent,
+                telegram_reserved_at,
+                is_internal_contact,
+                internal_contact_name
+
+            FROM calls
+
+            WHERE id = ?
+
+            LIMIT 1
+            """,
+            (
+                call_id,
+            ),
+        ).fetchone()
+
         conn.commit()
-
-        if db_call_id is not None:
-
-            row = conn.execute(
-                """
-                SELECT
-                    id,
-                    telegram_sent,
-                    is_internal_contact,
-                    internal_contact_name
-
-                FROM calls
-
-                WHERE db_call_id = ?
-                """,
-                (
-                    db_call_id,
-                ),
-            ).fetchone()
-
-        elif event_pbx_call_id:
-
-            row = conn.execute(
-                """
-                SELECT
-                    id,
-                    telegram_sent,
-                    is_internal_contact,
-                    internal_contact_name
-
-                FROM calls
-
-                WHERE
-                    event_pbx_call_id = ?
-
-                ORDER BY id DESC
-
-                LIMIT 1
-                """,
-                (
-                    event_pbx_call_id,
-                ),
-            ).fetchone()
-
-        else:
-
-            row = conn.execute(
-                """
-                SELECT
-                    id,
-                    telegram_sent,
-                    is_internal_contact,
-                    internal_contact_name
-
-                FROM calls
-
-                ORDER BY id DESC
-
-                LIMIT 1
-                """
-            ).fetchone()
 
     return {
         "call_id":
             (
                 row["id"]
                 if row
-                else cursor.lastrowid
+                else call_id
             ),
 
         "already_sent":
@@ -2509,6 +4475,9 @@ def save_call(
                     "telegram_sent"
                 ]
             ),
+
+        "telegram_claimed":
+            claim.rowcount == 1,
 
         "is_internal_contact":
             bool(
@@ -2571,6 +4540,7 @@ def mark_telegram_sent(
 
             SET
                 telegram_sent = 1,
+                telegram_reserved_at = NULL,
                 telegram_chat_id = ?,
                 telegram_message_id = ?
 
@@ -2588,6 +4558,35 @@ def mark_telegram_sent(
 
                 telegram_message_id,
 
+                call_id,
+            ),
+        )
+
+        conn.commit()
+
+
+def release_telegram_claim(
+    call_id: int,
+):
+
+    if not call_id:
+        return
+
+    with connect_db() as conn:
+        conn.execute(
+            """
+            UPDATE calls
+
+            SET telegram_reserved_at = NULL
+
+            WHERE
+                id = ?
+                AND COALESCE(
+                    telegram_sent,
+                    0
+                ) = 0
+            """,
+            (
                 call_id,
             ),
         )
@@ -2886,8 +4885,8 @@ def build_telegram_message(
     if answered:
 
         lines.append(
-            "🕐 Начало разговора: "
-            f"<b>{format_call_time(answer_time)}</b>"
+            "🕐 Начало звонка: "
+            f"<b>{format_call_time(start_time)}</b>"
         )
 
         lines.append(
@@ -2920,6 +4919,19 @@ def build_telegram_message(
             [
                 "",
                 "<b>Кто разговаривал?</b>",
+            ]
+        )
+
+    elif (
+        direction == 0
+        and not answered
+        and not internal_contact_name
+    ):
+
+        lines.extend(
+            [
+                "",
+                "<b>Кто отвечает за пропущенный звонок?</b>",
             ]
         )
 
@@ -3009,6 +5021,16 @@ def build_sale_keyboard(
 
                     "callback_data":
                         f"result:bought:{call_id}",
+                }
+            ],
+
+            [
+                {
+                    "text":
+                        "🕓 В работе / ожидает",
+
+                    "callback_data":
+                        f"result:pending:{call_id}",
                 }
             ],
 
@@ -3188,6 +5210,35 @@ def build_selected_keyboard(
                 }
             ],
 
+            [
+                {
+                    "text":
+                        "👤 Изменить менеджера",
+
+                    "callback_data":
+                        f"manager_back:{call_id}",
+                }
+            ],
+        ]
+    }
+
+
+def build_missed_manager_keyboard(
+    call_id: int,
+    manager_name: str,
+):
+
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text":
+                        f"👤 Ответственный: {manager_name}",
+
+                    "callback_data":
+                        f"manager_selected:{call_id}",
+                }
+            ],
             [
                 {
                     "text":
@@ -3583,7 +5634,9 @@ def mark_client_result(
                 id,
                 client_key,
                 client_number,
+                client_window_id,
                 is_internal_contact,
+                answered,
                 start_time,
                 talk_manager_code,
                 talk_manager_name
@@ -3621,55 +5674,83 @@ def mark_client_result(
                 "Результат для этого номера недоступен"
             )
 
+        if not call["answered"]:
+            conn.rollback()
+            raise ValueError(
+                "Результат доступен только для отвеченного звонка"
+            )
+
+        client_window_id = call[
+            "client_window_id"
+        ]
+
+        if not client_window_id:
+            client_window_id = (
+                assign_call_client_window(
+                    conn,
+                    call_id,
+                    client_key,
+                    call["start_time"],
+                    call["is_internal_contact"],
+                )
+            )
+
+        window = conn.execute(
+            """
+            SELECT *
+
+            FROM client_windows
+
+            WHERE id = ?
+
+            LIMIT 1
+            """,
+            (
+                client_window_id,
+            ),
+        ).fetchone()
+
+        if not window:
+            conn.rollback()
+            raise ValueError(
+                "Не удалось определить 30-часовую группу клиента"
+            )
+
         existing = conn.execute(
             """
             SELECT *
 
             FROM client_results
 
-            WHERE source_call_id = ?
-
-            ORDER BY marked_at DESC
+            WHERE client_window_id = ?
 
             LIMIT 1
             """,
             (
-                call_id,
+                client_window_id,
             ),
         ).fetchone()
-
-        if not existing:
-            existing = conn.execute(
-                """
-                SELECT *
-
-                FROM client_results
-
-                WHERE
-                    client_key = ?
-                    AND window_ends_at > ?
-
-                ORDER BY window_started_at DESC
-
-                LIMIT 1
-                """,
-                (
-                    client_key,
-                    now_ts,
-                ),
-            ).fetchone()
 
         attribution_time = int(
             call["start_time"]
             or now_ts
         )
 
-        next_window_ends_at = (
-            now_ts
-            + RESULT_COOLDOWN_HOURS
-            * 60
-            * 60
+        result_category = get_result_category(
+            sale_status,
+            reason_code,
         )
+
+        result_revision = conn.execute(
+            """
+            SELECT
+                COALESCE(
+                    MAX(result_revision),
+                    0
+                ) + 1
+            FROM calls
+            """
+        ).fetchone()[0]
 
         if existing:
 
@@ -3683,6 +5764,7 @@ def mark_client_result(
                     source_call_id = ?,
                     attribution_time = ?,
                     sale_status = ?,
+                    result_category = ?,
                     no_sale_reason = ?,
                     no_sale_reason_code = ?,
                     talk_manager_code = ?,
@@ -3690,7 +5772,6 @@ def mark_client_result(
                     marked_at = ?,
                     marked_by = ?,
                     marked_username = ?,
-                    window_ends_at = ?,
                     updated_at = CURRENT_TIMESTAMP
 
                 WHERE id = ?
@@ -3699,6 +5780,7 @@ def mark_client_result(
                     call_id,
                     attribution_time,
                     sale_status,
+                    result_category,
                     reason,
                     reason_code,
                     call["talk_manager_code"],
@@ -3706,7 +5788,6 @@ def mark_client_result(
                     now_ts,
                     marked_by,
                     marked_username,
-                    next_window_ends_at,
                     result_id,
                 ),
             )
@@ -3717,11 +5798,13 @@ def mark_client_result(
                 """
                 INSERT INTO client_results (
                     client_key,
+                    client_window_id,
                     window_started_at,
                     window_ends_at,
                     source_call_id,
                     attribution_time,
                     sale_status,
+                    result_category,
                     no_sale_reason,
                     no_sale_reason_code,
                     talk_manager_code,
@@ -3732,17 +5815,19 @@ def mark_client_result(
                 )
 
                 VALUES (
-                    ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
                     client_key,
-                    now_ts,
-                    next_window_ends_at,
+                    client_window_id,
+                    window["started_at"],
+                    window["ends_at"],
                     call_id,
                     attribution_time,
                     sale_status,
+                    result_category,
                     reason,
                     reason_code,
                     call["talk_manager_code"],
@@ -3764,6 +5849,7 @@ def mark_client_result(
                 no_sale_reason = ?,
                 no_sale_reason_code = ?,
                 sale_marked_at = ?,
+                result_revision = ?,
                 sale_marked_by = ?,
                 sale_marked_username = ?
 
@@ -3774,6 +5860,7 @@ def mark_client_result(
                 reason,
                 reason_code,
                 now_ts,
+                result_revision,
                 marked_by,
                 marked_username,
                 call_id,
@@ -3798,7 +5885,7 @@ def mark_client_result(
         "window_started_at": (
             existing["window_started_at"]
             if existing
-            else now_ts
+            else window["started_at"]
         ),
     }
 
@@ -4043,9 +6130,16 @@ async def telegram_webhook(
                 chat_id,
                 message_id,
 
-                build_sale_keyboard(
-                    call_id,
-                    manager_name,
+                (
+                    build_sale_keyboard(
+                        call_id,
+                        manager_name,
+                    )
+                    if call["answered"]
+                    else build_missed_manager_keyboard(
+                        call_id,
+                        manager_name,
+                    )
                 ),
             )
 
@@ -4165,6 +6259,16 @@ async def telegram_webhook(
                     "ok": True
                 }
 
+            if not call["answered"]:
+                answer_callback_query(
+                    callback_id,
+                    "Результат доступен только для отвеченного звонка",
+                )
+
+                return {
+                    "ok": True
+                }
+
             manager_name = (
                 call[
                     "talk_manager_name"
@@ -4272,6 +6376,17 @@ async def telegram_webhook(
                 answer_callback_query(
                     callback_id,
                     "Для контактов результат не нужен",
+                )
+
+                return {
+                    "ok": True
+                }
+
+            if not call["answered"]:
+
+                answer_callback_query(
+                    callback_id,
+                    "Результат доступен только для отвеченного звонка",
                 )
 
                 return {
@@ -5326,7 +7441,8 @@ def rating_page(
             """
             SELECT
                 score,
-                expires_at
+                expires_at,
+                client_window_id
 
             FROM call_ratings
 
@@ -5339,6 +7455,38 @@ def rating_page(
             ),
         ).fetchone()
 
+        window_score = None
+
+        if (
+            row
+            and row["client_window_id"]
+        ):
+            scored = conn.execute(
+                """
+                SELECT score
+
+                FROM call_ratings
+
+                WHERE
+                    client_window_id = ?
+                    AND score IS NOT NULL
+
+                ORDER BY
+                    rated_at,
+                    id
+
+                LIMIT 1
+                """,
+                (
+                    row["client_window_id"],
+                ),
+            ).fetchone()
+
+            if scored:
+                window_score = scored[
+                    "score"
+                ]
+
     if not row:
         return rating_html_response(
             "Ссылка не найдена",
@@ -5347,12 +7495,18 @@ def rating_page(
             status_code=404,
         )
 
-    if row["score"] is not None:
+    saved_score = (
+        window_score
+        if window_score is not None
+        else row["score"]
+    )
+
+    if saved_score is not None:
         return rating_html_response(
             "Спасибо за оценку!",
             "Ваш ответ уже сохранён.",
             "Javobingiz saqlandi. Rahmat!",
-            selected_score=row["score"],
+            selected_score=saved_score,
         )
 
     if row["expires_at"] < now_ts:
@@ -5424,8 +7578,10 @@ def submit_rating(
         row = conn.execute(
             """
             SELECT
+                id,
                 score,
-                expires_at
+                expires_at,
+                client_window_id
 
             FROM call_ratings
 
@@ -5448,14 +7604,49 @@ def submit_rating(
                 status_code=404,
             )
 
-        if row["score"] is not None:
+        window_score = None
+
+        if row["client_window_id"]:
+            scored = conn.execute(
+                """
+                SELECT score
+
+                FROM call_ratings
+
+                WHERE
+                    client_window_id = ?
+                    AND score IS NOT NULL
+
+                ORDER BY
+                    rated_at,
+                    id
+
+                LIMIT 1
+                """,
+                (
+                    row["client_window_id"],
+                ),
+            ).fetchone()
+
+            if scored:
+                window_score = scored[
+                    "score"
+                ]
+
+        saved_score = (
+            window_score
+            if window_score is not None
+            else row["score"]
+        )
+
+        if saved_score is not None:
             conn.commit()
 
             return rating_html_response(
                 "Спасибо за оценку!",
                 "Первая оценка уже сохранена.",
                 "Birinchi baho saqlangan.",
-                selected_score=row["score"],
+                selected_score=saved_score,
             )
 
         if row["expires_at"] < now_ts:
@@ -5762,7 +7953,7 @@ def stats(
                 )
                     AS avg_answer_delay
 
-            FROM calls
+            FROM reporting_calls
 
             WHERE
                 start_time >= ?
@@ -5770,6 +7961,33 @@ def stats(
                 AND
 
                 start_time < ?
+
+                AND
+
+                COALESCE(
+                    is_internal_contact,
+                    0
+                ) = 0
+            """,
+            (
+                start_ts,
+                end_ts,
+            ),
+        ).fetchone()
+
+        internal_row = conn.execute(
+            """
+            SELECT COUNT(*) AS internal_calls
+
+            FROM reporting_calls
+
+            WHERE
+                start_time >= ?
+                AND start_time < ?
+                AND COALESCE(
+                    is_internal_contact,
+                    0
+                ) = 1
             """,
             (
                 start_ts,
@@ -5788,7 +8006,7 @@ def stats(
                 SELECT DISTINCT
                     client_key
 
-                FROM calls
+                FROM reporting_calls
 
                 WHERE
                     start_time >= ?
@@ -5822,7 +8040,7 @@ def stats(
 
                             SELECT 1
 
-                            FROM calls AS old_call
+                            FROM reporting_calls AS old_call
 
                             WHERE
                                 old_call.client_key =
@@ -5854,7 +8072,7 @@ def stats(
 
                             SELECT 1
 
-                            FROM calls AS old_call
+                            FROM reporting_calls AS old_call
 
                             WHERE
                                 old_call.client_key =
@@ -5896,148 +8114,232 @@ def stats(
 
         missed_row = conn.execute(
             """
-            WITH missed_clients AS (
+            WITH RECURSIVE
+            parameters(cooldown_seconds) AS (
+                VALUES (?)
+            ),
 
+            missed_ordered AS (
                 SELECT
-                    client_key,
+                    call.id,
+                    call.client_key,
+                    call.start_time,
 
-                    MIN(start_time)
-                        AS first_missed_time
+                    ROW_NUMBER() OVER (
+                        PARTITION BY call.client_key
+                        ORDER BY call.start_time, call.id
+                    ) AS row_number
 
-                FROM calls
+                FROM reporting_calls AS call
 
                 WHERE
-                    direction = 0
-
-                    AND
-
-                    answered = 0
-
-                    AND
-
-                    COALESCE(
-                        is_internal_contact,
+                    call.direction = 0
+                    AND call.answered = 0
+                    AND COALESCE(
+                        call.is_internal_contact,
                         0
                     ) = 0
+                    AND call.client_key IS NOT NULL
+                    AND call.client_key != ''
+            ),
 
-                    AND
+            missed_grouped (
+                id,
+                client_key,
+                start_time,
+                row_number,
+                episode_number,
+                episode_started_at
+            ) AS (
+                SELECT
+                    id,
+                    client_key,
+                    start_time,
+                    row_number,
+                    1,
+                    start_time
 
-                    start_time >= ?
+                FROM missed_ordered
 
-                    AND
+                WHERE row_number = 1
 
-                    start_time < ?
+                UNION ALL
 
-                    AND
+                SELECT
+                    current.id,
+                    current.client_key,
+                    current.start_time,
+                    current.row_number,
 
-                    client_key IS NOT NULL
+                    CASE
+                        WHEN current.start_time >=
+                            previous.start_time
+                            + parameters.cooldown_seconds
+                        THEN previous.episode_number + 1
+                        ELSE previous.episode_number
+                    END,
 
-                    AND
+                    CASE
+                        WHEN current.start_time >=
+                            previous.start_time
+                            + parameters.cooldown_seconds
+                        THEN current.start_time
+                        ELSE previous.episode_started_at
+                    END
 
-                    client_key != ''
+                FROM missed_grouped AS previous
+
+                JOIN missed_ordered AS current
+                    ON current.client_key =
+                        previous.client_key
+                    AND current.row_number =
+                        previous.row_number + 1
+
+                CROSS JOIN parameters
+            ),
+
+            missed_episodes AS (
+                SELECT
+                    client_key,
+                    episode_number,
+                    MIN(start_time)
+                        AS first_missed_time,
+                    MAX(start_time)
+                        AS last_missed_time,
+                    MAX(start_time)
+                        + parameters.cooldown_seconds
+                        AS deadline
+
+                FROM missed_grouped
+
+                CROSS JOIN parameters
 
                 GROUP BY
-                    client_key
+                    client_key,
+                    episode_number
+            ),
+
+            period_episodes AS (
+                SELECT *
+
+                FROM missed_episodes
+
+                WHERE
+                    first_missed_time >= ?
+                    AND first_missed_time < ?
+            ),
+
+            episode_flags AS (
+                SELECT
+                    episode.*,
+
+                    EXISTS (
+                        SELECT 1
+                        FROM reporting_calls AS followup
+                        WHERE
+                            followup.client_key =
+                                episode.client_key
+                            AND COALESCE(
+                                followup.is_internal_contact,
+                                0
+                            ) = 0
+                            AND followup.start_time >
+                                episode.last_missed_time
+                            AND followup.start_time <
+                                episode.deadline
+                            AND followup.direction = 1
+                    ) AS outgoing_attempted,
+
+                    EXISTS (
+                        SELECT 1
+                        FROM reporting_calls AS followup
+                        WHERE
+                            followup.client_key =
+                                episode.client_key
+                            AND COALESCE(
+                                followup.is_internal_contact,
+                                0
+                            ) = 0
+                            AND followup.start_time >
+                                episode.last_missed_time
+                            AND followup.start_time <
+                                episode.deadline
+                            AND followup.direction = 1
+                            AND followup.answered = 1
+                    ) AS outgoing_success,
+
+                    EXISTS (
+                        SELECT 1
+                        FROM reporting_calls AS followup
+                        WHERE
+                            followup.client_key =
+                                episode.client_key
+                            AND COALESCE(
+                                followup.is_internal_contact,
+                                0
+                            ) = 0
+                            AND followup.start_time >
+                                episode.last_missed_time
+                            AND followup.start_time <
+                                episode.deadline
+                            AND followup.direction = 0
+                            AND followup.answered = 1
+                    ) AS customer_called_back
+
+                FROM period_episodes AS episode
             )
 
             SELECT
+                COUNT(*) AS unique_missed_clients,
 
-                COUNT(*)
-                    AS unique_missed_clients,
+                COALESCE(
+                    SUM(outgoing_attempted),
+                    0
+                ) AS missed_outgoing_attempted,
 
-                SUM(
-                    CASE
+                COALESCE(
+                    SUM(outgoing_success),
+                    0
+                ) AS missed_outgoing_success,
 
-                        WHEN EXISTS (
+                COALESCE(
+                    SUM(customer_called_back),
+                    0
+                ) AS missed_customer_called_back,
 
-                            SELECT 1
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN
+                                outgoing_success = 1
+                                OR customer_called_back = 1
+                            THEN 1
+                            ELSE 0
+                        END
+                    ),
+                    0
+                ) AS missed_contacted,
 
-                            FROM calls AS callback
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN
+                                outgoing_attempted = 0
+                                AND customer_called_back = 0
+                            THEN 1
+                            ELSE 0
+                        END
+                    ),
+                    0
+                ) AS missed_not_processed
 
-                            WHERE
-                                callback.client_key =
-                                    missed_clients.client_key
-
-                                AND
-
-                                callback.direction = 1
-
-                                AND
-
-                                callback.start_time >
-                                    missed_clients.first_missed_time
-                        )
-
-                        THEN 1
-                        ELSE 0
-
-                    END
-                )
-                    AS missed_called_back,
-
-                SUM(
-                    CASE
-
-                        WHEN EXISTS (
-
-                            SELECT 1
-
-                            FROM calls AS contact
-
-                            WHERE
-                                contact.client_key =
-                                    missed_clients.client_key
-
-                                AND
-
-                                contact.answered = 1
-
-                                AND
-
-                                contact.start_time >
-                                    missed_clients.first_missed_time
-                        )
-
-                        THEN 1
-                        ELSE 0
-
-                    END
-                )
-                    AS missed_contacted,
-
-                SUM(
-                    CASE
-
-                        WHEN NOT EXISTS (
-
-                            SELECT 1
-
-                            FROM calls AS contact
-
-                            WHERE
-                                contact.client_key =
-                                    missed_clients.client_key
-
-                                AND
-
-                                contact.answered = 1
-
-                                AND
-
-                                contact.start_time >
-                                    missed_clients.first_missed_time
-                        )
-
-                        THEN 1
-                        ELSE 0
-
-                    END
-                )
-                    AS missed_not_processed
-
-            FROM missed_clients
+            FROM episode_flags
             """,
             (
+                RESULT_COOLDOWN_HOURS
+                * 60
+                * 60,
+
                 start_ts,
                 end_ts,
             ),
@@ -6049,184 +8351,118 @@ def stats(
 
         sales_row = conn.execute(
             """
+            WITH call_ranked AS (
+                SELECT
+                    call.client_window_id,
+                    call.start_time,
+                    call.talk_manager_code,
+                    call.talk_manager_name,
+
+                    ROW_NUMBER() OVER (
+                        PARTITION BY
+                            call.client_window_id
+                        ORDER BY
+                            call.start_time DESC,
+                            call.id DESC
+                    ) AS row_number
+
+                FROM reporting_calls AS call
+
+                WHERE
+                    COALESCE(
+                        call.is_internal_contact,
+                        0
+                    ) = 0
+                    AND call.client_window_id
+                        IS NOT NULL
+            ),
+
+            outcomes AS (
+                SELECT
+                    window.id,
+                    result.id AS result_id,
+                    result.result_category,
+
+                    COALESCE(
+                        result.attribution_time,
+                        latest_call.start_time
+                    ) AS attribution_time,
+
+                    COALESCE(
+                        NULLIF(
+                            result.talk_manager_code,
+                            ''
+                        ),
+                        NULLIF(
+                            latest_call.talk_manager_code,
+                            ''
+                        )
+                    ) AS manager_code
+
+                FROM client_windows AS window
+
+                JOIN call_ranked AS latest_call
+                    ON latest_call.client_window_id =
+                        window.id
+                    AND latest_call.row_number = 1
+
+                LEFT JOIN client_results AS result
+                    ON result.client_window_id =
+                        window.id
+            )
+
             SELECT
+                COUNT(*) AS eligible_windows,
 
                 SUM(
                     CASE
-                        WHEN sale_status = 'bought'
-
-                        THEN 1
-                        ELSE 0
+                        WHEN result_category = 'bought'
+                        THEN 1 ELSE 0
                     END
-                )
-                    AS bought,
+                ) AS bought,
 
                 SUM(
                     CASE
-                        WHEN sale_status = 'not_bought'
-
-                        THEN 1
-                        ELSE 0
+                        WHEN result_category = 'lost'
+                        THEN 1 ELSE 0
                     END
-                )
-                    AS not_bought
+                ) AS not_bought,
 
-            FROM client_results
+                SUM(
+                    CASE
+                        WHEN result_category = 'pending'
+                        THEN 1 ELSE 0
+                    END
+                ) AS pending,
+
+                SUM(
+                    CASE
+                        WHEN result_category = 'non_target'
+                        THEN 1 ELSE 0
+                    END
+                ) AS non_target,
+
+                SUM(
+                    CASE
+                        WHEN result_id IS NULL
+                        THEN 1 ELSE 0
+                    END
+                ) AS sale_unmarked,
+
+                SUM(
+                    CASE
+                        WHEN manager_code IS NULL
+                        THEN 1 ELSE 0
+                    END
+                ) AS manager_unmarked
+
+            FROM outcomes
 
             WHERE
                 attribution_time >= ?
-
-                AND
-
-                attribution_time < ?
+                AND attribution_time < ?
             """,
             (
-                start_ts,
-                end_ts,
-            ),
-        ).fetchone()
-
-        unmarked_row = conn.execute(
-            """
-            SELECT
-
-                COUNT(
-                    DISTINCT
-
-                    CASE
-                        WHEN
-                            answered = 1
-
-                            AND
-
-                            COALESCE(
-                                is_internal_contact,
-                                0
-                            ) = 0
-
-                            AND
-
-                            client_key IS NOT NULL
-
-                            AND
-
-                            client_key != ''
-
-                            AND
-
-                            NOT EXISTS (
-                                SELECT 1
-
-                                FROM client_results
-                                    AS result
-
-                                WHERE
-                                    result.client_key =
-                                        calls.client_key
-
-                                    AND
-
-                                    (
-                                        (
-                                            result.attribution_time
-                                                >= ?
-
-                                            AND
-
-                                            result.attribution_time
-                                                < ?
-                                        )
-
-                                        OR
-
-                                        (
-                                            result.window_started_at
-                                                <= calls.start_time
-
-                                            AND
-
-                                            result.window_ends_at
-                                                > calls.start_time
-                                        )
-                                    )
-                            )
-
-                        THEN client_key
-                    END
-                )
-                    AS sale_unmarked,
-
-                COUNT(
-                    DISTINCT
-
-                    CASE
-                        WHEN
-                            answered = 1
-
-                            AND
-
-                            COALESCE(
-                                is_internal_contact,
-                                0
-                            ) = 0
-
-                            AND
-
-                            client_key IS NOT NULL
-
-                            AND
-
-                            client_key != ''
-
-                            AND
-
-                            NOT EXISTS (
-                                SELECT 1
-
-                                FROM calls AS managed_call
-
-                                WHERE
-                                    managed_call.client_key =
-                                        calls.client_key
-
-                                    AND
-
-                                    managed_call.start_time >= ?
-
-                                    AND
-
-                                    managed_call.start_time < ?
-
-                                    AND
-
-                                    managed_call.talk_manager_code
-                                        IS NOT NULL
-
-                                    AND
-
-                                    managed_call.talk_manager_code
-                                        != ''
-                            )
-
-                        THEN client_key
-                    END
-                )
-                    AS manager_unmarked
-
-            FROM calls
-
-            WHERE
-                start_time >= ?
-
-                AND
-
-                start_time < ?
-            """,
-            (
-                start_ts,
-                end_ts,
-                start_ts,
-                end_ts,
                 start_ts,
                 end_ts,
             ),
@@ -6234,17 +8470,73 @@ def stats(
 
         ratings_row = conn.execute(
             """
+            WITH rating_ranked AS (
+                SELECT
+                    rating.*,
+
+                    ROW_NUMBER() OVER (
+                        PARTITION BY COALESCE(
+                            CAST(
+                                rating.client_window_id
+                                AS TEXT
+                            ),
+                            'rating:'
+                            || CAST(
+                                rating.id AS TEXT
+                            )
+                        )
+
+                        ORDER BY
+                            CASE
+                                WHEN rating.score
+                                    IS NOT NULL
+                                THEN 0
+                                ELSE 1
+                            END,
+                            COALESCE(
+                                rating.rated_at,
+                                rating.sms_sent_at,
+                                rating.sms_reserved_at
+                            ),
+                            rating.id
+                    ) AS row_number,
+
+                    MAX(
+                        CASE
+                            WHEN
+                                rating.sms_sent_at
+                                    IS NOT NULL
+                                OR rating.score
+                                    IS NOT NULL
+                            THEN 1
+                            ELSE 0
+                        END
+                    ) OVER (
+                        PARTITION BY COALESCE(
+                            CAST(
+                                rating.client_window_id
+                                AS TEXT
+                            ),
+                            'rating:'
+                            || CAST(
+                                rating.id AS TEXT
+                            )
+                        )
+                    ) AS invited
+
+                FROM call_ratings AS rating
+            ),
+
+            canonical_ratings AS (
+                SELECT *
+                FROM rating_ranked
+                WHERE row_number = 1
+            )
+
             SELECT
-                COUNT(
-                    CASE
-                        WHEN
-                            rating.sms_sent_at
-                                IS NOT NULL
-                            OR
-                            rating.score
-                                IS NOT NULL
-                        THEN 1
-                    END
+                COALESCE(
+                    SUM(rating.invited),
+                    0
                 )
                     AS invitations_sent,
 
@@ -6294,10 +8586,10 @@ def stats(
                     END
                 ) AS score_5
 
-            FROM calls AS call
+            FROM canonical_ratings AS rating
 
-            LEFT JOIN call_ratings AS rating
-                ON rating.call_id = call.id
+            JOIN reporting_calls AS call
+                ON call.id = rating.call_id
 
             WHERE
                 call.start_time >= ?
@@ -6361,12 +8653,32 @@ def stats(
         or 0
     )
 
+    pending = (
+        sales_row["pending"]
+        or 0
+    )
+
+    non_target = (
+        sales_row["non_target"]
+        or 0
+    )
+
+    sale_unmarked = (
+        sales_row["sale_unmarked"]
+        or 0
+    )
+
+    eligible_windows = (
+        sales_row["eligible_windows"]
+        or 0
+    )
+
     marked_results = (
         bought
         + not_bought
     )
 
-    sale_conversion = (
+    processed_sale_conversion = (
         round(
             (
                 bought
@@ -6377,6 +8689,25 @@ def stats(
         )
 
         if marked_results
+        else 0
+    )
+
+    overall_denominator = max(
+        eligible_windows
+        - non_target,
+        0,
+    )
+
+    sale_conversion = (
+        round(
+            (
+                bought
+                / overall_denominator
+            )
+            * 100,
+            1,
+        )
+        if overall_denominator
         else 0
     )
 
@@ -6431,7 +8762,7 @@ def stats(
                 or 0,
 
             "internal_calls":
-                row[
+                internal_row[
                     "internal_calls"
                 ]
                 or 0,
@@ -6472,6 +8803,9 @@ def stats(
                 ]
                 or 0,
 
+            "client_windows_30h":
+                eligible_windows,
+
             "unique_missed_clients":
                 missed_row[
                     "unique_missed_clients"
@@ -6480,7 +8814,25 @@ def stats(
 
             "missed_called_back":
                 missed_row[
-                    "missed_called_back"
+                    "missed_outgoing_attempted"
+                ]
+                or 0,
+
+            "missed_outgoing_attempted":
+                missed_row[
+                    "missed_outgoing_attempted"
+                ]
+                or 0,
+
+            "missed_outgoing_success":
+                missed_row[
+                    "missed_outgoing_success"
+                ]
+                or 0,
+
+            "missed_customer_called_back":
+                missed_row[
+                    "missed_customer_called_back"
                 ]
                 or 0,
 
@@ -6524,20 +8876,26 @@ def stats(
             "not_bought":
                 not_bought,
 
+            "pending":
+                pending,
+
+            "non_target":
+                non_target,
+
             "sale_unmarked":
-                unmarked_row[
-                    "sale_unmarked"
-                ]
-                or 0,
+                sale_unmarked,
 
             "manager_unmarked":
-                unmarked_row[
+                sales_row[
                     "manager_unmarked"
                 ]
                 or 0,
 
             "sale_conversion":
                 sale_conversion,
+
+            "processed_sale_conversion":
+                processed_sale_conversion,
 
             "average_rating":
                 (
@@ -6623,8 +8981,8 @@ def stats_sales_reasons(
 
                 AND
 
-                sale_status =
-                    'not_bought'
+                result_category =
+                    'lost'
 
             GROUP BY
                 no_sale_reason_code,
@@ -6722,7 +9080,7 @@ def stats_timeline(
                     )
                         AS outgoing
 
-                FROM calls
+                FROM reporting_calls
 
                 WHERE
                     start_time >= ?
@@ -6730,6 +9088,13 @@ def stats_timeline(
                     AND
 
                     start_time < ?
+
+                    AND
+
+                    COALESCE(
+                        is_internal_contact,
+                        0
+                    ) = 0
 
                 GROUP BY bucket
 
@@ -6751,8 +9116,8 @@ def stats_timeline(
             points = []
 
             for hour in range(
-                8,
-                23,
+                0,
+                24,
             ):
 
                 row = by_hour.get(
@@ -6826,7 +9191,7 @@ def stats_timeline(
                     )
                         AS outgoing
 
-                FROM calls
+                FROM reporting_calls
 
                 WHERE
                     start_time >= ?
@@ -6834,6 +9199,13 @@ def stats_timeline(
                     AND
 
                     start_time < ?
+
+                    AND
+
+                    COALESCE(
+                        is_internal_contact,
+                        0
+                    ) = 0
 
                 GROUP BY bucket
 
@@ -6949,427 +9321,695 @@ def stats_managers(
         date_to,
     )
 
+    start_ts = p["start_ts"]
+    end_ts = p["end_ts"]
+
     with connect_db() as conn:
 
         rows = conn.execute(
             """
-            SELECT
+            WITH rating_ranked AS (
+                SELECT
+                    rating.*,
 
+                    ROW_NUMBER() OVER (
+                        PARTITION BY COALESCE(
+                            CAST(
+                                rating.client_window_id
+                                AS TEXT
+                            ),
+                            'rating:'
+                            || CAST(rating.id AS TEXT)
+                        )
+                        ORDER BY
+                            CASE
+                                WHEN rating.score IS NOT NULL
+                                THEN 0 ELSE 1
+                            END,
+                            COALESCE(
+                                rating.rated_at,
+                                rating.sms_sent_at,
+                                rating.sms_reserved_at
+                            ),
+                            rating.id
+                    ) AS row_number,
+
+                    MAX(
+                        CASE
+                            WHEN
+                                rating.sms_sent_at IS NOT NULL
+                                OR rating.score IS NOT NULL
+                            THEN 1 ELSE 0
+                        END
+                    ) OVER (
+                        PARTITION BY COALESCE(
+                            CAST(
+                                rating.client_window_id
+                                AS TEXT
+                            ),
+                            'rating:'
+                            || CAST(rating.id AS TEXT)
+                        )
+                    ) AS invited
+
+                FROM call_ratings AS rating
+            ),
+
+            canonical_ratings AS (
+                SELECT *
+                FROM rating_ranked
+                WHERE row_number = 1
+            )
+
+            SELECT
                 COALESCE(
                     NULLIF(
-                        talk_manager_name,
+                        call.talk_manager_code,
                         ''
                     ),
-                    'Не указан'
-                )
-                    AS manager,
+                    'unmarked'
+                ) AS manager_code,
 
-                COUNT(*)
-                    AS calls,
-
-                COUNT(
-                    DISTINCT
-
-                    CASE
-                        WHEN
-                            COALESCE(
-                                is_internal_contact,
-                                0
-                            ) = 0
-
-                            AND
-
-                            client_key IS NOT NULL
-
-                            AND
-
-                            client_key != ''
-
-                        THEN client_key
-                    END
-                )
-                    AS unique_clients,
-
-                SUM(
-                    CASE
-                        WHEN direction = 0
-                        THEN 1
-                        ELSE 0
-                    END
-                )
-                    AS incoming,
-
-                SUM(
-                    CASE
-                        WHEN direction = 1
-                        THEN 1
-                        ELSE 0
-                    END
-                )
-                    AS outgoing,
-
-                SUM(
-                    CASE
-                        WHEN
-                            direction = 0
-
-                            AND
-
-                            answered = 0
-
-                            AND
-
-                            COALESCE(
-                                is_internal_contact,
-                                0
-                            ) = 0
-
-                        THEN 1
-                        ELSE 0
-                    END
-                )
-                    AS missed,
-
-                SUM(
-                    CASE
-                        WHEN
-                            direction = 0
-
-                            AND
-
-                            answered = 1
-
-                        THEN 1
-                        ELSE 0
-                    END
-                )
-                    AS incoming_answered,
-
-                SUM(
-                    CASE
-                        WHEN answered = 1
-                        THEN duration
-                        ELSE 0
-                    END
-                )
-                    AS total_duration,
-
-                SUM(
-                    CASE
-                        WHEN
-                            COALESCE(
-                                is_internal_contact,
-                                0
-                            ) = 0
-
-                            AND
-
-                            sale_status =
-                                'bought'
-
-                        THEN 1
-                        ELSE 0
-                    END
-                )
-                    AS bought,
-
-                SUM(
-                    CASE
-                        WHEN
-                            COALESCE(
-                                is_internal_contact,
-                                0
-                            ) = 0
-
-                            AND
-
-                            sale_status =
-                                'not_bought'
-
-                        THEN 1
-                        ELSE 0
-                    END
-                )
-                    AS not_bought,
-
-                SUM(
-                    CASE
-                        WHEN
-                            COALESCE(
-                                is_internal_contact,
-                                0
-                            ) = 1
-
-                        THEN 1
-                        ELSE 0
-                    END
-                )
-                    AS internal_calls,
-
-                COUNT(rating.score)
-                    AS ratings_count,
-
-                AVG(rating.score)
-                    AS average_rating,
-
-                COUNT(
-                    CASE
-                        WHEN
-                            rating.sms_sent_at
-                                IS NOT NULL
-                            OR
-                            rating.score
-                                IS NOT NULL
-                        THEN 1
-                    END
-                )
-                    AS rating_invitations_sent
-
-            FROM calls
-
-            LEFT JOIN (
-                SELECT
-                    call_id,
-                    score,
-                    sms_sent_at
-
-                FROM call_ratings
-            ) AS rating
-                ON rating.call_id = calls.id
-
-            WHERE
-                start_time >= ?
-
-                AND
-
-                start_time < ?
-
-            GROUP BY
-                manager
-
-            ORDER BY
-                calls DESC
-            """,
-            (
-                p["start_ts"],
-                p["end_ts"],
-            ),
-        ).fetchall()
-
-        result_rows = conn.execute(
-            """
-            SELECT
                 COALESCE(
                     NULLIF(
-                        talk_manager_name,
+                        call.talk_manager_name,
                         ''
                     ),
                     'Не указан'
                 ) AS manager,
 
+                COUNT(*) AS calls,
+                COUNT(
+                    DISTINCT NULLIF(
+                        call.client_key,
+                        ''
+                    )
+                ) AS unique_clients,
+
+                SUM(
+                    CASE WHEN call.direction = 0
+                    THEN 1 ELSE 0 END
+                ) AS incoming,
+
+                SUM(
+                    CASE WHEN call.direction = 1
+                    THEN 1 ELSE 0 END
+                ) AS outgoing,
+
                 SUM(
                     CASE
-                        WHEN sale_status = 'bought'
-                        THEN 1
-                        ELSE 0
+                        WHEN call.direction = 0
+                            AND call.answered = 0
+                        THEN 1 ELSE 0
                     END
+                ) AS missed,
+
+                SUM(
+                    CASE
+                        WHEN call.direction = 0
+                            AND call.answered = 1
+                        THEN 1 ELSE 0
+                    END
+                ) AS incoming_answered,
+
+                SUM(
+                    CASE WHEN call.answered = 1
+                    THEN call.duration ELSE 0 END
+                ) AS total_duration,
+
+                COUNT(rating.score)
+                    AS ratings_count,
+                AVG(rating.score)
+                    AS average_rating,
+                COALESCE(
+                    SUM(rating.invited),
+                    0
+                ) AS rating_invitations_sent
+
+            FROM reporting_calls AS call
+
+            LEFT JOIN canonical_ratings AS rating
+                ON rating.call_id = call.id
+
+            WHERE
+                call.start_time >= ?
+                AND call.start_time < ?
+                AND COALESCE(
+                    call.is_internal_contact,
+                    0
+                ) = 0
+
+            GROUP BY
+                manager_code,
+                manager
+
+            ORDER BY calls DESC
+            """,
+            (
+                start_ts,
+                end_ts,
+            ),
+        ).fetchall()
+
+        outcome_rows = conn.execute(
+            """
+            WITH call_ranked AS (
+                SELECT
+                    call.client_window_id,
+                    call.start_time,
+                    call.talk_manager_code,
+                    call.talk_manager_name,
+
+                    ROW_NUMBER() OVER (
+                        PARTITION BY
+                            call.client_window_id
+                        ORDER BY
+                            call.start_time DESC,
+                            call.id DESC
+                    ) AS row_number
+
+                FROM reporting_calls AS call
+
+                WHERE
+                    COALESCE(
+                        call.is_internal_contact,
+                        0
+                    ) = 0
+                    AND call.client_window_id
+                        IS NOT NULL
+            ),
+
+            outcomes AS (
+                SELECT
+                    window.id,
+                    result.id AS result_id,
+                    result.result_category,
+
+                    COALESCE(
+                        result.attribution_time,
+                        latest_call.start_time
+                    ) AS attribution_time,
+
+                    COALESCE(
+                        NULLIF(
+                            result.talk_manager_code,
+                            ''
+                        ),
+                        NULLIF(
+                            latest_call.talk_manager_code,
+                            ''
+                        ),
+                        'unmarked'
+                    ) AS manager_code,
+
+                    COALESCE(
+                        NULLIF(
+                            result.talk_manager_name,
+                            ''
+                        ),
+                        NULLIF(
+                            latest_call.talk_manager_name,
+                            ''
+                        ),
+                        'Не указан'
+                    ) AS manager
+
+                FROM client_windows AS window
+
+                JOIN call_ranked AS latest_call
+                    ON latest_call.client_window_id =
+                        window.id
+                    AND latest_call.row_number = 1
+
+                LEFT JOIN client_results AS result
+                    ON result.client_window_id =
+                        window.id
+            )
+
+            SELECT
+                manager_code,
+                manager,
+                COUNT(*) AS eligible_windows,
+
+                SUM(
+                    CASE WHEN result_category = 'bought'
+                    THEN 1 ELSE 0 END
                 ) AS bought,
 
                 SUM(
-                    CASE
-                        WHEN sale_status = 'not_bought'
-                        THEN 1
-                        ELSE 0
-                    END
-                ) AS not_bought
+                    CASE WHEN result_category = 'lost'
+                    THEN 1 ELSE 0 END
+                ) AS not_bought,
 
-            FROM client_results
+                SUM(
+                    CASE WHEN result_category = 'pending'
+                    THEN 1 ELSE 0 END
+                ) AS pending,
+
+                SUM(
+                    CASE WHEN result_category = 'non_target'
+                    THEN 1 ELSE 0 END
+                ) AS non_target,
+
+                SUM(
+                    CASE WHEN result_id IS NULL
+                    THEN 1 ELSE 0 END
+                ) AS sale_unmarked
+
+            FROM outcomes
 
             WHERE
                 attribution_time >= ?
                 AND attribution_time < ?
 
-            GROUP BY manager
+            GROUP BY manager_code, manager
             """,
             (
-                p["start_ts"],
-                p["end_ts"],
+                start_ts,
+                end_ts,
             ),
         ).fetchall()
 
-    manager_results = {
-        row["manager"]: row
-        for row in result_rows
+        missed_rows = conn.execute(
+            """
+            WITH RECURSIVE
+            parameters(cooldown_seconds) AS (
+                VALUES (?)
+            ),
+
+            missed_ordered AS (
+                SELECT
+                    call.id,
+                    call.client_key,
+                    call.start_time,
+                    call.talk_manager_code,
+                    call.talk_manager_name,
+
+                    ROW_NUMBER() OVER (
+                        PARTITION BY call.client_key
+                        ORDER BY call.start_time, call.id
+                    ) AS row_number
+
+                FROM reporting_calls AS call
+
+                WHERE
+                    call.direction = 0
+                    AND call.answered = 0
+                    AND COALESCE(
+                        call.is_internal_contact,
+                        0
+                    ) = 0
+                    AND call.client_key IS NOT NULL
+                    AND call.client_key != ''
+            ),
+
+            missed_grouped (
+                id,
+                client_key,
+                start_time,
+                talk_manager_code,
+                talk_manager_name,
+                row_number,
+                episode_number,
+                episode_started_at
+            ) AS (
+                SELECT
+                    id,
+                    client_key,
+                    start_time,
+                    talk_manager_code,
+                    talk_manager_name,
+                    row_number,
+                    1,
+                    start_time
+
+                FROM missed_ordered
+                WHERE row_number = 1
+
+                UNION ALL
+
+                SELECT
+                    current.id,
+                    current.client_key,
+                    current.start_time,
+                    current.talk_manager_code,
+                    current.talk_manager_name,
+                    current.row_number,
+
+                    CASE
+                        WHEN current.start_time >=
+                            previous.start_time
+                            + parameters.cooldown_seconds
+                        THEN previous.episode_number + 1
+                        ELSE previous.episode_number
+                    END,
+
+                    CASE
+                        WHEN current.start_time >=
+                            previous.start_time
+                            + parameters.cooldown_seconds
+                        THEN current.start_time
+                        ELSE previous.episode_started_at
+                    END
+
+                FROM missed_grouped AS previous
+
+                JOIN missed_ordered AS current
+                    ON current.client_key =
+                        previous.client_key
+                    AND current.row_number =
+                        previous.row_number + 1
+
+                CROSS JOIN parameters
+            ),
+
+            missed_ranked AS (
+                SELECT
+                    *,
+
+                    ROW_NUMBER() OVER (
+                        PARTITION BY
+                            client_key,
+                            episode_number
+                        ORDER BY
+                            CASE
+                                WHEN talk_manager_code
+                                    IS NOT NULL
+                                    AND talk_manager_code != ''
+                                THEN 0 ELSE 1
+                            END,
+                            start_time DESC,
+                            id DESC
+                    ) AS manager_rank
+
+                FROM missed_grouped
+            ),
+
+            missed_episodes AS (
+                SELECT
+                    ranked.client_key,
+                    ranked.episode_number,
+                    MIN(ranked.start_time)
+                        AS first_missed_time,
+                    MAX(ranked.start_time)
+                        AS last_missed_time,
+                    MAX(ranked.start_time)
+                        + parameters.cooldown_seconds
+                        AS deadline,
+                    COALESCE(
+                        MAX(
+                            CASE
+                                WHEN manager_rank = 1
+                                THEN talk_manager_code
+                            END
+                        ),
+                        'unmarked'
+                    ) AS manager_code,
+                    COALESCE(
+                        MAX(
+                            CASE
+                                WHEN manager_rank = 1
+                                THEN talk_manager_name
+                            END
+                        ),
+                        'Не указан'
+                    ) AS manager
+
+                FROM missed_ranked AS ranked
+                CROSS JOIN parameters
+
+                GROUP BY
+                    ranked.client_key,
+                    ranked.episode_number
+            ),
+
+            episode_flags AS (
+                SELECT
+                    episode.*,
+
+                    EXISTS (
+                        SELECT 1
+                        FROM reporting_calls AS followup
+                        WHERE
+                            followup.client_key =
+                                episode.client_key
+                            AND COALESCE(
+                                followup.is_internal_contact,
+                                0
+                            ) = 0
+                            AND followup.start_time >
+                                episode.last_missed_time
+                            AND followup.start_time <
+                                episode.deadline
+                            AND followup.direction = 1
+                    ) AS outgoing_attempted,
+
+                    EXISTS (
+                        SELECT 1
+                        FROM reporting_calls AS followup
+                        WHERE
+                            followup.client_key =
+                                episode.client_key
+                            AND COALESCE(
+                                followup.is_internal_contact,
+                                0
+                            ) = 0
+                            AND followup.start_time >
+                                episode.last_missed_time
+                            AND followup.start_time <
+                                episode.deadline
+                            AND followup.direction = 1
+                            AND followup.answered = 1
+                    ) AS outgoing_success,
+
+                    EXISTS (
+                        SELECT 1
+                        FROM reporting_calls AS followup
+                        WHERE
+                            followup.client_key =
+                                episode.client_key
+                            AND COALESCE(
+                                followup.is_internal_contact,
+                                0
+                            ) = 0
+                            AND followup.start_time >
+                                episode.last_missed_time
+                            AND followup.start_time <
+                                episode.deadline
+                            AND followup.direction = 0
+                            AND followup.answered = 1
+                    ) AS customer_called_back
+
+                FROM missed_episodes AS episode
+
+                WHERE
+                    episode.first_missed_time >= ?
+                    AND episode.first_missed_time < ?
+            )
+
+            SELECT
+                manager_code,
+                manager,
+                COUNT(*) AS missed_episodes,
+                SUM(outgoing_attempted)
+                    AS missed_outgoing_attempted,
+                SUM(outgoing_success)
+                    AS missed_outgoing_success,
+                SUM(customer_called_back)
+                    AS missed_customer_called_back,
+                SUM(
+                    CASE
+                        WHEN outgoing_attempted = 0
+                            AND customer_called_back = 0
+                        THEN 1 ELSE 0
+                    END
+                ) AS missed_not_processed
+
+            FROM episode_flags
+
+            GROUP BY manager_code, manager
+            """,
+            (
+                RESULT_COOLDOWN_HOURS
+                * 60
+                * 60,
+                start_ts,
+                end_ts,
+            ),
+        ).fetchall()
+
+    manager_outcomes = {
+        row["manager_code"]: row
+        for row in outcome_rows
+    }
+
+    manager_missed = {
+        row["manager_code"]: row
+        for row in missed_rows
     }
 
     results = []
 
     for row in rows:
 
-        incoming = (
-            row["incoming"]
-            or 0
+        manager_code = row["manager_code"]
+        outcome = manager_outcomes.get(
+            manager_code
+        )
+        missed_metrics = manager_missed.get(
+            manager_code
         )
 
+        incoming = row["incoming"] or 0
         incoming_answered = (
-            row[
-                "incoming_answered"
-            ]
-            or 0
+            row["incoming_answered"] or 0
         )
 
-        manager_result = manager_results.get(
-            row["manager"]
-        )
-
+        eligible_windows = (
+            outcome["eligible_windows"]
+            if outcome else 0
+        ) or 0
         bought = (
-            manager_result["bought"]
-            if manager_result
-            else 0
+            outcome["bought"]
+            if outcome else 0
         ) or 0
-
         not_bought = (
-            manager_result["not_bought"]
-            if manager_result
-            else 0
+            outcome["not_bought"]
+            if outcome else 0
         ) or 0
-
-        marked = (
-            bought
-            + not_bought
-        )
+        pending = (
+            outcome["pending"]
+            if outcome else 0
+        ) or 0
+        non_target = (
+            outcome["non_target"]
+            if outcome else 0
+        ) or 0
+        sale_unmarked = (
+            outcome["sale_unmarked"]
+            if outcome else 0
+        ) or 0
 
         ratings_count = (
-            row[
-                "ratings_count"
-            ]
+            row["ratings_count"] or 0
+        )
+        invitations = (
+            row["rating_invitations_sent"]
             or 0
         )
-
-        rating_invitations_sent = (
-            row[
-                "rating_invitations_sent"
-            ]
-            or 0
+        processed = bought + not_bought
+        overall_denominator = max(
+            eligible_windows - non_target,
+            0,
         )
 
         results.append(
             {
-                "manager":
-                    row["manager"],
-
-                "calls":
-                    row["calls"]
-                    or 0,
-
-                "unique_clients":
-                    row[
-                        "unique_clients"
+                "manager_code": manager_code,
+                "manager": row["manager"],
+                "calls": row["calls"] or 0,
+                "unique_clients": (
+                    row["unique_clients"] or 0
+                ),
+                "incoming": incoming,
+                "outgoing": row["outgoing"] or 0,
+                "missed": row["missed"] or 0,
+                "internal_calls": 0,
+                "answer_rate": (
+                    round(
+                        incoming_answered
+                        / incoming
+                        * 100,
+                        1,
+                    )
+                    if incoming else 0
+                ),
+                "total_duration_seconds": (
+                    row["total_duration"] or 0
+                ),
+                "eligible_windows": eligible_windows,
+                "bought": bought,
+                "not_bought": not_bought,
+                "pending": pending,
+                "non_target": non_target,
+                "sale_unmarked": sale_unmarked,
+                "sale_conversion": (
+                    round(
+                        bought
+                        / overall_denominator
+                        * 100,
+                        1,
+                    )
+                    if overall_denominator else 0
+                ),
+                "processed_sale_conversion": (
+                    round(
+                        bought
+                        / processed
+                        * 100,
+                        1,
+                    )
+                    if processed else 0
+                ),
+                "average_rating": (
+                    round(
+                        float(
+                            row["average_rating"]
+                        ),
+                        2,
+                    )
+                    if row["average_rating"]
+                        is not None
+                    else None
+                ),
+                "ratings_count": ratings_count,
+                "rating_invitations_sent": (
+                    invitations
+                ),
+                "rating_response_rate": (
+                    round(
+                        ratings_count
+                        / invitations
+                        * 100,
+                        1,
+                    )
+                    if invitations else 0
+                ),
+                "missed_episodes": (
+                    missed_metrics[
+                        "missed_episodes"
                     ]
-                    or 0,
-
-                "incoming":
-                    incoming,
-
-                "outgoing":
-                    row["outgoing"]
-                    or 0,
-
-                "missed":
-                    row["missed"]
-                    or 0,
-
-                "internal_calls":
-                    row[
-                        "internal_calls"
+                    if missed_metrics else 0
+                ) or 0,
+                "missed_outgoing_attempted": (
+                    missed_metrics[
+                        "missed_outgoing_attempted"
                     ]
-                    or 0,
-
-                "answer_rate":
-                    (
-                        round(
-                            (
-                                incoming_answered
-                                / incoming
-                            )
-                            * 100,
-                            1,
-                        )
-
-                        if incoming
-
-                        else 0
-                    ),
-
-                "total_duration_seconds":
-                    row[
-                        "total_duration"
+                    if missed_metrics else 0
+                ) or 0,
+                "missed_outgoing_success": (
+                    missed_metrics[
+                        "missed_outgoing_success"
                     ]
-                    or 0,
-
-                "bought":
-                    bought,
-
-                "not_bought":
-                    not_bought,
-
-                "sale_conversion":
-                    (
-                        round(
-                            (
-                                bought
-                                / marked
-                            )
-                            * 100,
-                            1,
-                        )
-
-                        if marked
-
-                        else 0
-                    ),
-
-                "average_rating":
-                    (
-                        round(
-                            float(
-                                row[
-                                    "average_rating"
-                                ]
-                            ),
-                            2,
-                        )
-                        if row[
-                            "average_rating"
-                        ] is not None
-                        else None
-                    ),
-
-                "ratings_count":
-                    ratings_count,
-
-                "rating_invitations_sent":
-                    rating_invitations_sent,
-
-                "rating_response_rate":
-                    (
-                        round(
-                            (
-                                ratings_count
-                                / rating_invitations_sent
-                            )
-                            * 100,
-                            1,
-                        )
-                        if rating_invitations_sent
-                        else 0
-                    ),
+                    if missed_metrics else 0
+                ) or 0,
+                "missed_customer_called_back": (
+                    missed_metrics[
+                        "missed_customer_called_back"
+                    ]
+                    if missed_metrics else 0
+                ) or 0,
+                "missed_not_processed": (
+                    missed_metrics[
+                        "missed_not_processed"
+                    ]
+                    if missed_metrics else 0
+                ) or 0,
             }
         )
 
     return {
-        "results":
-            results
+        "results": results
     }
 
 
@@ -7396,6 +10036,59 @@ def stats_ratings_daily(
 
         rows = conn.execute(
             """
+            WITH rating_ranked AS (
+                SELECT
+                    rating.*,
+
+                    ROW_NUMBER() OVER (
+                        PARTITION BY COALESCE(
+                            CAST(
+                                rating.client_window_id
+                                AS TEXT
+                            ),
+                            'rating:'
+                            || CAST(rating.id AS TEXT)
+                        )
+                        ORDER BY
+                            CASE
+                                WHEN rating.score IS NOT NULL
+                                THEN 0 ELSE 1
+                            END,
+                            COALESCE(
+                                rating.rated_at,
+                                rating.sms_sent_at,
+                                rating.sms_reserved_at
+                            ),
+                            rating.id
+                    ) AS row_number,
+
+                    MAX(
+                        CASE
+                            WHEN
+                                rating.sms_sent_at IS NOT NULL
+                                OR rating.score IS NOT NULL
+                            THEN 1 ELSE 0
+                        END
+                    ) OVER (
+                        PARTITION BY COALESCE(
+                            CAST(
+                                rating.client_window_id
+                                AS TEXT
+                            ),
+                            'rating:'
+                            || CAST(rating.id AS TEXT)
+                        )
+                    ) AS invited
+
+                FROM call_ratings AS rating
+            ),
+
+            canonical_ratings AS (
+                SELECT *
+                FROM rating_ranked
+                WHERE row_number = 1
+            )
+
             SELECT
                 date(
                     datetime(
@@ -7430,23 +10123,16 @@ def stats_ratings_daily(
                 AVG(rating.score)
                     AS average_rating,
 
-                COUNT(
-                    CASE
-                        WHEN
-                            rating.sms_sent_at
-                                IS NOT NULL
-                            OR
-                            rating.score
-                                IS NOT NULL
-                        THEN 1
-                    END
+                COALESCE(
+                    SUM(rating.invited),
+                    0
                 )
                     AS invitations_sent
 
-            FROM calls AS call
+            FROM canonical_ratings AS rating
 
-            LEFT JOIN call_ratings AS rating
-                ON rating.call_id = call.id
+            JOIN reporting_calls AS call
+                ON call.id = rating.call_id
 
             WHERE
                 call.start_time >= ?
@@ -7669,7 +10355,7 @@ def stats_sims(
                 )
                     AS total_duration
 
-            FROM calls
+            FROM reporting_calls
 
             WHERE
                 start_time >= ?
@@ -7677,6 +10363,13 @@ def stats_sims(
                 AND
 
                 start_time < ?
+
+                AND
+
+                COALESCE(
+                    is_internal_contact,
+                    0
+                ) = 0
 
             GROUP BY
                 sim,
@@ -7766,6 +10459,41 @@ def stats_recent(
 
         rows = conn.execute(
             """
+            WITH rating_ranked AS (
+                SELECT
+                    rating.*,
+
+                    ROW_NUMBER() OVER (
+                        PARTITION BY COALESCE(
+                            CAST(
+                                rating.client_window_id
+                                AS TEXT
+                            ),
+                            'rating:'
+                            || CAST(rating.id AS TEXT)
+                        )
+                        ORDER BY
+                            CASE
+                                WHEN rating.score IS NOT NULL
+                                THEN 0 ELSE 1
+                            END,
+                            COALESCE(
+                                rating.rated_at,
+                                rating.sms_sent_at,
+                                rating.sms_reserved_at
+                            ),
+                            rating.id
+                    ) AS row_number
+
+                FROM call_ratings AS rating
+            ),
+
+            canonical_ratings AS (
+                SELECT *
+                FROM rating_ranked
+                WHERE row_number = 1
+            )
+
             SELECT
 
                 calls.id AS id,
@@ -7795,15 +10523,18 @@ def stats_recent(
                 client_result.no_sale_reason
                     AS no_sale_reason,
 
+                client_result.result_category
+                    AS result_category,
+
                 rating.score
                     AS customer_rating,
 
                 rating.sms_status
                     AS rating_sms_status
 
-            FROM calls
+            FROM reporting_calls AS calls
 
-            LEFT JOIN call_ratings AS rating
+            LEFT JOIN canonical_ratings AS rating
                 ON rating.call_id = calls.id
 
             LEFT JOIN client_results
@@ -7922,6 +10653,11 @@ def stats_recent(
                 "no_sale_reason":
                     row[
                         "no_sale_reason"
+                    ],
+
+                "result_category":
+                    row[
+                        "result_category"
                     ],
 
                 "customer_rating":
@@ -8577,6 +11313,14 @@ tbody tr:last-child td {
     color: #ffabab;
 }
 
+.sale-pending {
+    color: #d9b565;
+}
+
+.sale-non-target {
+    color: #aaa;
+}
+
 .sale-unmarked {
     color: #777;
 }
@@ -8901,7 +11645,7 @@ tbody tr:last-child td {
 
     <div class="card">
         <div class="label">
-            Всего звонков
+            Клиентские звонки
         </div>
 
         <div
@@ -9021,7 +11765,19 @@ tbody tr:last-child td {
 
     <div class="card">
         <div class="label">
-            Уникально пропущено
+            Клиентские обращения (30 ч)
+        </div>
+
+        <div
+            class="value"
+            id="client_windows_30h"
+        >—</div>
+    </div>
+
+
+    <div class="card">
+        <div class="label">
+            Пропущенные обращения (30 ч)
         </div>
 
         <div
@@ -9033,7 +11789,7 @@ tbody tr:last-child td {
 
     <div class="card">
         <div class="label">
-            Были исходящие после пропущенного
+            Попытались перезвонить за 30 ч
         </div>
 
         <div
@@ -9043,9 +11799,33 @@ tbody tr:last-child td {
     </div>
 
 
+    <div class="card good">
+        <div class="label">
+            Успешно дозвонились за 30 ч
+        </div>
+
+        <div
+            class="value"
+            id="missed_outgoing_success"
+        >—</div>
+    </div>
+
+
+    <div class="card good">
+        <div class="label">
+            Клиент сам перезвонил за 30 ч
+        </div>
+
+        <div
+            class="value"
+            id="missed_customer_called_back"
+        >—</div>
+    </div>
+
+
     <div class="card">
         <div class="label">
-            Связались после пропущенного
+            Связались любым способом за 30 ч
         </div>
 
         <div
@@ -9057,7 +11837,7 @@ tbody tr:last-child td {
 
     <div class="card">
         <div class="label">
-            Не обработано
+            Не обработано за 30 ч
         </div>
 
         <div
@@ -9129,12 +11909,40 @@ tbody tr:last-child td {
     <div class="card bad">
 
         <div class="label">
-            ❌ Не купил
+            ❌ Потерян
         </div>
 
         <div
             class="value"
             id="not_bought"
+        >—</div>
+
+    </div>
+
+
+    <div class="card warn">
+
+        <div class="label">
+            🕓 В работе / ожидает
+        </div>
+
+        <div
+            class="value"
+            id="pending"
+        >—</div>
+
+    </div>
+
+
+    <div class="card">
+
+        <div class="label">
+            🚫 Не целевой
+        </div>
+
+        <div
+            class="value"
+            id="non_target"
         >—</div>
 
     </div>
@@ -9171,12 +11979,26 @@ tbody tr:last-child td {
     <div class="card good">
 
         <div class="label">
-            Конверсия отмеченных
+            Общая конверсия
         </div>
 
         <div
             class="value"
             id="sale_conversion"
+        >—</div>
+
+    </div>
+
+
+    <div class="card good">
+
+        <div class="label">
+            Конверсия завершённых
+        </div>
+
+        <div
+            class="value"
+            id="processed_sale_conversion"
         >—</div>
 
     </div>
@@ -9361,9 +12183,17 @@ tbody tr:last-child td {
                 <th>Исход.</th>
                 <th>Пропущ.</th>
                 <th>Ответ %</th>
+                <th>Попытка за 30ч</th>
+                <th>Дозвонился за 30ч</th>
+                <th>Клиент перезвонил</th>
+                <th>Не обработано</th>
                 <th>Купил</th>
-                <th>Не купил</th>
-                <th>Конверсия</th>
+                <th>Потерян</th>
+                <th>В работе</th>
+                <th>Не целевой</th>
+                <th>Не отмечен</th>
+                <th>Общая конв.</th>
+                <th>Заверш. конв.</th>
                 <th>Ср. оценка</th>
                 <th>Оценок</th>
                 <th>Ответили</th>
@@ -9764,11 +12594,20 @@ async function loadStats() {
         repeat_clients:
             s.repeat_clients,
 
+        client_windows_30h:
+            s.client_windows_30h,
+
         unique_missed_clients:
             s.unique_missed_clients,
 
         missed_called_back:
             s.missed_called_back,
+
+        missed_outgoing_success:
+            s.missed_outgoing_success,
+
+        missed_customer_called_back:
+            s.missed_customer_called_back,
 
         missed_contacted:
             s.missed_contacted,
@@ -9782,6 +12621,12 @@ async function loadStats() {
         not_bought:
             s.not_bought,
 
+        pending:
+            s.pending,
+
+        non_target:
+            s.non_target,
+
         sale_unmarked:
             s.sale_unmarked,
 
@@ -9790,6 +12635,10 @@ async function loadStats() {
 
         sale_conversion:
             s.sale_conversion
+            + "%",
+
+        processed_sale_conversion:
+            s.processed_sale_conversion
             + "%",
 
         average_rating:
@@ -10223,11 +13072,28 @@ async function loadManagers() {
                 row.answer_rate
                 + "%",
 
+                row.missed_outgoing_attempted,
+
+                row.missed_outgoing_success,
+
+                row.missed_customer_called_back,
+
+                row.missed_not_processed,
+
                 row.bought,
 
                 row.not_bought,
 
+                row.pending,
+
+                row.non_target,
+
+                row.sale_unmarked,
+
                 row.sale_conversion
+                + "%",
+
+                row.processed_sale_conversion
                 + "%",
 
                 row.average_rating === null
@@ -10911,8 +13777,36 @@ async function loadRecent() {
                     "✅ Купил";
 
             } else if (
-                row.sale_status
-                === "not_bought"
+                row.result_category
+                === "pending"
+            ) {
+
+                sale.className =
+                    "sale-pending";
+
+
+                sale.textContent =
+                    row.no_sale_reason
+                    || "🕓 В работе / ожидает";
+
+            } else if (
+                row.result_category
+                === "non_target"
+            ) {
+
+                sale.className =
+                    "sale-non-target";
+
+
+                sale.textContent =
+                    row.no_sale_reason
+                    || "🚫 Не целевой";
+
+            } else if (
+                row.result_category
+                === "lost"
+                || row.sale_status
+                    === "not_bought"
             ) {
 
                 sale.className =
@@ -11317,6 +14211,14 @@ async def moizvonki_webhook(
         or 0
     )
 
+    direction = int(
+        event.get(
+            "direction",
+            0,
+        )
+        or 0
+    )
+
     recording = event.get(
         "recording"
     )
@@ -11372,6 +14274,12 @@ async def moizvonki_webhook(
     telegram_already_sent = (
         save_result[
             "already_sent"
+        ]
+    )
+
+    telegram_claimed = (
+        save_result[
+            "telegram_claimed"
         ]
     )
 
@@ -11567,10 +14475,14 @@ async def moizvonki_webhook(
     telegram_status = (
         "already_sent"
         if telegram_already_sent
-        else "not_sent"
+        else (
+            "not_sent"
+            if telegram_claimed
+            else "in_progress"
+        )
     )
 
-    if not telegram_already_sent:
+    if telegram_claimed:
 
         text = build_telegram_message(
             event,
@@ -11581,11 +14493,17 @@ async def moizvonki_webhook(
         result_keyboard = None
 
         if (
-            answered
+            not is_internal_contact
 
             and
 
-            not is_internal_contact
+            (
+                answered
+                or (
+                    direction == 0
+                    and not answered
+                )
+            )
         ):
             result_keyboard = (
                 build_manager_keyboard(
@@ -11628,13 +14546,17 @@ async def moizvonki_webhook(
 
             telegram_status = "error"
 
+            release_telegram_claim(
+                call_id
+            )
+
             print(
                 "TELEGRAM ERROR:",
                 repr(exc),
             )
 
     duplicate = (
-        telegram_already_sent
+        not telegram_claimed
         and sms_status in {
             "cooldown",
             "internal_contact",
