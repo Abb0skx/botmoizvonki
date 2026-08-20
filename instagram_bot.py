@@ -1,9 +1,18 @@
+import csv
 import hashlib
 import hmac
+import io
 import os
 import re
 import sqlite3
+import threading
+import time
 
+from decimal import (
+    Decimal,
+    InvalidOperation,
+    ROUND_HALF_UP,
+)
 from pathlib import Path
 
 import requests
@@ -79,12 +88,92 @@ INSTAGRAM_DB_PATH = Path(
     )
 )
 
+INSTAGRAM_RULES_SHEET_ID = os.getenv(
+    "INSTAGRAM_RULES_SHEET_ID",
+    "1ZdSyTJr9jSBdBDUZowXi2CpjTb7GZMQCQNsMRCMjywk",
+).strip()
+
+INSTAGRAM_RULES_SHEET_NAME = os.getenv(
+    "INSTAGRAM_RULES_SHEET_NAME",
+    "Лист1",
+).strip()
+
+INSTAGRAM_PRODUCTS_SHEET_ID = os.getenv(
+    "INSTAGRAM_PRODUCTS_SHEET_ID",
+    "1TrS6C4oHe6nzQTPTa_4se_upXBFF6rmbfnE7RqznR8U",
+).strip()
+
+INSTAGRAM_PRODUCTS_SHEET_NAME = os.getenv(
+    "INSTAGRAM_PRODUCTS_SHEET_NAME",
+    "bot_prices",
+).strip()
+
+INSTAGRAM_SETTINGS_SHEET_NAME = os.getenv(
+    "INSTAGRAM_SETTINGS_SHEET_NAME",
+    "bot_settings",
+).strip()
+
+try:
+    INSTAGRAM_RULES_CACHE_TTL = max(
+        30,
+        int(
+            os.getenv(
+                "INSTAGRAM_RULES_CACHE_TTL",
+                "60",
+            )
+        ),
+    )
+except ValueError:
+    INSTAGRAM_RULES_CACHE_TTL = 60
+
+try:
+    INSTAGRAM_PRODUCTS_CACHE_TTL = max(
+        30,
+        int(
+            os.getenv(
+                "INSTAGRAM_PRODUCTS_CACHE_TTL",
+                "60",
+            )
+        ),
+    )
+except ValueError:
+    INSTAGRAM_PRODUCTS_CACHE_TTL = 60
+
+try:
+    INSTAGRAM_RULES_HTTP_TIMEOUT = max(
+        3,
+        int(
+            os.getenv(
+                "INSTAGRAM_RULES_HTTP_TIMEOUT",
+                "15",
+            )
+        ),
+    )
+except ValueError:
+    INSTAGRAM_RULES_HTTP_TIMEOUT = 15
+
 INSTAGRAM_DB_PATH.parent.mkdir(
     parents=True,
     exist_ok=True,
 )
 
 HTTP = requests.Session()
+RULES_HTTP = requests.Session()
+PRODUCTS_HTTP = requests.Session()
+
+RULES_CACHE_LOCK = threading.Lock()
+RULES_CACHE = {
+    "rules": [],
+    "loaded_at": 0.0,
+    "source": "not_loaded",
+}
+
+PRODUCTS_CACHE_LOCK = threading.Lock()
+PRODUCTS_CACHE = {
+    "catalog": None,
+    "loaded_at": 0.0,
+    "source": "not_loaded",
+}
 
 
 # =========================================================
@@ -101,7 +190,7 @@ GRAPH_BASE_URL = (
 # TRIGGERS
 # =========================================================
 
-PRICE_TRIGGERS = {
+PRICE_TRIGGER_WORDS = {
     "+",
     "++",
     "+++",
@@ -125,6 +214,21 @@ PRICE_TRIGGERS = {
     "bor",
     "есть",
     "наличие",
+
+    "нечпул",
+    "nechpul",
+    "necha",
+    "nechchi",
+    "сколько",
+    "почем",
+}
+
+
+PRICE_TRIGGER_PHRASES = {
+    "necha pul",
+    "narxi qancha",
+    "qancha turadi",
+    "сколько стоит",
 }
 
 
@@ -423,6 +527,9 @@ def detect_language(
         "kancha",
         "bormi",
         "bor",
+        "nechpul",
+        "necha",
+        "nechchi",
     }
 
     words = set(
@@ -480,7 +587,7 @@ def is_generic_trigger(
         return True
 
     # -------------------------------------------------
-    # WORDS
+    # WORDS AND PHRASES
     # -------------------------------------------------
 
     words = set(
@@ -490,12 +597,1703 @@ def is_generic_trigger(
     if (
         words
         &
-        PRICE_TRIGGERS
+        PRICE_TRIGGER_WORDS
     ):
 
         return True
 
+    for phrase in PRICE_TRIGGER_PHRASES:
+
+        phrase_pattern = re.compile(
+            r"(?<![\w])"
+            + re.escape(phrase).replace(
+                r"\ ",
+                r"\s+",
+            )
+            + r"(?![\w])",
+            flags=re.IGNORECASE,
+        )
+
+        if phrase_pattern.search(normalized):
+
+            return True
+
     return False
+
+
+# =========================================================
+# GOOGLE SHEETS RESPONSE RULES
+# =========================================================
+
+SUPPORTED_RULE_MATCH_TYPES = {
+    "contains_any",
+    "contains_all",
+    "exact",
+    "default",
+}
+
+LOCAL_DEFAULT_RULE = {
+    "priority": 0,
+    "keywords": [],
+    "match_type": "default",
+    "private_reply": (
+        "Здравствуйте! Спасибо за обращение в Texnikach.\n\n"
+        "Наш Telegram-канал:\n"
+        "https://t.me/texnikach\n\n"
+        "Сайт:\n"
+        "https://texnikach.uz/go\n\n"
+        "Для заказа или уточнения напишите менеджеру:\n"
+        "https://t.me/texnikach_admin"
+    ),
+    "public_reply": "Ответили в Direct ✅",
+    "row_number": 0,
+}
+
+
+def parse_enabled(value: str | None) -> bool:
+
+    return str(
+        value
+        or ""
+    ).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "да",
+    }
+
+
+def split_rule_keywords(
+    value: str | None,
+) -> list[str]:
+
+    keywords = []
+
+    for item in re.split(
+        r"[,;\n]+",
+        str(
+            value
+            or ""
+        ),
+    ):
+
+        normalized = normalize_text(
+            item
+        )
+
+        if (
+            normalized
+            and
+            normalized != "default"
+            and
+            normalized not in keywords
+        ):
+
+            keywords.append(
+                normalized
+            )
+
+    return keywords
+
+
+def parse_rules_csv(
+    csv_text: str,
+) -> list[dict]:
+
+    reader = csv.DictReader(
+        io.StringIO(
+            csv_text.lstrip(
+                "\ufeff"
+            )
+        )
+    )
+
+    headers = {
+        str(
+            header
+            or ""
+        ).strip().lower()
+        for header in (
+            reader.fieldnames
+            or []
+        )
+    }
+
+    required_headers = {
+        "priority",
+        "enabled",
+        "keywords",
+        "match_type",
+        "private_reply",
+        "public_reply",
+    }
+
+    missing_headers = (
+        required_headers
+        - headers
+    )
+
+    if missing_headers:
+
+        raise ValueError(
+            "Google Sheets is missing columns: "
+            + ", ".join(
+                sorted(
+                    missing_headers
+                )
+            )
+        )
+
+    rules = []
+
+    for row_number, raw_row in enumerate(
+        reader,
+        start=2,
+    ):
+
+        row = {
+            str(
+                key
+                or ""
+            ).strip().lower(): (
+                value
+                or ""
+            )
+            for key, value in raw_row.items()
+        }
+
+        if not parse_enabled(
+            row.get(
+                "enabled"
+            )
+        ):
+
+            continue
+
+        match_type = str(
+            row.get(
+                "match_type"
+            )
+            or ""
+        ).strip().lower()
+
+        if (
+            match_type
+            not in SUPPORTED_RULE_MATCH_TYPES
+        ):
+
+            print(
+                "INSTAGRAM RULE SKIPPED:",
+                {
+                    "row": row_number,
+                    "reason": "unsupported_match_type",
+                    "match_type": match_type,
+                },
+            )
+
+            continue
+
+        private_reply = str(
+            row.get(
+                "private_reply"
+            )
+            or ""
+        ).strip()
+
+        if not private_reply:
+
+            print(
+                "INSTAGRAM RULE SKIPPED:",
+                {
+                    "row": row_number,
+                    "reason": "empty_private_reply",
+                },
+            )
+
+            continue
+
+        try:
+            priority = int(
+                str(
+                    row.get(
+                        "priority"
+                    )
+                    or "0"
+                ).strip()
+            )
+        except ValueError:
+            priority = 0
+
+        keywords = split_rule_keywords(
+            row.get(
+                "keywords"
+            )
+        )
+
+        if (
+            match_type != "default"
+            and
+            not keywords
+        ):
+
+            print(
+                "INSTAGRAM RULE SKIPPED:",
+                {
+                    "row": row_number,
+                    "reason": "empty_keywords",
+                },
+            )
+
+            continue
+
+        rules.append(
+            {
+                "priority": priority,
+                "keywords": keywords,
+                "match_type": match_type,
+                "private_reply": private_reply,
+                "public_reply": str(
+                    row.get(
+                        "public_reply"
+                    )
+                    or ""
+                ).strip(),
+                "row_number": row_number,
+            }
+        )
+
+    if not rules:
+
+        raise ValueError(
+            "Google Sheets contains no active valid rules"
+        )
+
+    return sorted(
+        rules,
+        key=lambda rule: (
+            -rule[
+                "priority"
+            ],
+            rule[
+                "row_number"
+            ],
+        ),
+    )
+
+
+def fetch_google_sheet_rules() -> list[dict]:
+
+    if not INSTAGRAM_RULES_SHEET_ID:
+
+        raise RuntimeError(
+            "INSTAGRAM_RULES_SHEET_ID is not configured"
+        )
+
+    url = (
+        "https://docs.google.com/spreadsheets/d/"
+        f"{INSTAGRAM_RULES_SHEET_ID}/gviz/tq"
+    )
+
+    response = RULES_HTTP.get(
+        url,
+        params={
+            "tqx": "out:csv",
+            "sheet": INSTAGRAM_RULES_SHEET_NAME,
+        },
+        timeout=INSTAGRAM_RULES_HTTP_TIMEOUT,
+    )
+
+    if not response.ok:
+
+        print(
+            "INSTAGRAM RULES DOWNLOAD ERROR:",
+            response.status_code,
+            response.text[
+                :500
+            ],
+        )
+
+        response.raise_for_status()
+
+    csv_text = response.content.decode(
+        "utf-8-sig"
+    )
+
+    return parse_rules_csv(
+        csv_text
+    )
+
+
+def get_response_rules(
+    *,
+    force_refresh: bool = False,
+) -> list[dict]:
+
+    now = time.monotonic()
+
+    cached_rules = RULES_CACHE[
+        "rules"
+    ]
+
+    if (
+        not force_refresh
+        and
+        cached_rules
+        and
+        now
+        - RULES_CACHE[
+            "loaded_at"
+        ]
+        < INSTAGRAM_RULES_CACHE_TTL
+    ):
+
+        return cached_rules
+
+    with RULES_CACHE_LOCK:
+
+        now = time.monotonic()
+
+        cached_rules = RULES_CACHE[
+            "rules"
+        ]
+
+        if (
+            not force_refresh
+            and
+            cached_rules
+            and
+            now
+            - RULES_CACHE[
+                "loaded_at"
+            ]
+            < INSTAGRAM_RULES_CACHE_TTL
+        ):
+
+            return cached_rules
+
+        try:
+
+            rules = fetch_google_sheet_rules()
+
+            RULES_CACHE.update(
+                {
+                    "rules": rules,
+                    "loaded_at": now,
+                    "source": "google_sheets",
+                }
+            )
+
+            print(
+                "INSTAGRAM RULES LOADED:",
+                {
+                    "count": len(
+                        rules
+                    ),
+                    "sheet": INSTAGRAM_RULES_SHEET_NAME,
+                },
+            )
+
+            return rules
+
+        except Exception as exc:
+
+            print(
+                "INSTAGRAM RULES LOAD FAILED:",
+                repr(
+                    exc
+                )[
+                    :1000
+                ],
+            )
+
+            if cached_rules:
+
+                RULES_CACHE.update(
+                    {
+                        "loaded_at": now,
+                        "source": "stale_cache",
+                    }
+                )
+
+                print(
+                    "INSTAGRAM RULES USING STALE CACHE:",
+                    {
+                        "count": len(
+                            cached_rules
+                        ),
+                    },
+                )
+
+                return cached_rules
+
+            fallback_rules = [
+                dict(
+                    LOCAL_DEFAULT_RULE
+                )
+            ]
+
+            RULES_CACHE.update(
+                {
+                    "rules": fallback_rules,
+                    "loaded_at": now,
+                    "source": "local_fallback",
+                }
+            )
+
+            return fallback_rules
+
+
+def keyword_matches_text(
+    normalized_text: str,
+    keyword: str,
+) -> bool:
+
+    pattern = re.compile(
+        r"(?<![\w])"
+        + re.escape(
+            keyword
+        ).replace(
+            r"\ ",
+            r"\s+",
+        )
+        + r"(?![\w])",
+        flags=re.IGNORECASE,
+    )
+
+    return bool(
+        pattern.search(
+            normalized_text
+        )
+    )
+
+
+def resolve_response_rule(
+    text: str,
+    *,
+    rules: list[dict] | None = None,
+) -> dict:
+
+    normalized = normalize_text(
+        text
+    )
+
+    active_rules = (
+        rules
+        if rules is not None
+        else get_response_rules()
+    )
+
+    default_rule = None
+
+    for rule in active_rules:
+
+        match_type = rule[
+            "match_type"
+        ]
+
+        if match_type == "default":
+
+            if default_rule is None:
+                default_rule = rule
+
+            continue
+
+        keyword_results = [
+            keyword_matches_text(
+                normalized,
+                keyword,
+            )
+            for keyword in rule[
+                "keywords"
+            ]
+        ]
+
+        matched = False
+
+        if match_type == "contains_any":
+            matched = any(
+                keyword_results
+            )
+
+        elif match_type == "contains_all":
+            matched = all(
+                keyword_results
+            )
+
+        elif match_type == "exact":
+            matched = normalized in rule[
+                "keywords"
+            ]
+
+        if matched:
+
+            return {
+                "rule": rule,
+                "source": (
+                    "google_sheet_rule_"
+                    f"row_{rule['row_number']}"
+                ),
+            }
+
+    selected_default = (
+        default_rule
+        or LOCAL_DEFAULT_RULE
+    )
+
+    return {
+        "rule": selected_default,
+        "source": (
+            "google_sheet_default"
+            if default_rule
+            else "local_default"
+        ),
+    }
+
+
+# =========================================================
+# LIVE PRODUCT PRICES FROM GOOGLE SHEETS
+# =========================================================
+
+PRODUCT_REQUIRED_HEADERS = {
+    "product_id",
+    "model_name",
+    "memory",
+    "color",
+    "price",
+    "warranty_period",
+}
+
+SIM_VARIANT_SUFFIX_PATTERN = re.compile(
+    r"\s*\(\s*(?:e?sim)"
+    r"(?:\s*\+\s*e?sim)?\s*\)\s*$",
+    flags=re.IGNORECASE,
+)
+
+MARKET_VARIANT_SUFFIX_PATTERN = re.compile(
+    r"\s*\(\s*(?:"
+    r"global\s+(?:rom|version)|"
+    r"china\s+version|"
+    r"hong\s+kong|"
+    r"cn|eu|usa|uae|hk"
+    r")\s*\)\s*$",
+    flags=re.IGNORECASE,
+)
+
+NETWORK_SUFFIX_PATTERN = re.compile(
+    r"\s+(?:[345]g)\s*$",
+    flags=re.IGNORECASE,
+)
+
+CONNECTOR_SUFFIX_PATTERN = re.compile(
+    r"\s+(?:usb[\s-]*c|lightning)\s*$",
+    flags=re.IGNORECASE,
+)
+
+INSTAGRAM_PRICE_MESSAGE_LIMIT = 950
+
+UNSAFE_SINGLE_MODEL_ALIASES = {
+    "active",
+    "air",
+    "book",
+    "edge",
+    "lite",
+    "max",
+    "mini",
+    "note",
+    "pad",
+    "phone",
+    "plus",
+    "pro",
+    "ultra",
+    "watch",
+}
+
+
+def normalize_model_text(
+    value: str | None,
+) -> str:
+
+    if not value:
+        return ""
+
+    normalized = str(
+        value
+    ).casefold()
+
+    normalized = (
+        normalized
+        .replace(
+            "ё",
+            "е",
+        )
+        .replace(
+            "+",
+            " plus ",
+        )
+        .replace(
+            "’",
+            "'",
+        )
+        .replace(
+            "ʻ",
+            "'",
+        )
+        .replace(
+            "‘",
+            "'",
+        )
+    )
+
+    normalized = re.sub(
+        r"[^a-zа-я0-9']+",
+        " ",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+
+    normalized = re.sub(
+        r"\s+",
+        " ",
+        normalized,
+    )
+
+    return normalized.strip()
+
+
+def model_family_name(
+    model_name: str,
+) -> str:
+
+    family_name = str(
+        model_name
+    ).strip()
+
+    family_name = SIM_VARIANT_SUFFIX_PATTERN.sub(
+        "",
+        family_name,
+    ).strip()
+
+    family_name = MARKET_VARIANT_SUFFIX_PATTERN.sub(
+        "",
+        family_name,
+    ).strip()
+
+    family_name = NETWORK_SUFFIX_PATTERN.sub(
+        "",
+        family_name,
+    ).strip()
+
+    family_name = CONNECTOR_SUFFIX_PATTERN.sub(
+        "",
+        family_name,
+    ).strip()
+
+    return family_name
+
+
+def parse_decimal_value(
+    value,
+) -> Decimal | None:
+
+    raw_value = str(
+        value
+        or ""
+    ).strip().replace(
+        " ",
+        "",
+    )
+
+    if not raw_value:
+        return None
+
+    if (
+        "," in raw_value
+        and
+        "." not in raw_value
+    ):
+        raw_value = raw_value.replace(
+            ",",
+            ".",
+        )
+
+    try:
+        return Decimal(
+            raw_value
+        )
+    except InvalidOperation:
+        return None
+
+
+def read_csv_rows(
+    csv_text: str,
+    *,
+    required_headers: set[str],
+) -> list[dict]:
+
+    reader = csv.DictReader(
+        io.StringIO(
+            csv_text.lstrip(
+                "\ufeff"
+            )
+        )
+    )
+
+    headers = {
+        str(
+            header
+            or ""
+        ).strip().lower()
+        for header in (
+            reader.fieldnames
+            or []
+        )
+    }
+
+    missing_headers = (
+        required_headers
+        - headers
+    )
+
+    if missing_headers:
+
+        raise ValueError(
+            "Google Sheets is missing columns: "
+            + ", ".join(
+                sorted(
+                    missing_headers
+                )
+            )
+        )
+
+    rows = []
+
+    for raw_row in reader:
+
+        rows.append(
+            {
+                str(
+                    key
+                    or ""
+                ).strip().lower(): (
+                    value
+                    or ""
+                )
+                for key, value in raw_row.items()
+            }
+        )
+
+    return rows
+
+
+def parse_product_catalog(
+    products_csv: str,
+    settings_csv: str,
+) -> dict:
+
+    raw_products = read_csv_rows(
+        products_csv,
+        required_headers=
+            PRODUCT_REQUIRED_HEADERS,
+    )
+
+    raw_settings = read_csv_rows(
+        settings_csv,
+        required_headers={
+            "setting",
+            "value",
+        },
+    )
+
+    kurs = None
+
+    for setting in raw_settings:
+
+        if (
+            str(
+                setting.get(
+                    "setting"
+                )
+                or ""
+            ).strip().casefold()
+            == "kurs"
+        ):
+
+            kurs = parse_decimal_value(
+                setting.get(
+                    "value"
+                )
+            )
+
+            break
+
+    if (
+        kurs is None
+        or
+        kurs <= 0
+    ):
+
+        raise ValueError(
+            "bot_settings has no valid positive kurs"
+        )
+
+    families = {}
+    valid_rows = []
+
+    for raw_product in raw_products:
+
+        model_name = str(
+            raw_product.get(
+                "model_name"
+            )
+            or ""
+        ).strip()
+
+        price = parse_decimal_value(
+            raw_product.get(
+                "price"
+            )
+        )
+
+        if (
+            not model_name
+            or
+            price is None
+            or
+            price <= 0
+        ):
+
+            continue
+
+        raw_product_id = str(
+            raw_product.get(
+                "product_id"
+            )
+            or ""
+        ).strip()
+
+        try:
+            product_id = int(
+                Decimal(
+                    raw_product_id
+                )
+            )
+        except (
+            InvalidOperation,
+            ValueError,
+        ):
+            continue
+
+        family_name = model_family_name(
+            model_name
+        )
+
+        family_key = normalize_model_text(
+            family_name
+        )
+
+        if not family_key:
+            continue
+
+        warranty = parse_decimal_value(
+            raw_product.get(
+                "warranty_period"
+            )
+        )
+
+        product = {
+            "product_id": product_id,
+            "model_name": model_name,
+            "family_name": family_name,
+            "memory": str(
+                raw_product.get(
+                    "memory"
+                )
+                or ""
+            ).strip(),
+            "color": str(
+                raw_product.get(
+                    "color"
+                )
+                or ""
+            ).strip(),
+            "price": price,
+            "warranty_period": warranty,
+        }
+
+        valid_rows.append(
+            product
+        )
+
+        family = families.setdefault(
+            family_key,
+            {
+                "key": family_key,
+                "name": family_name,
+                "rows": [],
+            },
+        )
+
+        family[
+            "rows"
+        ].append(
+            product
+        )
+
+    if not valid_rows:
+
+        raise ValueError(
+            "bot_prices contains no valid products"
+        )
+
+    aliases = {}
+
+    for family_key, family in families.items():
+
+        normalized_name = normalize_model_text(
+            family[
+                "name"
+            ]
+        )
+
+        tokens = normalized_name.split()
+
+        candidate_aliases = {
+            normalized_name,
+        }
+
+        for start_index in range(
+            1,
+            len(
+                tokens
+            ),
+        ):
+
+            alias_tokens = tokens[
+                start_index:
+            ]
+
+            has_mixed_model_token = any(
+                re.search(
+                    r"[a-zа-я]",
+                    token,
+                    flags=re.IGNORECASE,
+                )
+                and
+                re.search(
+                    r"\d",
+                    token,
+                )
+                for token in alias_tokens
+            )
+
+            safe_text_alias = (
+                len(
+                    alias_tokens
+                ) >= 2
+                or
+                (
+                    len(
+                        alias_tokens
+                    ) == 1
+                    and
+                    len(
+                        alias_tokens[
+                            0
+                        ]
+                    ) >= 5
+                    and
+                    alias_tokens[
+                        0
+                    ]
+                    not in UNSAFE_SINGLE_MODEL_ALIASES
+                )
+            )
+
+            if (
+                has_mixed_model_token
+                or
+                safe_text_alias
+            ):
+
+                candidate_aliases.add(
+                    " ".join(
+                        alias_tokens
+                    )
+                )
+
+        for alias in candidate_aliases:
+
+            if not alias:
+                continue
+
+            aliases.setdefault(
+                alias,
+                set(),
+            ).add(
+                family_key
+            )
+
+    sorted_aliases = sorted(
+        aliases,
+        key=lambda alias: (
+            len(
+                alias.split()
+            ),
+            len(
+                alias
+            ),
+        ),
+        reverse=True,
+    )
+
+    return {
+        "kurs": kurs,
+        "rows": valid_rows,
+        "families": families,
+        "aliases": aliases,
+        "sorted_aliases": sorted_aliases,
+    }
+
+
+def fetch_sheet_csv(
+    spreadsheet_id: str,
+    sheet_name: str,
+) -> str:
+
+    url = (
+        "https://docs.google.com/spreadsheets/d/"
+        f"{spreadsheet_id}/gviz/tq"
+    )
+
+    response = PRODUCTS_HTTP.get(
+        url,
+        params={
+            "tqx": "out:csv",
+            "sheet": sheet_name,
+        },
+        timeout=INSTAGRAM_RULES_HTTP_TIMEOUT,
+    )
+
+    if not response.ok:
+
+        print(
+            "INSTAGRAM PRODUCTS DOWNLOAD ERROR:",
+            {
+                "sheet": sheet_name,
+                "status_code": response.status_code,
+                "response": response.text[
+                    :500
+                ],
+            },
+        )
+
+        response.raise_for_status()
+
+    return response.content.decode(
+        "utf-8-sig"
+    )
+
+
+def fetch_product_catalog() -> dict:
+
+    if not INSTAGRAM_PRODUCTS_SHEET_ID:
+
+        raise RuntimeError(
+            "INSTAGRAM_PRODUCTS_SHEET_ID is not configured"
+        )
+
+    products_csv = fetch_sheet_csv(
+        INSTAGRAM_PRODUCTS_SHEET_ID,
+        INSTAGRAM_PRODUCTS_SHEET_NAME,
+    )
+
+    settings_csv = fetch_sheet_csv(
+        INSTAGRAM_PRODUCTS_SHEET_ID,
+        INSTAGRAM_SETTINGS_SHEET_NAME,
+    )
+
+    return parse_product_catalog(
+        products_csv,
+        settings_csv,
+    )
+
+
+def get_product_catalog(
+    *,
+    force_refresh: bool = False,
+) -> dict | None:
+
+    now = time.monotonic()
+
+    cached_catalog = PRODUCTS_CACHE[
+        "catalog"
+    ]
+
+    if (
+        not force_refresh
+        and
+        cached_catalog is not None
+        and
+        now
+        - PRODUCTS_CACHE[
+            "loaded_at"
+        ]
+        < INSTAGRAM_PRODUCTS_CACHE_TTL
+    ):
+
+        return cached_catalog
+
+    with PRODUCTS_CACHE_LOCK:
+
+        now = time.monotonic()
+
+        cached_catalog = PRODUCTS_CACHE[
+            "catalog"
+        ]
+
+        if (
+            not force_refresh
+            and
+            cached_catalog is not None
+            and
+            now
+            - PRODUCTS_CACHE[
+                "loaded_at"
+            ]
+            < INSTAGRAM_PRODUCTS_CACHE_TTL
+        ):
+
+            return cached_catalog
+
+        try:
+
+            catalog = fetch_product_catalog()
+
+            PRODUCTS_CACHE.update(
+                {
+                    "catalog": catalog,
+                    "loaded_at": now,
+                    "source": "google_sheets",
+                }
+            )
+
+            print(
+                "INSTAGRAM PRODUCTS LOADED:",
+                {
+                    "products": len(
+                        catalog[
+                            "rows"
+                        ]
+                    ),
+                    "models": len(
+                        catalog[
+                            "families"
+                        ]
+                    ),
+                    "sheet": INSTAGRAM_PRODUCTS_SHEET_NAME,
+                },
+            )
+
+            return catalog
+
+        except Exception as exc:
+
+            print(
+                "INSTAGRAM PRODUCTS LOAD FAILED:",
+                repr(
+                    exc
+                )[
+                    :1000
+                ],
+            )
+
+            if cached_catalog is not None:
+
+                PRODUCTS_CACHE.update(
+                    {
+                        "loaded_at": now,
+                        "source": "stale_cache",
+                    }
+                )
+
+                return cached_catalog
+
+            PRODUCTS_CACHE.update(
+                {
+                    "loaded_at": now,
+                    "source": "unavailable",
+                }
+            )
+
+            return None
+
+
+def model_alias_pattern(
+    alias: str,
+):
+
+    return re.compile(
+        r"(?<![a-zа-я0-9'])"
+        + re.escape(
+            alias
+        ).replace(
+            r"\ ",
+            r"\s+",
+        )
+        + r"(?![a-zа-я0-9'])",
+        flags=re.IGNORECASE,
+    )
+
+
+def find_price_model_in_text(
+    text: str,
+    *,
+    catalog: dict | None = None,
+) -> dict:
+
+    active_catalog = (
+        catalog
+        if catalog is not None
+        else get_product_catalog()
+    )
+
+    if not active_catalog:
+
+        return {
+            "status": "unavailable",
+            "family": None,
+            "alias": None,
+        }
+
+    normalized_text = normalize_model_text(
+        text
+    )
+
+    if not normalized_text:
+
+        return {
+            "status": "not_found",
+            "family": None,
+            "alias": None,
+        }
+
+    matches = []
+
+    for alias in active_catalog[
+        "sorted_aliases"
+    ]:
+
+        if not model_alias_pattern(
+            alias
+        ).search(
+            normalized_text
+        ):
+
+            continue
+
+        matches.append(
+            {
+                "alias": alias,
+                "family_keys": active_catalog[
+                    "aliases"
+                ][
+                    alias
+                ],
+                "score": (
+                    len(
+                        alias.split()
+                    ),
+                    len(
+                        alias
+                    ),
+                ),
+            }
+        )
+
+    if not matches:
+
+        return {
+            "status": "not_found",
+            "family": None,
+            "alias": None,
+        }
+
+    best_score = max(
+        match[
+            "score"
+        ]
+        for match in matches
+    )
+
+    best_matches = [
+        match
+        for match in matches
+        if match[
+            "score"
+        ] == best_score
+    ]
+
+    family_keys = set()
+
+    for match in best_matches:
+        family_keys.update(
+            match[
+                "family_keys"
+            ]
+        )
+
+    if len(
+        family_keys
+    ) != 1:
+
+        return {
+            "status": "ambiguous",
+            "family": None,
+            "alias": best_matches[
+                0
+            ][
+                "alias"
+            ],
+        }
+
+    family_key = next(
+        iter(
+            family_keys
+        )
+    )
+
+    return {
+        "status": "found",
+        "family": active_catalog[
+            "families"
+        ][
+            family_key
+        ],
+        "alias": best_matches[
+            0
+        ][
+            "alias"
+        ],
+        "kurs": active_catalog[
+            "kurs"
+        ],
+    }
+
+
+def format_decimal_compact(
+    value: Decimal,
+) -> str:
+
+    if value == value.to_integral_value():
+        return str(
+            int(
+                value
+            )
+        )
+
+    return format(
+        value.normalize(),
+        "f",
+    )
+
+
+def format_live_price(
+    price: Decimal,
+    kurs: Decimal,
+) -> str:
+
+    uzs = price * kurs
+
+    if uzs > 10000:
+
+        uzs = (
+            uzs
+            / Decimal(
+                "1000"
+            )
+        ).quantize(
+            Decimal(
+                "1"
+            ),
+            rounding=ROUND_HALF_UP,
+        ) * Decimal(
+            "1000"
+        )
+
+    else:
+
+        uzs = uzs.quantize(
+            Decimal(
+                "1"
+            ),
+            rounding=ROUND_HALF_UP,
+        )
+
+    uzs_text = f"{int(uzs):,}".replace(
+        ",",
+        " ",
+    )
+
+    return (
+        f"{uzs_text} So'm "
+        f"(${format_decimal_compact(price)})"
+    )
+
+
+def memory_sort_key(
+    memory: str,
+):
+
+    values = [
+        int(
+            value
+        )
+        for value in re.findall(
+            r"\d+",
+            memory,
+        )
+    ]
+
+    return (
+        values[
+            -1
+        ]
+        if values
+        else 999999,
+        normalize_model_text(
+            memory
+        ),
+    )
+
+
+def concrete_model_qualifier(
+    model_name: str,
+) -> str:
+
+    match = (
+        SIM_VARIANT_SUFFIX_PATTERN.search(
+            model_name
+        )
+        or MARKET_VARIANT_SUFFIX_PATTERN.search(
+            model_name
+        )
+        or CONNECTOR_SUFFIX_PATTERN.search(
+            model_name
+        )
+    )
+
+    if not match:
+        return ""
+
+    qualifier = model_name[
+        match.start():
+    ].strip()
+
+    return qualifier.strip(
+        "() "
+    )
+
+
+def build_live_product_message(
+    family: dict,
+    kurs: Decimal,
+) -> str:
+
+    rows_by_model = {}
+
+    for row in family[
+        "rows"
+    ]:
+
+        rows_by_model.setdefault(
+            row[
+                "model_name"
+            ],
+            [],
+        ).append(
+            row
+        )
+
+    detail_lines = []
+    multiple_concrete_models = (
+        len(
+            rows_by_model
+        ) > 1
+    )
+
+    for model_name, model_rows in rows_by_model.items():
+
+        qualifier = concrete_model_qualifier(
+            model_name
+        )
+
+        if multiple_concrete_models:
+
+            detail_lines.append(
+                (
+                    qualifier
+                    or model_name
+                )
+                + ":"
+            )
+
+        rows_by_memory = {}
+
+        for row in model_rows:
+
+            memory = row[
+                "memory"
+            ]
+
+            rows_by_memory.setdefault(
+                memory,
+                [],
+            ).append(
+                row
+            )
+
+        for memory in sorted(
+            rows_by_memory,
+            key=memory_sort_key,
+        ):
+
+            price_values = sorted(
+                {
+                    row[
+                        "price"
+                    ]
+                    for row in rows_by_memory[
+                        memory
+                    ]
+                }
+            )
+
+            minimum_price = price_values[
+                0
+            ]
+
+            price_text = format_live_price(
+                minimum_price,
+                kurs,
+            )
+
+            if len(
+                price_values
+            ) > 1:
+                price_text = (
+                    "от "
+                    + price_text
+                )
+
+            label = (
+                memory
+                or "Цена"
+            )
+
+            detail_lines.append(
+                f"• {label} — {price_text}"
+            )
+
+        if multiple_concrete_models:
+            detail_lines.append(
+                ""
+            )
+
+    while (
+        detail_lines
+        and
+        detail_lines[
+            -1
+        ] == ""
+    ):
+        detail_lines.pop()
+
+    kurs_text = f"{int(kurs):,}".replace(
+        ",",
+        " ",
+    )
+
+    footer_lines = [
+        "",
+        f"💱 Курс: {kurs_text}",
+        "Цвета и точное наличие уточняйте у менеджера:",
+        "https://t.me/texnikach_admin",
+    ]
+
+    selected_detail_lines = []
+    omitted = False
+
+    for line in detail_lines:
+
+        candidate_lines = [
+            family[
+                "name"
+            ],
+            "",
+            "Актуальные цены:",
+            *selected_detail_lines,
+            line,
+            *footer_lines,
+        ]
+
+        if len(
+            "\n".join(
+                candidate_lines
+            )
+        ) > INSTAGRAM_PRICE_MESSAGE_LIMIT:
+
+            omitted = True
+            break
+
+        selected_detail_lines.append(
+            line
+        )
+
+    if omitted:
+
+        omitted_lines = [
+            "",
+            "Другие варианты уточните у менеджера.",
+        ]
+
+        while selected_detail_lines:
+
+            candidate_message = "\n".join(
+                [
+                    family[
+                        "name"
+                    ],
+                    "",
+                    "Актуальные цены:",
+                    *selected_detail_lines,
+                    *omitted_lines,
+                    *footer_lines,
+                ]
+            )
+
+            if len(
+                candidate_message
+            ) <= INSTAGRAM_PRICE_MESSAGE_LIMIT:
+                break
+
+            selected_detail_lines.pop()
+
+        selected_detail_lines.extend(
+            omitted_lines
+        )
+
+    return "\n".join(
+        [
+            family[
+                "name"
+            ],
+            "",
+            "Актуальные цены:",
+            *selected_detail_lines,
+            *footer_lines,
+        ]
+    )
 
 
 # =========================================================
@@ -1587,116 +3385,117 @@ def process_instagram_comment(
             return
 
         # -------------------------------------------------
-        # LANGUAGE
+        # PRODUCT MODEL HAS FIRST PRIORITY
         # -------------------------------------------------
 
-        language = detect_language(
+        model_resolution = find_price_model_in_text(
             comment_text
         )
 
-        # -------------------------------------------------
-        # PRODUCT
-        # -------------------------------------------------
-
-        resolution = resolve_product(
-            comment_text,
-            media_id,
-        )
-
-        action = (
-            resolution[
-                "action"
-            ]
-        )
-
-        source = (
-            resolution[
-                "source"
-            ]
-        )
-
-        product = (
-            resolution[
-                "product"
-            ]
-        )
-
-        print(
-            "INSTAGRAM RESOLUTION:",
-            {
-                "action":
-                    action,
-
-                "source":
-                    source,
-
-                "product_id":
-                    (
-                        product[
-                            "id"
-                        ]
-                        if product
-                        else None
-                    ),
-
-                "product_name":
-                    (
-                        product[
-                            "name"
-                        ]
-                        if product
-                        else None
-                    ),
-            },
-        )
-
-        # -------------------------------------------------
-        # IGNORE NORMAL COMMENTS
-        # -------------------------------------------------
-
-        if action == "ignore":
-
-            update_comment_status(
-                comment_id,
-                "ignored",
-                detection_source=
-                    source,
-            )
-
-            return
-
-        # -------------------------------------------------
-        # BUILD PRIVATE MESSAGE
-        # -------------------------------------------------
-
         if (
-            action == "product"
-            and
-            product
+            model_resolution[
+                "status"
+            ]
+            == "found"
         ):
 
-            private_message = (
-                build_product_message(
-                    product,
-                    language,
-                )
+            family = model_resolution[
+                "family"
+            ]
+
+            private_message = build_live_product_message(
+                family,
+                model_resolution[
+                    "kurs"
+                ],
             )
 
-            product_id = (
-                product[
-                    "id"
-                ]
+            public_message = LOCAL_DEFAULT_RULE[
+                "public_reply"
+            ]
+
+            source = "product_sheet_model"
+
+            print(
+                "INSTAGRAM PRODUCT MATCH:",
+                {
+                    "source": source,
+                    "alias": model_resolution[
+                        "alias"
+                    ],
+                    "model": family[
+                        "name"
+                    ],
+                    "variants": len(
+                        family[
+                            "rows"
+                        ]
+                    ),
+                },
             )
 
         else:
 
-            private_message = (
-                build_fallback_message(
-                    language
+            if (
+                model_resolution[
+                    "status"
+                ]
+                == "ambiguous"
+            ):
+
+                print(
+                    "INSTAGRAM PRODUCT MATCH AMBIGUOUS:",
+                    {
+                        "alias": model_resolution[
+                            "alias"
+                        ],
+                    },
                 )
+
+            # ---------------------------------------------
+            # NO RELIABLE MODEL: USE GOOGLE SHEETS RULES
+            # ---------------------------------------------
+
+            resolution = resolve_response_rule(
+                comment_text
             )
 
-            product_id = None
+            rule = resolution[
+                "rule"
+            ]
+
+            source = resolution[
+                "source"
+            ]
+
+            private_message = rule[
+                "private_reply"
+            ]
+
+            public_message = (
+                rule.get(
+                    "public_reply"
+                )
+                or LOCAL_DEFAULT_RULE[
+                    "public_reply"
+                ]
+            )
+
+            print(
+                "INSTAGRAM RULE MATCH:",
+                {
+                    "source": source,
+                    "row": rule.get(
+                        "row_number"
+                    ),
+                    "priority": rule.get(
+                        "priority"
+                    ),
+                    "match_type": rule.get(
+                        "match_type"
+                    ),
+                },
+            )
 
         # -------------------------------------------------
         # PRIVATE REPLY FIRST
@@ -1718,9 +3517,7 @@ def process_instagram_comment(
 
                 send_public_comment_reply(
                     comment_id,
-                    build_public_reply(
-                        language
-                    ),
+                    public_message,
                 )
 
             except Exception as exc:
@@ -1743,7 +3540,7 @@ def process_instagram_comment(
             comment_id,
             "done",
             product_id=
-                product_id,
+                None,
             detection_source=
                 source,
         )
@@ -2111,6 +3908,42 @@ Email:
 )
 async def instagram_status():
 
+    rules_loaded_at = RULES_CACHE[
+        "loaded_at"
+    ]
+
+    rules_cache_age_seconds = (
+        int(
+            max(
+                0,
+                time.monotonic()
+                - rules_loaded_at,
+            )
+        )
+        if rules_loaded_at
+        else None
+    )
+
+    products_loaded_at = PRODUCTS_CACHE[
+        "loaded_at"
+    ]
+
+    products_cache_age_seconds = (
+        int(
+            max(
+                0,
+                time.monotonic()
+                - products_loaded_at,
+            )
+        )
+        if products_loaded_at
+        else None
+    )
+
+    live_catalog = PRODUCTS_CACHE[
+        "catalog"
+    ]
+
     with connect_instagram_db() as conn:
 
         products = conn.execute(
@@ -2167,6 +4000,67 @@ async def instagram_status():
 
         "processed_comments":
             processed,
+
+        "rules_sheet_configured":
+            bool(
+                INSTAGRAM_RULES_SHEET_ID
+            ),
+
+        "rules_sheet_name":
+            INSTAGRAM_RULES_SHEET_NAME,
+
+        "rules_cache_source":
+            RULES_CACHE[
+                "source"
+            ],
+
+        "rules_cache_count":
+            len(
+                RULES_CACHE[
+                    "rules"
+                ]
+            ),
+
+        "rules_cache_age_seconds":
+            rules_cache_age_seconds,
+
+        "products_sheet_configured":
+            bool(
+                INSTAGRAM_PRODUCTS_SHEET_ID
+            ),
+
+        "products_sheet_name":
+            INSTAGRAM_PRODUCTS_SHEET_NAME,
+
+        "products_cache_source":
+            PRODUCTS_CACHE[
+                "source"
+            ],
+
+        "products_cache_age_seconds":
+            products_cache_age_seconds,
+
+        "live_price_rows":
+            (
+                len(
+                    live_catalog[
+                        "rows"
+                    ]
+                )
+                if live_catalog
+                else 0
+            ),
+
+        "live_price_models":
+            (
+                len(
+                    live_catalog[
+                        "families"
+                    ]
+                )
+                if live_catalog
+                else 0
+            ),
     }
 
 
