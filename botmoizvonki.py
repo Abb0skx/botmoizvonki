@@ -698,6 +698,22 @@ def init_db():
                 rated_at INTEGER,
                 expires_at INTEGER NOT NULL,
 
+                first_opened_at INTEGER,
+                last_opened_at INTEGER,
+                open_count INTEGER DEFAULT 0,
+
+                first_ip TEXT,
+                last_ip TEXT,
+                rated_ip TEXT,
+
+                user_agent TEXT,
+                accept_language TEXT,
+                referer TEXT,
+
+                request_headers_json TEXT,
+                device_data_json TEXT,
+                device_data_updated_at INTEGER,
+
                 created_at TIMESTAMP
                     DEFAULT CURRENT_TIMESTAMP,
 
@@ -706,6 +722,97 @@ def init_db():
             )
             """
         )
+
+        rating_columns = {
+            row["name"]
+            for row in conn.execute(
+                """
+                PRAGMA table_info(call_ratings)
+                """
+            ).fetchall()
+        }
+
+        rating_migrations = {
+            "first_opened_at":
+                """
+                ALTER TABLE call_ratings
+                ADD COLUMN first_opened_at INTEGER
+                """,
+
+            "last_opened_at":
+                """
+                ALTER TABLE call_ratings
+                ADD COLUMN last_opened_at INTEGER
+                """,
+
+            "open_count":
+                """
+                ALTER TABLE call_ratings
+                ADD COLUMN open_count INTEGER DEFAULT 0
+                """,
+
+            "first_ip":
+                """
+                ALTER TABLE call_ratings
+                ADD COLUMN first_ip TEXT
+                """,
+
+            "last_ip":
+                """
+                ALTER TABLE call_ratings
+                ADD COLUMN last_ip TEXT
+                """,
+
+            "rated_ip":
+                """
+                ALTER TABLE call_ratings
+                ADD COLUMN rated_ip TEXT
+                """,
+
+            "user_agent":
+                """
+                ALTER TABLE call_ratings
+                ADD COLUMN user_agent TEXT
+                """,
+
+            "accept_language":
+                """
+                ALTER TABLE call_ratings
+                ADD COLUMN accept_language TEXT
+                """,
+
+            "referer":
+                """
+                ALTER TABLE call_ratings
+                ADD COLUMN referer TEXT
+                """,
+
+            "request_headers_json":
+                """
+                ALTER TABLE call_ratings
+                ADD COLUMN request_headers_json TEXT
+                """,
+
+            "device_data_json":
+                """
+                ALTER TABLE call_ratings
+                ADD COLUMN device_data_json TEXT
+                """,
+
+            "device_data_updated_at":
+                """
+                ALTER TABLE call_ratings
+                ADD COLUMN device_data_updated_at INTEGER
+                """,
+        }
+
+        for column, sql in (
+            rating_migrations.items()
+        ):
+            if column not in rating_columns:
+                conn.execute(
+                    sql
+                )
 
         # -------------------------------------------------
         # NORMALIZE OLD CLIENT NUMBERS
@@ -4019,6 +4126,342 @@ def get_period(
 # CUSTOMER RATING PAGE
 # =========================================================
 
+def limit_text(
+    value,
+    max_length: int = 2000,
+):
+
+    if value is None:
+        return None
+
+    return str(
+        value
+    )[:max_length]
+
+
+def get_request_ip(
+    request: Request,
+):
+
+    forwarded_for = request.headers.get(
+        "x-forwarded-for",
+        "",
+    )
+
+    if forwarded_for:
+        return limit_text(
+            forwarded_for.split(
+                ","
+            )[0].strip(),
+            100,
+        )
+
+    connecting_ip = request.headers.get(
+        "cf-connecting-ip",
+        "",
+    )
+
+    if connecting_ip:
+        return limit_text(
+            connecting_ip,
+            100,
+        )
+
+    if request.client:
+        return limit_text(
+            request.client.host,
+            100,
+        )
+
+    return None
+
+
+def get_rating_request_metadata(
+    request: Request,
+):
+
+    header_names = [
+        "user-agent",
+        "accept-language",
+        "referer",
+        "sec-ch-ua",
+        "sec-ch-ua-mobile",
+        "sec-ch-ua-platform",
+        "sec-ch-ua-model",
+        "sec-ch-ua-platform-version",
+        "sec-ch-ua-arch",
+        "sec-ch-ua-bitness",
+        "sec-ch-ua-form-factors",
+        "sec-ch-device-memory",
+        "sec-ch-dpr",
+        "sec-ch-viewport-width",
+        "sec-ch-viewport-height",
+        "save-data",
+        "downlink",
+        "ect",
+        "rtt",
+    ]
+
+    selected_headers = {}
+
+    for name in header_names:
+
+        value = request.headers.get(
+            name
+        )
+
+        if value:
+            selected_headers[name] = (
+                limit_text(
+                    value,
+                    1000,
+                )
+            )
+
+    return {
+        "ip": get_request_ip(
+            request
+        ),
+
+        "user_agent": limit_text(
+            request.headers.get(
+                "user-agent"
+            ),
+            2000,
+        ),
+
+        "accept_language": limit_text(
+            request.headers.get(
+                "accept-language"
+            ),
+            500,
+        ),
+
+        "referer": limit_text(
+            request.headers.get(
+                "referer"
+            ),
+            2000,
+        ),
+
+        "headers_json": json.dumps(
+            selected_headers,
+            ensure_ascii=False,
+        )[:10000],
+    }
+
+
+def record_rating_request(
+    token: str,
+    request: Request,
+    *,
+    is_submission: bool = False,
+):
+
+    token_hash = hash_rating_token(
+        token
+    )
+
+    metadata = get_rating_request_metadata(
+        request
+    )
+
+    now_ts = int(
+        datetime.now(
+            timezone.utc
+        ).timestamp()
+    )
+
+    with connect_db() as conn:
+
+        if is_submission:
+
+            cursor = conn.execute(
+                """
+                UPDATE call_ratings
+
+                SET
+                    rated_ip = ?,
+                    user_agent = ?,
+                    accept_language = ?,
+                    referer = ?,
+                    request_headers_json = ?
+
+                WHERE token_hash = ?
+                """,
+                (
+                    metadata["ip"],
+                    metadata["user_agent"],
+                    metadata["accept_language"],
+                    metadata["referer"],
+                    metadata["headers_json"],
+                    token_hash,
+                ),
+            )
+
+        else:
+
+            cursor = conn.execute(
+                """
+                UPDATE call_ratings
+
+                SET
+                    first_opened_at = COALESCE(
+                        first_opened_at,
+                        ?
+                    ),
+                    last_opened_at = ?,
+                    open_count = COALESCE(
+                        open_count,
+                        0
+                    ) + 1,
+                    first_ip = COALESCE(
+                        first_ip,
+                        ?
+                    ),
+                    last_ip = ?,
+                    user_agent = ?,
+                    accept_language = ?,
+                    referer = ?,
+                    request_headers_json = ?
+
+                WHERE token_hash = ?
+                """,
+                (
+                    now_ts,
+                    now_ts,
+                    metadata["ip"],
+                    metadata["ip"],
+                    metadata["user_agent"],
+                    metadata["accept_language"],
+                    metadata["referer"],
+                    metadata["headers_json"],
+                    token_hash,
+                ),
+            )
+
+        conn.commit()
+
+        return bool(
+            cursor.rowcount
+        )
+
+
+def sanitize_device_value(
+    value,
+    depth: int = 0,
+):
+
+    if depth > 3:
+        return None
+
+    if value is None:
+        return None
+
+    if isinstance(
+        value,
+        bool,
+    ):
+        return value
+
+    if isinstance(
+        value,
+        (
+            int,
+            float,
+        ),
+    ):
+        return value
+
+    if isinstance(
+        value,
+        str,
+    ):
+        return value[:500]
+
+    if isinstance(
+        value,
+        list,
+    ):
+        return [
+            sanitize_device_value(
+                item,
+                depth + 1,
+            )
+            for item in value[:30]
+        ]
+
+    if isinstance(
+        value,
+        dict,
+    ):
+        return {
+            str(key)[:100]:
+                sanitize_device_value(
+                    item,
+                    depth + 1,
+                )
+            for key, item in list(
+                value.items()
+            )[:50]
+        }
+
+    return limit_text(
+        value,
+        500,
+    )
+
+
+def sanitize_device_payload(
+    payload,
+):
+
+    if not isinstance(
+        payload,
+        dict,
+    ):
+        return {}
+
+    allowed_keys = {
+        "language",
+        "languages",
+        "timezone",
+        "timezone_offset_minutes",
+        "screen_width",
+        "screen_height",
+        "screen_avail_width",
+        "screen_avail_height",
+        "color_depth",
+        "pixel_depth",
+        "viewport_width",
+        "viewport_height",
+        "device_pixel_ratio",
+        "max_touch_points",
+        "touch_supported",
+        "platform",
+        "hardware_concurrency",
+        "device_memory_gb",
+        "cookie_enabled",
+        "do_not_track",
+        "online",
+        "color_scheme",
+        "reduced_motion",
+        "connection",
+        "user_agent_data",
+        "high_entropy",
+    }
+
+    return {
+        key: sanitize_device_value(
+            payload.get(
+                key
+            )
+        )
+        for key in allowed_keys
+        if key in payload
+    }
+
+
 def rating_html_response(
     title: str,
     message_ru: str,
@@ -4029,6 +4472,7 @@ def rating_html_response(
 ):
 
     buttons_html = ""
+    privacy_html = ""
 
     if token:
 
@@ -4073,6 +4517,15 @@ def rating_html_response(
             + "</div>"
         )
 
+        privacy_html = """
+        <p class="privacy">
+            При открытии сохраняются IP-адрес и технические
+            данные браузера.<br>
+            Sahifa ochilganda IP-manzil va brauzerning texnik
+            ma’lumotlari saqlanadi.
+        </p>
+        """
+
     score_html = ""
 
     if selected_score is not None:
@@ -4080,6 +4533,151 @@ def rating_html_response(
             '<div class="selected">'
             + str(selected_score)
             + " ★</div>"
+        )
+
+    device_script = ""
+
+    if token:
+
+        token_json = json.dumps(
+            token
+        )
+
+        device_script = """
+<script>
+(async () => {
+    try {
+        const nav = window.navigator || {};
+        const connection =
+            nav.connection
+            || nav.mozConnection
+            || nav.webkitConnection
+            || null;
+
+        const data = {
+            language: nav.language || null,
+            languages: Array.from(
+                nav.languages || []
+            ),
+            timezone: (
+                Intl.DateTimeFormat()
+                    .resolvedOptions()
+                    .timeZone
+                || null
+            ),
+            timezone_offset_minutes:
+                new Date().getTimezoneOffset(),
+            screen_width: window.screen.width,
+            screen_height: window.screen.height,
+            screen_avail_width:
+                window.screen.availWidth,
+            screen_avail_height:
+                window.screen.availHeight,
+            color_depth: window.screen.colorDepth,
+            pixel_depth: window.screen.pixelDepth,
+            viewport_width: window.innerWidth,
+            viewport_height: window.innerHeight,
+            device_pixel_ratio:
+                window.devicePixelRatio || 1,
+            max_touch_points:
+                Number(nav.maxTouchPoints || 0),
+            touch_supported:
+                (
+                    "ontouchstart" in window
+                    || Number(nav.maxTouchPoints || 0) > 0
+                ),
+            platform: nav.platform || null,
+            hardware_concurrency:
+                nav.hardwareConcurrency || null,
+            device_memory_gb:
+                nav.deviceMemory || null,
+            cookie_enabled:
+                Boolean(nav.cookieEnabled),
+            do_not_track:
+                nav.doNotTrack || null,
+            online:
+                Boolean(nav.onLine),
+            color_scheme:
+                window.matchMedia(
+                    "(prefers-color-scheme: dark)"
+                ).matches
+                    ? "dark"
+                    : "light",
+            reduced_motion:
+                window.matchMedia(
+                    "(prefers-reduced-motion: reduce)"
+                ).matches,
+            connection: connection
+                ? {
+                    effective_type:
+                        connection.effectiveType || null,
+                    downlink_mbps:
+                        connection.downlink || null,
+                    rtt_ms:
+                        connection.rtt || null,
+                    save_data:
+                        Boolean(connection.saveData),
+                }
+                : null,
+            user_agent_data: nav.userAgentData
+                ? {
+                    brands:
+                        nav.userAgentData.brands || [],
+                    mobile:
+                        Boolean(nav.userAgentData.mobile),
+                    platform:
+                        nav.userAgentData.platform || null,
+                }
+                : null,
+            high_entropy: null,
+        };
+
+        if (
+            nav.userAgentData
+            && nav.userAgentData.getHighEntropyValues
+        ) {
+            try {
+                data.high_entropy =
+                    await nav.userAgentData
+                        .getHighEntropyValues(
+                            [
+                                "architecture",
+                                "bitness",
+                                "formFactors",
+                                "fullVersionList",
+                                "model",
+                                "platformVersion",
+                            ]
+                        );
+            } catch (error) {
+                data.high_entropy = null;
+            }
+        }
+
+        const ratingToken = __RATING_TOKEN__;
+
+        await fetch(
+            "/rating-device/"
+            + encodeURIComponent(ratingToken),
+            {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify(data),
+                credentials: "omit",
+                keepalive: true,
+            }
+        );
+    } catch (error) {
+        // Оценка должна работать,
+        // даже если браузер не отдал данные.
+    }
+})();
+</script>
+        """.replace(
+            "__RATING_TOKEN__",
+            token_json,
         )
 
     html = f"""
@@ -4170,6 +4768,11 @@ def rating_html_response(
             font-size: 44px;
             font-weight: 800;
         }}
+        .privacy {{
+            margin-top: 22px;
+            color: #777;
+            font-size: 11px;
+        }}
     </style>
 </head>
 <body>
@@ -4180,7 +4783,9 @@ def rating_html_response(
         <p>{escape(message_uz)}</p>
         {score_html}
         {buttons_html}
+        {privacy_html}
     </main>
+    {device_script}
 </body>
 </html>
     """
@@ -4201,6 +4806,7 @@ def rating_html_response(
 )
 def rating_page(
     token: str,
+    request: Request,
 ):
 
     token_hash = hash_rating_token(
@@ -4256,6 +4862,12 @@ def rating_page(
             status_code=410,
         )
 
+    record_rating_request(
+        token,
+        request,
+        is_submission=False,
+    )
+
     return rating_html_response(
         "Оцените разговор",
         "Выберите оценку от 1 до 5.",
@@ -4271,6 +4883,7 @@ def rating_page(
 def submit_rating(
     token: str,
     score: int,
+    request: Request,
 ):
 
     if score not in {
@@ -4293,6 +4906,12 @@ def submit_rating(
         datetime.now(
             timezone.utc
         ).timestamp()
+    )
+
+    request_metadata = (
+        get_rating_request_metadata(
+            request
+        )
     )
 
     with connect_db() as conn:
@@ -4354,7 +4973,12 @@ def submit_rating(
 
             SET
                 score = ?,
-                rated_at = ?
+                rated_at = ?,
+                rated_ip = ?,
+                user_agent = ?,
+                accept_language = ?,
+                referer = ?,
+                request_headers_json = ?
 
             WHERE
                 token_hash = ?
@@ -4363,6 +4987,11 @@ def submit_rating(
             (
                 score,
                 now_ts,
+                request_metadata["ip"],
+                request_metadata["user_agent"],
+                request_metadata["accept_language"],
+                request_metadata["referer"],
+                request_metadata["headers_json"],
                 token_hash,
             ),
         )
@@ -4375,6 +5004,86 @@ def submit_rating(
         "Javobingiz saqlandi. Rahmat!",
         selected_score=score,
     )
+
+
+@app.post(
+    "/rating-device/{token}"
+)
+async def capture_rating_device(
+    token: str,
+    request: Request,
+):
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="Некорректные данные устройства",
+        )
+
+    clean_payload = sanitize_device_payload(
+        payload
+    )
+
+    payload_json = json.dumps(
+        clean_payload,
+        ensure_ascii=False,
+        separators=(
+            ",",
+            ":",
+        ),
+    )
+
+    if len(payload_json) > 20000:
+        raise HTTPException(
+            status_code=413,
+            detail="Слишком большой объём данных",
+        )
+
+    token_hash = hash_rating_token(
+        token
+    )
+
+    now_ts = int(
+        datetime.now(
+            timezone.utc
+        ).timestamp()
+    )
+
+    with connect_db() as conn:
+
+        cursor = conn.execute(
+            """
+            UPDATE call_ratings
+
+            SET
+                device_data_json = ?,
+                device_data_updated_at = ?
+
+            WHERE
+                token_hash = ?
+                AND expires_at >= ?
+            """,
+            (
+                payload_json,
+                now_ts,
+                token_hash,
+                now_ts,
+            ),
+        )
+
+        conn.commit()
+
+    if cursor.rowcount != 1:
+        raise HTTPException(
+            status_code=404,
+            detail="Ссылка не найдена или истекла",
+        )
+
+    return {
+        "ok": True,
+    }
 
 
 # =========================================================
@@ -6609,6 +7318,264 @@ def stats_recent(
     }
 
 
+def format_uz_datetime(
+    value,
+):
+
+    if value in {
+        None,
+        "",
+        0,
+    }:
+        return "—"
+
+    try:
+        return (
+            datetime
+            .fromtimestamp(
+                int(value),
+                UZ_TZ,
+            )
+            .strftime(
+                "%d.%m.%Y %H:%M:%S"
+            )
+        )
+    except (
+        TypeError,
+        ValueError,
+        OSError,
+    ):
+        return str(value)
+
+
+def parse_saved_json(
+    value,
+):
+
+    if not value:
+        return {}
+
+    try:
+        parsed = json.loads(
+            value
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return {
+            "raw": str(value),
+        }
+
+    return parsed
+
+
+@app.get(
+    "/stats/rating/details/{call_id}"
+)
+def rating_details(
+    call_id: int,
+):
+
+    with connect_db() as conn:
+
+        row = conn.execute(
+            """
+            SELECT
+                call.id,
+                call.db_call_id,
+                call.event_pbx_call_id,
+                call.client_number,
+                call.client_name,
+                call.is_internal_contact,
+                call.internal_contact_name,
+                call.direction,
+                call.answered,
+                call.user_id,
+                call.user_login,
+                call.src_number,
+                call.src_id,
+                call.src_slot,
+                call.event_created,
+                call.start_time,
+                call.answer_time,
+                call.end_time,
+                call.duration,
+                call.api_duration,
+                call.duration_source,
+                call.recording,
+                call.account_id,
+                call.account_name,
+                call.talk_manager_code,
+                call.talk_manager_name,
+                call.manager_marked_at,
+                call.manager_marked_username,
+                call.sale_status,
+                call.no_sale_reason,
+                call.no_sale_reason_code,
+                call.sale_marked_at,
+                call.sale_marked_username,
+                call.created_at AS call_created_at,
+
+                rating.sender_user_login,
+                rating.sms_status,
+                rating.sms_reserved_at,
+                rating.sms_sent_at,
+                rating.sms_error,
+                rating.provider_response,
+                rating.score,
+                rating.rated_at,
+                rating.expires_at,
+                rating.created_at AS rating_created_at,
+                rating.first_opened_at,
+                rating.last_opened_at,
+                rating.open_count,
+                rating.first_ip,
+                rating.last_ip,
+                rating.rated_ip,
+                rating.user_agent,
+                rating.accept_language,
+                rating.referer,
+                rating.request_headers_json,
+                rating.device_data_json,
+                rating.device_data_updated_at
+
+            FROM calls AS call
+
+            JOIN call_ratings AS rating
+                ON rating.call_id = call.id
+
+            WHERE
+                call.id = ?
+                AND rating.score IS NOT NULL
+
+            LIMIT 1
+            """,
+            (
+                call_id,
+            ),
+        ).fetchone()
+
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail="Оценка для этого звонка не найдена",
+        )
+
+    direction = (
+        "Входящий"
+        if row["direction"] == 0
+        else "Исходящий"
+    )
+
+    answered = (
+        "Отвечен"
+        if row["answered"]
+        else "Не отвечен"
+    )
+
+    sale_labels = {
+        "bought": "Купил",
+        "not_bought": "Не купил",
+    }
+
+    return {
+        "call_id": row["id"],
+        "score": row["score"],
+        "sections": [
+            {
+                "title": "Звонок",
+                "items": {
+                    "ID звонка": row["id"],
+                    "ID Мои Звонки": row["db_call_id"],
+                    "PBX ID": row["event_pbx_call_id"],
+                    "Клиент": row["client_number"] or "—",
+                    "Имя клиента": row["client_name"] or "—",
+                    "Внутренний контакт": (
+                        row["internal_contact_name"]
+                        if row["is_internal_contact"]
+                        else "Нет"
+                    ),
+                    "Направление": direction,
+                    "Статус": answered,
+                    "Начало": format_uz_datetime(row["start_time"]),
+                    "Ответ": format_uz_datetime(row["answer_time"]),
+                    "Окончание": format_uz_datetime(row["end_time"]),
+                    "Разговор, сек": row["duration"] or 0,
+                    "Длительность API, сек": row["api_duration"],
+                    "Источник длительности": row["duration_source"] or "—",
+                    "Запись": row["recording"] or "—",
+                },
+            },
+            {
+                "title": "Менеджер и результат",
+                "items": {
+                    "Менеджер": row["talk_manager_name"] or "—",
+                    "Код менеджера": row["talk_manager_code"] or "—",
+                    "Менеджер отмечен": format_uz_datetime(row["manager_marked_at"]),
+                    "Кто отметил менеджера": row["manager_marked_username"] or "—",
+                    "Результат": sale_labels.get(row["sale_status"], "Не отмечено"),
+                    "Причина": row["no_sale_reason"] or "—",
+                    "Код причины": row["no_sale_reason_code"] or "—",
+                    "Результат отмечен": format_uz_datetime(row["sale_marked_at"]),
+                    "Кто отметил результат": row["sale_marked_username"] or "—",
+                },
+            },
+            {
+                "title": "SIM и аккаунт",
+                "items": {
+                    "SIM / номер телефона": row["src_number"] or "—",
+                    "SIM ID": row["src_id"],
+                    "SIM слот": row["src_slot"],
+                    "Пользователь": row["user_login"] or "—",
+                    "ID пользователя": row["user_id"],
+                    "Аккаунт": row["account_name"] or "—",
+                    "ID аккаунта": row["account_id"],
+                    "Время события": row["event_created"] or "—",
+                    "Запись создана": row["call_created_at"] or "—",
+                },
+            },
+            {
+                "title": "Оценка и SMS",
+                "items": {
+                    "Оценка": f'{row["score"]} из 5',
+                    "Оценено": format_uz_datetime(row["rated_at"]),
+                    "SMS статус": row["sms_status"] or "—",
+                    "SMS зарезервировано": format_uz_datetime(row["sms_reserved_at"]),
+                    "SMS отправлено": format_uz_datetime(row["sms_sent_at"]),
+                    "Телефон-отправитель": row["sender_user_login"] or "—",
+                    "Ошибка SMS": row["sms_error"] or "—",
+                    "Ответ SMS-сервиса": row["provider_response"] or "—",
+                    "Ссылка действует до": format_uz_datetime(row["expires_at"]),
+                    "Запрос оценки создан": row["rating_created_at"] or "—",
+                },
+            },
+            {
+                "title": "Открытие страницы",
+                "items": {
+                    "Первое открытие": format_uz_datetime(row["first_opened_at"]),
+                    "Последнее открытие": format_uz_datetime(row["last_opened_at"]),
+                    "Количество открытий": row["open_count"] or 0,
+                    "Первый IP": row["first_ip"] or "—",
+                    "Последний IP": row["last_ip"] or "—",
+                    "IP при оценке": row["rated_ip"] or "—",
+                    "User-Agent": row["user_agent"] or "—",
+                    "Язык HTTP": row["accept_language"] or "—",
+                    "Источник перехода": row["referer"] or "—",
+                    "HTTP-заголовки": parse_saved_json(row["request_headers_json"]),
+                },
+            },
+            {
+                "title": "Телефон и браузер",
+                "items": {
+                    "Данные браузера": parse_saved_json(row["device_data_json"]),
+                    "Обновлены": format_uz_datetime(row["device_data_updated_at"]),
+                },
+            },
+        ],
+    }
+
+
 # =========================================================
 # DASHBOARD
 # =========================================================
@@ -6990,6 +7957,137 @@ tbody tr:last-child td {
     color: #777;
 }
 
+.details-button {
+    appearance: none;
+    border: 1px solid #d9b565;
+    border-radius: 9px;
+    background: transparent;
+    color: #d9b565;
+    padding: 7px 10px;
+    cursor: pointer;
+    white-space: nowrap;
+    font-weight: 650;
+}
+
+.details-button:hover,
+.details-button:focus {
+    background: #d9b565;
+    color: #111;
+}
+
+.modal-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    background: rgba(0, 0, 0, .78);
+}
+
+.modal-overlay.visible {
+    display: flex;
+}
+
+.modal-card {
+    width: min(980px, 100%);
+    max-height: calc(100vh - 40px);
+    overflow: auto;
+    border: 1px solid #3a3a3a;
+    border-radius: 18px;
+    background: #171717;
+    box-shadow: 0 24px 80px rgba(0, 0, 0, .55);
+}
+
+.modal-header {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 18px 20px;
+    border-bottom: 1px solid #333;
+    background: #171717;
+}
+
+.modal-title {
+    margin: 0;
+    font-size: 21px;
+}
+
+.modal-close {
+    width: 38px;
+    height: 38px;
+    border: 1px solid #444;
+    border-radius: 10px;
+    background: #222;
+    color: #fff;
+    cursor: pointer;
+    font-size: 24px;
+    line-height: 1;
+}
+
+.modal-content {
+    padding: 20px;
+}
+
+.details-section {
+    margin-bottom: 22px;
+}
+
+.details-section:last-child {
+    margin-bottom: 0;
+}
+
+.details-section h3 {
+    margin: 0 0 10px;
+    color: #d9b565;
+    font-size: 16px;
+}
+
+.details-grid {
+    display: grid;
+    grid-template-columns: minmax(170px, 260px) minmax(260px, 1fr);
+    border: 1px solid #303030;
+    border-radius: 12px;
+    overflow: hidden;
+}
+
+.details-label,
+.details-value {
+    padding: 10px 12px;
+    border-bottom: 1px solid #2b2b2b;
+}
+
+.details-label {
+    color: #999;
+    background: #1c1c1c;
+}
+
+.details-value {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.details-grid > :nth-last-child(-n + 2) {
+    border-bottom: 0;
+}
+
+.details-value pre {
+    margin: 0;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    color: #ddd;
+    font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.details-value a {
+    color: #d9b565;
+}
+
 @media (
     max-width: 1000px
 ) {
@@ -7039,6 +8137,35 @@ tbody tr:last-child td {
 
     .panel {
         padding: 15px;
+    }
+
+    .modal-overlay {
+        padding: 8px;
+    }
+
+    .modal-card {
+        max-height: calc(100vh - 16px);
+    }
+
+    .modal-content {
+        padding: 14px;
+    }
+
+    .details-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .details-label {
+        border-bottom: 0;
+        padding-bottom: 3px;
+    }
+
+    .details-value {
+        padding-top: 3px;
+    }
+
+    .details-grid > :nth-last-child(-n + 2) {
+        border-bottom: 0;
     }
 }
 
@@ -7728,10 +8855,11 @@ tbody tr:last-child td {
                 <th>Направление</th>
                 <th>Статус</th>
                 <th>Менеджер</th>
-                <th>Оценка</th>
                 <th>SIM</th>
                 <th>Разговор</th>
                 <th>Результат</th>
+                <th>Оценка</th>
+                <th>Все данные</th>
 
             </tr>
 
@@ -7747,6 +8875,44 @@ tbody tr:last-child td {
 
 </div>
 
+
+</div>
+
+
+<div
+    class="modal-overlay"
+    id="rating_details_modal"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="rating_details_title"
+>
+
+    <div class="modal-card">
+
+        <div class="modal-header">
+
+            <h2
+                class="modal-title"
+                id="rating_details_title"
+            >
+                Все данные оценки
+            </h2>
+
+            <button
+                class="modal-close"
+                id="rating_details_close"
+                type="button"
+                aria-label="Закрыть"
+            >×</button>
+
+        </div>
+
+        <div
+            class="modal-content"
+            id="rating_details_content"
+        ></div>
+
+    </div>
 
 </div>
 
@@ -8654,6 +9820,257 @@ async function loadSims() {
 }
 
 
+function closeRatingDetails() {
+
+    document
+        .getElementById(
+            "rating_details_modal"
+        )
+        .classList.remove(
+            "visible"
+        );
+
+    document.body.style.overflow =
+        "";
+}
+
+
+function appendDetailsValue(
+    container,
+    value
+) {
+
+    if (
+        value !== null
+        && typeof value === "object"
+    ) {
+
+        const pre =
+            document.createElement(
+                "pre"
+            );
+
+        pre.textContent =
+            Object.keys(value).length
+                ? JSON.stringify(
+                    value,
+                    null,
+                    2
+                )
+                : "—";
+
+        container.appendChild(
+            pre
+        );
+
+        return;
+    }
+
+    const text =
+        value === null
+        || value === undefined
+        || value === ""
+            ? "—"
+            : String(value);
+
+    if (
+        text.startsWith("https://")
+        || text.startsWith("http://")
+    ) {
+
+        const link =
+            document.createElement(
+                "a"
+            );
+
+        link.href = text;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.textContent = text;
+
+        container.appendChild(
+            link
+        );
+
+        return;
+    }
+
+    container.textContent = text;
+}
+
+
+async function openRatingDetails(
+    callId
+) {
+
+    const modal =
+        document.getElementById(
+            "rating_details_modal"
+        );
+
+    const content =
+        document.getElementById(
+            "rating_details_content"
+        );
+
+    content.textContent =
+        "Загрузка…";
+
+    modal.classList.add(
+        "visible"
+    );
+
+    document.body.style.overflow =
+        "hidden";
+
+    try {
+
+        const response =
+            await fetch(
+                "/stats/rating/details/"
+                + encodeURIComponent(callId),
+                {
+                    cache: "no-store",
+                }
+            );
+
+        if (!response.ok) {
+            throw new Error(
+                "HTTP "
+                + response.status
+            );
+        }
+
+        const data =
+            await response.json();
+
+        content.textContent = "";
+
+        data.sections.forEach(
+            section => {
+
+                const sectionElement =
+                    document.createElement(
+                        "section"
+                    );
+
+                sectionElement.className =
+                    "details-section";
+
+                const heading =
+                    document.createElement(
+                        "h3"
+                    );
+
+                heading.textContent =
+                    section.title;
+
+                const grid =
+                    document.createElement(
+                        "div"
+                    );
+
+                grid.className =
+                    "details-grid";
+
+                Object.entries(
+                    section.items
+                ).forEach(
+                    ([label, value]) => {
+
+                        const labelElement =
+                            document.createElement(
+                                "div"
+                            );
+
+                        labelElement.className =
+                            "details-label";
+
+                        labelElement.textContent =
+                            label;
+
+                        const valueElement =
+                            document.createElement(
+                                "div"
+                            );
+
+                        valueElement.className =
+                            "details-value";
+
+                        appendDetailsValue(
+                            valueElement,
+                            value
+                        );
+
+                        grid.appendChild(
+                            labelElement
+                        );
+
+                        grid.appendChild(
+                            valueElement
+                        );
+                    }
+                );
+
+                sectionElement.appendChild(
+                    heading
+                );
+
+                sectionElement.appendChild(
+                    grid
+                );
+
+                content.appendChild(
+                    sectionElement
+                );
+            }
+        );
+
+    } catch (error) {
+
+        content.textContent =
+            "Не удалось загрузить данные оценки.";
+    }
+}
+
+
+document
+    .getElementById(
+        "rating_details_close"
+    )
+    .addEventListener(
+        "click",
+        closeRatingDetails
+    );
+
+
+document
+    .getElementById(
+        "rating_details_modal"
+    )
+    .addEventListener(
+        "click",
+        event => {
+            if (
+                event.target.id
+                === "rating_details_modal"
+            ) {
+                closeRatingDetails();
+            }
+        }
+    );
+
+
+document.addEventListener(
+    "keydown",
+    event => {
+        if (event.key === "Escape") {
+            closeRatingDetails();
+        }
+    }
+);
+
+
 async function loadRecent() {
 
     const data =
@@ -8892,6 +10309,49 @@ async function loadRecent() {
             }
 
 
+            const details =
+                document.createElement(
+                    "td"
+                );
+
+
+            if (
+                row.customer_rating
+                !== null
+            ) {
+
+                const detailsButton =
+                    document.createElement(
+                        "button"
+                    );
+
+                detailsButton.type =
+                    "button";
+
+                detailsButton.className =
+                    "details-button";
+
+                detailsButton.textContent =
+                    "Все данные";
+
+                detailsButton.addEventListener(
+                    "click",
+                    () => openRatingDetails(
+                        row.id
+                    )
+                );
+
+                details.appendChild(
+                    detailsButton
+                );
+
+            } else {
+
+                details.textContent =
+                    "—";
+            }
+
+
             tr.appendChild(
                 time
             );
@@ -8918,11 +10378,6 @@ async function loadRecent() {
 
 
             tr.appendChild(
-                customerRating
-            );
-
-
-            tr.appendChild(
                 sim
             );
 
@@ -8934,6 +10389,16 @@ async function loadRecent() {
 
             tr.appendChild(
                 sale
+            );
+
+
+            tr.appendChild(
+                customerRating
+            );
+
+
+            tr.appendChild(
+                details
             );
 
 
