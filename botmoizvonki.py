@@ -94,6 +94,8 @@ PUBLIC_BASE_URL = os.getenv(
 
 SMS_COOLDOWN_DAYS = 30
 
+RESULT_COOLDOWN_HOURS = 30
+
 SMS_TEXT = """TEXNIKACH
 
 Все актуальные цены, модели и каталог:
@@ -814,6 +816,67 @@ def init_db():
                     sql
                 )
 
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS client_results (
+
+                id INTEGER
+                    PRIMARY KEY
+                    AUTOINCREMENT,
+
+                client_key TEXT
+                    NOT NULL,
+
+                window_started_at INTEGER
+                    NOT NULL,
+
+                window_ends_at INTEGER
+                    NOT NULL,
+
+                source_call_id INTEGER
+                    NOT NULL,
+
+                attribution_time INTEGER
+                    NOT NULL,
+
+                sale_status TEXT
+                    NOT NULL
+                    CHECK (
+                        sale_status IN (
+                            'bought',
+                            'not_bought'
+                        )
+                    ),
+
+                no_sale_reason TEXT,
+                no_sale_reason_code TEXT,
+
+                talk_manager_code TEXT,
+                talk_manager_name TEXT,
+
+                marked_at INTEGER
+                    NOT NULL,
+
+                marked_by INTEGER,
+                marked_username TEXT,
+
+                created_at TIMESTAMP
+                    DEFAULT CURRENT_TIMESTAMP,
+
+                updated_at TIMESTAMP
+                    DEFAULT CURRENT_TIMESTAMP,
+
+                UNIQUE(
+                    client_key,
+                    window_started_at
+                ),
+
+                FOREIGN KEY(source_call_id)
+                    REFERENCES calls(id)
+            )
+            """
+        )
+
         # -------------------------------------------------
         # NORMALIZE OLD CLIENT NUMBERS
         # -------------------------------------------------
@@ -893,6 +956,195 @@ def init_db():
                         row["id"],
                     ),
                 )
+
+        # -------------------------------------------------
+        # BACKFILL 30-HOUR CLIENT RESULTS
+        # -------------------------------------------------
+
+        existing_client_results = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM client_results
+            """
+        ).fetchone()["count"]
+
+        if not existing_client_results:
+
+            legacy_results = conn.execute(
+                """
+                SELECT
+                    id,
+                    client_key,
+                    start_time,
+                    sale_status,
+                    no_sale_reason,
+                    no_sale_reason_code,
+                    talk_manager_code,
+                    talk_manager_name,
+                    sale_marked_at,
+                    sale_marked_by,
+                    sale_marked_username
+
+                FROM calls
+
+                WHERE
+                    COALESCE(
+                        is_internal_contact,
+                        0
+                    ) = 0
+
+                    AND
+
+                    client_key IS NOT NULL
+
+                    AND
+
+                    client_key != ''
+
+                    AND
+
+                    sale_status IN (
+                        'bought',
+                        'not_bought'
+                    )
+
+                ORDER BY
+                    client_key,
+                    COALESCE(
+                        sale_marked_at,
+                        start_time,
+                        id
+                    ),
+                    id
+                """
+            ).fetchall()
+
+            active_windows = {}
+            cooldown_seconds = (
+                RESULT_COOLDOWN_HOURS
+                * 60
+                * 60
+            )
+
+            for result in legacy_results:
+
+                action_time = int(
+                    result["sale_marked_at"]
+                    or result["start_time"]
+                    or 0
+                )
+
+                if action_time <= 0:
+                    continue
+
+                client_key = result[
+                    "client_key"
+                ]
+
+                active = active_windows.get(
+                    client_key
+                )
+
+                values = (
+                    result["id"],
+                    int(
+                        result["start_time"]
+                        or action_time
+                    ),
+                    result["sale_status"],
+                    result["no_sale_reason"],
+                    result["no_sale_reason_code"],
+                    result["talk_manager_code"],
+                    result["talk_manager_name"],
+                    action_time,
+                    result["sale_marked_by"],
+                    result["sale_marked_username"],
+                )
+
+                if (
+                    active
+                    and action_time
+                    < active["window_ends_at"]
+                ):
+
+                    conn.execute(
+                        """
+                        UPDATE client_results
+
+                        SET
+                            source_call_id = ?,
+                            attribution_time = ?,
+                            sale_status = ?,
+                            no_sale_reason = ?,
+                            no_sale_reason_code = ?,
+                            talk_manager_code = ?,
+                            talk_manager_name = ?,
+                            marked_at = ?,
+                            marked_by = ?,
+                            marked_username = ?,
+                            window_ends_at = ?,
+                            updated_at = CURRENT_TIMESTAMP
+
+                        WHERE id = ?
+                        """,
+                        values
+                        + (
+                            action_time
+                            + cooldown_seconds,
+                            active["id"],
+                        ),
+                    )
+
+                    active[
+                        "window_ends_at"
+                    ] = (
+                        action_time
+                        + cooldown_seconds
+                    )
+
+                else:
+
+                    window_ends_at = (
+                        action_time
+                        + cooldown_seconds
+                    )
+
+                    cursor = conn.execute(
+                        """
+                        INSERT INTO client_results (
+                            client_key,
+                            window_started_at,
+                            window_ends_at,
+                            source_call_id,
+                            attribution_time,
+                            sale_status,
+                            no_sale_reason,
+                            no_sale_reason_code,
+                            talk_manager_code,
+                            talk_manager_name,
+                            marked_at,
+                            marked_by,
+                            marked_username
+                        )
+
+                        VALUES (
+                            ?, ?, ?, ?, ?, ?, ?,
+                            ?, ?, ?, ?, ?, ?
+                        )
+                        """,
+                        (
+                            client_key,
+                            action_time,
+                            window_ends_at,
+                        )
+                        + values,
+                    )
+
+                    active_windows[client_key] = {
+                        "id": cursor.lastrowid,
+                        "window_ends_at":
+                            window_ends_at,
+                    }
 
         # -------------------------------------------------
         # OLD TELEGRAM RECORDS
@@ -1037,6 +1289,39 @@ def init_db():
                 sms_status,
                 sms_sent_at
             )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_client_results_client_window
+
+            ON client_results(
+                client_key,
+                window_ends_at
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_client_results_attribution
+
+            ON client_results(
+                attribution_time,
+                sale_status
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_client_results_source_call
+
+            ON client_results(source_call_id)
             """
         )
 
@@ -3215,6 +3500,24 @@ def mark_talk_manager(
             ),
         )
 
+        conn.execute(
+            """
+            UPDATE client_results
+
+            SET
+                talk_manager_code = ?,
+                talk_manager_name = ?,
+                updated_at = CURRENT_TIMESTAMP
+
+            WHERE source_call_id = ?
+            """,
+            (
+                manager_code,
+                manager_name,
+                call_id,
+            ),
+        )
+
         conn.commit()
 
     return manager_name
@@ -3224,10 +3527,33 @@ def mark_talk_manager(
 # SALE DATABASE
 # =========================================================
 
-def mark_sale_bought(
+def mark_client_result(
     call_id: int,
+    sale_status: str,
     telegram_user: dict,
+    *,
+    reason_code: str | None = None,
 ):
+
+    if sale_status not in {
+        "bought",
+        "not_bought",
+    }:
+        raise ValueError(
+            "Неизвестный результат"
+        )
+
+    reason = None
+
+    if sale_status == "not_bought":
+        reason = SALE_REASONS.get(
+            reason_code
+        )
+
+        if not reason:
+            raise ValueError(
+                "Неизвестная причина"
+            )
 
     now_ts = int(
         datetime
@@ -3237,18 +3563,206 @@ def mark_sale_bought(
         .timestamp()
     )
 
+    marked_by = telegram_user.get(
+        "id"
+    )
+
+    marked_username = get_telegram_user_name(
+        telegram_user
+    )
+
     with connect_db() as conn:
+
+        conn.execute(
+            "BEGIN IMMEDIATE"
+        )
+
+        call = conn.execute(
+            """
+            SELECT
+                id,
+                client_key,
+                client_number,
+                is_internal_contact,
+                start_time,
+                talk_manager_code,
+                talk_manager_name
+
+            FROM calls
+
+            WHERE id = ?
+
+            LIMIT 1
+            """,
+            (
+                call_id,
+            ),
+        ).fetchone()
+
+        if not call:
+            conn.rollback()
+            raise ValueError(
+                "Звонок не найден"
+            )
+
+        client_key = (
+            call["client_key"]
+            or normalize_phone(
+                call["client_number"]
+            )
+        )
+
+        if (
+            not client_key
+            or call["is_internal_contact"]
+        ):
+            conn.rollback()
+            raise ValueError(
+                "Результат для этого номера недоступен"
+            )
+
+        existing = conn.execute(
+            """
+            SELECT *
+
+            FROM client_results
+
+            WHERE source_call_id = ?
+
+            ORDER BY marked_at DESC
+
+            LIMIT 1
+            """,
+            (
+                call_id,
+            ),
+        ).fetchone()
+
+        if not existing:
+            existing = conn.execute(
+                """
+                SELECT *
+
+                FROM client_results
+
+                WHERE
+                    client_key = ?
+                    AND window_ends_at > ?
+
+                ORDER BY window_started_at DESC
+
+                LIMIT 1
+                """,
+                (
+                    client_key,
+                    now_ts,
+                ),
+            ).fetchone()
+
+        attribution_time = int(
+            call["start_time"]
+            or now_ts
+        )
+
+        next_window_ends_at = (
+            now_ts
+            + RESULT_COOLDOWN_HOURS
+            * 60
+            * 60
+        )
+
+        if existing:
+
+            result_id = existing["id"]
+
+            conn.execute(
+                """
+                UPDATE client_results
+
+                SET
+                    source_call_id = ?,
+                    attribution_time = ?,
+                    sale_status = ?,
+                    no_sale_reason = ?,
+                    no_sale_reason_code = ?,
+                    talk_manager_code = ?,
+                    talk_manager_name = ?,
+                    marked_at = ?,
+                    marked_by = ?,
+                    marked_username = ?,
+                    window_ends_at = ?,
+                    updated_at = CURRENT_TIMESTAMP
+
+                WHERE id = ?
+                """,
+                (
+                    call_id,
+                    attribution_time,
+                    sale_status,
+                    reason,
+                    reason_code,
+                    call["talk_manager_code"],
+                    call["talk_manager_name"],
+                    now_ts,
+                    marked_by,
+                    marked_username,
+                    next_window_ends_at,
+                    result_id,
+                ),
+            )
+
+        else:
+
+            cursor = conn.execute(
+                """
+                INSERT INTO client_results (
+                    client_key,
+                    window_started_at,
+                    window_ends_at,
+                    source_call_id,
+                    attribution_time,
+                    sale_status,
+                    no_sale_reason,
+                    no_sale_reason_code,
+                    talk_manager_code,
+                    talk_manager_name,
+                    marked_at,
+                    marked_by,
+                    marked_username
+                )
+
+                VALUES (
+                    ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    client_key,
+                    now_ts,
+                    next_window_ends_at,
+                    call_id,
+                    attribution_time,
+                    sale_status,
+                    reason,
+                    reason_code,
+                    call["talk_manager_code"],
+                    call["talk_manager_name"],
+                    now_ts,
+                    marked_by,
+                    marked_username,
+                ),
+            )
+
+            result_id = cursor.lastrowid
 
         conn.execute(
             """
             UPDATE calls
 
             SET
-                sale_status = 'bought',
-
-                no_sale_reason = NULL,
-                no_sale_reason_code = NULL,
-
+                sale_status = ?,
+                no_sale_reason = ?,
+                no_sale_reason_code = ?,
                 sale_marked_at = ?,
                 sale_marked_by = ?,
                 sale_marked_username = ?
@@ -3256,21 +3770,49 @@ def mark_sale_bought(
             WHERE id = ?
             """,
             (
+                sale_status,
+                reason,
+                reason_code,
                 now_ts,
-
-                telegram_user.get(
-                    "id"
-                ),
-
-                get_telegram_user_name(
-                    telegram_user
-                ),
-
+                marked_by,
+                marked_username,
                 call_id,
             ),
         )
 
         conn.commit()
+
+    return {
+        "result_id": result_id,
+        "replaced": bool(existing),
+        "previous_status": (
+            existing["sale_status"]
+            if existing
+            else None
+        ),
+        "previous_call_id": (
+            existing["source_call_id"]
+            if existing
+            else None
+        ),
+        "window_started_at": (
+            existing["window_started_at"]
+            if existing
+            else now_ts
+        ),
+    }
+
+
+def mark_sale_bought(
+    call_id: int,
+    telegram_user: dict,
+):
+
+    return mark_client_result(
+        call_id,
+        "bought",
+        telegram_user,
+    )
 
 
 def mark_sale_not_bought(
@@ -3279,61 +3821,12 @@ def mark_sale_not_bought(
     telegram_user: dict,
 ):
 
-    reason = SALE_REASONS.get(
-        reason_code
+    return mark_client_result(
+        call_id,
+        "not_bought",
+        telegram_user,
+        reason_code=reason_code,
     )
-
-    if not reason:
-
-        raise ValueError(
-            "Неизвестная причина"
-        )
-
-    now_ts = int(
-        datetime
-        .now(
-            UZ_TZ
-        )
-        .timestamp()
-    )
-
-    with connect_db() as conn:
-
-        conn.execute(
-            """
-            UPDATE calls
-
-            SET
-                sale_status = 'not_bought',
-
-                no_sale_reason = ?,
-                no_sale_reason_code = ?,
-
-                sale_marked_at = ?,
-                sale_marked_by = ?,
-                sale_marked_username = ?
-
-            WHERE id = ?
-            """,
-            (
-                reason,
-                reason_code,
-
-                now_ts,
-
-                telegram_user.get(
-                    "id"
-                ),
-
-                get_telegram_user_name(
-                    telegram_user
-                ),
-
-                call_id,
-            ),
-        )
-
-        conn.commit()
 
 
 # =========================================================
@@ -3817,7 +4310,7 @@ async def telegram_webhook(
 
             if result_code == "bought":
 
-                mark_sale_bought(
+                saved_result = mark_sale_bought(
                     call_id,
                     telegram_user,
                 )
@@ -3835,7 +4328,11 @@ async def telegram_webhook(
 
                 answer_callback_query(
                     callback_id,
-                    "✅ Сохранено",
+                    (
+                        "✅ Последний результат клиента обновлён"
+                        if saved_result["replaced"]
+                        else "✅ Сохранено"
+                    ),
                 )
 
                 return {
@@ -3867,7 +4364,7 @@ async def telegram_webhook(
                     "ok": True
                 }
 
-            mark_sale_not_bought(
+            saved_result = mark_sale_not_bought(
                 call_id,
                 result_code,
                 telegram_user,
@@ -3886,7 +4383,11 @@ async def telegram_webhook(
 
             answer_callback_query(
                 callback_id,
-                "✅ Сохранено",
+                (
+                    "✅ Последний результат клиента обновлён"
+                    if saved_result["replaced"]
+                    else "✅ Сохранено"
+                ),
             )
 
             return {
@@ -5552,20 +6053,7 @@ def stats(
 
                 SUM(
                     CASE
-                        WHEN
-                            answered = 1
-
-                            AND
-
-                            COALESCE(
-                                is_internal_contact,
-                                0
-                            ) = 0
-
-                            AND
-
-                            sale_status =
-                                'bought'
+                        WHEN sale_status = 'bought'
 
                         THEN 1
                         ELSE 0
@@ -5575,28 +6063,36 @@ def stats(
 
                 SUM(
                     CASE
-                        WHEN
-                            answered = 1
-
-                            AND
-
-                            COALESCE(
-                                is_internal_contact,
-                                0
-                            ) = 0
-
-                            AND
-
-                            sale_status =
-                                'not_bought'
+                        WHEN sale_status = 'not_bought'
 
                         THEN 1
                         ELSE 0
                     END
                 )
-                    AS not_bought,
+                    AS not_bought
 
-                SUM(
+            FROM client_results
+
+            WHERE
+                attribution_time >= ?
+
+                AND
+
+                attribution_time < ?
+            """,
+            (
+                start_ts,
+                end_ts,
+            ),
+        ).fetchone()
+
+        unmarked_row = conn.execute(
+            """
+            SELECT
+
+                COUNT(
+                    DISTINCT
+
                     CASE
                         WHEN
                             answered = 1
@@ -5610,19 +6106,59 @@ def stats(
 
                             AND
 
-                            (
-                                sale_status IS NULL
-                                OR
-                                sale_status = ''
+                            client_key IS NOT NULL
+
+                            AND
+
+                            client_key != ''
+
+                            AND
+
+                            NOT EXISTS (
+                                SELECT 1
+
+                                FROM client_results
+                                    AS result
+
+                                WHERE
+                                    result.client_key =
+                                        calls.client_key
+
+                                    AND
+
+                                    (
+                                        (
+                                            result.attribution_time
+                                                >= ?
+
+                                            AND
+
+                                            result.attribution_time
+                                                < ?
+                                        )
+
+                                        OR
+
+                                        (
+                                            result.window_started_at
+                                                <= calls.start_time
+
+                                            AND
+
+                                            result.window_ends_at
+                                                > calls.start_time
+                                        )
+                                    )
                             )
 
-                        THEN 1
-                        ELSE 0
+                        THEN client_key
                     END
                 )
                     AS sale_unmarked,
 
-                SUM(
+                COUNT(
+                    DISTINCT
+
                     CASE
                         WHEN
                             answered = 1
@@ -5636,14 +6172,43 @@ def stats(
 
                             AND
 
-                            (
-                                talk_manager_code IS NULL
-                                OR
-                                talk_manager_code = ''
+                            client_key IS NOT NULL
+
+                            AND
+
+                            client_key != ''
+
+                            AND
+
+                            NOT EXISTS (
+                                SELECT 1
+
+                                FROM calls AS managed_call
+
+                                WHERE
+                                    managed_call.client_key =
+                                        calls.client_key
+
+                                    AND
+
+                                    managed_call.start_time >= ?
+
+                                    AND
+
+                                    managed_call.start_time < ?
+
+                                    AND
+
+                                    managed_call.talk_manager_code
+                                        IS NOT NULL
+
+                                    AND
+
+                                    managed_call.talk_manager_code
+                                        != ''
                             )
 
-                        THEN 1
-                        ELSE 0
+                        THEN client_key
                     END
                 )
                     AS manager_unmarked
@@ -5658,6 +6223,10 @@ def stats(
                 start_time < ?
             """,
             (
+                start_ts,
+                end_ts,
+                start_ts,
+                end_ts,
                 start_ts,
                 end_ts,
             ),
@@ -5956,13 +6525,13 @@ def stats(
                 not_bought,
 
             "sale_unmarked":
-                sales_row[
+                unmarked_row[
                     "sale_unmarked"
                 ]
                 or 0,
 
             "manager_unmarked":
-                sales_row[
+                unmarked_row[
                     "manager_unmarked"
                 ]
                 or 0,
@@ -6043,21 +6612,14 @@ def stats_sales_reasons(
                 COUNT(*)
                     AS count
 
-            FROM calls
+            FROM client_results
 
             WHERE
-                start_time >= ?
+                attribution_time >= ?
 
                 AND
 
-                start_time < ?
-
-                AND
-
-                COALESCE(
-                    is_internal_contact,
-                    0
-                ) = 0
+                attribution_time < ?
 
                 AND
 
@@ -6594,6 +7156,52 @@ def stats_managers(
             ),
         ).fetchall()
 
+        result_rows = conn.execute(
+            """
+            SELECT
+                COALESCE(
+                    NULLIF(
+                        talk_manager_name,
+                        ''
+                    ),
+                    'Не указан'
+                ) AS manager,
+
+                SUM(
+                    CASE
+                        WHEN sale_status = 'bought'
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS bought,
+
+                SUM(
+                    CASE
+                        WHEN sale_status = 'not_bought'
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS not_bought
+
+            FROM client_results
+
+            WHERE
+                attribution_time >= ?
+                AND attribution_time < ?
+
+            GROUP BY manager
+            """,
+            (
+                p["start_ts"],
+                p["end_ts"],
+            ),
+        ).fetchall()
+
+    manager_results = {
+        row["manager"]: row
+        for row in result_rows
+    }
+
     results = []
 
     for row in rows:
@@ -6610,15 +7218,21 @@ def stats_managers(
             or 0
         )
 
-        bought = (
-            row["bought"]
-            or 0
+        manager_result = manager_results.get(
+            row["manager"]
         )
 
+        bought = (
+            manager_result["bought"]
+            if manager_result
+            else 0
+        ) or 0
+
         not_bought = (
-            row["not_bought"]
-            or 0
-        )
+            manager_result["not_bought"]
+            if manager_result
+            else 0
+        ) or 0
 
         marked = (
             bought
@@ -7166,7 +7780,8 @@ def stats_recent(
                 direction,
                 answered,
 
-                talk_manager_name,
+                calls.talk_manager_name
+                    AS talk_manager_name,
 
                 src_number,
 
@@ -7174,8 +7789,11 @@ def stats_recent(
 
                 duration,
 
-                sale_status,
-                no_sale_reason,
+                client_result.sale_status
+                    AS sale_status,
+
+                client_result.no_sale_reason
+                    AS no_sale_reason,
 
                 rating.score
                     AS customer_rating,
@@ -7187,6 +7805,12 @@ def stats_recent(
 
             LEFT JOIN call_ratings AS rating
                 ON rating.call_id = calls.id
+
+            LEFT JOIN client_results
+                AS client_result
+
+                ON client_result.source_call_id =
+                    calls.id
 
             WHERE
                 start_time >= ?
@@ -7410,11 +8034,13 @@ def rating_details(
                 call.talk_manager_name,
                 call.manager_marked_at,
                 call.manager_marked_username,
-                call.sale_status,
-                call.no_sale_reason,
-                call.no_sale_reason_code,
-                call.sale_marked_at,
-                call.sale_marked_username,
+                client_result.sale_status,
+                client_result.no_sale_reason,
+                client_result.no_sale_reason_code,
+                client_result.marked_at
+                    AS sale_marked_at,
+                client_result.marked_username
+                    AS sale_marked_username,
                 call.created_at AS call_created_at,
 
                 rating.sender_user_login,
@@ -7444,6 +8070,12 @@ def rating_details(
 
             JOIN call_ratings AS rating
                 ON rating.call_id = call.id
+
+            LEFT JOIN client_results
+                AS client_result
+
+                ON client_result.source_call_id =
+                    call.id
 
             WHERE
                 call.id = ?
