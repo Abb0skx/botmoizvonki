@@ -1,5 +1,7 @@
+import hashlib
 import json
 import os
+import secrets
 import sqlite3
 import subprocess
 import tempfile
@@ -85,6 +87,11 @@ MOIZVONKI_API_KEY = os.getenv(
     "",
 )
 
+PUBLIC_BASE_URL = os.getenv(
+    "PUBLIC_BASE_URL",
+    "",
+).rstrip("/")
+
 SMS_COOLDOWN_DAYS = 30
 
 SMS_TEXT = """TEXNIKACH
@@ -108,6 +115,12 @@ https://t.me/texnikach_admin
 
 Biz haqimizda to‘liq ma’lumot:
 https://texnikach.uz/go"""
+
+RATING_SMS_TEXT = """TEXNIKACH
+Оцените звонок от 1 до 5.
+Qo‘ng‘iroqni 1 dan 5 gacha baholang.
+{rating_url}
+1 — плохо/yomon, 5 — отлично/a’lo"""
 
 DB_PATH = Path(
     os.getenv(
@@ -146,6 +159,13 @@ print(
 print(
     "DATABASE:",
     DB_PATH,
+)
+
+print(
+    "PUBLIC BASE URL EXISTS:",
+    bool(
+        PUBLIC_BASE_URL
+    ),
 )
 
 
@@ -576,6 +596,54 @@ def init_db():
                 """
             )
 
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS call_ratings (
+
+                id INTEGER
+                    PRIMARY KEY
+                    AUTOINCREMENT,
+
+                call_id INTEGER
+                    NOT NULL
+                    UNIQUE,
+
+                token_hash TEXT
+                    NOT NULL
+                    UNIQUE,
+
+                client_key TEXT
+                    NOT NULL,
+
+                sender_user_login TEXT,
+
+                sms_status TEXT
+                    NOT NULL,
+
+                sms_reserved_at INTEGER
+                    NOT NULL,
+
+                sms_sent_at INTEGER,
+                sms_error TEXT,
+                provider_response TEXT,
+
+                score INTEGER
+                    CHECK (
+                        score BETWEEN 1 AND 5
+                    ),
+
+                rated_at INTEGER,
+                expires_at INTEGER NOT NULL,
+
+                created_at TIMESTAMP
+                    DEFAULT CURRENT_TIMESTAMP,
+
+                FOREIGN KEY(call_id)
+                    REFERENCES calls(id)
+            )
+            """
+        )
+
         # -------------------------------------------------
         # NORMALIZE OLD CLIENT NUMBERS
         # -------------------------------------------------
@@ -778,6 +846,30 @@ def init_db():
             """
         )
 
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_call_ratings_score_time
+
+            ON call_ratings(
+                score,
+                rated_at
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_call_ratings_sms_status
+
+            ON call_ratings(
+                sms_status,
+                sms_sent_at
+            )
+            """
+        )
+
         conn.commit()
 
 
@@ -925,6 +1017,7 @@ def reserve_client_sms(
 def send_client_sms(
     client_number: str,
     sender_user_login: str | None,
+    message_text: str = SMS_TEXT,
 ):
 
     if not MOIZVONKI_API_URL:
@@ -962,7 +1055,7 @@ def send_client_sms(
         "api_key": MOIZVONKI_API_KEY,
         "action": "calls.send_sms",
         "to": "+" + phone,
-        "text": SMS_TEXT,
+        "text": message_text,
     }
 
     print(
@@ -1103,6 +1196,241 @@ def mark_sms_error(
             (
                 error_text,
                 call_id,
+            ),
+        )
+
+        conn.commit()
+
+
+# =========================================================
+# CUSTOMER RATINGS
+# =========================================================
+
+def hash_rating_token(
+    token: str,
+) -> str:
+
+    return hashlib.sha256(
+        token.encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+def build_rating_url(
+    token: str,
+) -> str:
+
+    if not PUBLIC_BASE_URL:
+        raise RuntimeError(
+            "PUBLIC_BASE_URL не указан"
+        )
+
+    if not PUBLIC_BASE_URL.startswith(
+        (
+            "https://",
+            "http://",
+        )
+    ):
+        raise RuntimeError(
+            "PUBLIC_BASE_URL должен начинаться "
+            "с https:// или http://"
+        )
+
+    return (
+        PUBLIC_BASE_URL
+        + "/rate/"
+        + token
+    )
+
+
+def reserve_call_rating(
+    call_id: int,
+    client_number: str,
+    sender_user_login: str | None,
+):
+
+    client_key = normalize_phone(
+        client_number
+    )
+
+    if not call_id:
+        return {
+            "reserved": False,
+            "reason": "empty_call_id",
+        }
+
+    if not client_key:
+        return {
+            "reserved": False,
+            "reason": "empty_number",
+        }
+
+    if get_internal_contact_name(
+        client_key
+    ):
+        return {
+            "reserved": False,
+            "reason": "internal_contact",
+        }
+
+    now_ts = int(
+        datetime.now(
+            timezone.utc
+        ).timestamp()
+    )
+
+    expires_at = (
+        now_ts
+        + 30
+        * 24
+        * 60
+        * 60
+    )
+
+    raw_token = secrets.token_urlsafe(
+        32
+    )
+
+    token_hash = hash_rating_token(
+        raw_token
+    )
+
+    with connect_db() as conn:
+
+        conn.execute(
+            "BEGIN IMMEDIATE"
+        )
+
+        previous = conn.execute(
+            """
+            SELECT
+                id,
+                sms_status,
+                score
+
+            FROM call_ratings
+
+            WHERE call_id = ?
+
+            LIMIT 1
+            """,
+            (
+                call_id,
+            ),
+        ).fetchone()
+
+        if previous:
+
+            conn.commit()
+
+            return {
+                "reserved": False,
+                "reason": "already_created",
+                "rating_id": previous["id"],
+                "sms_status": previous["sms_status"],
+                "score": previous["score"],
+            }
+
+        cursor = conn.execute(
+            """
+            INSERT INTO call_ratings (
+                call_id,
+                token_hash,
+                client_key,
+                sender_user_login,
+                sms_status,
+                sms_reserved_at,
+                expires_at
+            )
+
+            VALUES (?, ?, ?, ?, 'reserved', ?, ?)
+            """,
+            (
+                call_id,
+                token_hash,
+                client_key,
+                sender_user_login,
+                now_ts,
+                expires_at,
+            ),
+        )
+
+        conn.commit()
+
+        return {
+            "reserved": True,
+            "reason": "reserved",
+            "rating_id": cursor.lastrowid,
+            "token": raw_token,
+        }
+
+
+def mark_rating_sms_sent(
+    rating_id: int,
+    provider_result,
+):
+
+    now_ts = int(
+        datetime.now(
+            timezone.utc
+        ).timestamp()
+    )
+
+    provider_response = json.dumps(
+        provider_result,
+        ensure_ascii=False,
+        default=str,
+    )[:10000]
+
+    with connect_db() as conn:
+
+        conn.execute(
+            """
+            UPDATE call_ratings
+
+            SET
+                sms_status = 'sent',
+                sms_sent_at = ?,
+                sms_error = NULL,
+                provider_response = ?
+
+            WHERE id = ?
+            """,
+            (
+                now_ts,
+                provider_response,
+                rating_id,
+            ),
+        )
+
+        conn.commit()
+
+
+def mark_rating_sms_error(
+    rating_id: int,
+    error,
+):
+
+    error_text = str(
+        error
+    )[:2000]
+
+    with connect_db() as conn:
+
+        conn.execute(
+            """
+            UPDATE call_ratings
+
+            SET
+                sms_status = 'error',
+                sms_error = ?
+
+            WHERE id = ?
+            """,
+            (
+                error_text,
+                rating_id,
             ),
         )
 
@@ -3609,6 +3937,368 @@ def get_period(
 
 
 # =========================================================
+# CUSTOMER RATING PAGE
+# =========================================================
+
+def rating_html_response(
+    title: str,
+    message_ru: str,
+    message_uz: str,
+    token: str | None = None,
+    selected_score: int | None = None,
+    status_code: int = 200,
+):
+
+    buttons_html = ""
+
+    if token:
+
+        safe_token = escape(
+            token,
+            quote=True,
+        )
+
+        buttons = []
+
+        for score in range(
+            1,
+            6,
+        ):
+            buttons.append(
+                f"""
+                <form
+                    method="post"
+                    action="/rate/{safe_token}/{score}"
+                >
+                    <button
+                        type="submit"
+                        aria-label="Оценка {score}"
+                    >
+                        {score}
+                    </button>
+                </form>
+                """
+            )
+
+        buttons_html = (
+            """
+            <div class="scale">
+                <span>1 — плохо / yomon</span>
+                <span>5 — отлично / a’lo</span>
+            </div>
+            <div class="buttons">
+            """
+            + "".join(
+                buttons
+            )
+            + "</div>"
+        )
+
+    score_html = ""
+
+    if selected_score is not None:
+        score_html = (
+            '<div class="selected">'
+            + str(selected_score)
+            + " ★</div>"
+        )
+
+    html = f"""
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    >
+    <meta
+        name="robots"
+        content="noindex,nofollow"
+    >
+    <title>{escape(title)}</title>
+    <style>
+        * {{ box-sizing: border-box; }}
+        body {{
+            margin: 0;
+            min-height: 100vh;
+            display: grid;
+            place-items: center;
+            padding: 20px;
+            background: #111;
+            color: #fff;
+            font-family: -apple-system, BlinkMacSystemFont,
+                "Segoe UI", Arial, sans-serif;
+        }}
+        .card {{
+            width: 100%;
+            max-width: 620px;
+            padding: 34px 26px;
+            border: 1px solid #333;
+            border-radius: 22px;
+            background: #1b1b1b;
+            text-align: center;
+        }}
+        .brand {{
+            color: #d9b565;
+            font-weight: 800;
+            letter-spacing: .08em;
+        }}
+        h1 {{
+            margin: 18px 0 12px;
+            font-size: 28px;
+        }}
+        p {{
+            margin: 8px 0;
+            color: #c7c7c7;
+            line-height: 1.5;
+        }}
+        .buttons {{
+            display: grid;
+            grid-template-columns: repeat(5, 1fr);
+            gap: 10px;
+            margin-top: 18px;
+        }}
+        form {{ margin: 0; }}
+        button {{
+            width: 100%;
+            min-height: 58px;
+            border: 1px solid #4a4a4a;
+            border-radius: 14px;
+            background: #242424;
+            color: #fff;
+            font-size: 24px;
+            font-weight: 800;
+            cursor: pointer;
+        }}
+        button:hover,
+        button:focus {{
+            background: #d9b565;
+            color: #111;
+            border-color: #d9b565;
+        }}
+        .scale {{
+            display: flex;
+            justify-content: space-between;
+            gap: 15px;
+            margin-top: 24px;
+            color: #888;
+            font-size: 12px;
+        }}
+        .selected {{
+            margin: 24px auto 4px;
+            color: #d9b565;
+            font-size: 44px;
+            font-weight: 800;
+        }}
+    </style>
+</head>
+<body>
+    <main class="card">
+        <div class="brand">TEXNIKACH</div>
+        <h1>{escape(title)}</h1>
+        <p>{escape(message_ru)}</p>
+        <p>{escape(message_uz)}</p>
+        {score_html}
+        {buttons_html}
+    </main>
+</body>
+</html>
+    """
+
+    return HTMLResponse(
+        content=html,
+        status_code=status_code,
+        headers={
+            "Cache-Control": "no-store",
+            "X-Robots-Tag": "noindex, nofollow",
+        },
+    )
+
+
+@app.get(
+    "/rate/{token}",
+    response_class=HTMLResponse,
+)
+def rating_page(
+    token: str,
+):
+
+    token_hash = hash_rating_token(
+        token
+    )
+
+    now_ts = int(
+        datetime.now(
+            timezone.utc
+        ).timestamp()
+    )
+
+    with connect_db() as conn:
+
+        row = conn.execute(
+            """
+            SELECT
+                score,
+                expires_at
+
+            FROM call_ratings
+
+            WHERE token_hash = ?
+
+            LIMIT 1
+            """,
+            (
+                token_hash,
+            ),
+        ).fetchone()
+
+    if not row:
+        return rating_html_response(
+            "Ссылка не найдена",
+            "Проверьте ссылку из SMS.",
+            "SMSdagi havolani tekshiring.",
+            status_code=404,
+        )
+
+    if row["score"] is not None:
+        return rating_html_response(
+            "Спасибо за оценку!",
+            "Ваш ответ уже сохранён.",
+            "Javobingiz saqlandi. Rahmat!",
+            selected_score=row["score"],
+        )
+
+    if row["expires_at"] < now_ts:
+        return rating_html_response(
+            "Срок ссылки истёк",
+            "Эта ссылка была активна 30 дней.",
+            "Ushbu havola 30 kun davomida faol edi.",
+            status_code=410,
+        )
+
+    return rating_html_response(
+        "Оцените разговор",
+        "Выберите оценку от 1 до 5.",
+        "Suhbatni 1 dan 5 gacha baholang.",
+        token=token,
+    )
+
+
+@app.post(
+    "/rate/{token}/{score}",
+    response_class=HTMLResponse,
+)
+def submit_rating(
+    token: str,
+    score: int,
+):
+
+    if score not in {
+        1,
+        2,
+        3,
+        4,
+        5,
+    }:
+        raise HTTPException(
+            status_code=400,
+            detail="Rating must be from 1 to 5",
+        )
+
+    token_hash = hash_rating_token(
+        token
+    )
+
+    now_ts = int(
+        datetime.now(
+            timezone.utc
+        ).timestamp()
+    )
+
+    with connect_db() as conn:
+
+        conn.execute(
+            "BEGIN IMMEDIATE"
+        )
+
+        row = conn.execute(
+            """
+            SELECT
+                score,
+                expires_at
+
+            FROM call_ratings
+
+            WHERE token_hash = ?
+
+            LIMIT 1
+            """,
+            (
+                token_hash,
+            ),
+        ).fetchone()
+
+        if not row:
+            conn.commit()
+
+            return rating_html_response(
+                "Ссылка не найдена",
+                "Проверьте ссылку из SMS.",
+                "SMSdagi havolani tekshiring.",
+                status_code=404,
+            )
+
+        if row["score"] is not None:
+            conn.commit()
+
+            return rating_html_response(
+                "Спасибо за оценку!",
+                "Первая оценка уже сохранена.",
+                "Birinchi baho saqlangan.",
+                selected_score=row["score"],
+            )
+
+        if row["expires_at"] < now_ts:
+            conn.commit()
+
+            return rating_html_response(
+                "Срок ссылки истёк",
+                "Эта ссылка была активна 30 дней.",
+                "Ushbu havola 30 kun davomida faol edi.",
+                status_code=410,
+            )
+
+        conn.execute(
+            """
+            UPDATE call_ratings
+
+            SET
+                score = ?,
+                rated_at = ?
+
+            WHERE
+                token_hash = ?
+                AND score IS NULL
+            """,
+            (
+                score,
+                now_ts,
+                token_hash,
+            ),
+        )
+
+        conn.commit()
+
+    return rating_html_response(
+        "Спасибо за оценку!",
+        "Ваш ответ сохранён.",
+        "Javobingiz saqlandi. Rahmat!",
+        selected_score=score,
+    )
+
+
+# =========================================================
 # ROOT
 # =========================================================
 
@@ -4185,6 +4875,97 @@ def stats(
             ),
         ).fetchone()
 
+        ratings_row = conn.execute(
+            """
+            SELECT
+                COUNT(
+                    CASE
+                        WHEN
+                            rating.sms_sent_at
+                                IS NOT NULL
+                            OR
+                            rating.score
+                                IS NOT NULL
+                        THEN 1
+                    END
+                )
+                    AS invitations_sent,
+
+                COUNT(rating.score)
+                    AS ratings_count,
+
+                AVG(rating.score)
+                    AS average_rating,
+
+                SUM(
+                    CASE
+                        WHEN rating.score = 1
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS score_1,
+
+                SUM(
+                    CASE
+                        WHEN rating.score = 2
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS score_2,
+
+                SUM(
+                    CASE
+                        WHEN rating.score = 3
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS score_3,
+
+                SUM(
+                    CASE
+                        WHEN rating.score = 4
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS score_4,
+
+                SUM(
+                    CASE
+                        WHEN rating.score = 5
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS score_5
+
+            FROM calls AS call
+
+            LEFT JOIN call_ratings AS rating
+                ON rating.call_id = call.id
+
+            WHERE
+                call.start_time >= ?
+
+                AND
+
+                call.start_time < ?
+
+                AND
+
+                call.answered = 1
+
+                AND
+
+                COALESCE(
+                    call.is_internal_contact,
+                    0
+                ) = 0
+            """,
+            (
+                start_ts,
+                end_ts,
+            ),
+        ).fetchone()
+
     incoming = (
         row["incoming"]
         or 0
@@ -4239,6 +5020,33 @@ def stats(
         )
 
         if marked_results
+        else 0
+    )
+
+    ratings_count = (
+        ratings_row[
+            "ratings_count"
+        ]
+        or 0
+    )
+
+    rating_invitations_sent = (
+        ratings_row[
+            "invitations_sent"
+        ]
+        or 0
+    )
+
+    rating_response_rate = (
+        round(
+            (
+                ratings_count
+                / rating_invitations_sent
+            )
+            * 100,
+            1,
+        )
+        if rating_invitations_sent
         else 0
     )
 
@@ -4373,6 +5181,44 @@ def stats(
 
             "sale_conversion":
                 sale_conversion,
+
+            "average_rating":
+                (
+                    round(
+                        float(
+                            ratings_row[
+                                "average_rating"
+                            ]
+                        ),
+                        2,
+                    )
+                    if ratings_row[
+                        "average_rating"
+                    ] is not None
+                    else None
+                ),
+
+            "ratings_count":
+                ratings_count,
+
+            "rating_invitations_sent":
+                rating_invitations_sent,
+
+            "rating_response_rate":
+                rating_response_rate,
+
+            "rating_distribution": {
+                str(score): (
+                    ratings_row[
+                        f"score_{score}"
+                    ]
+                    or 0
+                )
+                for score in range(
+                    1,
+                    6,
+                )
+            },
         },
     }
 
@@ -4908,9 +5754,38 @@ def stats_managers(
                         ELSE 0
                     END
                 )
-                    AS internal_calls
+                    AS internal_calls,
+
+                COUNT(rating.score)
+                    AS ratings_count,
+
+                AVG(rating.score)
+                    AS average_rating,
+
+                COUNT(
+                    CASE
+                        WHEN
+                            rating.sms_sent_at
+                                IS NOT NULL
+                            OR
+                            rating.score
+                                IS NOT NULL
+                        THEN 1
+                    END
+                )
+                    AS rating_invitations_sent
 
             FROM calls
+
+            LEFT JOIN (
+                SELECT
+                    call_id,
+                    score,
+                    sms_sent_at
+
+                FROM call_ratings
+            ) AS rating
+                ON rating.call_id = calls.id
 
             WHERE
                 start_time >= ?
@@ -4960,6 +5835,20 @@ def stats_managers(
         marked = (
             bought
             + not_bought
+        )
+
+        ratings_count = (
+            row[
+                "ratings_count"
+            ]
+            or 0
+        )
+
+        rating_invitations_sent = (
+            row[
+                "rating_invitations_sent"
+            ]
+            or 0
         )
 
         results.append(
@@ -5035,6 +5924,227 @@ def stats_managers(
 
                         if marked
 
+                        else 0
+                    ),
+
+                "average_rating":
+                    (
+                        round(
+                            float(
+                                row[
+                                    "average_rating"
+                                ]
+                            ),
+                            2,
+                        )
+                        if row[
+                            "average_rating"
+                        ] is not None
+                        else None
+                    ),
+
+                "ratings_count":
+                    ratings_count,
+
+                "rating_invitations_sent":
+                    rating_invitations_sent,
+
+                "rating_response_rate":
+                    (
+                        round(
+                            (
+                                ratings_count
+                                / rating_invitations_sent
+                            )
+                            * 100,
+                            1,
+                        )
+                        if rating_invitations_sent
+                        else 0
+                    ),
+            }
+        )
+
+    return {
+        "results":
+            results
+    }
+
+
+# =========================================================
+# DAILY CUSTOMER RATINGS BY MANAGER
+# =========================================================
+
+@app.get(
+    "/stats/ratings/daily"
+)
+def stats_ratings_daily(
+    period: str = "today",
+    date_from: str | None = None,
+    date_to: str | None = None,
+):
+
+    p = get_period(
+        period,
+        date_from,
+        date_to,
+    )
+
+    with connect_db() as conn:
+
+        rows = conn.execute(
+            """
+            SELECT
+                date(
+                    datetime(
+                        call.start_time,
+                        'unixepoch',
+                        '+5 hours'
+                    )
+                )
+                    AS call_date,
+
+                COALESCE(
+                    NULLIF(
+                        call.talk_manager_code,
+                        ''
+                    ),
+                    'unmarked'
+                )
+                    AS manager_code,
+
+                COALESCE(
+                    NULLIF(
+                        call.talk_manager_name,
+                        ''
+                    ),
+                    'Не указан'
+                )
+                    AS manager,
+
+                COUNT(rating.score)
+                    AS ratings_count,
+
+                AVG(rating.score)
+                    AS average_rating,
+
+                COUNT(
+                    CASE
+                        WHEN
+                            rating.sms_sent_at
+                                IS NOT NULL
+                            OR
+                            rating.score
+                                IS NOT NULL
+                        THEN 1
+                    END
+                )
+                    AS invitations_sent
+
+            FROM calls AS call
+
+            LEFT JOIN call_ratings AS rating
+                ON rating.call_id = call.id
+
+            WHERE
+                call.start_time >= ?
+
+                AND
+
+                call.start_time < ?
+
+                AND
+
+                call.answered = 1
+
+                AND
+
+                COALESCE(
+                    call.is_internal_contact,
+                    0
+                ) = 0
+
+            GROUP BY
+                call_date,
+                manager_code,
+                manager
+
+            HAVING
+                invitations_sent > 0
+                OR ratings_count > 0
+
+            ORDER BY
+                call_date DESC,
+                manager
+            """,
+            (
+                p["start_ts"],
+                p["end_ts"],
+            ),
+        ).fetchall()
+
+    results = []
+
+    for row in rows:
+
+        invitations_sent = (
+            row[
+                "invitations_sent"
+            ]
+            or 0
+        )
+
+        ratings_count = (
+            row[
+                "ratings_count"
+            ]
+            or 0
+        )
+
+        results.append(
+            {
+                "date":
+                    row["call_date"],
+
+                "manager_code":
+                    row["manager_code"],
+
+                "manager":
+                    row["manager"],
+
+                "average_rating":
+                    (
+                        round(
+                            float(
+                                row[
+                                    "average_rating"
+                                ]
+                            ),
+                            2,
+                        )
+                        if row[
+                            "average_rating"
+                        ] is not None
+                        else None
+                    ),
+
+                "ratings_count":
+                    ratings_count,
+
+                "invitations_sent":
+                    invitations_sent,
+
+                "response_rate":
+                    (
+                        round(
+                            (
+                                ratings_count
+                                / invitations_sent
+                            )
+                            * 100,
+                            1,
+                        )
+                        if invitations_sent
                         else 0
                     ),
             }
@@ -5256,7 +6366,7 @@ def stats_recent(
             """
             SELECT
 
-                id,
+                calls.id AS id,
                 db_call_id,
 
                 client_number,
@@ -5277,9 +6387,18 @@ def stats_recent(
                 duration,
 
                 sale_status,
-                no_sale_reason
+                no_sale_reason,
+
+                rating.score
+                    AS customer_rating,
+
+                rating.sms_status
+                    AS rating_sms_status
 
             FROM calls
+
+            LEFT JOIN call_ratings AS rating
+                ON rating.call_id = calls.id
 
             WHERE
                 start_time >= ?
@@ -5391,6 +6510,16 @@ def stats_recent(
                 "no_sale_reason":
                     row[
                         "no_sale_reason"
+                    ],
+
+                "customer_rating":
+                    row[
+                        "customer_rating"
+                    ],
+
+                "rating_sms_status":
+                    row[
+                        "rating_sms_status"
                     ],
             }
         )
@@ -6217,6 +7346,76 @@ tbody tr:last-child td {
 </div>
 
 
+<h2 class="section-title">
+    Качество обслуживания
+</h2>
+
+
+<div class="grid">
+
+    <div class="card good">
+        <div class="label">
+            Средняя оценка клиентов
+        </div>
+
+        <div
+            class="value"
+            id="average_rating"
+        >—</div>
+    </div>
+
+
+    <div class="card">
+        <div class="label">
+            Получено оценок
+        </div>
+
+        <div
+            class="value"
+            id="ratings_count"
+        >—</div>
+    </div>
+
+
+    <div class="card">
+        <div class="label">
+            Отправлено приглашений
+        </div>
+
+        <div
+            class="value"
+            id="rating_invitations_sent"
+        >—</div>
+    </div>
+
+
+    <div class="card">
+        <div class="label">
+            Ответили на оценку
+        </div>
+
+        <div
+            class="value"
+            id="rating_response_rate"
+        >—</div>
+    </div>
+
+
+    <div class="card">
+        <div class="label">
+            Распределение 1–5
+        </div>
+
+        <div
+            class="value"
+            id="rating_distribution"
+            style="font-size: 18px"
+        >—</div>
+    </div>
+
+</div>
+
+
 <div class="panel">
 
     <div class="panel-header">
@@ -6327,6 +7526,9 @@ tbody tr:last-child td {
                 <th>Купил</th>
                 <th>Не купил</th>
                 <th>Конверсия</th>
+                <th>Ср. оценка</th>
+                <th>Оценок</th>
+                <th>Ответили</th>
                 <th>Разговор</th>
 
             </tr>
@@ -6335,6 +7537,44 @@ tbody tr:last-child td {
 
             <tbody
                 id="managers_body"
+            ></tbody>
+
+        </table>
+
+    </div>
+
+</div>
+
+
+<div class="panel">
+
+    <div class="panel-header">
+
+        <h2>
+            Оценки продавцов по дням
+        </h2>
+
+    </div>
+
+    <div class="table-wrap">
+
+        <table>
+
+            <thead>
+
+            <tr>
+                <th>Дата</th>
+                <th>Менеджер</th>
+                <th>Средняя оценка</th>
+                <th>Оценок</th>
+                <th>Приглашений</th>
+                <th>Ответили</th>
+            </tr>
+
+            </thead>
+
+            <tbody
+                id="ratings_daily_body"
             ></tbody>
 
         </table>
@@ -6409,6 +7649,7 @@ tbody tr:last-child td {
                 <th>Направление</th>
                 <th>Статус</th>
                 <th>Менеджер</th>
+                <th>Оценка</th>
                 <th>SIM</th>
                 <th>Разговор</th>
                 <th>Результат</th>
@@ -6673,6 +7914,40 @@ async function loadStats() {
         sale_conversion:
             s.sale_conversion
             + "%",
+
+        average_rating:
+            s.average_rating === null
+                ? "—"
+                : Number(
+                    s.average_rating
+                ).toFixed(2)
+                + " ★",
+
+        ratings_count:
+            s.ratings_count,
+
+        rating_invitations_sent:
+            s.rating_invitations_sent,
+
+        rating_response_rate:
+            s.rating_response_rate
+            + "%",
+
+        rating_distribution:
+            [1, 2, 3, 4, 5]
+                .map(
+                    score => (
+                        score
+                        + "★: "
+                        + (
+                            s.rating_distribution[
+                                String(score)
+                            ]
+                            || 0
+                        )
+                    )
+                )
+                .join(" · "),
     };
 
 
@@ -7078,6 +8353,18 @@ async function loadManagers() {
                 row.sale_conversion
                 + "%",
 
+                row.average_rating === null
+                    ? "—"
+                    : Number(
+                        row.average_rating
+                    ).toFixed(2)
+                    + " ★",
+
+                row.ratings_count,
+
+                row.rating_response_rate
+                + "%",
+
                 formatDuration(
                     row.total_duration_seconds
                 ),
@@ -7103,6 +8390,103 @@ async function loadManagers() {
                 }
             );
 
+
+            body.appendChild(
+                tr
+            );
+        }
+    );
+}
+
+
+async function loadRatingsDaily() {
+
+    const data =
+        await getJson(
+            "/stats/ratings/daily"
+        );
+
+
+    const body =
+        document.getElementById(
+            "ratings_daily_body"
+        );
+
+
+    body.innerHTML =
+        "";
+
+
+    if (
+        data.results.length
+        === 0
+    ) {
+
+        const tr =
+            document.createElement(
+                "tr"
+            );
+
+        const td =
+            document.createElement(
+                "td"
+            );
+
+        td.colSpan = 6;
+        td.className = "empty";
+        td.textContent =
+            "Пока нет отправленных приглашений";
+
+        tr.appendChild(
+            td
+        );
+
+        body.appendChild(
+            tr
+        );
+
+        return;
+    }
+
+
+    data.results.forEach(
+        row => {
+
+            const tr =
+                document.createElement(
+                    "tr"
+                );
+
+            const values = [
+                row.date,
+                row.manager,
+                row.average_rating === null
+                    ? "—"
+                    : Number(
+                        row.average_rating
+                    ).toFixed(2)
+                    + " ★",
+                row.ratings_count,
+                row.invitations_sent,
+                row.response_rate + "%",
+            ];
+
+            values.forEach(
+                value => {
+
+                    const td =
+                        document.createElement(
+                            "td"
+                        );
+
+                    td.textContent =
+                        value;
+
+                    tr.appendChild(
+                        td
+                    );
+                }
+            );
 
             body.appendChild(
                 tr
@@ -7309,6 +8693,40 @@ async function loadRecent() {
                 row.manager;
 
 
+            const customerRating =
+                document.createElement(
+                    "td"
+                );
+
+
+            if (
+                row.customer_rating
+                !== null
+            ) {
+                customerRating.textContent =
+                    row.customer_rating
+                    + " ★";
+
+            } else if (
+                row.rating_sms_status
+                === "sent"
+            ) {
+                customerRating.textContent =
+                    "Ожидаем";
+
+            } else if (
+                row.rating_sms_status
+                === "error"
+            ) {
+                customerRating.textContent =
+                    "SMS ошибка";
+
+            } else {
+                customerRating.textContent =
+                    "—";
+            }
+
+
             const sim =
                 document.createElement(
                     "td"
@@ -7421,6 +8839,11 @@ async function loadRecent() {
 
 
             tr.appendChild(
+                customerRating
+            );
+
+
+            tr.appendChild(
                 sim
             );
 
@@ -7457,6 +8880,8 @@ async function loadAll() {
                 loadReasons(),
 
                 loadManagers(),
+
+                loadRatingsDaily(),
 
                 loadSims(),
 
@@ -7862,6 +9287,104 @@ async def moizvonki_webhook(
             ]
 
     # -----------------------------------------------------
+    # CUSTOMER RATING SMS
+    # -----------------------------------------------------
+
+    rating_sms_status = "not_applicable"
+
+    if (
+        answered
+
+        and
+
+        not is_internal_contact
+
+        and
+
+        normalize_phone(
+            client_number
+        )
+    ):
+
+        rating_reservation = (
+            reserve_call_rating(
+                call_id,
+                client_number,
+                sender_user_login,
+            )
+        )
+
+        if rating_reservation[
+            "reserved"
+        ]:
+
+            rating_id = rating_reservation[
+                "rating_id"
+            ]
+
+            try:
+
+                rating_url = build_rating_url(
+                    rating_reservation[
+                        "token"
+                    ]
+                )
+
+                rating_text = (
+                    RATING_SMS_TEXT.format(
+                        rating_url=rating_url
+                    )
+                )
+
+                rating_sms_result = (
+                    send_client_sms(
+                        client_number,
+                        sender_user_login,
+                        rating_text,
+                    )
+                )
+
+                mark_rating_sms_sent(
+                    rating_id,
+                    rating_sms_result,
+                )
+
+                rating_sms_status = "sent"
+
+                print(
+                    "RATING SMS SENT:",
+                    call_id,
+                    client_number,
+                    sender_user_login,
+                )
+
+            except Exception as exc:
+
+                mark_rating_sms_error(
+                    rating_id,
+                    repr(exc),
+                )
+
+                rating_sms_status = "error"
+
+                print(
+                    "RATING SMS ERROR:",
+                    call_id,
+                    client_number,
+                    repr(exc),
+                )
+
+        else:
+            rating_sms_status = (
+                rating_reservation.get(
+                    "sms_status"
+                )
+                or rating_reservation[
+                    "reason"
+                ]
+            )
+
+    # -----------------------------------------------------
     # TELEGRAM
     # -----------------------------------------------------
 
@@ -7975,4 +9498,7 @@ async def moizvonki_webhook(
 
         "sms":
             sms_status,
+
+        "rating_sms":
+            rating_sms_status,
     }
