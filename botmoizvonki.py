@@ -596,6 +596,69 @@ def init_db():
                 """
             )
 
+        # -------------------------------------------------
+        # OLD PLAIN-TEXT SUCCESS RESPONSES
+        # -------------------------------------------------
+
+        conn.execute(
+            """
+            UPDATE sms_history
+
+            SET
+                status = 'sent',
+                sent_at = COALESCE(
+                    sent_at,
+                    reserved_at
+                ),
+                error = NULL,
+                provider_response = COALESCE(
+                    provider_response,
+                    '{"success":true,"status":"SMS posted"}'
+                )
+
+            WHERE
+                status = 'error'
+
+                AND
+
+                error LIKE '%SMS posted%'
+            """
+        )
+
+        conn.execute(
+            """
+            UPDATE calls
+
+            SET
+                sms_sent = 1,
+                sms_sent_at = COALESCE(
+                    sms_sent_at,
+                    (
+                        SELECT MAX(
+                            history.sent_at
+                        )
+
+                        FROM sms_history AS history
+
+                        WHERE
+                            history.call_id = calls.id
+                            AND history.status = 'sent'
+                    )
+                ),
+                sms_error = NULL
+
+            WHERE EXISTS (
+                SELECT 1
+
+                FROM sms_history AS history
+
+                WHERE
+                    history.call_id = calls.id
+                    AND history.status = 'sent'
+            )
+            """
+        )
+
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS call_ratings (
@@ -1075,10 +1138,26 @@ def send_client_sms(
         result = response.json()
 
     except ValueError as exc:
-        raise RuntimeError(
-            "Мои Звонки вернул не JSON: "
-            + response.text[:500]
-        ) from exc
+
+        response_text = (
+            response.text
+            or ""
+        ).strip()
+
+        if (
+            response_text.casefold()
+            == "sms posted"
+        ):
+            result = {
+                "success": True,
+                "status": response_text,
+            }
+
+        else:
+            raise RuntimeError(
+                "Мои Звонки вернул не JSON: "
+                + response_text[:500]
+            ) from exc
 
     if (
         isinstance(result, dict)
