@@ -23,6 +23,7 @@ from fastapi import (
 from fastapi.responses import HTMLResponse
 
 from instagram_bot import router as instagram_router
+from reviews.router import router as reviews_router
 
 
 # =========================================================
@@ -33,6 +34,10 @@ app = FastAPI()
 
 app.include_router(
     instagram_router
+)
+
+app.include_router(
+    reviews_router
 )
 
 

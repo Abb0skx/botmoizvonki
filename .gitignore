@@ -7,3 +7,6 @@ data/sheets-auto-update-484813-fe0f96f83d38.json
 ~$*.xlsx
 **/~$*.xlsx
 data/Data/sheets-auto-update-484813-fe0f96f83d38.json
+data/reviews.db
+data/reviews.db-shm
+data/reviews.db-wal
