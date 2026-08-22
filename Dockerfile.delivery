@@ -10,4 +10,11 @@ RUN pip install --no-cache-dir -r requirements-delivery.txt
 
 COPY . .
 
+RUN addgroup --system delivery \
+    && adduser --system --ingroup delivery delivery \
+    && mkdir -p /app/data \
+    && chown -R delivery:delivery /app/data
+
+USER delivery
+
 CMD ["python", "-m", "app.main"]
