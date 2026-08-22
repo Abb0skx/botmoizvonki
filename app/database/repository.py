@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS orders (
     manager_id INTEGER NOT NULL,
     manager_name TEXT NOT NULL,
     seller_name TEXT,
+    payment_status TEXT NOT NULL DEFAULT 'collect_on_delivery',
     client_phone TEXT NOT NULL,
     product TEXT NOT NULL,
     amount_usd INTEGER,
@@ -50,6 +51,7 @@ INSERT OR IGNORE INTO counters(name, value) VALUES ('order_number', 0);
 
 MIGRATION_COLUMNS = {
     "seller_name": "TEXT",
+    "payment_status": "TEXT NOT NULL DEFAULT 'collect_on_delivery'",
     "address_text": "TEXT",
     "district": "TEXT",
     "mahalla": "TEXT",
@@ -62,7 +64,7 @@ def now() -> str:
 
 class OrderRepository:
     editable_fields = {
-        "seller_name", "product", "client_phone", "amount_usd", "amount_uzs", "location_url",
+        "seller_name", "payment_status", "product", "client_phone", "amount_usd", "amount_uzs", "location_url",
         "latitude", "longitude", "address_text", "district", "mahalla",
         "delivery_time", "comment", "status",
         "courier_id", "courier_name", "delivery_photo", "received_usd",
@@ -103,12 +105,13 @@ class OrderRepository:
             number = db.execute("SELECT value FROM counters WHERE name='order_number'").fetchone()[0]
             cursor = db.execute(
                 """INSERT INTO orders
-                (order_number, manager_id, manager_name, seller_name, client_phone, product,
+                (order_number, manager_id, manager_name, seller_name, payment_status, client_phone, product,
                  amount_usd, amount_uzs, location_url, latitude, longitude,
                  address_text, district, mahalla, delivery_time, comment,
                  created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (number, manager_id, manager_name, data.get("seller_name"),
+                 data.get("payment_status", "collect_on_delivery"),
                  data["client_phone"], data["product"],
                  data.get("amount_usd"), data.get("amount_uzs"), data.get("location_url"),
                  data.get("latitude"), data.get("longitude"), data.get("address_text"),

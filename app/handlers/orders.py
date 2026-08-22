@@ -12,19 +12,20 @@ from telegram.ext import (
 
 from app.bot.keyboards import (
     all_locations_keyboard, courier_keyboard, delivery_pending_keyboard,
-    main_keyboard, manager_sent_keyboard, on_way_keyboard, review_keyboard,
-    seller_keyboard, skip_keyboard,
+    main_keyboard, manager_sent_keyboard, on_way_keyboard, payment_keyboard,
+    review_keyboard, seller_keyboard, skip_keyboard,
 )
 from app.config import Settings
 from app.database import OrderRepository
 from app.utils import (
     completed_card, courier_card, enrich_location, manager_card, normalize_phone,
-    normalize_seller, parse_amount, parse_order_details,
+    normalize_payment, normalize_seller, PAID_AT_ASSEMBLY, parse_amount,
+    parse_order_details,
 )
 from app.utils.formatters import all_locations_card
 
 logger = logging.getLogger(__name__)
-SELLER, PRODUCT, DETAILS, DELIVERY_TIME, COMMENT = range(5)
+SELLER, PRODUCT, DETAILS, PAYMENT, DELIVERY_TIME, COMMENT = range(6)
 MANAGER_EDITABLE_STATUSES = {"draft", "pending", "on_way"}
 
 
@@ -136,7 +137,7 @@ async def new_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("Создание заказа доступно менеджерам в личном чате с ботом.")
         return ConversationHandler.END
     context.user_data["draft"] = {}
-    await update.message.reply_text("1/5. Выберите продавца:", reply_markup=seller_keyboard())
+    await update.message.reply_text("1/6. Выберите продавца:", reply_markup=seller_keyboard())
     return SELLER
 
 
@@ -147,7 +148,7 @@ async def seller(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text(str(error), reply_markup=seller_keyboard())
         return SELLER
     context.user_data["draft"]["seller_name"] = value
-    await update.message.reply_text("2/5. Введите модель товара:", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text("2/6. Введите модель товара:", reply_markup=ReplyKeyboardRemove())
     return PRODUCT
 
 
@@ -159,7 +160,7 @@ async def product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return PRODUCT
     context.user_data["draft"]["product"] = value
     await update.message.reply_text(
-        "3/5. Отправьте телефон, цену и локацию. Можно одним сообщением или отдельно, в любом порядке.\n\n"
+        "3/6. Отправьте телефон, цену и локацию. Можно одним сообщением или отдельно, в любом порядке.\n\n"
         "Пример одного сообщения:\n"
         "Телефон: 90 133 39 99\n"
         "Цена: 100$ 1 920 000\n"
@@ -222,7 +223,21 @@ async def details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return DETAILS
 
     await update.message.reply_text(
-        "4/5. Укажите время доставки (например, До 17:00) или пропустите:",
+        "4/6. Выберите вариант оплаты:",
+        reply_markup=payment_keyboard(),
+    )
+    return PAYMENT
+
+
+async def payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        value = normalize_payment(update.message.text or "")
+    except ValueError as error:
+        await update.message.reply_text(str(error), reply_markup=payment_keyboard())
+        return PAYMENT
+    context.user_data["draft"]["payment_status"] = value
+    await update.message.reply_text(
+        "5/6. Укажите время доставки (например, До 17:00) или пропустите:",
         reply_markup=skip_keyboard(),
     )
     return DELIVERY_TIME
@@ -235,7 +250,7 @@ async def delivery_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await update.message.reply_text(str(error))
         return DELIVERY_TIME
     context.user_data["draft"]["delivery_time"] = value
-    await update.message.reply_text("5/5. Добавьте комментарий или пропустите:", reply_markup=skip_keyboard())
+    await update.message.reply_text("6/6. Добавьте комментарий или пропустите:", reply_markup=skip_keyboard())
     return COMMENT
 
 
@@ -268,8 +283,13 @@ async def begin_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "message_id": query.message.message_id,
         "chat_id": query.message.chat_id,
     }
-    prompts = {"seller": "Выберите нового продавца:", "product": "Введите новую модель:", "phone": "Введите новый номер:", "location": "Отправьте новую локацию или ссылку:", "amount": "Введите новую сумму:", "delivery_time": "Введите новое время (или Пропустить):", "comment": "Введите новый комментарий (или Пропустить):"}
-    keyboard = seller_keyboard() if field == "seller" else ReplyKeyboardRemove()
+    prompts = {"seller": "Выберите нового продавца:", "payment_status": "Выберите новый вариант оплаты:", "product": "Введите новую модель:", "phone": "Введите новый номер:", "location": "Отправьте новую локацию или ссылку:", "amount": "Введите новую сумму:", "delivery_time": "Введите новое время (или Пропустить):", "comment": "Введите новый комментарий (или Пропустить):"}
+    if field == "seller":
+        keyboard = seller_keyboard()
+    elif field == "payment_status":
+        keyboard = payment_keyboard()
+    else:
+        keyboard = ReplyKeyboardRemove()
     await query.message.reply_text(prompts[field], reply_markup=keyboard)
 
 
@@ -280,6 +300,7 @@ async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     field, values = edit["field"], {}
     try:
         if field == "seller": values["seller_name"] = normalize_seller(update.message.text or "")
+        elif field == "payment_status": values["payment_status"] = normalize_payment(update.message.text or "")
         elif field == "phone": values["client_phone"] = normalize_phone(update.message.text or "")
         elif field == "amount": values["amount_usd"], values["amount_uzs"] = parse_amount(update.message.text or "")
         elif field == "location":
@@ -410,6 +431,37 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.message.reply_text(f"Заказ №{order.order_number}: отправьте фото доставки 📸")
 
 
+async def _publish_completed(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    order,
+    timestamp: datetime,
+) -> None:
+    result_text = completed_card(
+        order,
+        timestamp.astimezone(ZoneInfo("Asia/Tashkent")).strftime("%H:%M"),
+    )
+    try:
+        await context.bot.edit_message_text(
+            chat_id=order.delivery_chat_id,
+            message_id=order.delivery_message_id,
+            text=result_text,
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        logger.exception("Could not update delivery group message for order %s", order.id)
+    try:
+        await context.bot.send_photo(
+            order.manager_id,
+            order.delivery_photo,
+            caption=result_text,
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        logger.exception("Could not notify manager %s about order %s", order.manager_id, order.id)
+    await update.message.reply_text("✅ Доставка подтверждена.")
+
+
 async def delivery_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings: Settings = context.application.bot_data["settings"]
     if update.effective_chat.id != settings.delivery_group_id or update.effective_user.id not in settings.courier_ids:
@@ -421,7 +473,26 @@ async def delivery_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if order.status == "awaiting_photo":
         if not update.message.photo:
             await update.message.reply_text("Нужно отправить фотографию."); return
-        updated = repo.transition(order.id, {"awaiting_photo"}, status="awaiting_amount", delivery_photo=update.message.photo[-1].file_id)
+        photo_id = update.message.photo[-1].file_id
+        if order.payment_status == PAID_AT_ASSEMBLY:
+            timestamp = datetime.now().astimezone()
+            updated = repo.transition(
+                order.id,
+                {"awaiting_photo"},
+                status="completed",
+                delivery_photo=photo_id,
+                delivered_at=timestamp.isoformat(timespec="seconds"),
+            )
+            if not updated:
+                await update.message.reply_text("Статус заказа уже изменился."); return
+            await _publish_completed(update, context, updated, timestamp)
+            return
+        updated = repo.transition(
+            order.id,
+            {"awaiting_photo"},
+            status="awaiting_amount",
+            delivery_photo=photo_id,
+        )
         if not updated:
             await update.message.reply_text("Статус заказа уже изменился."); return
         try:
@@ -446,16 +517,7 @@ async def delivery_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     order = repo.transition(order.id, {"awaiting_amount"}, status="completed", received_usd=usd, received_uzs=uzs, delivered_at=timestamp.isoformat(timespec="seconds"))
     if not order:
         await update.message.reply_text("Заказ уже обработан."); return
-    result_text = completed_card(order, timestamp.astimezone(ZoneInfo("Asia/Tashkent")).strftime("%H:%M"))
-    try:
-        await context.bot.edit_message_text(chat_id=order.delivery_chat_id, message_id=order.delivery_message_id, text=result_text, parse_mode=ParseMode.HTML)
-    except Exception:
-        logger.exception("Could not update delivery group message for order %s", order.id)
-    try:
-        await context.bot.send_photo(order.manager_id, order.delivery_photo, caption=result_text, parse_mode=ParseMode.HTML)
-    except Exception:
-        logger.exception("Could not notify manager %s about order %s", order.manager_id, order.id)
-    await update.message.reply_text("✅ Доставка подтверждена.")
+    await _publish_completed(update, context, order, timestamp)
 
 
 async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -496,6 +558,7 @@ def register_handlers(application: Application) -> None:
             SELLER: [MessageHandler(filters.TEXT & ~filters.COMMAND, seller)],
             PRODUCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, product)],
             DETAILS: [MessageHandler((filters.LOCATION | filters.TEXT) & ~filters.COMMAND, details)],
+            PAYMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment)],
             DELIVERY_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, delivery_time)],
             COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, comment)],
         },

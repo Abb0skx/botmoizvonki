@@ -11,6 +11,7 @@ class Order:
     client_phone: str
     product: str
     seller_name: str | None = None
+    payment_status: str = "collect_on_delivery"
     amount_usd: int | None = None
     amount_uzs: int | None = None
     location_url: str | None = None

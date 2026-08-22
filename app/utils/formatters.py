@@ -3,6 +3,7 @@ from urllib.parse import urlencode
 
 from app.models import Order
 from .parsers import display_phone
+from .payments import PAID_AT_ASSEMBLY, payment_label
 
 
 def money(usd: int | None, uzs: int | None) -> str:
@@ -60,7 +61,8 @@ def manager_card(order: Order, *, sent: bool = False) -> str:
         f"{title}\n\n🚚 <b>Заказ №{order.order_number}</b>\n\n"
         f"👤 Продавец:\n{escape(order.seller_name or '—')}\n\n"
         f"📱 Телефон:\n{display_phone(order.client_phone)}\n\n📦 Товар:\n{escape(order.product)}\n\n"
-        f"💰 Сумма:\n{money(order.amount_usd, order.amount_uzs)}\n\n📍 Локация:\n{location(order)}\n\n"
+        f"💰 Сумма:\n{money(order.amount_usd, order.amount_uzs)}\n\n"
+        f"💳 Оплата:\n{payment_label(order.payment_status)}\n\n📍 Локация:\n{location(order)}\n\n"
         f"🕒 Время:\n{escape(order.delivery_time or '—')}\n\n💬 Комментарий:\n{escape(order.comment or '—')}"
     )
 
@@ -70,6 +72,7 @@ def courier_card(order: Order, state: str = "") -> str:
     return (
         f"{heading}🚚 <b>Заказ №{order.order_number}</b>\n\n📱 {display_phone(order.client_phone)}\n\n"
         f"📦 {escape(order.product)}\n\n💰 {money(order.amount_usd, order.amount_uzs)}\n\n"
+        f"💳 {payment_label(order.payment_status)}\n\n"
         f"📍 {location(order)}\n\n🕒 {escape(order.delivery_time or '—')}\n\n"
         f"💬 {escape(order.comment or '—')}\n\n👤 Продавец:\n{escape(order.seller_name or '—')}\n\n"
         f"🧑‍💼 Создал заказ:\n{escape(order.manager_name)}"
@@ -77,9 +80,14 @@ def courier_card(order: Order, state: str = "") -> str:
 
 
 def completed_card(order: Order, local_time: str) -> str:
+    payment_result = (
+        "💳 Оплата:\n✅ Оплачено при сборе товара"
+        if order.payment_status == PAID_AT_ASSEMBLY
+        else f"💰 Получено:\n{money(order.received_usd, order.received_uzs)}"
+    )
     return (
         f"✅ <b>Заказ №{order.order_number} доставлен</b>\n\n📸 Фото получено\n\n"
-        f"💰 Получено:\n{money(order.received_usd, order.received_uzs)}\n\n"
+        f"{payment_result}\n\n"
         f"👤 Курьер:\n{escape(order.courier_name or '—')}\n\n🕒 Время:\n{local_time}"
     )
 

@@ -2,6 +2,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
 
 from app.models import Order
 from app.utils.formatters import yandex_map_url, yandex_route_url
+from app.utils.payments import PAYMENT_LABELS
 from app.utils.sellers import SELLERS
 
 
@@ -21,6 +22,14 @@ def seller_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+def payment_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(label)] for label in PAYMENT_LABELS.values()],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
 def review_keyboard(order_id: int) -> InlineKeyboardMarkup:
     keyboard = _edit_rows(order_id)
     keyboard += [[InlineKeyboardButton("🚚 Отправить курьеру", callback_data=f"send:{order_id}")],
@@ -30,7 +39,7 @@ def review_keyboard(order_id: int) -> InlineKeyboardMarkup:
 
 def _edit_rows(order_id: int) -> list[list[InlineKeyboardButton]]:
     rows = [
-        [("👤 Изменить продавца", "seller")],
+        [("👤 Изменить продавца", "seller"), ("💳 Изменить оплату", "payment_status")],
         [("✏️ Изменить товар", "product"), ("📞 Изменить номер", "phone")],
         [("📍 Изменить локацию", "location"), ("💰 Изменить сумму", "amount")],
         [("🕒 Изменить время", "delivery_time"), ("💬 Изменить комментарий", "comment")],

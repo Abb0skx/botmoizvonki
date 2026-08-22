@@ -6,11 +6,12 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from app.database import OrderRepository
-from app.database.repository import SCHEMA
-from app.handlers.orders import DETAILS, DELIVERY_TIME, details
+from app.database.repository import MIGRATION_COLUMNS, SCHEMA
+from app.handlers.orders import DETAILS, PAYMENT, delivery_input, details
 from app.utils.formatters import all_locations_card, courier_card, manager_card, yandex_map_url, yandex_route_url
 from app.utils.geocoding import extract_address, resolve_map_url
 from app.utils.parsers import normalize_phone, parse_amount, parse_location_url, parse_order_details
+from app.utils.payments import PAID_AT_ASSEMBLY, normalize_payment
 from app.utils.sellers import normalize_seller
 
 
@@ -71,6 +72,11 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(normalize_seller("otabek"), "Otabek")
         with self.assertRaises(ValueError):
             normalize_seller("Другой")
+
+    def test_payment_normalization(self):
+        self.assertEqual(normalize_payment("✅ Оплачено при сборе товара"), PAID_AT_ASSEMBLY)
+        with self.assertRaises(ValueError):
+            normalize_payment("потом")
 
     def test_yandex_coordinates(self):
         lat, lon, _ = parse_location_url("https://yandex.uz/maps/?ll=69.240562%2C41.311081")
@@ -137,7 +143,7 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
         }
         with patch("app.handlers.orders.enrich_location", AsyncMock(return_value=location)):
             state = await details(update, context)
-        self.assertEqual(state, DELIVERY_TIME)
+        self.assertEqual(state, PAYMENT)
         self.assertEqual(context.user_data["draft"]["client_phone"], "+998901333999")
         self.assertEqual(context.user_data["draft"]["amount_uzs"], 1920000)
 
@@ -159,7 +165,91 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
         }
         with patch("app.handlers.orders.enrich_location", AsyncMock(return_value=location)):
             state = await details(map_update, context)
-        self.assertEqual(state, DELIVERY_TIME)
+        self.assertEqual(state, PAYMENT)
+
+    async def test_paid_at_assembly_completes_after_photo(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = OrderRepository(Path(tempdir) / "delivery.db")
+            repo.initialize()
+            order = repo.create(
+                manager_id=1,
+                manager_name="Manager",
+                data={
+                    "seller_name": "Ali",
+                    "payment_status": PAID_AT_ASSEMBLY,
+                    "client_phone": "+998901333999",
+                    "product": "A7 Pro",
+                    "amount_usd": 100,
+                },
+            )
+            repo.update(
+                order.id,
+                status="awaiting_photo",
+                courier_id=2,
+                courier_name="Courier",
+                delivery_chat_id=-100,
+                delivery_message_id=50,
+            )
+            message = SimpleNamespace(
+                photo=[SimpleNamespace(file_id="photo-file-id")],
+                text=None,
+                reply_text=AsyncMock(),
+            )
+            update = SimpleNamespace(
+                effective_chat=SimpleNamespace(id=-100),
+                effective_user=SimpleNamespace(id=2),
+                message=message,
+            )
+            bot = SimpleNamespace(edit_message_text=AsyncMock(), send_photo=AsyncMock())
+            settings = SimpleNamespace(delivery_group_id=-100, courier_ids=frozenset({2}))
+            context = SimpleNamespace(
+                application=SimpleNamespace(bot_data={"settings": settings, "repo": repo}),
+                bot=bot,
+            )
+
+            await delivery_input(update, context)
+
+            completed = repo.get(order.id)
+            self.assertEqual(completed.status, "completed")
+            self.assertEqual(completed.delivery_photo, "photo-file-id")
+            self.assertIsNotNone(completed.delivered_at)
+            self.assertIsNone(completed.received_usd)
+            bot.send_photo.assert_awaited_once()
+            self.assertIn("Оплачено при сборе товара", bot.send_photo.await_args.kwargs["caption"])
+            message.reply_text.assert_awaited_once_with("✅ Доставка подтверждена.")
+
+            collect_order = repo.create(
+                manager_id=1,
+                manager_name="Manager",
+                data={
+                    "seller_name": "Olmas",
+                    "client_phone": "+998901333999",
+                    "product": "S25 Ultra",
+                    "amount_usd": 150,
+                },
+            )
+            repo.update(
+                collect_order.id,
+                status="awaiting_photo",
+                courier_id=2,
+                courier_name="Courier",
+                delivery_chat_id=-100,
+                delivery_message_id=51,
+            )
+            collect_message = SimpleNamespace(
+                photo=[SimpleNamespace(file_id="second-photo")],
+                text=None,
+                reply_text=AsyncMock(),
+            )
+            update.message = collect_message
+
+            await delivery_input(update, context)
+
+            self.assertEqual(repo.get(collect_order.id).status, "awaiting_amount")
+            collect_message.reply_text.assert_awaited_once_with(
+                "Введите полученную сумму, например: 100$ 1920000"
+            )
+            bot.send_photo.assert_awaited_once()
 
 
 class RepositoryTests(unittest.TestCase):
@@ -176,18 +266,18 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(self.repo.create(manager_id=1, manager_name="A", data=self.data).order_number, 1)
         self.assertEqual(self.repo.create(manager_id=1, manager_name="A", data=self.data).order_number, 2)
 
-    def test_existing_database_gets_address_migration(self):
+    def test_existing_database_gets_delivery_migrations(self):
         legacy_path = Path(self.tempdir.name) / "legacy.db"
         legacy_schema = SCHEMA
-        for column in ("seller_name", "address_text", "district", "mahalla"):
-            legacy_schema = legacy_schema.replace(f"    {column} TEXT,\n", "")
+        for column, definition in MIGRATION_COLUMNS.items():
+            legacy_schema = legacy_schema.replace(f"    {column} {definition},\n", "")
         with sqlite3.connect(legacy_path) as db:
             db.executescript(legacy_schema)
         migrated = OrderRepository(legacy_path)
         migrated.initialize()
         with migrated.connect() as db:
             columns = {row[1] for row in db.execute("PRAGMA table_info(orders)")}
-        self.assertTrue({"seller_name", "address_text", "district", "mahalla"}.issubset(columns))
+        self.assertTrue(set(MIGRATION_COLUMNS).issubset(columns))
 
     def test_seller_is_saved_and_editable(self):
         order = self.repo.create(
@@ -198,6 +288,16 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(order.seller_name, "Olmas")
         updated = self.repo.transition(order.id, {"draft"}, seller_name="Ali")
         self.assertEqual(updated.seller_name, "Ali")
+
+    def test_payment_status_is_saved_and_editable(self):
+        order = self.repo.create(
+            manager_id=1,
+            manager_name="A",
+            data={**self.data, "payment_status": PAID_AT_ASSEMBLY},
+        )
+        self.assertEqual(order.payment_status, PAID_AT_ASSEMBLY)
+        updated = self.repo.transition(order.id, {"draft"}, payment_status="collect_on_delivery")
+        self.assertEqual(updated.payment_status, "collect_on_delivery")
 
     def test_atomic_courier_claim(self):
         order = self.repo.create(manager_id=1, manager_name="A", data=self.data)
