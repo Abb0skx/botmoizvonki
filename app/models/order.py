@@ -15,6 +15,9 @@ class Order:
     location_url: str | None = None
     latitude: float | None = None
     longitude: float | None = None
+    address_text: str | None = None
+    district: str | None = None
+    mahalla: str | None = None
     delivery_time: str | None = None
     comment: str | None = None
     status: str = "draft"

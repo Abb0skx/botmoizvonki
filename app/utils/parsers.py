@@ -56,12 +56,20 @@ def parse_location_url(url: str) -> tuple[float | None, float | None, str]:
     if len(url) > 2048 or not re.match(r"https?://[^\s]+$", url, re.I):
         raise ValueError("Отправьте геолокацию или ссылку на карту")
     decoded = unquote(url)
-    patterns = [r"[?&]ll=([\d.-]+)[,%2C]+([\d.-]+)", r"[?&]pt=([\d.-]+),([\d.-]+)", r"/@([\d.-]+),([\d.-]+)"]
-    for pattern in patterns:
+    patterns = [
+        (r"[?&]ll=([\d.-]+),([\d.-]+)", "lonlat"),
+        (r"[?&]pt=([\d.-]+),([\d.-]+)", "lonlat"),
+        (r"[?&]whatshere\[point\]=([\d.-]+),([\d.-]+)", "lonlat"),
+        (r"[?&]q=([\d.-]+),([\d.-]+)", "latlon"),
+        (r"[?&]rtext=(?:[^&~]*~)?([\d.-]+),([\d.-]+)", "latlon"),
+        (r"/@([\d.-]+),([\d.-]+)", "latlon"),
+        (r"!3d([\d.-]+)!4d([\d.-]+)", "latlon"),
+    ]
+    for pattern, orientation in patterns:
         match = re.search(pattern, decoded, re.I)
         if match:
             first, second = map(float, match.groups())
-            if "ll=" in match.group(0) or "pt=" in match.group(0):
-                return second, first, url  # Yandex stores longitude,latitude
-            return first, second, url
+            latitude, longitude = (second, first) if orientation == "lonlat" else (first, second)
+            if -90 <= latitude <= 90 and -180 <= longitude <= 180:
+                return latitude, longitude, url
     return None, None, url

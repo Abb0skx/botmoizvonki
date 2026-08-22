@@ -1,34 +1,82 @@
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 
+from app.models import Order
+from app.utils.formatters import yandex_map_url, yandex_route_url
+
 
 def main_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup([[KeyboardButton("➕ Новый заказ")]], resize_keyboard=True)
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("➕ Новый заказ"), KeyboardButton("📋 Мои заказы")]],
+        resize_keyboard=True,
+    )
 
 
 def review_keyboard(order_id: int) -> InlineKeyboardMarkup:
-    rows = [
-        [("✏️ Изменить товар", "product"), ("📞 Изменить номер", "phone")],
-        [("📍 Изменить локацию", "location"), ("💰 Изменить сумму", "amount")],
-        [("🕒 Изменить время", "delivery_time"), ("💬 Изменить комментарий", "comment")],
-    ]
-    keyboard = [[InlineKeyboardButton(label, callback_data=f"edit:{order_id}:{field}") for label, field in row] for row in rows]
+    keyboard = _edit_rows(order_id)
     keyboard += [[InlineKeyboardButton("🚚 Отправить курьеру", callback_data=f"send:{order_id}")],
                  [InlineKeyboardButton("❌ Отменить заказ", callback_data=f"manager_cancel:{order_id}")]]
     return InlineKeyboardMarkup(keyboard)
 
 
-def courier_keyboard(order_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚗 Еду к заказу", callback_data=f"onway:{order_id}")],
-        [InlineKeyboardButton("✅ Доставлено", callback_data=f"complete:{order_id}"),
-         InlineKeyboardButton("❌ Отменён", callback_data=f"cancel:{order_id}")],
-    ])
+def _edit_rows(order_id: int) -> list[list[InlineKeyboardButton]]:
+    rows = [
+        [("✏️ Изменить товар", "product"), ("📞 Изменить номер", "phone")],
+        [("📍 Изменить локацию", "location"), ("💰 Изменить сумму", "amount")],
+        [("🕒 Изменить время", "delivery_time"), ("💬 Изменить комментарий", "comment")],
+    ]
+    return [[InlineKeyboardButton(label, callback_data=f"edit:{order_id}:{field}") for label, field in row] for row in rows]
 
 
-def delivery_pending_keyboard(order_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("❌ Отменён", callback_data=f"cancel:{order_id}")],
-    ])
+def manager_sent_keyboard(order_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(_edit_rows(order_id))
+
+
+def _location_rows(order: Order) -> list[list[InlineKeyboardButton]]:
+    row = []
+    route_url = yandex_route_url(order)
+    map_url = yandex_map_url(order)
+    if route_url:
+        row.append(InlineKeyboardButton("🧭 Маршрут", url=route_url))
+    if map_url:
+        row.append(InlineKeyboardButton("🗺 Карта", url=map_url))
+    return [row] if row else []
+
+
+def courier_keyboard(order: Order) -> InlineKeyboardMarkup:
+    rows = _location_rows(order)
+    rows += [
+        [InlineKeyboardButton("🚗 Еду к заказу", callback_data=f"onway:{order.id}")],
+        [InlineKeyboardButton("✅ Доставлено", callback_data=f"complete:{order.id}"),
+         InlineKeyboardButton("❌ Отменён", callback_data=f"cancel:{order.id}")],
+        [InlineKeyboardButton("🗺 Все активные заказы", callback_data="map:all")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def on_way_keyboard(order: Order) -> InlineKeyboardMarkup:
+    rows = _location_rows(order)
+    rows += [
+        [InlineKeyboardButton("↩️ Отменить выезд", callback_data=f"undo_onway:{order.id}")],
+        [InlineKeyboardButton("✅ Доставлено", callback_data=f"complete:{order.id}"),
+         InlineKeyboardButton("❌ Отменён", callback_data=f"cancel:{order.id}")],
+        [InlineKeyboardButton("🗺 Все активные заказы", callback_data="map:all")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def delivery_pending_keyboard(order: Order) -> InlineKeyboardMarkup:
+    rows = _location_rows(order)
+    rows += [
+        [InlineKeyboardButton("❌ Отменён", callback_data=f"cancel:{order.id}")],
+        [InlineKeyboardButton("🗺 Все активные заказы", callback_data="map:all")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def all_locations_keyboard(map_url: str | None) -> InlineKeyboardMarkup | None:
+    if not map_url:
+        return None
+    return InlineKeyboardMarkup([[InlineKeyboardButton("📌 Открыть общую карту", url=map_url)]])
 
 
 def skip_keyboard() -> ReplyKeyboardMarkup:

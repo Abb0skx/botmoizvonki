@@ -19,6 +19,9 @@ CREATE TABLE IF NOT EXISTS orders (
     location_url TEXT,
     latitude REAL,
     longitude REAL,
+    address_text TEXT,
+    district TEXT,
+    mahalla TEXT,
     delivery_time TEXT,
     comment TEXT,
     status TEXT NOT NULL DEFAULT 'draft',
@@ -44,6 +47,12 @@ CREATE TABLE IF NOT EXISTS counters (
 INSERT OR IGNORE INTO counters(name, value) VALUES ('order_number', 0);
 """
 
+MIGRATION_COLUMNS = {
+    "address_text": "TEXT",
+    "district": "TEXT",
+    "mahalla": "TEXT",
+}
+
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -52,7 +61,8 @@ def now() -> str:
 class OrderRepository:
     editable_fields = {
         "product", "client_phone", "amount_usd", "amount_uzs", "location_url",
-        "latitude", "longitude", "delivery_time", "comment", "status",
+        "latitude", "longitude", "address_text", "district", "mahalla",
+        "delivery_time", "comment", "status",
         "courier_id", "courier_name", "delivery_photo", "received_usd",
         "received_uzs", "delivered_at", "time_started", "delivery_chat_id",
         "delivery_message_id",
@@ -72,6 +82,10 @@ class OrderRepository:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as db:
             db.executescript(SCHEMA)
+            existing = {row[1] for row in db.execute("PRAGMA table_info(orders)")}
+            for column, definition in MIGRATION_COLUMNS.items():
+                if column not in existing:
+                    db.execute(f"ALTER TABLE orders ADD COLUMN {column} {definition}")
             db.execute("PRAGMA journal_mode=WAL")
             db.execute(
                 """UPDATE counters
@@ -89,11 +103,13 @@ class OrderRepository:
                 """INSERT INTO orders
                 (order_number, manager_id, manager_name, client_phone, product,
                  amount_usd, amount_uzs, location_url, latitude, longitude,
-                 delivery_time, comment, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 address_text, district, mahalla, delivery_time, comment,
+                 created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (number, manager_id, manager_name, data["client_phone"], data["product"],
                  data.get("amount_usd"), data.get("amount_uzs"), data.get("location_url"),
-                 data.get("latitude"), data.get("longitude"), data.get("delivery_time"),
+                 data.get("latitude"), data.get("longitude"), data.get("address_text"),
+                 data.get("district"), data.get("mahalla"), data.get("delivery_time"),
                  data.get("comment"), timestamp, timestamp),
             )
             row = db.execute("SELECT * FROM orders WHERE id=?", (cursor.lastrowid,)).fetchone()
@@ -113,6 +129,26 @@ class OrderRepository:
                 (courier_id,),
             ).fetchone()
         return Order.from_row(row) if row else None
+
+    def list_active(self) -> list[Order]:
+        with self.connect() as db:
+            rows = db.execute(
+                """SELECT * FROM orders
+                   WHERE status IN ('pending', 'on_way', 'awaiting_photo', 'awaiting_amount')
+                   ORDER BY order_number"""
+            ).fetchall()
+        return [Order.from_row(row) for row in rows]
+
+    def list_manager_open(self, manager_id: int) -> list[Order]:
+        with self.connect() as db:
+            rows = db.execute(
+                """SELECT * FROM orders
+                   WHERE manager_id=?
+                     AND status IN ('draft', 'pending', 'on_way', 'awaiting_photo', 'awaiting_amount')
+                   ORDER BY order_number DESC LIMIT 20""",
+                (manager_id,),
+            ).fetchall()
+        return [Order.from_row(row) for row in rows]
 
     def update(self, order_id: int, **fields: Any) -> Order | None:
         invalid = set(fields) - self.editable_fields
