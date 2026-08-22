@@ -12,8 +12,9 @@ from telegram.ext import (
 
 from app.bot.keyboards import (
     all_locations_keyboard, courier_keyboard, delivery_pending_keyboard,
-    main_keyboard, manager_sent_keyboard, on_way_keyboard, payment_keyboard,
-    review_keyboard, seller_keyboard, skip_keyboard,
+    location_channel_keyboard, main_keyboard, manager_sent_keyboard,
+    on_way_keyboard, payment_keyboard, review_keyboard, seller_keyboard,
+    skip_keyboard,
 )
 from app.config import Settings
 from app.database import OrderRepository
@@ -27,6 +28,14 @@ from app.utils.formatters import all_locations_card
 logger = logging.getLogger(__name__)
 SELLER, PRODUCT, DETAILS, PAYMENT, DELIVERY_TIME, COMMENT = range(6)
 MANAGER_EDITABLE_STATUSES = {"draft", "pending", "on_way"}
+LOCATION_STATUS_MARKERS = {
+    "pending": "🆕",
+    "on_way": "🚗",
+    "awaiting_photo": "📸",
+    "awaiting_amount": "💰",
+    "completed": "✅",
+    "cancelled": "❌",
+}
 
 
 def _name(user) -> str:
@@ -97,6 +106,52 @@ async def _refresh_delivery_message(context: ContextTypes.DEFAULT_TYPE, order) -
     except Exception:
         logger.exception("Could not refresh delivery message for order %s", order.id)
         return False
+
+
+async def _set_location_marker(
+    context: ContextTypes.DEFAULT_TYPE,
+    order,
+    marker: str | None = None,
+) -> bool:
+    if not order.location_chat_id or not order.location_message_id:
+        return True
+    try:
+        await context.bot.edit_message_reply_markup(
+            chat_id=order.location_chat_id,
+            message_id=order.location_message_id,
+            reply_markup=location_channel_keyboard(
+                order,
+                marker or LOCATION_STATUS_MARKERS.get(order.status, "📍"),
+            ),
+        )
+        return True
+    except Exception:
+        logger.exception("Could not update location channel message for order %s", order.id)
+        return False
+
+
+async def _publish_location(
+    context: ContextTypes.DEFAULT_TYPE,
+    repo: OrderRepository,
+    order,
+):
+    if order.latitude is None or order.longitude is None:
+        raise ValueError("Order has no coordinates")
+    settings: Settings = context.application.bot_data["settings"]
+    sent = await context.bot.send_location(
+        chat_id=settings.location_channel_id,
+        latitude=order.latitude,
+        longitude=order.longitude,
+        reply_markup=location_channel_keyboard(
+            order,
+            LOCATION_STATUS_MARKERS.get(order.status, "📍"),
+        ),
+    )
+    return repo.update(
+        order.id,
+        location_chat_id=sent.chat_id,
+        location_message_id=sent.message_id,
+    )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -312,17 +367,35 @@ async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(str(error))
         return
     repo: OrderRepository = context.application.bot_data["repo"]
+    previous = repo.get(edit["order_id"])
     order = repo.transition(edit["order_id"], MANAGER_EDITABLE_STATUSES, **values)
     if not order:
         context.user_data.pop("edit", None)
         await update.message.reply_text("Заказ уже отправлен или отменён.", reply_markup=main_keyboard())
         return
     sent = order.status != "draft"
+    location_published = True
+    if sent and field == "location":
+        if previous:
+            await _set_location_marker(context, previous, "⚠️")
+        order = repo.update(order.id, location_chat_id=None, location_message_id=None)
+        try:
+            order = await _publish_location(context, repo, order)
+        except Exception:
+            location_published = False
+            logger.exception("Could not publish replacement location for order %s", order.id)
+    elif sent:
+        await _set_location_marker(context, order)
     keyboard = manager_sent_keyboard(order.id) if sent else review_keyboard(order.id)
     await context.bot.edit_message_text(chat_id=edit["chat_id"], message_id=edit["message_id"], text=manager_card(order, sent=sent), parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=keyboard)
     refreshed = await _refresh_delivery_message(context, order) if sent else True
     context.user_data.pop("edit", None)
-    result = "✅ Данные обновлены у менеджера и курьера." if refreshed else "⚠️ Данные сохранены, но карточку в группе обновить не удалось."
+    if not location_published:
+        result = "⚠️ Данные сохранены, но новую Telegram Location отправить не удалось. Проверьте права бота в канале локаций."
+    elif not refreshed:
+        result = "⚠️ Данные сохранены, но карточку в группе обновить не удалось."
+    else:
+        result = "✅ Данные обновлены у менеджера и курьера."
     await update.message.reply_text(result, reply_markup=main_keyboard())
 
 
@@ -344,8 +417,18 @@ async def manager_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not updated:
         await sent.edit_text(f"⚠️ Заказ №{order.order_number} был отменён до отправки")
         await query.answer("Заказ уже обработан", show_alert=True); return
+    location_published = True
+    try:
+        updated = await _publish_location(context, repo, updated)
+    except Exception:
+        location_published = False
+        logger.exception("Could not publish location for order %s", updated.id)
+    await _refresh_delivery_message(context, updated)
     await query.edit_message_text(manager_card(updated, sent=True), parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=manager_sent_keyboard(updated.id))
-    await query.answer("Заказ отправлен")
+    if location_published:
+        await query.answer("Заказ и Telegram Location отправлены")
+    else:
+        await query.answer("Заказ отправлен, но канал локаций недоступен", show_alert=True)
 
 
 async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -380,6 +463,7 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             reply_markup=courier_keyboard(order),
         )
         await query.answer("Заказ возвращён в очередь")
+        await _set_location_marker(context, order)
         await _notify_manager(
             context,
             order.manager_id,
@@ -397,6 +481,7 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await query.answer("Заказ уже взял другой курьер", show_alert=True); return
         await query.edit_message_text(courier_card(order, "🚗 <b>Курьер едет</b>"), parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=on_way_keyboard(order))
         await query.answer("Статус обновлён")
+        await _set_location_marker(context, order)
     elif action == "cancel":
         order = repo.transition(
             order.id, {"pending", "on_way", "awaiting_photo", "awaiting_amount"},
@@ -407,6 +492,7 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await query.answer("Заказ уже обработан другим курьером", show_alert=True); return
         await query.edit_message_text(f"❌ <b>Заказ №{order.order_number} отменён</b>\n\n👤 Курьер: {escape(_name(query.from_user))}", parse_mode=ParseMode.HTML)
         await query.answer("Заказ отменён")
+        await _set_location_marker(context, order)
         await _notify_manager(context, order.manager_id, f"❌ <b>Заказ №{order.order_number} отменён</b>\n\n👤 Курьер: {escape(_name(query.from_user))}")
     else:
         active = repo.get_active_delivery(query.from_user.id)
@@ -429,6 +515,7 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             reply_markup=delivery_pending_keyboard(order),
         )
         await query.message.reply_text(f"Заказ №{order.order_number}: отправьте фото доставки 📸")
+        await _set_location_marker(context, order)
 
 
 async def _publish_completed(
@@ -459,6 +546,7 @@ async def _publish_completed(
         )
     except Exception:
         logger.exception("Could not notify manager %s about order %s", order.manager_id, order.id)
+    await _set_location_marker(context, order)
     await update.message.reply_text("✅ Доставка подтверждена.")
 
 
@@ -506,6 +594,7 @@ async def delivery_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
         except Exception:
             logger.exception("Could not update photo confirmation state for order %s", updated.id)
+        await _set_location_marker(context, updated)
         await update.message.reply_text("Введите полученную сумму, например: 100$ 1920000")
         return
     if update.message.photo:
@@ -551,6 +640,29 @@ async def show_all_locations(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
+async def location_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    settings: Settings = context.application.bot_data["settings"]
+    if (
+        query.message.chat_id != settings.location_channel_id
+        or query.from_user.id not in (settings.manager_ids | settings.courier_ids)
+    ):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    _, raw_id = query.data.split(":")
+    repo: OrderRepository = context.application.bot_data["repo"]
+    order = repo.get(int(raw_id))
+    if not order:
+        await query.answer("Заказ не найден", show_alert=True)
+        return
+    status = LOCATION_STATUS_MARKERS.get(order.status, "📍")
+    product = " ".join(order.product.split())[:80]
+    await query.answer(
+        f"{status} Заказ №{order.order_number}\n{product}\n{order.client_phone}",
+        show_alert=True,
+    )
+
+
 def register_handlers(application: Application) -> None:
     conversation = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^➕ Новый заказ$") & filters.ChatType.PRIVATE, new_order)],
@@ -572,6 +684,7 @@ def register_handlers(application: Application) -> None:
     application.add_handler(CallbackQueryHandler(begin_edit, pattern=r"^edit:\d+:"))
     application.add_handler(CallbackQueryHandler(manager_action, pattern=r"^(send|manager_cancel):\d+$"))
     application.add_handler(CallbackQueryHandler(show_all_locations, pattern=r"^map:all$"))
+    application.add_handler(CallbackQueryHandler(location_info, pattern=r"^location_info:\d+$"))
     application.add_handler(CallbackQueryHandler(courier_action, pattern=r"^(onway|undo_onway|complete|cancel):\d+$"))
     application.add_handler(MessageHandler((filters.LOCATION | filters.TEXT) & ~filters.COMMAND, save_edit), group=1)
     application.add_handler(MessageHandler(filters.PHOTO | (filters.TEXT & ~filters.COMMAND), delivery_input), group=2)

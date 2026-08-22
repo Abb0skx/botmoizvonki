@@ -33,6 +33,20 @@ def yandex_route_url(order: Order) -> str | None:
     return f"https://yandex.uz/maps/?{query}"
 
 
+def telegram_message_url(chat_id: int | None, message_id: int | None) -> str | None:
+    """Build a private supergroup/channel message link from Telegram numeric IDs."""
+    if chat_id is None or message_id is None or message_id <= 0:
+        return None
+    raw_chat_id = str(chat_id)
+    if not raw_chat_id.startswith("-100"):
+        return None
+    return f"https://t.me/c/{raw_chat_id[4:]}/{message_id}"
+
+
+def telegram_location_url(order: Order) -> str | None:
+    return telegram_message_url(order.location_chat_id, order.location_message_id)
+
+
 def location(order: Order) -> str:
     details: list[str] = []
     if order.district:
@@ -44,8 +58,11 @@ def location(order: Order) -> str:
         details.append("<i>Адресные данные: OpenStreetMap</i>")
 
     links = []
+    telegram_url = telegram_location_url(order)
     route_url = yandex_route_url(order)
     map_url = yandex_map_url(order)
+    if telegram_url:
+        links.append(f'<a href="{escape(telegram_url, quote=True)}">📍 Открыть Telegram Location</a>')
     if route_url:
         links.append(f'<a href="{escape(route_url, quote=True)}">🧭 Построить маршрут</a>')
     if map_url:
@@ -110,7 +127,7 @@ def all_locations_card(orders: list[Order]) -> tuple[str, str | None]:
     lines = [f"🗺 <b>Активные заказы: {len(orders)}</b>"]
     for order in orders[:20]:
         area = (order.mahalla or order.district or "район не определён")[:100]
-        point_url = yandex_map_url(order)
+        point_url = telegram_location_url(order) or yandex_map_url(order)
         model = escape(order.product[:100])
         model_text = f'<a href="{escape(point_url, quote=True)}">{model}</a>' if point_url else model
         marker = f"📌 {marker_numbers[order.id]} · " if order.id in marker_numbers else ""

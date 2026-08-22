@@ -34,6 +34,8 @@ class Order:
     time_started: str | None = None
     delivery_chat_id: int | None = None
     delivery_message_id: int | None = None
+    location_chat_id: int | None = None
+    location_message_id: int | None = None
 
     @classmethod
     def from_row(cls, row: Any) -> "Order":

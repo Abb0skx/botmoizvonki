@@ -7,8 +7,11 @@ from unittest.mock import AsyncMock, patch
 
 from app.database import OrderRepository
 from app.database.repository import MIGRATION_COLUMNS, SCHEMA
-from app.handlers.orders import DETAILS, PAYMENT, delivery_input, details
-from app.utils.formatters import all_locations_card, courier_card, manager_card, yandex_map_url, yandex_route_url
+from app.handlers.orders import DETAILS, PAYMENT, _publish_location, delivery_input, details
+from app.utils.formatters import (
+    all_locations_card, courier_card, manager_card, telegram_location_url,
+    telegram_message_url, yandex_map_url, yandex_route_url,
+)
 from app.utils.geocoding import extract_address, resolve_map_url
 from app.utils.parsers import normalize_phone, parse_amount, parse_location_url, parse_order_details
 from app.utils.payments import PAID_AT_ASSEMBLY, normalize_payment
@@ -104,6 +107,14 @@ class ParserTests(unittest.TestCase):
         })
         self.assertEqual(result["district"], "Чиланзарский район")
         self.assertEqual(result["mahalla"], "Махалля Бунёдкор")
+
+    def test_private_channel_message_link(self):
+        self.assertEqual(
+            telegram_message_url(-1004398605075, 125),
+            "https://t.me/c/4398605075/125",
+        )
+        self.assertIsNone(telegram_message_url(-5125237049, 125))
+        self.assertIsNone(telegram_message_url(-1004398605075, None))
 
 
 class MapUrlTests(unittest.IsolatedAsyncioTestCase):
@@ -251,6 +262,43 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
             )
             bot.send_photo.assert_awaited_once()
 
+    async def test_publish_location_saves_channel_message(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = OrderRepository(Path(tempdir) / "delivery.db")
+            repo.initialize()
+            order = repo.create(
+                manager_id=1,
+                manager_name="Manager",
+                data={
+                    "client_phone": "+998901333999",
+                    "product": "A7 Pro",
+                    "amount_usd": 100,
+                    "latitude": 41.311081,
+                    "longitude": 69.240562,
+                },
+            )
+            repo.update(order.id, status="pending")
+            bot = SimpleNamespace(
+                send_location=AsyncMock(
+                    return_value=SimpleNamespace(chat_id=-1004398605075, message_id=88)
+                )
+            )
+            settings = SimpleNamespace(location_channel_id=-1004398605075)
+            context = SimpleNamespace(
+                application=SimpleNamespace(bot_data={"settings": settings}),
+                bot=bot,
+            )
+
+            published = await _publish_location(context, repo, repo.get(order.id))
+
+            bot.send_location.assert_awaited_once()
+            self.assertEqual(published.location_chat_id, -1004398605075)
+            self.assertEqual(published.location_message_id, 88)
+            self.assertEqual(
+                telegram_location_url(published),
+                "https://t.me/c/4398605075/88",
+            )
+
 
 class RepositoryTests(unittest.TestCase):
     def setUp(self):
@@ -271,6 +319,11 @@ class RepositoryTests(unittest.TestCase):
         legacy_schema = SCHEMA
         for column, definition in MIGRATION_COLUMNS.items():
             legacy_schema = legacy_schema.replace(f"    {column} {definition},\n", "")
+            legacy_schema = legacy_schema.replace(f"    {column} {definition}\n", "")
+        legacy_schema = legacy_schema.replace(
+            "    delivery_message_id INTEGER,\n);",
+            "    delivery_message_id INTEGER\n);",
+        )
         with sqlite3.connect(legacy_path) as db:
             db.executescript(legacy_schema)
         migrated = OrderRepository(legacy_path)
@@ -334,6 +387,23 @@ class RepositoryTests(unittest.TestCase):
         )
         self.assertEqual(order.district, "Чиланзарский район")
         self.assertEqual(order.mahalla, "Бунёдкор")
+
+    def test_location_channel_message_is_saved_and_linked(self):
+        order = self.repo.create(
+            manager_id=1,
+            manager_name="A",
+            data={**self.data, "latitude": 41.31, "longitude": 69.24},
+        )
+        order = self.repo.update(
+            order.id,
+            location_chat_id=-1004398605075,
+            location_message_id=77,
+        )
+        self.assertEqual(
+            telegram_location_url(order),
+            "https://t.me/c/4398605075/77",
+        )
+        self.assertIn("Telegram Location", manager_card(order))
 
     def test_undo_on_way_returns_order_to_queue(self):
         order = self.repo.create(manager_id=1, manager_name="A", data=self.data)

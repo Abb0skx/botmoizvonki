@@ -1,7 +1,7 @@
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 
 from app.models import Order
-from app.utils.formatters import yandex_map_url, yandex_route_url
+from app.utils.formatters import telegram_location_url, yandex_map_url, yandex_route_url
 from app.utils.payments import PAYMENT_LABELS
 from app.utils.sellers import SELLERS
 
@@ -52,6 +52,10 @@ def manager_sent_keyboard(order_id: int) -> InlineKeyboardMarkup:
 
 
 def _location_rows(order: Order) -> list[list[InlineKeyboardButton]]:
+    rows: list[list[InlineKeyboardButton]] = []
+    telegram_url = telegram_location_url(order)
+    if telegram_url:
+        rows.append([InlineKeyboardButton("📍 Выбрать навигатор", url=telegram_url)])
     row = []
     route_url = yandex_route_url(order)
     map_url = yandex_map_url(order)
@@ -59,7 +63,19 @@ def _location_rows(order: Order) -> list[list[InlineKeyboardButton]]:
         row.append(InlineKeyboardButton("🧭 Маршрут", url=route_url))
     if map_url:
         row.append(InlineKeyboardButton("🗺 Карта", url=map_url))
-    return [row] if row else []
+    if row:
+        rows.append(row)
+    return rows
+
+
+def location_channel_keyboard(order: Order, marker: str = "🆕") -> InlineKeyboardMarkup:
+    product = " ".join(order.product.split())
+    if len(product) > 36:
+        product = product[:33] + "…"
+    label = f"{marker} №{order.order_number} · {product}"
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(label, callback_data=f"location_info:{order.id}")
+    ]])
 
 
 def courier_keyboard(order: Order) -> InlineKeyboardMarkup:

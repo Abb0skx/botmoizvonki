@@ -37,7 +37,9 @@ CREATE TABLE IF NOT EXISTS orders (
     delivered_at TEXT,
     time_started TEXT,
     delivery_chat_id INTEGER,
-    delivery_message_id INTEGER
+    delivery_message_id INTEGER,
+    location_chat_id INTEGER,
+    location_message_id INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
 CREATE INDEX IF NOT EXISTS idx_orders_manager ON orders(manager_id, created_at);
@@ -55,6 +57,8 @@ MIGRATION_COLUMNS = {
     "address_text": "TEXT",
     "district": "TEXT",
     "mahalla": "TEXT",
+    "location_chat_id": "INTEGER",
+    "location_message_id": "INTEGER",
 }
 
 
@@ -69,7 +73,7 @@ class OrderRepository:
         "delivery_time", "comment", "status",
         "courier_id", "courier_name", "delivery_photo", "received_usd",
         "received_uzs", "delivered_at", "time_started", "delivery_chat_id",
-        "delivery_message_id",
+        "delivery_message_id", "location_chat_id", "location_message_id",
     }
 
     def __init__(self, path: Path):
