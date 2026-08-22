@@ -551,7 +551,7 @@ class RepositoryTests(unittest.TestCase):
         call_button = keyboard.inline_keyboard[1][0]
         self.assertEqual(
             call_button.url,
-            "https://bot.texnikach.uz/call/998901333999",
+            "https://bot.texnikach.uz/call#998901333999",
         )
 
     def test_delivery_confirmation_and_compact_edit_buttons_have_back(self):

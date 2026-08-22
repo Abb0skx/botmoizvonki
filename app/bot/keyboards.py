@@ -101,7 +101,7 @@ def location_channel_keyboard(
         [
             InlineKeyboardButton(
                 "📞 Позвонить",
-                url=f"https://bot.texnikach.uz/call/{phone_digits}",
+                url=f"https://bot.texnikach.uz/call#{phone_digits}",
             ),
             InlineKeyboardButton(
                 "💬 Telegram клиента",

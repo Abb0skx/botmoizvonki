@@ -24,10 +24,10 @@ class ReviewsFoundationTests(unittest.TestCase):
         app = FastAPI()
         app.include_router(reviews_router)
         client = TestClient(app)
-        response = client.get("/call/998901333999")
+        response = client.get("/call")
         self.assertEqual(response.status_code, 200)
-        self.assertIn("tel:+998901333999", response.text)
-        self.assertEqual(client.get("/call/123").status_code, 404)
+        self.assertIn("window.location.hash", response.text)
+        self.assertIn("tel:+${digits}", response.text)
 
     def test_catalog_has_all_categories_and_translations(self):
         expected = {

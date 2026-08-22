@@ -1,6 +1,5 @@
 import base64
 import json
-import re
 import secrets
 from pathlib import Path
 
@@ -194,24 +193,32 @@ def reviews_status():
     }
 
 
-@router.get("/call/{phone}", response_class=HTMLResponse)
-def open_phone_call(phone: str):
-    digits = re.sub(r"\D", "", phone)
-    if len(digits) != 12 or not digits.startswith("998"):
-        raise HTTPException(status_code=404, detail="invalid_phone")
-    dial_url = f"tel:+{digits}"
-    html = f"""<!doctype html>
+@router.get("/call", response_class=HTMLResponse)
+def open_phone_call():
+    html = """<!doctype html>
 <html lang="ru">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta http-equiv="refresh" content="0;url={dial_url}">
   <meta name="robots" content="noindex,nofollow">
   <title>Позвонить клиенту</title>
 </head>
 <body style="font-family:system-ui;text-align:center;padding:40px 16px">
-  <p>Открываем приложение телефона…</p>
-  <p><a href="{dial_url}" style="font-size:22px">📞 Позвонить +{digits}</a></p>
+  <p id="status">Открываем приложение телефона…</p>
+  <p><a id="call" href="#" style="font-size:22px">📞 Позвонить</a></p>
+  <script>
+    const digits = window.location.hash.replace(/\D/g, "");
+    const link = document.getElementById("call");
+    if (digits.length === 12 && digits.startsWith("998")) {
+      const target = `tel:+${digits}`;
+      link.href = target;
+      link.textContent = `📞 Позвонить +${digits}`;
+      window.setTimeout(() => window.location.href = target, 50);
+    } else {
+      document.getElementById("status").textContent = "Номер телефона не найден";
+      link.hidden = true;
+    }
+  </script>
 </body>
 </html>"""
     response = HTMLResponse(html)
