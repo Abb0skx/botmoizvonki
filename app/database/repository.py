@@ -192,6 +192,15 @@ class OrderRepository:
             ).fetchall()
         return [Order.from_row(row) for row in rows]
 
+    def list_open(self) -> list[Order]:
+        with self.connect() as db:
+            rows = db.execute(
+                """SELECT * FROM orders
+                   WHERE status IN ('draft', 'pending', 'on_way', 'awaiting_photo', 'awaiting_amount')
+                   ORDER BY order_number DESC"""
+            ).fetchall()
+        return [Order.from_row(row) for row in rows]
+
     def update(self, order_id: int, **fields: Any) -> Order | None:
         invalid = set(fields) - self.editable_fields
         if invalid:

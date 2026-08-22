@@ -208,17 +208,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Бот доставки TEXNIKACH готов.", reply_markup=main_keyboard())
 
 
-async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _show_orders(update: Update, context: ContextTypes.DEFAULT_TYPE, *, active_only: bool) -> None:
     settings: Settings = context.application.bot_data["settings"]
     if update.effective_chat.type != "private" or update.effective_user.id not in settings.manager_ids:
         await update.message.reply_text("Список заказов доступен менеджерам в личном чате.")
         return
     repo: OrderRepository = context.application.bot_data["repo"]
-    orders = repo.list_all()
+    orders = repo.list_open() if active_only else repo.list_all()
     if not orders:
-        await update.message.reply_text("Заказов пока нет.", reply_markup=main_keyboard())
+        text = "Активных заказов нет." if active_only else "Заказов пока нет."
+        await update.message.reply_text(text, reply_markup=main_keyboard())
         return
-    await update.message.reply_text(f"📋 Все заказы: {len(orders)}")
+    title = "📋 Активные заказы" if active_only else "📚 Все заказы"
+    await update.message.reply_text(f"{title}: {len(orders)}")
     for order in orders:
         editable = order.status in MANAGER_EDITABLE_STATUSES
         keyboard = review_keyboard(order.id) if order.status == "draft" else manager_sent_keyboard(order) if editable else None
@@ -228,6 +230,14 @@ async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             disable_web_page_preview=True,
             reply_markup=keyboard,
         )
+
+
+async def active_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _show_orders(update, context, active_only=True)
+
+
+async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _show_orders(update, context, active_only=False)
 
 
 async def new_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -897,8 +907,8 @@ def register_handlers(application: Application) -> None:
     )
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("map", show_all_locations))
-    application.add_handler(MessageHandler(filters.Regex(r"^📋 (?:Мои|Все) заказы$") & filters.ChatType.PRIVATE, my_orders))
-    application.add_handler(MessageHandler(filters.Regex(r"^📦 Все активные заказы$") & filters.ChatType.PRIVATE, show_all_locations))
+    application.add_handler(MessageHandler(filters.Regex(r"^(?:📋 (?:Мои|Активные) заказы|📦 Все активные заказы)$") & filters.ChatType.PRIVATE, active_orders))
+    application.add_handler(MessageHandler(filters.Regex(r"^(?:📋|📚) Все заказы$") & filters.ChatType.PRIVATE, my_orders))
     application.add_handler(conversation)
     application.add_handler(CommandHandler("cancel", cancel_conversation))
     application.add_handler(CallbackQueryHandler(toggle_edit_menu, pattern=r"^edit_(?:menu|close):\d+$"))

@@ -713,6 +713,17 @@ class RepositoryTests(unittest.TestCase):
             [second.order_number, first.order_number],
         )
 
+    def test_active_orders_include_drafts_but_hide_closed_orders(self):
+        draft = self.repo.create(manager_id=1, manager_name="A", data=self.data)
+        pending = self.repo.create(manager_id=2, manager_name="B", data=self.data)
+        completed = self.repo.create(manager_id=3, manager_name="C", data=self.data)
+        self.repo.update(pending.id, status="pending")
+        self.repo.update(completed.id, status="completed")
+        self.assertEqual(
+            [order.order_number for order in self.repo.list_open()],
+            [pending.order_number, draft.order_number],
+        )
+
     def test_address_is_compact(self):
         order = self.repo.create(
             manager_id=1,

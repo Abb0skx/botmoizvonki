@@ -9,8 +9,8 @@ from app.utils.sellers import SELLERS
 def main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("➕ Новый заказ"), KeyboardButton("📋 Все заказы")],
-            [KeyboardButton("📦 Все активные заказы")],
+            [KeyboardButton("➕ Новый заказ"), KeyboardButton("📋 Активные заказы")],
+            [KeyboardButton("📚 Все заказы")],
         ],
         resize_keyboard=True,
     )
