@@ -383,6 +383,7 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(completed.status, "completed")
             self.assertIsNone(completed.delivery_photo)
             query.answer.assert_awaited_once_with("Заказ доставлен")
+            self.assertIn("📦 A56", query.edit_message_text.await_args.args[0])
             self.assertEqual(
                 query.edit_message_text.await_args.kwargs["reply_markup"].inline_keyboard[-1][0].callback_data,
                 f"undo_complete:{order.id}",

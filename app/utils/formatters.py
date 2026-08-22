@@ -135,6 +135,7 @@ def completed_card(order: Order, local_time: str) -> str:
     photo_result = "\n📸 Фото получено" if order.delivery_photo else ""
     return (
         f"✅ <b>Заказ №{order.order_number} доставлен</b>{photo_result}\n"
+        f"📦 {escape(order.product)}\n"
         f"{payment_result}\n"
         f"👤 {escape(order.courier_name or '—')}\n🕒 {local_time}"
     )
