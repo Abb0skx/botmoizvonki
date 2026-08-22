@@ -2,12 +2,16 @@ import tempfile
 import unittest
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from app.database import OrderRepository
 from app.database.repository import SCHEMA
+from app.handlers.orders import DETAILS, DELIVERY_TIME, details
 from app.utils.formatters import all_locations_card, courier_card, manager_card, yandex_map_url, yandex_route_url
 from app.utils.geocoding import extract_address, resolve_map_url
-from app.utils.parsers import normalize_phone, parse_amount, parse_location_url
+from app.utils.parsers import normalize_phone, parse_amount, parse_location_url, parse_order_details
+from app.utils.sellers import normalize_seller
 
 
 class ParserTests(unittest.TestCase):
@@ -36,6 +40,37 @@ class ParserTests(unittest.TestCase):
         for raw in ("", "нет суммы", "0", "-100"):
             with self.assertRaises(ValueError):
                 parse_amount(raw)
+
+    def test_combined_order_details(self):
+        result = parse_order_details(
+            "Телефон: 90 133 39 99\n"
+            "Цена: 100$ 1 920 000\n"
+            "Локация: https://yandex.uz/maps/?ll=69.240562%2C41.311081"
+        )
+        self.assertEqual(result["client_phone"], "+998901333999")
+        self.assertEqual((result["amount_usd"], result["amount_uzs"]), (100, 1920000))
+        self.assertEqual(
+            result["location_url"],
+            "https://yandex.uz/maps/?ll=69.240562%2C41.311081",
+        )
+
+    def test_order_details_can_arrive_separately(self):
+        self.assertEqual(parse_order_details("901333999")["client_phone"], "+998901333999")
+        self.assertEqual(parse_order_details("100$ 1920000")["amount_usd"], 100)
+        self.assertEqual(
+            parse_order_details("https://yandex.uz/maps/?ll=69.24%2C41.31")["location_url"],
+            "https://yandex.uz/maps/?ll=69.24%2C41.31",
+        )
+
+    def test_large_uzs_amount_is_not_mistaken_for_phone(self):
+        result = parse_order_details("100000000 сум")
+        self.assertNotIn("client_phone", result)
+        self.assertEqual(result["amount_uzs"], 100000000)
+
+    def test_seller_normalization(self):
+        self.assertEqual(normalize_seller("otabek"), "Otabek")
+        with self.assertRaises(ValueError):
+            normalize_seller("Другой")
 
     def test_yandex_coordinates(self):
         lat, lon, _ = parse_location_url("https://yandex.uz/maps/?ll=69.240562%2C41.311081")
@@ -75,6 +110,58 @@ class MapUrlTests(unittest.IsolatedAsyncioTestCase):
             await resolve_map_url("https://example.com/?q=41.3,69.2")
 
 
+class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def context() -> SimpleNamespace:
+        return SimpleNamespace(user_data={"draft": {"seller_name": "Ali", "product": "A7 Pro"}})
+
+    @staticmethod
+    def update(text: str) -> SimpleNamespace:
+        message = SimpleNamespace(text=text, location=None, reply_text=AsyncMock())
+        return SimpleNamespace(message=message)
+
+    async def test_combined_details_complete_collection(self):
+        update = self.update(
+            "Телефон: 90 133 39 99\n"
+            "Цена: 100$ 1920000\n"
+            "Локация: https://yandex.uz/maps/?ll=69.24%2C41.31"
+        )
+        context = self.context()
+        location = {
+            "location_url": "https://yandex.uz/maps/?ll=69.24%2C41.31",
+            "latitude": 41.31,
+            "longitude": 69.24,
+            "address_text": "Ташкент",
+            "district": None,
+            "mahalla": None,
+        }
+        with patch("app.handlers.orders.enrich_location", AsyncMock(return_value=location)):
+            state = await details(update, context)
+        self.assertEqual(state, DELIVERY_TIME)
+        self.assertEqual(context.user_data["draft"]["client_phone"], "+998901333999")
+        self.assertEqual(context.user_data["draft"]["amount_uzs"], 1920000)
+
+    async def test_details_accumulate_in_any_order(self):
+        context = self.context()
+        price_update = self.update("100$ 1920000")
+        self.assertEqual(await details(price_update, context), DETAILS)
+        phone_update = self.update("901333999")
+        self.assertEqual(await details(phone_update, context), DETAILS)
+
+        map_update = self.update("https://yandex.uz/maps/?ll=69.24%2C41.31")
+        location = {
+            "location_url": "https://yandex.uz/maps/?ll=69.24%2C41.31",
+            "latitude": 41.31,
+            "longitude": 69.24,
+            "address_text": None,
+            "district": None,
+            "mahalla": None,
+        }
+        with patch("app.handlers.orders.enrich_location", AsyncMock(return_value=location)):
+            state = await details(map_update, context)
+        self.assertEqual(state, DELIVERY_TIME)
+
+
 class RepositoryTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
@@ -92,7 +179,7 @@ class RepositoryTests(unittest.TestCase):
     def test_existing_database_gets_address_migration(self):
         legacy_path = Path(self.tempdir.name) / "legacy.db"
         legacy_schema = SCHEMA
-        for column in ("address_text", "district", "mahalla"):
+        for column in ("seller_name", "address_text", "district", "mahalla"):
             legacy_schema = legacy_schema.replace(f"    {column} TEXT,\n", "")
         with sqlite3.connect(legacy_path) as db:
             db.executescript(legacy_schema)
@@ -100,7 +187,17 @@ class RepositoryTests(unittest.TestCase):
         migrated.initialize()
         with migrated.connect() as db:
             columns = {row[1] for row in db.execute("PRAGMA table_info(orders)")}
-        self.assertTrue({"address_text", "district", "mahalla"}.issubset(columns))
+        self.assertTrue({"seller_name", "address_text", "district", "mahalla"}.issubset(columns))
+
+    def test_seller_is_saved_and_editable(self):
+        order = self.repo.create(
+            manager_id=1,
+            manager_name="A",
+            data={**self.data, "seller_name": "Olmas"},
+        )
+        self.assertEqual(order.seller_name, "Olmas")
+        updated = self.repo.transition(order.id, {"draft"}, seller_name="Ali")
+        self.assertEqual(updated.seller_name, "Ali")
 
     def test_atomic_courier_claim(self):
         order = self.repo.create(manager_id=1, manager_name="A", data=self.data)
@@ -177,9 +274,14 @@ class RepositoryTests(unittest.TestCase):
         self.assertIn("pt", yandex_map_url(self.repo.get(first.id)))
 
     def test_cards_escape_employee_text(self):
-        order = self.repo.create(manager_id=1, manager_name="<Manager>", data={**self.data, "product": "A7 <Pro>"})
+        order = self.repo.create(
+            manager_id=1,
+            manager_name="<Manager>",
+            data={**self.data, "product": "A7 <Pro>", "seller_name": "<Seller>"},
+        )
         self.assertIn("A7 &lt;Pro&gt;", manager_card(order))
         self.assertIn("&lt;Manager&gt;", courier_card(order))
+        self.assertIn("&lt;Seller&gt;", courier_card(order))
 
 
 if __name__ == "__main__":

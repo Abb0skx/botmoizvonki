@@ -58,6 +58,7 @@ def manager_card(order: Order, *, sent: bool = False) -> str:
     title = "✅ <b>Заказ отправлен курьерам</b>" if sent else "✅ <b>Заказ создан</b>"
     return (
         f"{title}\n\n🚚 <b>Заказ №{order.order_number}</b>\n\n"
+        f"👤 Продавец:\n{escape(order.seller_name or '—')}\n\n"
         f"📱 Телефон:\n{display_phone(order.client_phone)}\n\n📦 Товар:\n{escape(order.product)}\n\n"
         f"💰 Сумма:\n{money(order.amount_usd, order.amount_uzs)}\n\n📍 Локация:\n{location(order)}\n\n"
         f"🕒 Время:\n{escape(order.delivery_time or '—')}\n\n💬 Комментарий:\n{escape(order.comment or '—')}"
@@ -70,7 +71,8 @@ def courier_card(order: Order, state: str = "") -> str:
         f"{heading}🚚 <b>Заказ №{order.order_number}</b>\n\n📱 {display_phone(order.client_phone)}\n\n"
         f"📦 {escape(order.product)}\n\n💰 {money(order.amount_usd, order.amount_uzs)}\n\n"
         f"📍 {location(order)}\n\n🕒 {escape(order.delivery_time or '—')}\n\n"
-        f"💬 {escape(order.comment or '—')}\n\n👤 Менеджер:\n{escape(order.manager_name)}"
+        f"💬 {escape(order.comment or '—')}\n\n👤 Продавец:\n{escape(order.seller_name or '—')}\n\n"
+        f"🧑‍💼 Создал заказ:\n{escape(order.manager_name)}"
     )
 
 
@@ -106,7 +108,8 @@ def all_locations_card(orders: list[Order]) -> tuple[str, str | None]:
         marker = f"📌 {marker_numbers[order.id]} · " if order.id in marker_numbers else ""
         lines.append(
             f"\n{marker}<b>№{order.order_number}</b> · {model_text}\n"
-            f"{STATUS_LABELS.get(order.status, order.status)} · {escape(area)}"
+            f"{STATUS_LABELS.get(order.status, order.status)} · {escape(area)} · "
+            f"{escape(order.seller_name or 'продавец не указан')}"
         )
     if len(orders) > 20:
         lines.append(f"\n…и ещё {len(orders) - 20}")

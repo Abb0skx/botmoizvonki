@@ -13,15 +13,18 @@ from telegram.ext import (
 from app.bot.keyboards import (
     all_locations_keyboard, courier_keyboard, delivery_pending_keyboard,
     main_keyboard, manager_sent_keyboard, on_way_keyboard, review_keyboard,
-    skip_keyboard,
+    seller_keyboard, skip_keyboard,
 )
 from app.config import Settings
 from app.database import OrderRepository
-from app.utils import completed_card, courier_card, enrich_location, manager_card, normalize_phone, parse_amount
+from app.utils import (
+    completed_card, courier_card, enrich_location, manager_card, normalize_phone,
+    normalize_seller, parse_amount, parse_order_details,
+)
 from app.utils.formatters import all_locations_card
 
 logger = logging.getLogger(__name__)
-PRODUCT, AMOUNT, PHONE, LOCATION, DELIVERY_TIME, COMMENT = range(6)
+SELLER, PRODUCT, DETAILS, DELIVERY_TIME, COMMENT = range(5)
 MANAGER_EDITABLE_STATUSES = {"draft", "pending", "on_way"}
 
 
@@ -133,7 +136,18 @@ async def new_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("Создание заказа доступно менеджерам в личном чате с ботом.")
         return ConversationHandler.END
     context.user_data["draft"] = {}
-    await update.message.reply_text("1/6. Введите модель товара:", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text("1/5. Выберите продавца:", reply_markup=seller_keyboard())
+    return SELLER
+
+
+async def seller(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        value = normalize_seller(update.message.text or "")
+    except ValueError as error:
+        await update.message.reply_text(str(error), reply_markup=seller_keyboard())
+        return SELLER
+    context.user_data["draft"]["seller_name"] = value
+    await update.message.reply_text("2/5. Введите модель товара:", reply_markup=ReplyKeyboardRemove())
     return PRODUCT
 
 
@@ -144,40 +158,73 @@ async def product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text(str(error))
         return PRODUCT
     context.user_data["draft"]["product"] = value
-    await update.message.reply_text("2/6. Введите общую сумму, например: 100$ 1920000")
-    return AMOUNT
+    await update.message.reply_text(
+        "3/5. Отправьте телефон, цену и локацию. Можно одним сообщением или отдельно, в любом порядке.\n\n"
+        "Пример одного сообщения:\n"
+        "Телефон: 90 133 39 99\n"
+        "Цена: 100$ 1 920 000\n"
+        "Локация: https://yandex.uz/maps/…\n\n"
+        "Telegram Location отправляется отдельным сообщением."
+    )
+    return DETAILS
 
 
-async def amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+def _missing_details(draft: dict) -> list[str]:
+    missing = []
+    if not draft.get("client_phone"):
+        missing.append("номер клиента")
+    if draft.get("amount_usd") is None and draft.get("amount_uzs") is None:
+        missing.append("цена")
+    if draft.get("latitude") is None or draft.get("longitude") is None:
+        missing.append("локация")
+    return missing
+
+
+async def details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    draft = context.user_data.get("draft")
+    if draft is None:
+        await update.message.reply_text("Начните новый заказ заново.", reply_markup=main_keyboard())
+        return ConversationHandler.END
+
+    recognized: list[str] = []
     try:
-        usd, uzs = parse_amount(update.message.text or "")
+        if update.message.location:
+            draft.update(await _location_values(update.message))
+            recognized.append("локация")
+        else:
+            parsed = parse_order_details(update.message.text or "")
+            if "client_phone" in parsed:
+                draft["client_phone"] = parsed["client_phone"]
+                recognized.append("номер")
+            if "amount_usd" in parsed or "amount_uzs" in parsed:
+                draft["amount_usd"] = parsed.get("amount_usd")
+                draft["amount_uzs"] = parsed.get("amount_uzs")
+                recognized.append("цена")
+            if parsed.get("location_url"):
+                draft.update(await enrich_location(None, None, str(parsed["location_url"])))
+                if draft.get("latitude") is None or draft.get("longitude") is None:
+                    raise ValueError("Не удалось определить координаты по ссылке")
+                recognized.append("локация")
     except ValueError as error:
-        await update.message.reply_text(str(error))
-        return AMOUNT
-    context.user_data["draft"].update(amount_usd=usd, amount_uzs=uzs)
-    await update.message.reply_text("3/6. Введите номер телефона клиента:")
-    return PHONE
+        await update.message.reply_text(f"Не удалось сохранить данные: {error}")
+        return DETAILS
 
+    missing = _missing_details(draft)
+    if not recognized:
+        await update.message.reply_text(
+            "Не распознал данные. Отправьте номер клиента, цену или ссылку на карту."
+        )
+        return DETAILS
+    if missing:
+        await update.message.reply_text(
+            f"✅ Сохранено: {', '.join(recognized)}. Осталось отправить: {', '.join(missing)}."
+        )
+        return DETAILS
 
-async def phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    try:
-        value = normalize_phone(update.message.text or "")
-    except ValueError as error:
-        await update.message.reply_text(str(error))
-        return PHONE
-    context.user_data["draft"]["client_phone"] = value
-    await update.message.reply_text("4/6. Отправьте Telegram Location или ссылку Яндекс/Google карт:")
-    return LOCATION
-
-
-async def location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    try:
-        values = await _location_values(update.message)
-    except ValueError as error:
-        await update.message.reply_text(str(error))
-        return LOCATION
-    context.user_data["draft"].update(values)
-    await update.message.reply_text("5/6. Укажите время доставки (например, До 17:00) или пропустите:", reply_markup=skip_keyboard())
+    await update.message.reply_text(
+        "4/5. Укажите время доставки (например, До 17:00) или пропустите:",
+        reply_markup=skip_keyboard(),
+    )
     return DELIVERY_TIME
 
 
@@ -188,7 +235,7 @@ async def delivery_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await update.message.reply_text(str(error))
         return DELIVERY_TIME
     context.user_data["draft"]["delivery_time"] = value
-    await update.message.reply_text("6/6. Добавьте комментарий или пропустите:", reply_markup=skip_keyboard())
+    await update.message.reply_text("5/5. Добавьте комментарий или пропустите:", reply_markup=skip_keyboard())
     return COMMENT
 
 
@@ -221,8 +268,9 @@ async def begin_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "message_id": query.message.message_id,
         "chat_id": query.message.chat_id,
     }
-    prompts = {"product": "Введите новую модель:", "phone": "Введите новый номер:", "location": "Отправьте новую локацию или ссылку:", "amount": "Введите новую сумму:", "delivery_time": "Введите новое время (или Пропустить):", "comment": "Введите новый комментарий (или Пропустить):"}
-    await query.message.reply_text(prompts[field], reply_markup=ReplyKeyboardRemove())
+    prompts = {"seller": "Выберите нового продавца:", "product": "Введите новую модель:", "phone": "Введите новый номер:", "location": "Отправьте новую локацию или ссылку:", "amount": "Введите новую сумму:", "delivery_time": "Введите новое время (или Пропустить):", "comment": "Введите новый комментарий (или Пропустить):"}
+    keyboard = seller_keyboard() if field == "seller" else ReplyKeyboardRemove()
+    await query.message.reply_text(prompts[field], reply_markup=keyboard)
 
 
 async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -231,7 +279,8 @@ async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     field, values = edit["field"], {}
     try:
-        if field == "phone": values["client_phone"] = normalize_phone(update.message.text or "")
+        if field == "seller": values["seller_name"] = normalize_seller(update.message.text or "")
+        elif field == "phone": values["client_phone"] = normalize_phone(update.message.text or "")
         elif field == "amount": values["amount_usd"], values["amount_uzs"] = parse_amount(update.message.text or "")
         elif field == "location":
             values.update(await _location_values(update.message))
@@ -443,7 +492,13 @@ async def show_all_locations(update: Update, context: ContextTypes.DEFAULT_TYPE)
 def register_handlers(application: Application) -> None:
     conversation = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^➕ Новый заказ$") & filters.ChatType.PRIVATE, new_order)],
-        states={PRODUCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, product)], AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, amount)], PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, phone)], LOCATION: [MessageHandler((filters.LOCATION | filters.TEXT) & ~filters.COMMAND, location)], DELIVERY_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, delivery_time)], COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, comment)]},
+        states={
+            SELLER: [MessageHandler(filters.TEXT & ~filters.COMMAND, seller)],
+            PRODUCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, product)],
+            DETAILS: [MessageHandler((filters.LOCATION | filters.TEXT) & ~filters.COMMAND, details)],
+            DELIVERY_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, delivery_time)],
+            COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, comment)],
+        },
         fallbacks=[CommandHandler("cancel", cancel_conversation)], allow_reentry=True,
     )
     application.add_handler(CommandHandler("start", start))
