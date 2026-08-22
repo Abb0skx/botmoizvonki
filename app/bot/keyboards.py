@@ -155,7 +155,9 @@ def courier_cancelled_keyboard(order: Order) -> InlineKeyboardMarkup:
 def all_locations_keyboard(map_url: str | None) -> InlineKeyboardMarkup | None:
     if not map_url:
         return None
-    return InlineKeyboardMarkup([[InlineKeyboardButton("📌 Открыть общую карту", url=map_url)]])
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🗺 Все локации на карте", url=map_url),
+    ]])
 
 
 def skip_keyboard() -> ReplyKeyboardMarkup:

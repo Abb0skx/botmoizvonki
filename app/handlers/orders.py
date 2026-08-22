@@ -220,7 +220,14 @@ async def _show_orders(update: Update, context: ContextTypes.DEFAULT_TYPE, *, ac
         await update.message.reply_text(text, reply_markup=main_keyboard())
         return
     title = "📋 Активные заказы" if active_only else "📚 Все заказы"
-    await update.message.reply_text(f"{title}: {len(orders)}")
+    map_keyboard = None
+    if active_only:
+        _, map_url = all_locations_card(orders)
+        map_keyboard = all_locations_keyboard(map_url)
+    await update.message.reply_text(
+        f"{title}: {len(orders)}",
+        reply_markup=map_keyboard,
+    )
     for order in orders:
         editable = order.status in MANAGER_EDITABLE_STATUSES
         keyboard = review_keyboard(order.id) if order.status == "draft" else manager_sent_keyboard(order) if editable else None

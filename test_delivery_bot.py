@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from app.bot.keyboards import (
-    completed_keyboard, courier_cancelled_keyboard, courier_keyboard,
+    all_locations_keyboard, completed_keyboard, courier_cancelled_keyboard, courier_keyboard,
     delivery_pending_keyboard, location_channel_keyboard, manager_cancelled_keyboard,
     manager_sent_keyboard, review_keyboard,
 )
@@ -677,6 +677,9 @@ class RepositoryTests(unittest.TestCase):
         self.assertIn("S25 Ultra", text)
         self.assertIn("Бунёдкор", text)
         self.assertTrue(map_url.startswith("https://yandex.uz/maps/?"))
+        map_button = all_locations_keyboard(map_url).inline_keyboard[0][0]
+        self.assertEqual(map_button.text, "🗺 Все локации на карте")
+        self.assertEqual(map_button.url, map_url)
         self.assertIn("rtext", yandex_route_url(self.repo.get(first.id)))
         self.assertIn("pt", yandex_map_url(self.repo.get(first.id)))
 
