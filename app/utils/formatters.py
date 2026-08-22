@@ -3,7 +3,7 @@ from urllib.parse import urlencode
 
 from app.models import Order
 from .parsers import display_phone
-from .payments import PAID_AT_ASSEMBLY, payment_label
+from .payments import PAID_AT_ASSEMBLY
 
 
 def money(usd: int | None, uzs: int | None) -> str:
@@ -43,43 +43,72 @@ def telegram_message_url(chat_id: int | None, message_id: int | None) -> str | N
     return f"https://t.me/c/{raw_chat_id[4:]}/{message_id}"
 
 
-def telegram_location_url(order: Order) -> str | None:
+def telegram_location_url(order: Order, location_number: int = 1) -> str | None:
+    if location_number == 2:
+        return telegram_message_url(
+            order.second_location_chat_id,
+            order.second_location_message_id,
+        )
     return telegram_message_url(order.location_chat_id, order.location_message_id)
 
 
-def location(order: Order) -> str:
-    details: list[str] = []
-    if order.district:
-        details.append(f"🏙 Район: {escape(order.district)}")
-    if order.mahalla and order.mahalla != order.district:
-        details.append(f"🏘 Махалля: {escape(order.mahalla)}")
-    if order.address_text:
-        details.append(f"🏠 Адрес: {escape(order.address_text)}")
-        details.append("<i>Адресные данные: OpenStreetMap</i>")
+def _short_address_parts(
+    address_text: str | None,
+    district: str | None,
+    mahalla: str | None,
+) -> str:
+    result: list[str] = []
+    for value in (mahalla, district):
+        cleaned = " ".join((value or "").split()).strip(" ,")
+        if cleaned and cleaned.casefold() not in {item.casefold() for item in result}:
+            result.append(cleaned)
 
-    links = []
-    telegram_url = telegram_location_url(order)
-    route_url = yandex_route_url(order)
-    map_url = yandex_map_url(order)
-    if telegram_url:
-        links.append(f'<a href="{escape(telegram_url, quote=True)}">📍 Открыть Telegram Location</a>')
-    if route_url:
-        links.append(f'<a href="{escape(route_url, quote=True)}">🧭 Построить маршрут</a>')
-    if map_url:
-        links.append(f'<a href="{escape(map_url, quote=True)}">🗺 Открыть на карте</a>')
-    if not details and not links:
-        return "—"
-    return "\n".join([*details, *links])
+    excluded = {
+        "узбекистан", "o‘zbekiston", "ташкент", "toshkent",
+        "город ташкент", "toshkent shahri",
+    }
+    for part in (address_text or "").split(","):
+        cleaned = " ".join(part.split()).strip(" ,")
+        if not cleaned or cleaned.casefold() in excluded or cleaned.isdigit():
+            continue
+        if any(cleaned.casefold() in existing.casefold() or existing.casefold() in cleaned.casefold() for existing in result):
+            continue
+        result.append(cleaned)
+        if len(result) >= 3:
+            break
+    value = ", ".join(result) or "Адрес не определён"
+    return value[:180]
+
+
+def short_address(order: Order, location_number: int = 1) -> str:
+    if location_number == 2:
+        return _short_address_parts(
+            order.second_address_text,
+            order.second_district,
+            order.second_mahalla,
+        )
+    return _short_address_parts(order.address_text, order.district, order.mahalla)
+
+
+def locations_text(order: Order) -> str:
+    lines = [f"📍 Локация: {escape(short_address(order))}"]
+    if order.second_latitude is not None and order.second_longitude is not None:
+        lines.append(f"📍 Доп. локация: {escape(short_address(order, 2))}")
+    return "\n".join(lines)
+
+
+def amount_text(order: Order) -> str:
+    title = "✅ Оплачено" if order.payment_status == PAID_AT_ASSEMBLY else "💰 Сумма"
+    return f"{title}:\n{money(order.amount_usd, order.amount_uzs)}"
 
 
 def manager_card(order: Order, *, sent: bool = False) -> str:
     title = "✅ <b>Заказ отправлен курьерам</b>" if sent else "✅ <b>Заказ создан</b>"
     return (
         f"{title}\n\n🚚 <b>Заказ №{order.order_number}</b>\n\n"
-        f"👤 Продавец:\n{escape(order.seller_name or '—')}\n\n"
+        f"👤 Заказ принадлежит: <b>{escape(order.seller_name or '—')}</b>\n\n"
         f"📱 Телефон:\n{display_phone(order.client_phone)}\n\n📦 Товар:\n{escape(order.product)}\n\n"
-        f"💰 Сумма:\n{money(order.amount_usd, order.amount_uzs)}\n\n"
-        f"💳 Оплата:\n{payment_label(order.payment_status)}\n\n📍 Локация:\n{location(order)}\n\n"
+        f"{amount_text(order)}\n\n{locations_text(order)}\n\n"
         f"🕒 Время:\n{escape(order.delivery_time or '—')}\n\n💬 Комментарий:\n{escape(order.comment or '—')}"
     )
 
@@ -87,18 +116,17 @@ def manager_card(order: Order, *, sent: bool = False) -> str:
 def courier_card(order: Order, state: str = "") -> str:
     heading = f"{state}\n\n" if state else ""
     return (
-        f"{heading}🚚 <b>Заказ №{order.order_number}</b>\n\n📱 {display_phone(order.client_phone)}\n\n"
-        f"📦 {escape(order.product)}\n\n💰 {money(order.amount_usd, order.amount_uzs)}\n\n"
-        f"💳 {payment_label(order.payment_status)}\n\n"
-        f"📍 {location(order)}\n\n🕒 {escape(order.delivery_time or '—')}\n\n"
-        f"💬 {escape(order.comment or '—')}\n\n👤 Продавец:\n{escape(order.seller_name or '—')}\n\n"
-        f"🧑‍💼 Создал заказ:\n{escape(order.manager_name)}"
+        f"{heading}🚚 <b>Заказ №{order.order_number}</b>\n\n"
+        f"👤 Заказ принадлежит: <b>{escape(order.seller_name or '—')}</b>\n\n"
+        f"📱 {display_phone(order.client_phone)}\n\n📦 {escape(order.product)}\n\n"
+        f"{amount_text(order)}\n\n{locations_text(order)}\n\n"
+        f"🕒 {escape(order.delivery_time or '—')}\n\n💬 {escape(order.comment or '—')}"
     )
 
 
 def completed_card(order: Order, local_time: str) -> str:
     payment_result = (
-        "💳 Оплата:\n✅ Оплачено при сборе товара"
+        f"✅ Оплачено:\n{money(order.amount_usd, order.amount_uzs)}"
         if order.payment_status == PAID_AT_ASSEMBLY
         else f"💰 Получено:\n{money(order.received_usd, order.received_uzs)}"
     )
@@ -122,11 +150,11 @@ def all_locations_card(orders: list[Order]) -> tuple[str, str | None]:
     visible = located[:25]
     marker_numbers = {order.id: index for index, order in enumerate(visible, start=1)}
     if not orders:
-        return "🗺 <b>Активных заказов сейчас нет.</b>", None
+        return "📦 <b>Активных заказов сейчас нет.</b>", None
 
-    lines = [f"🗺 <b>Активные заказы: {len(orders)}</b>"]
+    lines = [f"📦 <b>Активные заказы: {len(orders)}</b>"]
     for order in orders[:20]:
-        area = (order.mahalla or order.district or "район не определён")[:100]
+        area = short_address(order)
         point_url = telegram_location_url(order) or yandex_map_url(order)
         model = escape(order.product[:100])
         model_text = f'<a href="{escape(point_url, quote=True)}">{model}</a>' if point_url else model
@@ -134,23 +162,32 @@ def all_locations_card(orders: list[Order]) -> tuple[str, str | None]:
         lines.append(
             f"\n{marker}<b>№{order.order_number}</b> · {model_text}\n"
             f"{STATUS_LABELS.get(order.status, order.status)} · {escape(area)} · "
-            f"{escape(order.seller_name or 'продавец не указан')}"
+            f"{escape(order.seller_name or 'владелец не указан')}"
         )
+        second_url = telegram_location_url(order, 2)
+        if second_url:
+            lines.append(f'<a href="{escape(second_url, quote=True)}">📍 Доп. локация</a>')
     if len(orders) > 20:
         lines.append(f"\n…и ещё {len(orders) - 20}")
 
     if not located:
         return "\n".join(lines), None
-    center_lat = sum(order.latitude for order in visible) / len(visible)
-    center_lon = sum(order.longitude for order in visible) / len(visible)
+    map_points: list[tuple[float, float]] = []
+    for order in visible:
+        map_points.append((order.latitude, order.longitude))
+        if order.second_latitude is not None and order.second_longitude is not None:
+            map_points.append((order.second_latitude, order.second_longitude))
+    map_points = map_points[:25]
+    center_lat = sum(point[0] for point in map_points) / len(map_points)
+    center_lon = sum(point[1] for point in map_points) / len(map_points)
     span = max(
-        max(order.latitude for order in visible) - min(order.latitude for order in visible),
-        max(order.longitude for order in visible) - min(order.longitude for order in visible),
+        max(point[0] for point in map_points) - min(point[0] for point in map_points),
+        max(point[1] for point in map_points) - min(point[1] for point in map_points),
     )
     zoom = 14 if span < 0.02 else 12 if span < 0.05 else 10 if span < 0.15 else 8 if span < 0.5 else 6
     points = "~".join(
-        f"{order.longitude:.6f},{order.latitude:.6f},pm2rdm{index}"
-        for index, order in enumerate(visible, start=1)
+        f"{longitude:.6f},{latitude:.6f},pm2rdm{index}"
+        for index, (latitude, longitude) in enumerate(map_points, start=1)
     )
     map_url = "https://yandex.uz/maps/?" + urlencode({
         "ll": f"{center_lon:.6f},{center_lat:.6f}",
@@ -158,6 +195,10 @@ def all_locations_card(orders: list[Order]) -> tuple[str, str | None]:
         "pt": points,
     })
     lines.append(f'\n<a href="{escape(map_url, quote=True)}">📌 Показать все точки на одной карте</a>')
-    if len(located) > 25:
+    total_points = sum(
+        1 + int(order.second_latitude is not None and order.second_longitude is not None)
+        for order in located
+    )
+    if total_points > 25:
         lines.append("На общей карте показаны первые 25 точек.")
     return "\n".join(lines), map_url

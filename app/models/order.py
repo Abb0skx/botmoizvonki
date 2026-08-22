@@ -20,6 +20,12 @@ class Order:
     address_text: str | None = None
     district: str | None = None
     mahalla: str | None = None
+    second_location_url: str | None = None
+    second_latitude: float | None = None
+    second_longitude: float | None = None
+    second_address_text: str | None = None
+    second_district: str | None = None
+    second_mahalla: str | None = None
     delivery_time: str | None = None
     comment: str | None = None
     status: str = "draft"
@@ -36,6 +42,8 @@ class Order:
     delivery_message_id: int | None = None
     location_chat_id: int | None = None
     location_message_id: int | None = None
+    second_location_chat_id: int | None = None
+    second_location_message_id: int | None = None
 
     @classmethod
     def from_row(cls, row: Any) -> "Order":

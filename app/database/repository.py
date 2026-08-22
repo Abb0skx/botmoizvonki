@@ -24,6 +24,12 @@ CREATE TABLE IF NOT EXISTS orders (
     address_text TEXT,
     district TEXT,
     mahalla TEXT,
+    second_location_url TEXT,
+    second_latitude REAL,
+    second_longitude REAL,
+    second_address_text TEXT,
+    second_district TEXT,
+    second_mahalla TEXT,
     delivery_time TEXT,
     comment TEXT,
     status TEXT NOT NULL DEFAULT 'draft',
@@ -39,7 +45,9 @@ CREATE TABLE IF NOT EXISTS orders (
     delivery_chat_id INTEGER,
     delivery_message_id INTEGER,
     location_chat_id INTEGER,
-    location_message_id INTEGER
+    location_message_id INTEGER,
+    second_location_chat_id INTEGER,
+    second_location_message_id INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
 CREATE INDEX IF NOT EXISTS idx_orders_manager ON orders(manager_id, created_at);
@@ -59,6 +67,14 @@ MIGRATION_COLUMNS = {
     "mahalla": "TEXT",
     "location_chat_id": "INTEGER",
     "location_message_id": "INTEGER",
+    "second_location_url": "TEXT",
+    "second_latitude": "REAL",
+    "second_longitude": "REAL",
+    "second_address_text": "TEXT",
+    "second_district": "TEXT",
+    "second_mahalla": "TEXT",
+    "second_location_chat_id": "INTEGER",
+    "second_location_message_id": "INTEGER",
 }
 
 
@@ -70,10 +86,13 @@ class OrderRepository:
     editable_fields = {
         "seller_name", "payment_status", "product", "client_phone", "amount_usd", "amount_uzs", "location_url",
         "latitude", "longitude", "address_text", "district", "mahalla",
+        "second_location_url", "second_latitude", "second_longitude",
+        "second_address_text", "second_district", "second_mahalla",
         "delivery_time", "comment", "status",
         "courier_id", "courier_name", "delivery_photo", "received_usd",
         "received_uzs", "delivered_at", "time_started", "delivery_chat_id",
         "delivery_message_id", "location_chat_id", "location_message_id",
+        "second_location_chat_id", "second_location_message_id",
     }
 
     def __init__(self, path: Path):
@@ -111,15 +130,21 @@ class OrderRepository:
                 """INSERT INTO orders
                 (order_number, manager_id, manager_name, seller_name, payment_status, client_phone, product,
                  amount_usd, amount_uzs, location_url, latitude, longitude,
-                 address_text, district, mahalla, delivery_time, comment,
+                 address_text, district, mahalla,
+                 second_location_url, second_latitude, second_longitude,
+                 second_address_text, second_district, second_mahalla,
+                 delivery_time, comment,
                  created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (number, manager_id, manager_name, data.get("seller_name"),
                  data.get("payment_status", "collect_on_delivery"),
                  data["client_phone"], data["product"],
                  data.get("amount_usd"), data.get("amount_uzs"), data.get("location_url"),
                  data.get("latitude"), data.get("longitude"), data.get("address_text"),
-                 data.get("district"), data.get("mahalla"), data.get("delivery_time"),
+                 data.get("district"), data.get("mahalla"), data.get("second_location_url"),
+                 data.get("second_latitude"), data.get("second_longitude"),
+                 data.get("second_address_text"), data.get("second_district"),
+                 data.get("second_mahalla"), data.get("delivery_time"),
                  data.get("comment"), timestamp, timestamp),
             )
             row = db.execute("SELECT * FROM orders WHERE id=?", (cursor.lastrowid,)).fetchone()

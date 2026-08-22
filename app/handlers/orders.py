@@ -14,7 +14,7 @@ from app.bot.keyboards import (
     all_locations_keyboard, courier_keyboard, delivery_pending_keyboard,
     location_channel_keyboard, main_keyboard, manager_sent_keyboard,
     on_way_keyboard, payment_keyboard, review_keyboard, seller_keyboard,
-    skip_keyboard,
+    second_location_keyboard, skip_keyboard,
 )
 from app.config import Settings
 from app.database import OrderRepository
@@ -23,10 +23,10 @@ from app.utils import (
     normalize_payment, normalize_seller, PAID_AT_ASSEMBLY, parse_amount,
     parse_order_details,
 )
-from app.utils.formatters import all_locations_card
+from app.utils.formatters import all_locations_card, short_address
 
 logger = logging.getLogger(__name__)
-SELLER, PRODUCT, DETAILS, PAYMENT, DELIVERY_TIME, COMMENT = range(6)
+SELLER, PRODUCT, DETAILS, SECOND_LOCATION, PAYMENT, DELIVERY_TIME, COMMENT = range(7)
 MANAGER_EDITABLE_STATUSES = {"draft", "pending", "on_way"}
 LOCATION_STATUS_MARKERS = {
     "pending": "🆕",
@@ -112,46 +112,80 @@ async def _set_location_marker(
     context: ContextTypes.DEFAULT_TYPE,
     order,
     marker: str | None = None,
+    location_number: int | None = None,
 ) -> bool:
-    if not order.location_chat_id or not order.location_message_id:
-        return True
-    try:
-        await context.bot.edit_message_reply_markup(
-            chat_id=order.location_chat_id,
-            message_id=order.location_message_id,
-            reply_markup=location_channel_keyboard(
-                order,
-                marker or LOCATION_STATUS_MARKERS.get(order.status, "📍"),
-            ),
-        )
-        return True
-    except Exception:
-        logger.exception("Could not update location channel message for order %s", order.id)
-        return False
+    numbers = (location_number,) if location_number else (1, 2)
+    success = True
+    for number in numbers:
+        if number == 2:
+            chat_id = order.second_location_chat_id
+            message_id = order.second_location_message_id
+        else:
+            chat_id = order.location_chat_id
+            message_id = order.location_message_id
+        if not chat_id or not message_id:
+            continue
+        try:
+            await context.bot.edit_message_reply_markup(
+                chat_id=chat_id,
+                message_id=message_id,
+                reply_markup=location_channel_keyboard(
+                    order,
+                    marker or LOCATION_STATUS_MARKERS.get(order.status, "📍"),
+                    number,
+                ),
+            )
+        except Exception:
+            success = False
+            logger.exception(
+                "Could not update location %s channel message for order %s",
+                number,
+                order.id,
+            )
+    return success
 
 
 async def _publish_location(
     context: ContextTypes.DEFAULT_TYPE,
     repo: OrderRepository,
     order,
+    location_number: int = 1,
 ):
-    if order.latitude is None or order.longitude is None:
+    if location_number == 2:
+        latitude = order.second_latitude
+        longitude = order.second_longitude
+        update_fields = {
+            "second_location_chat_id": None,
+            "second_location_message_id": None,
+        }
+    else:
+        latitude = order.latitude
+        longitude = order.longitude
+        update_fields = {"location_chat_id": None, "location_message_id": None}
+    if latitude is None or longitude is None:
         raise ValueError("Order has no coordinates")
     settings: Settings = context.application.bot_data["settings"]
     sent = await context.bot.send_location(
         chat_id=settings.location_channel_id,
-        latitude=order.latitude,
-        longitude=order.longitude,
+        latitude=latitude,
+        longitude=longitude,
         reply_markup=location_channel_keyboard(
             order,
             LOCATION_STATUS_MARKERS.get(order.status, "📍"),
+            location_number,
         ),
     )
-    return repo.update(
-        order.id,
-        location_chat_id=sent.chat_id,
-        location_message_id=sent.message_id,
-    )
+    if location_number == 2:
+        update_fields.update(
+            second_location_chat_id=sent.chat_id,
+            second_location_message_id=sent.message_id,
+        )
+    else:
+        update_fields.update(
+            location_chat_id=sent.chat_id,
+            location_message_id=sent.message_id,
+        )
+    return repo.update(order.id, **update_fields)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -177,7 +211,7 @@ async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f"📋 Открытые заказы: {len(orders)}")
     for order in orders:
         editable = order.status in MANAGER_EDITABLE_STATUSES
-        keyboard = review_keyboard(order.id) if order.status == "draft" else manager_sent_keyboard(order.id) if editable else None
+        keyboard = review_keyboard(order.id) if order.status == "draft" else manager_sent_keyboard(order) if editable else None
         await update.message.reply_text(
             manager_card(order, sent=order.status != "draft"),
             parse_mode=ParseMode.HTML,
@@ -192,7 +226,7 @@ async def new_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("Создание заказа доступно менеджерам в личном чате с ботом.")
         return ConversationHandler.END
     context.user_data["draft"] = {}
-    await update.message.reply_text("1/6. Выберите продавца:", reply_markup=seller_keyboard())
+    await update.message.reply_text("1/7. Выберите, кому принадлежит заказ:", reply_markup=seller_keyboard())
     return SELLER
 
 
@@ -203,7 +237,7 @@ async def seller(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text(str(error), reply_markup=seller_keyboard())
         return SELLER
     context.user_data["draft"]["seller_name"] = value
-    await update.message.reply_text("2/6. Введите модель товара:", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text("2/7. Введите модель товара:", reply_markup=ReplyKeyboardRemove())
     return PRODUCT
 
 
@@ -215,12 +249,12 @@ async def product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return PRODUCT
     context.user_data["draft"]["product"] = value
     await update.message.reply_text(
-        "3/6. Отправьте телефон, цену и локацию. Можно одним сообщением или отдельно, в любом порядке.\n\n"
+        "3/7. Отправьте телефон, цену и основную локацию. Можно одним сообщением или отдельно, в любом порядке.\n\n"
         "Пример одного сообщения:\n"
         "Телефон: 90 133 39 99\n"
         "Цена: 100$ 1 920 000\n"
         "Локация: https://yandex.uz/maps/…\n\n"
-        "Telegram Location отправляется отдельным сообщением."
+        "Telegram Location отправляется отдельным сообщением. После этого можно будет добавить вторую локацию."
     )
     return DETAILS
 
@@ -278,7 +312,35 @@ async def details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return DETAILS
 
     await update.message.reply_text(
-        "4/6. Выберите вариант оплаты:",
+        "4/7. Отправьте вторую локацию или продолжите без неё:",
+        reply_markup=second_location_keyboard(),
+    )
+    return SECOND_LOCATION
+
+
+def _as_second_location(values: dict) -> dict:
+    return {f"second_{key}": value for key, value in values.items()}
+
+
+async def second_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.message.text or "").strip().casefold()
+    if text == "продолжить без второй локации":
+        await update.message.reply_text(
+            "5/7. Выберите вариант оплаты:",
+            reply_markup=payment_keyboard(),
+        )
+        return PAYMENT
+    try:
+        values = await _location_values(update.message)
+    except ValueError as error:
+        await update.message.reply_text(
+            f"Не удалось сохранить вторую локацию: {error}",
+            reply_markup=second_location_keyboard(),
+        )
+        return SECOND_LOCATION
+    context.user_data["draft"].update(_as_second_location(values))
+    await update.message.reply_text(
+        "✅ Вторая локация сохранена.\n\n5/7. Выберите вариант оплаты:",
         reply_markup=payment_keyboard(),
     )
     return PAYMENT
@@ -292,7 +354,7 @@ async def payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return PAYMENT
     context.user_data["draft"]["payment_status"] = value
     await update.message.reply_text(
-        "5/6. Укажите время доставки (например, До 17:00) или пропустите:",
+        "6/7. Укажите время доставки (например, До 17:00) или пропустите:",
         reply_markup=skip_keyboard(),
     )
     return DELIVERY_TIME
@@ -305,7 +367,7 @@ async def delivery_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await update.message.reply_text(str(error))
         return DELIVERY_TIME
     context.user_data["draft"]["delivery_time"] = value
-    await update.message.reply_text("6/6. Добавьте комментарий или пропустите:", reply_markup=skip_keyboard())
+    await update.message.reply_text("7/7. Добавьте комментарий или пропустите:", reply_markup=skip_keyboard())
     return COMMENT
 
 
@@ -338,7 +400,17 @@ async def begin_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "message_id": query.message.message_id,
         "chat_id": query.message.chat_id,
     }
-    prompts = {"seller": "Выберите нового продавца:", "payment_status": "Выберите новый вариант оплаты:", "product": "Введите новую модель:", "phone": "Введите новый номер:", "location": "Отправьте новую локацию или ссылку:", "amount": "Введите новую сумму:", "delivery_time": "Введите новое время (или Пропустить):", "comment": "Введите новый комментарий (или Пропустить):"}
+    prompts = {
+        "seller": "Выберите нового владельца заказа:",
+        "payment_status": "Выберите новый вариант оплаты:",
+        "product": "Введите новую модель:",
+        "phone": "Введите новый номер:",
+        "location": "Отправьте новую основную локацию или ссылку:",
+        "second_location": "Отправьте дополнительную локацию или ссылку:",
+        "amount": "Введите новую сумму:",
+        "delivery_time": "Введите новое время (или Пропустить):",
+        "comment": "Введите новый комментарий (или Пропустить):",
+    }
     if field == "seller":
         keyboard = seller_keyboard()
     elif field == "payment_status":
@@ -358,8 +430,10 @@ async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         elif field == "payment_status": values["payment_status"] = normalize_payment(update.message.text or "")
         elif field == "phone": values["client_phone"] = normalize_phone(update.message.text or "")
         elif field == "amount": values["amount_usd"], values["amount_uzs"] = parse_amount(update.message.text or "")
-        elif field == "location":
+        elif field in {"location", "second_location"}:
             values.update(await _location_values(update.message))
+            if field == "second_location":
+                values = _as_second_location(values)
         else:
             limits = {"product": 200, "delivery_time": 100, "comment": 1000}
             values[field] = _text(update.message, maximum=limits[field], required=field == "product")
@@ -375,18 +449,25 @@ async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     sent = order.status != "draft"
     location_published = True
-    if sent and field == "location":
+    if sent and field in {"location", "second_location"}:
+        location_number = 2 if field == "second_location" else 1
         if previous:
-            await _set_location_marker(context, previous, "⚠️")
-        order = repo.update(order.id, location_chat_id=None, location_message_id=None)
+            await _set_location_marker(context, previous, "⚠️", location_number)
+        clear_fields = (
+            {"second_location_chat_id": None, "second_location_message_id": None}
+            if location_number == 2
+            else {"location_chat_id": None, "location_message_id": None}
+        )
+        order = repo.update(order.id, **clear_fields)
         try:
-            order = await _publish_location(context, repo, order)
+            order = await _publish_location(context, repo, order, location_number)
+            await _set_location_marker(context, order)
         except Exception:
             location_published = False
             logger.exception("Could not publish replacement location for order %s", order.id)
     elif sent:
         await _set_location_marker(context, order)
-    keyboard = manager_sent_keyboard(order.id) if sent else review_keyboard(order.id)
+    keyboard = manager_sent_keyboard(order) if sent else review_keyboard(order.id)
     await context.bot.edit_message_text(chat_id=edit["chat_id"], message_id=edit["message_id"], text=manager_card(order, sent=sent), parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=keyboard)
     refreshed = await _refresh_delivery_message(context, order) if sent else True
     context.user_data.pop("edit", None)
@@ -418,13 +499,21 @@ async def manager_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await sent.edit_text(f"⚠️ Заказ №{order.order_number} был отменён до отправки")
         await query.answer("Заказ уже обработан", show_alert=True); return
     location_published = True
-    try:
-        updated = await _publish_location(context, repo, updated)
-    except Exception:
-        location_published = False
-        logger.exception("Could not publish location for order %s", updated.id)
+    location_numbers = [1]
+    if updated.second_latitude is not None and updated.second_longitude is not None:
+        location_numbers.append(2)
+    for location_number in location_numbers:
+        try:
+            updated = await _publish_location(context, repo, updated, location_number)
+        except Exception:
+            location_published = False
+            logger.exception(
+                "Could not publish location %s for order %s",
+                location_number,
+                updated.id,
+            )
     await _refresh_delivery_message(context, updated)
-    await query.edit_message_text(manager_card(updated, sent=True), parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=manager_sent_keyboard(updated.id))
+    await query.edit_message_text(manager_card(updated, sent=True), parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=manager_sent_keyboard(updated))
     if location_published:
         await query.answer("Заказ и Telegram Location отправлены")
     else:
@@ -618,21 +707,13 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def show_all_locations(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings: Settings = context.application.bot_data["settings"]
     user_id = update.effective_user.id
-    allowed = user_id in settings.manager_ids or user_id in settings.courier_ids
-    if update.effective_chat.id != settings.delivery_group_id or not allowed:
-        if update.callback_query:
-            await update.callback_query.answer("Карта доступна сотрудникам в группе доставки", show_alert=True)
-        elif update.effective_message:
-            await update.effective_message.reply_text("Карта доступна сотрудникам в группе доставки.")
+    if update.effective_chat.type != "private" or user_id not in settings.manager_ids:
+        if update.effective_message:
+            await update.effective_message.reply_text("Все активные заказы доступны менеджерам в личном чате с ботом.")
         return
     repo: OrderRepository = context.application.bot_data["repo"]
     text, map_url = all_locations_card(repo.list_active())
-    if update.callback_query:
-        await update.callback_query.answer()
-        message = update.callback_query.message
-    else:
-        message = update.effective_message
-    await message.reply_text(
+    await update.effective_message.reply_text(
         text,
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
@@ -649,7 +730,7 @@ async def location_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     ):
         await query.answer("Нет доступа", show_alert=True)
         return
-    _, raw_id = query.data.split(":")
+    _, raw_id, raw_location_number = query.data.split(":")
     repo: OrderRepository = context.application.bot_data["repo"]
     order = repo.get(int(raw_id))
     if not order:
@@ -657,8 +738,10 @@ async def location_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     status = LOCATION_STATUS_MARKERS.get(order.status, "📍")
     product = " ".join(order.product.split())[:80]
+    location_number = int(raw_location_number)
+    address = short_address(order, location_number)
     await query.answer(
-        f"{status} Заказ №{order.order_number}\n{product}\n{order.client_phone}",
+        f"{status} Заказ №{order.order_number}\n{product}\n{address}\n{order.client_phone}",
         show_alert=True,
     )
 
@@ -670,6 +753,7 @@ def register_handlers(application: Application) -> None:
             SELLER: [MessageHandler(filters.TEXT & ~filters.COMMAND, seller)],
             PRODUCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, product)],
             DETAILS: [MessageHandler((filters.LOCATION | filters.TEXT) & ~filters.COMMAND, details)],
+            SECOND_LOCATION: [MessageHandler((filters.LOCATION | filters.TEXT) & ~filters.COMMAND, second_location)],
             PAYMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment)],
             DELIVERY_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, delivery_time)],
             COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, comment)],
@@ -679,12 +763,12 @@ def register_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("map", show_all_locations))
     application.add_handler(MessageHandler(filters.Regex(r"^📋 Мои заказы$") & filters.ChatType.PRIVATE, my_orders))
+    application.add_handler(MessageHandler(filters.Regex(r"^📦 Все активные заказы$") & filters.ChatType.PRIVATE, show_all_locations))
     application.add_handler(conversation)
     application.add_handler(CommandHandler("cancel", cancel_conversation))
     application.add_handler(CallbackQueryHandler(begin_edit, pattern=r"^edit:\d+:"))
     application.add_handler(CallbackQueryHandler(manager_action, pattern=r"^(send|manager_cancel):\d+$"))
-    application.add_handler(CallbackQueryHandler(show_all_locations, pattern=r"^map:all$"))
-    application.add_handler(CallbackQueryHandler(location_info, pattern=r"^location_info:\d+$"))
+    application.add_handler(CallbackQueryHandler(location_info, pattern=r"^location_info:\d+:[12]$"))
     application.add_handler(CallbackQueryHandler(courier_action, pattern=r"^(onway|undo_onway|complete|cancel):\d+$"))
     application.add_handler(MessageHandler((filters.LOCATION | filters.TEXT) & ~filters.COMMAND, save_edit), group=1)
     application.add_handler(MessageHandler(filters.PHOTO | (filters.TEXT & ~filters.COMMAND), delivery_input), group=2)

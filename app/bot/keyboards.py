@@ -1,14 +1,20 @@
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
+from telegram import (
+    CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
+    ReplyKeyboardMarkup,
+)
 
 from app.models import Order
-from app.utils.formatters import telegram_location_url, yandex_map_url, yandex_route_url
+from app.utils.formatters import telegram_location_url
 from app.utils.payments import PAYMENT_LABELS
 from app.utils.sellers import SELLERS
 
 
 def main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [[KeyboardButton("➕ Новый заказ"), KeyboardButton("📋 Мои заказы")]],
+        [
+            [KeyboardButton("➕ Новый заказ"), KeyboardButton("📋 Мои заказы")],
+            [KeyboardButton("📦 Все активные заказы")],
+        ],
         resize_keyboard=True,
     )
 
@@ -39,43 +45,55 @@ def review_keyboard(order_id: int) -> InlineKeyboardMarkup:
 
 def _edit_rows(order_id: int) -> list[list[InlineKeyboardButton]]:
     rows = [
-        [("👤 Изменить продавца", "seller"), ("💳 Изменить оплату", "payment_status")],
+        [("👤 Изменить владельца", "seller"), ("💳 Изменить оплату", "payment_status")],
         [("✏️ Изменить товар", "product"), ("📞 Изменить номер", "phone")],
-        [("📍 Изменить локацию", "location"), ("💰 Изменить сумму", "amount")],
+        [("📍 Основная локация", "location"), ("📍 Доп. локация", "second_location")],
+        [("💰 Изменить сумму", "amount")],
         [("🕒 Изменить время", "delivery_time"), ("💬 Изменить комментарий", "comment")],
     ]
     return [[InlineKeyboardButton(label, callback_data=f"edit:{order_id}:{field}") for label, field in row] for row in rows]
 
 
-def manager_sent_keyboard(order_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(_edit_rows(order_id))
+def manager_sent_keyboard(order: Order) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(_location_rows(order) + _edit_rows(order.id))
 
 
 def _location_rows(order: Order) -> list[list[InlineKeyboardButton]]:
-    rows: list[list[InlineKeyboardButton]] = []
-    telegram_url = telegram_location_url(order)
-    if telegram_url:
-        rows.append([InlineKeyboardButton("📍 Выбрать навигатор", url=telegram_url)])
-    row = []
-    route_url = yandex_route_url(order)
-    map_url = yandex_map_url(order)
-    if route_url:
-        row.append(InlineKeyboardButton("🧭 Маршрут", url=route_url))
-    if map_url:
-        row.append(InlineKeyboardButton("🗺 Карта", url=map_url))
-    if row:
-        rows.append(row)
-    return rows
+    row: list[InlineKeyboardButton] = []
+    first_url = telegram_location_url(order)
+    second_url = telegram_location_url(order, 2)
+    if first_url:
+        row.append(InlineKeyboardButton("📍 Локация", url=first_url))
+    if second_url:
+        row.append(InlineKeyboardButton("📍 Доп. локация", url=second_url))
+    return [row] if row else []
 
 
-def location_channel_keyboard(order: Order, marker: str = "🆕") -> InlineKeyboardMarkup:
+def location_channel_keyboard(
+    order: Order,
+    marker: str = "🆕",
+    location_number: int = 1,
+) -> InlineKeyboardMarkup:
     product = " ".join(order.product.split())
     if len(product) > 36:
         product = product[:33] + "…"
-    label = f"{marker} №{order.order_number} · {product}"
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton(label, callback_data=f"location_info:{order.id}")
-    ]])
+    has_second = order.second_latitude is not None and order.second_longitude is not None
+    location_label = f" · Локация {location_number}" if has_second else ""
+    label = f"{marker} №{order.order_number}{location_label} · {product}"
+    phone_digits = "".join(character for character in order.client_phone if character.isdigit())
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            label,
+            callback_data=f"location_info:{order.id}:{location_number}",
+        )],
+        [
+            InlineKeyboardButton("📞 Позвонить", url=f"tg://resolve?phone={phone_digits}"),
+            InlineKeyboardButton(
+                "📋 Скопировать номер",
+                copy_text=CopyTextButton(order.client_phone),
+            ),
+        ],
+    ])
 
 
 def courier_keyboard(order: Order) -> InlineKeyboardMarkup:
@@ -84,7 +102,6 @@ def courier_keyboard(order: Order) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🚗 Еду к заказу", callback_data=f"onway:{order.id}")],
         [InlineKeyboardButton("✅ Доставлено", callback_data=f"complete:{order.id}"),
          InlineKeyboardButton("❌ Отменён", callback_data=f"cancel:{order.id}")],
-        [InlineKeyboardButton("🗺 Все активные заказы", callback_data="map:all")],
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -95,7 +112,6 @@ def on_way_keyboard(order: Order) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("↩️ Отменить выезд", callback_data=f"undo_onway:{order.id}")],
         [InlineKeyboardButton("✅ Доставлено", callback_data=f"complete:{order.id}"),
          InlineKeyboardButton("❌ Отменён", callback_data=f"cancel:{order.id}")],
-        [InlineKeyboardButton("🗺 Все активные заказы", callback_data="map:all")],
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -104,7 +120,6 @@ def delivery_pending_keyboard(order: Order) -> InlineKeyboardMarkup:
     rows = _location_rows(order)
     rows += [
         [InlineKeyboardButton("❌ Отменён", callback_data=f"cancel:{order.id}")],
-        [InlineKeyboardButton("🗺 Все активные заказы", callback_data="map:all")],
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -117,3 +132,11 @@ def all_locations_keyboard(map_url: str | None) -> InlineKeyboardMarkup | None:
 
 def skip_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup([[KeyboardButton("Пропустить")]], resize_keyboard=True, one_time_keyboard=True)
+
+
+def second_location_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("Продолжить без второй локации")]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )

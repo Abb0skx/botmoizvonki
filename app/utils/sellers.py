@@ -6,4 +6,4 @@ def normalize_seller(value: str) -> str:
     for seller in SELLERS:
         if seller.casefold() == normalized:
             return seller
-    raise ValueError("Выберите продавца кнопкой: Olmas, Otabek, Ali или Abbos")
+    raise ValueError("Выберите владельца заказа кнопкой: Olmas, Otabek, Ali или Abbos")
