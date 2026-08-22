@@ -6,8 +6,9 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from app.bot.keyboards import (
-    courier_cancelled_keyboard, courier_keyboard, location_channel_keyboard,
-    manager_cancelled_keyboard, manager_sent_keyboard,
+    courier_cancelled_keyboard, courier_keyboard, delivery_pending_keyboard,
+    location_channel_keyboard, manager_cancelled_keyboard, manager_sent_keyboard,
+    review_keyboard,
 )
 from app.database import OrderRepository
 from app.database.repository import MIGRATION_COLUMNS, SCHEMA
@@ -253,7 +254,7 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("edit", context.user_data)
             self.assertIn("Новая цена сохранена", message.reply_text.await_args.args[0])
 
-    async def test_paid_at_assembly_completes_after_photo(self):
+    async def test_delivery_completes_from_photo_with_price_caption(self):
         with tempfile.TemporaryDirectory() as tempdir:
             repo = OrderRepository(Path(tempdir) / "delivery.db")
             repo.initialize()
@@ -279,6 +280,7 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
             message = SimpleNamespace(
                 photo=[SimpleNamespace(file_id="photo-file-id")],
                 text=None,
+                caption="100$ 1 920 000",
                 reply_text=AsyncMock(),
             )
             update = SimpleNamespace(
@@ -299,7 +301,7 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(completed.status, "completed")
             self.assertEqual(completed.delivery_photo, "photo-file-id")
             self.assertIsNotNone(completed.delivered_at)
-            self.assertIsNone(completed.received_usd)
+            self.assertEqual((completed.received_usd, completed.received_uzs), (100, 1920000))
             bot.send_photo.assert_awaited_once()
             self.assertIn("✅ Оплачено", bot.send_photo.await_args.kwargs["caption"])
             self.assertIn("100$", bot.send_photo.await_args.kwargs["caption"])
@@ -326,17 +328,21 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
             collect_message = SimpleNamespace(
                 photo=[SimpleNamespace(file_id="second-photo")],
                 text=None,
+                caption="150$ 2 400 000",
                 reply_text=AsyncMock(),
             )
             update.message = collect_message
 
             await delivery_input(update, context)
 
-            self.assertEqual(repo.get(collect_order.id).status, "awaiting_amount")
-            collect_message.reply_text.assert_awaited_once_with(
-                "Введите полученную сумму, например: 100$ 1920000"
+            completed_collect = repo.get(collect_order.id)
+            self.assertEqual(completed_collect.status, "completed")
+            self.assertEqual(
+                (completed_collect.received_usd, completed_collect.received_uzs),
+                (150, 2400000),
             )
-            bot.send_photo.assert_awaited_once()
+            collect_message.reply_text.assert_awaited_once_with("✅ Доставка подтверждена.")
+            self.assertEqual(bot.send_photo.await_count, 2)
 
     async def test_publish_location_saves_channel_message(self):
         with tempfile.TemporaryDirectory() as tempdir:
@@ -519,7 +525,7 @@ class RepositoryTests(unittest.TestCase):
             telegram_location_url(order, 2),
             "https://t.me/c/4398605075/78",
         )
-        self.assertIn("Доп. локация", manager_card(order))
+        self.assertEqual(manager_card(order).count("📍"), 2)
         keyboard = courier_keyboard(order)
         button_texts = [button.text for row in keyboard.inline_keyboard for button in row]
         self.assertIn("📍 Локация", button_texts)
@@ -540,7 +546,24 @@ class RepositoryTests(unittest.TestCase):
         keyboard = location_channel_keyboard(order)
         button_texts = [button.text for row in keyboard.inline_keyboard for button in row]
         self.assertIn("📞 Позвонить", button_texts)
-        self.assertIn("📋 Скопировать номер", button_texts)
+        self.assertIn("💬 Telegram клиента", button_texts)
+        self.assertNotIn("📋 Скопировать номер", button_texts)
+        call_button = keyboard.inline_keyboard[1][0]
+        self.assertEqual(
+            call_button.url,
+            "https://bot.texnikach.uz/call/998901333999",
+        )
+
+    def test_delivery_confirmation_and_compact_edit_buttons_have_back(self):
+        order = self.repo.create(manager_id=1, manager_name="A", data=self.data)
+        pending_buttons = [
+            button for row in delivery_pending_keyboard(order).inline_keyboard for button in row
+        ]
+        self.assertTrue(any(button.callback_data == f"undo_complete:{order.id}" for button in pending_buttons))
+        compact = review_keyboard(order.id)
+        self.assertEqual(compact.inline_keyboard[0][0].text, "✏️ Изменить")
+        expanded = review_keyboard(order.id, expanded=True)
+        self.assertTrue(any(button.text == "↩️ Назад" for row in expanded.inline_keyboard for button in row))
 
     def test_undo_on_way_returns_order_to_queue(self):
         order = self.repo.create(manager_id=1, manager_name="A", data=self.data)
@@ -619,6 +642,28 @@ class RepositoryTests(unittest.TestCase):
         self.assertIn("&lt;Seller&gt;", courier_card(order))
         self.assertNotIn("Создал заказ", courier_card(order))
         self.assertNotIn("Получить при доставке", courier_card(order))
+
+    def test_compact_card_hides_empty_time_and_comment_and_keeps_location_last(self):
+        order = self.repo.create(
+            manager_id=1,
+            manager_name="A",
+            data={**self.data, "seller_name": "Ali", "address_text": "Чиланзар"},
+        )
+        card = manager_card(order)
+        self.assertNotIn("🕒", card)
+        self.assertNotIn("💬", card)
+        self.assertGreater(card.index("📍"), card.index("📱"))
+        self.assertLess(card.index("📦"), card.index("💰"))
+
+    def test_all_orders_are_listed_for_managers(self):
+        first = self.repo.create(manager_id=1, manager_name="A", data=self.data)
+        second = self.repo.create(manager_id=2, manager_name="B", data=self.data)
+        self.repo.update(first.id, status="completed")
+        self.repo.update(second.id, status="cancelled")
+        self.assertEqual(
+            [order.order_number for order in self.repo.list_all()],
+            [second.order_number, first.order_number],
+        )
 
     def test_address_is_compact(self):
         order = self.repo.create(

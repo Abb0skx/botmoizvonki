@@ -185,6 +185,13 @@ class OrderRepository:
             ).fetchall()
         return [Order.from_row(row) for row in rows]
 
+    def list_all(self) -> list[Order]:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM orders ORDER BY order_number DESC"
+            ).fetchall()
+        return [Order.from_row(row) for row in rows]
+
     def update(self, order_id: int, **fields: Any) -> Order | None:
         invalid = set(fields) - self.editable_fields
         if invalid:

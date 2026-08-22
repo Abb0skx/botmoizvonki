@@ -1,7 +1,4 @@
-from telegram import (
-    CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
-    ReplyKeyboardMarkup,
-)
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 
 from app.models import Order
 from app.utils.formatters import telegram_location_url
@@ -12,7 +9,7 @@ from app.utils.sellers import SELLERS
 def main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("➕ Новый заказ"), KeyboardButton("📋 Мои заказы")],
+            [KeyboardButton("➕ Новый заказ"), KeyboardButton("📋 Все заказы")],
             [KeyboardButton("📦 Все активные заказы")],
         ],
         resize_keyboard=True,
@@ -36,8 +33,12 @@ def payment_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-def review_keyboard(order_id: int) -> InlineKeyboardMarkup:
-    keyboard = _edit_rows(order_id)
+def review_keyboard(order_id: int, *, expanded: bool = False) -> InlineKeyboardMarkup:
+    keyboard = _edit_rows(order_id) if expanded else [[
+        InlineKeyboardButton("✏️ Изменить", callback_data=f"edit_menu:{order_id}"),
+    ]]
+    if expanded:
+        keyboard.append([InlineKeyboardButton("↩️ Назад", callback_data=f"edit_close:{order_id}")])
     keyboard += [[InlineKeyboardButton("🚚 Отправить курьеру", callback_data=f"send:{order_id}")],
                  [InlineKeyboardButton("❌ Отменить заказ", callback_data=f"manager_cancel:{order_id}")]]
     return InlineKeyboardMarkup(keyboard)
@@ -60,8 +61,13 @@ def _edit_rows(order_id: int) -> list[list[InlineKeyboardButton]]:
     return [[InlineKeyboardButton(label, callback_data=f"edit:{order_id}:{field}") for label, field in row] for row in rows]
 
 
-def manager_sent_keyboard(order: Order) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(_location_rows(order) + _edit_rows(order.id))
+def manager_sent_keyboard(order: Order, *, expanded: bool = False) -> InlineKeyboardMarkup:
+    edit_rows = _edit_rows(order.id) if expanded else [[
+        InlineKeyboardButton("✏️ Изменить", callback_data=f"edit_menu:{order.id}"),
+    ]]
+    if expanded:
+        edit_rows.append([InlineKeyboardButton("↩️ Назад", callback_data=f"edit_close:{order.id}")])
+    return InlineKeyboardMarkup(_location_rows(order) + edit_rows)
 
 
 def _location_rows(order: Order) -> list[list[InlineKeyboardButton]]:
@@ -93,10 +99,13 @@ def location_channel_keyboard(
             callback_data=f"location_info:{order.id}:{location_number}",
         )],
         [
-            InlineKeyboardButton("📞 Позвонить", url=f"tg://resolve?phone={phone_digits}"),
             InlineKeyboardButton(
-                "📋 Скопировать номер",
-                copy_text=CopyTextButton(order.client_phone),
+                "📞 Позвонить",
+                url=f"https://bot.texnikach.uz/call/{phone_digits}",
+            ),
+            InlineKeyboardButton(
+                "💬 Telegram клиента",
+                url=f"tg://resolve?phone={phone_digits}",
             ),
         ],
     ])
@@ -125,6 +134,7 @@ def on_way_keyboard(order: Order) -> InlineKeyboardMarkup:
 def delivery_pending_keyboard(order: Order) -> InlineKeyboardMarkup:
     rows = _location_rows(order)
     rows += [
+        [InlineKeyboardButton("↩️ Назад", callback_data=f"undo_complete:{order.id}")],
         [InlineKeyboardButton("❌ Отменён", callback_data=f"cancel:{order.id}")],
     ]
     return InlineKeyboardMarkup(rows)

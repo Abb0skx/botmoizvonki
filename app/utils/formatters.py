@@ -91,37 +91,38 @@ def short_address(order: Order, location_number: int = 1) -> str:
 
 
 def locations_text(order: Order) -> str:
-    lines = [f"📍 Локация: {escape(short_address(order))}"]
+    lines = [f"📍 {escape(short_address(order))}"]
     if order.second_latitude is not None and order.second_longitude is not None:
-        lines.append(f"📍 Доп. локация: {escape(short_address(order, 2))}")
+        lines.append(f"📍 {escape(short_address(order, 2))}")
     return "\n".join(lines)
 
 
 def amount_text(order: Order) -> str:
-    title = "✅ Оплачено" if order.payment_status == PAID_AT_ASSEMBLY else "💰 Сумма"
-    return f"{title}:\n{money(order.amount_usd, order.amount_uzs)}"
+    title = "✅ Оплачено" if order.payment_status == PAID_AT_ASSEMBLY else "💰"
+    return f"{title} {money(order.amount_usd, order.amount_uzs)}"
+
+
+def _compact_order(order: Order) -> str:
+    lines = [
+        f"🚚 <b>Заказ №{order.order_number}</b> · <b>{escape(order.seller_name or '—')}</b>",
+        f"📦 {escape(order.product)}",
+        amount_text(order),
+        f"📱 {display_phone(order.client_phone)}",
+    ]
+    if order.delivery_time:
+        lines.append(f"🕒 {escape(order.delivery_time)}")
+    if order.comment:
+        lines.append(f"💬 {escape(order.comment)}")
+    return "\n".join(lines) + f"\n\n{locations_text(order)}"
 
 
 def manager_card(order: Order, *, sent: bool = False) -> str:
-    title = "✅ <b>Заказ отправлен курьерам</b>" if sent else "✅ <b>Заказ создан</b>"
-    return (
-        f"{title}\n\n🚚 <b>Заказ №{order.order_number}</b>\n\n"
-        f"👤 Заказ принадлежит: <b>{escape(order.seller_name or '—')}</b>\n\n"
-        f"📱 Телефон:\n{display_phone(order.client_phone)}\n\n📦 Товар:\n{escape(order.product)}\n\n"
-        f"{amount_text(order)}\n\n{locations_text(order)}\n\n"
-        f"🕒 Время:\n{escape(order.delivery_time or '—')}\n\n💬 Комментарий:\n{escape(order.comment or '—')}"
-    )
+    return _compact_order(order)
 
 
 def courier_card(order: Order, state: str = "") -> str:
-    heading = f"{state}\n\n" if state else ""
-    return (
-        f"{heading}🚚 <b>Заказ №{order.order_number}</b>\n\n"
-        f"👤 Заказ принадлежит: <b>{escape(order.seller_name or '—')}</b>\n\n"
-        f"📱 {display_phone(order.client_phone)}\n\n📦 {escape(order.product)}\n\n"
-        f"{amount_text(order)}\n\n{locations_text(order)}\n\n"
-        f"🕒 {escape(order.delivery_time or '—')}\n\n💬 {escape(order.comment or '—')}"
-    )
+    heading = f"{state}\n" if state else ""
+    return heading + _compact_order(order)
 
 
 def completed_card(order: Order, local_time: str) -> str:

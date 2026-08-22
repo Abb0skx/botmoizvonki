@@ -20,6 +20,15 @@ from reviews.service import (
 
 
 class ReviewsFoundationTests(unittest.TestCase):
+    def test_call_link_opens_system_phone_handler(self):
+        app = FastAPI()
+        app.include_router(reviews_router)
+        client = TestClient(app)
+        response = client.get("/call/998901333999")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("tel:+998901333999", response.text)
+        self.assertEqual(client.get("/call/123").status_code, 404)
+
     def test_catalog_has_all_categories_and_translations(self):
         expected = {
             "manager", "price", "availability", "delivery",

@@ -22,7 +22,7 @@ from app.config import Settings
 from app.database import OrderRepository
 from app.utils import (
     completed_card, courier_card, enrich_location, manager_card, normalize_phone,
-    normalize_payment, normalize_seller, PAID_AT_ASSEMBLY, parse_amount,
+    normalize_payment, normalize_seller, parse_amount,
     parse_order_details,
 )
 from app.utils.formatters import all_locations_card, money, short_address
@@ -214,11 +214,11 @@ async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Список заказов доступен менеджерам в личном чате.")
         return
     repo: OrderRepository = context.application.bot_data["repo"]
-    orders = repo.list_manager_open(update.effective_user.id)
+    orders = repo.list_all()
     if not orders:
-        await update.message.reply_text("Открытых заказов нет.", reply_markup=main_keyboard())
+        await update.message.reply_text("Заказов пока нет.", reply_markup=main_keyboard())
         return
-    await update.message.reply_text(f"📋 Открытые заказы: {len(orders)}")
+    await update.message.reply_text(f"📋 Все заказы: {len(orders)}")
     for order in orders:
         editable = order.status in MANAGER_EDITABLE_STATUSES
         keyboard = review_keyboard(order.id) if order.status == "draft" else manager_sent_keyboard(order) if editable else None
@@ -400,7 +400,8 @@ async def begin_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     _, raw_id, field = query.data.split(":")
     repo: OrderRepository = context.application.bot_data["repo"]
     order = repo.get(int(raw_id))
-    if not order or order.manager_id != query.from_user.id or order.status not in MANAGER_EDITABLE_STATUSES:
+    settings: Settings = context.application.bot_data["settings"]
+    if not order or not _allowed(query.from_user.id, settings.manager_ids) or order.status not in MANAGER_EDITABLE_STATUSES:
         await query.answer("Этот заказ уже нельзя изменять", show_alert=True)
         return
     await query.answer()
@@ -428,6 +429,33 @@ async def begin_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     else:
         keyboard = ReplyKeyboardRemove()
     await query.message.reply_text(prompts[field], reply_markup=keyboard)
+
+
+async def toggle_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    action, raw_id = query.data.split(":")
+    settings: Settings = context.application.bot_data["settings"]
+    repo: OrderRepository = context.application.bot_data["repo"]
+    order = repo.get(int(raw_id))
+    if (
+        not order
+        or not _allowed(query.from_user.id, settings.manager_ids)
+        or order.status not in MANAGER_EDITABLE_STATUSES
+    ):
+        await query.answer("Этот заказ уже нельзя изменять", show_alert=True)
+        return
+    expanded = action == "edit_menu"
+    keyboard = (
+        review_keyboard(order.id, expanded=expanded)
+        if order.status == "draft"
+        else manager_sent_keyboard(order, expanded=expanded)
+    )
+    try:
+        await query.edit_message_reply_markup(reply_markup=keyboard)
+    except Exception as error:
+        if not _message_is_not_modified(error):
+            raise
+    await query.answer()
 
 
 async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -511,8 +539,9 @@ async def manager_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     query = update.callback_query
     action, raw_id = query.data.split(":")
     repo: OrderRepository = context.application.bot_data["repo"]
+    settings: Settings = context.application.bot_data["settings"]
     order = repo.get(int(raw_id))
-    if not order or order.manager_id != query.from_user.id:
+    if not order or not _allowed(query.from_user.id, settings.manager_ids):
         await query.answer("Заказ недоступен", show_alert=True); return
     if action == "manager_restore":
         if order.delivery_message_id is not None:
@@ -538,7 +567,6 @@ async def manager_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             reply_markup=manager_cancelled_keyboard(order.id),
         )
         await query.answer(); return
-    settings: Settings = context.application.bot_data["settings"]
     sent = await context.bot.send_message(settings.delivery_group_id, courier_card(order), parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=courier_keyboard(order))
     updated = repo.transition(order.id, {"draft"}, status="pending", delivery_chat_id=sent.chat_id, delivery_message_id=sent.message_id)
     if not updated:
@@ -608,6 +636,39 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"↩️ Отмена заказа №{order.order_number} снята. Заказ снова ожидает курьера.",
         )
         return
+    if action == "undo_complete":
+        if order.status not in {"awaiting_photo", "awaiting_amount"} or order.courier_id != query.from_user.id:
+            await query.answer("Подтверждение уже нельзя отменить", show_alert=True); return
+        target_status = "on_way" if order.time_started else "pending"
+        reset = {
+            "status": target_status,
+            "delivery_photo": None,
+            "received_usd": None,
+            "received_uzs": None,
+            "delivered_at": None,
+        }
+        if target_status == "pending":
+            reset.update(courier_id=None, courier_name=None)
+        order = repo.transition(
+            order.id,
+            {"awaiting_photo", "awaiting_amount"},
+            guard_courier_id=query.from_user.id,
+            require_unassigned_or_same=True,
+            **reset,
+        )
+        if not order:
+            await query.answer("Подтверждение уже нельзя отменить", show_alert=True); return
+        state = "↩️ <b>Подтверждение доставки отменено</b>"
+        keyboard = on_way_keyboard(order) if target_status == "on_way" else courier_keyboard(order)
+        await query.edit_message_text(
+            courier_card(order, state),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=keyboard,
+        )
+        await query.answer("Возвращено назад")
+        await _set_location_marker(context, order)
+        return
     if order.status in {"completed", "cancelled"}:
         await query.answer("Заказ уже закрыт", show_alert=True); return
     if order.courier_id and order.courier_id != query.from_user.id:
@@ -667,13 +728,12 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         await query.answer("Заказ отменён")
         await _set_location_marker(context, order)
-        await _notify_manager(context, order.manager_id, f"❌ <b>Заказ №{order.order_number} отменён</b>\n\n👤 Курьер: {escape(_name(query.from_user))}")
     else:
         active = repo.get_active_delivery(query.from_user.id)
         if active and active.id != order.id:
             await query.answer(f"Сначала завершите заказ №{active.order_number}", show_alert=True); return
         if order.status in {"awaiting_photo", "awaiting_amount"} and order.courier_id == query.from_user.id:
-            prompt = "Отправьте фото доставки 📸" if order.status == "awaiting_photo" else "Введите полученную сумму"
+            prompt = "Отправьте фото и цену в подписи к фото 📸"
             await query.answer(prompt, show_alert=True); return
         order = repo.transition(
             order.id, {"pending", "on_way"}, status="awaiting_photo",
@@ -688,7 +748,11 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             disable_web_page_preview=True,
             reply_markup=delivery_pending_keyboard(order),
         )
-        await query.message.reply_text(f"Заказ №{order.order_number}: отправьте фото доставки 📸")
+        prompt = (
+            f"Заказ №{order.order_number}: отправьте фото и укажите полученную цену в подписи к фото.\n"
+            "Пример подписи: 100$ 1 920 000"
+        )
+        await query.message.reply_text(prompt)
         await _set_location_marker(context, order)
 
 
@@ -734,42 +798,31 @@ async def delivery_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     if order.status == "awaiting_photo":
         if not update.message.photo:
-            await update.message.reply_text("Нужно отправить фотографию."); return
-        photo_id = update.message.photo[-1].file_id
-        if order.payment_status == PAID_AT_ASSEMBLY:
-            timestamp = datetime.now().astimezone()
-            updated = repo.transition(
-                order.id,
-                {"awaiting_photo"},
-                status="completed",
-                delivery_photo=photo_id,
-                delivered_at=timestamp.isoformat(timespec="seconds"),
+            await update.message.reply_text(
+                "Отправьте фото и укажите цену в подписи к фото. Пример: 100$ 1 920 000"
+            ); return
+        try:
+            usd, uzs = parse_amount(update.message.caption or "")
+        except ValueError:
+            await update.message.reply_text(
+                "Цена не распознана. Отправьте фото заново и напишите цену в подписи. "
+                "Пример: 100$ 1 920 000"
             )
-            if not updated:
-                await update.message.reply_text("Статус заказа уже изменился."); return
-            await _publish_completed(update, context, updated, timestamp)
             return
+        photo_id = update.message.photo[-1].file_id
+        timestamp = datetime.now().astimezone()
         updated = repo.transition(
             order.id,
             {"awaiting_photo"},
-            status="awaiting_amount",
+            status="completed",
             delivery_photo=photo_id,
+            received_usd=usd,
+            received_uzs=uzs,
+            delivered_at=timestamp.isoformat(timespec="seconds"),
         )
         if not updated:
             await update.message.reply_text("Статус заказа уже изменился."); return
-        try:
-            await context.bot.edit_message_text(
-                chat_id=updated.delivery_chat_id,
-                message_id=updated.delivery_message_id,
-                text=courier_card(updated, "💰 <b>Фото получено, ожидается сумма</b>"),
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-                reply_markup=delivery_pending_keyboard(updated),
-            )
-        except Exception:
-            logger.exception("Could not update photo confirmation state for order %s", updated.id)
-        await _set_location_marker(context, updated)
-        await update.message.reply_text("Введите полученную сумму, например: 100$ 1920000")
+        await _publish_completed(update, context, updated, timestamp)
         return
     if update.message.photo:
         await update.message.reply_text("Фото уже получено. Теперь введите сумму текстом."); return
@@ -847,13 +900,14 @@ def register_handlers(application: Application) -> None:
     )
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("map", show_all_locations))
-    application.add_handler(MessageHandler(filters.Regex(r"^📋 Мои заказы$") & filters.ChatType.PRIVATE, my_orders))
+    application.add_handler(MessageHandler(filters.Regex(r"^📋 (?:Мои|Все) заказы$") & filters.ChatType.PRIVATE, my_orders))
     application.add_handler(MessageHandler(filters.Regex(r"^📦 Все активные заказы$") & filters.ChatType.PRIVATE, show_all_locations))
     application.add_handler(conversation)
     application.add_handler(CommandHandler("cancel", cancel_conversation))
+    application.add_handler(CallbackQueryHandler(toggle_edit_menu, pattern=r"^edit_(?:menu|close):\d+$"))
     application.add_handler(CallbackQueryHandler(begin_edit, pattern=r"^edit:\d+:"))
     application.add_handler(CallbackQueryHandler(manager_action, pattern=r"^(send|manager_cancel|manager_restore):\d+$"))
     application.add_handler(CallbackQueryHandler(location_info, pattern=r"^location_info:\d+:[12]$"))
-    application.add_handler(CallbackQueryHandler(courier_action, pattern=r"^(onway|undo_onway|complete|cancel|undo_cancel):\d+$"))
+    application.add_handler(CallbackQueryHandler(courier_action, pattern=r"^(onway|undo_onway|complete|cancel|undo_cancel|undo_complete):\d+$"))
     application.add_handler(MessageHandler((filters.LOCATION | filters.TEXT) & ~filters.COMMAND, save_edit), group=1)
     application.add_handler(MessageHandler(filters.PHOTO | (filters.TEXT & ~filters.COMMAND), delivery_input), group=2)
