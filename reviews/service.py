@@ -1,4 +1,5 @@
 import hashlib
+import json
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -19,9 +20,30 @@ from .database import connect_reviews_db, init_reviews_db
 
 
 COMMENT_LIMIT = 2000
-USER_AGENT_LIMIT = 500
+USER_AGENT_LIMIT = 2000
+DEVICE_DATA_LIMIT = 20000
+HEADERS_LIMIT = 10000
 SOURCE_PATTERN = re.compile(r"^[a-z0-9_-]{1,40}$")
 CRITICAL_CATEGORIES = {"manager", "delivery", "courier", "product", "overall"}
+CATEGORY_LABELS = {
+    "manager": "Менеджер",
+    "price": "Цена",
+    "availability": "Наличие",
+    "delivery": "Доставка",
+    "courier": "Курьер",
+    "product": "Товар",
+    "overall": "Общая оценка",
+}
+DEVICE_KEYS = {
+    "language", "languages", "timezone", "timezone_offset_minutes",
+    "screen_width", "screen_height", "screen_avail_width",
+    "screen_avail_height", "color_depth", "pixel_depth",
+    "viewport_width", "viewport_height", "device_pixel_ratio",
+    "max_touch_points", "touch_supported", "platform",
+    "hardware_concurrency", "device_memory_gb", "cookie_enabled",
+    "do_not_track", "online", "color_scheme", "reduced_motion",
+    "connection", "user_agent_data", "high_entropy",
+}
 
 
 class ReviewValidationError(ValueError):
@@ -67,6 +89,33 @@ def _clean_comment(value: Any, field: str) -> str | None:
     if len(value) > COMMENT_LIMIT:
         raise ReviewValidationError(f"{field}_too_long")
     return value or None
+
+
+def _sanitize_device_value(value: Any, depth: int = 0) -> Any:
+    if depth > 3 or value is None:
+        return None
+    if isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value[:500]
+    if isinstance(value, list):
+        return [_sanitize_device_value(item, depth + 1) for item in value[:30]]
+    if isinstance(value, dict):
+        return {
+            str(key)[:100]: _sanitize_device_value(item, depth + 1)
+            for key, item in list(value.items())[:50]
+        }
+    return str(value)[:500]
+
+
+def sanitize_device_payload(payload: Any) -> dict:
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        key: _sanitize_device_value(payload[key])
+        for key in DEVICE_KEYS
+        if key in payload
+    }
 
 
 def _validate_payload(payload: Any, active_manager_codes: set[str]) -> dict:
@@ -152,6 +201,11 @@ def _validate_payload(payload: Any, active_manager_codes: set[str]) -> dict:
         and answer["rating"] <= REVIEWS_CRITICAL_RATING
         for category, answer in scores.items()
     )
+    should_notify = (
+        any(answer["rating"] < 5 for answer in scores.values())
+        or has_category_comment
+        or bool(final_comment)
+    )
     return {
         "language": language,
         "source": source,
@@ -162,6 +216,8 @@ def _validate_payload(payload: Any, active_manager_codes: set[str]) -> dict:
         "final_comment": final_comment,
         "customer_phone": phone,
         "needs_attention": needs_attention,
+        "should_notify": should_notify,
+        "device": sanitize_device_payload(payload.get("device")),
     }
 
 
@@ -171,6 +227,9 @@ def create_review(
     ip_address: str | None,
     user_agent: str | None,
     db_path: Path | str,
+    accept_language: str | None = None,
+    referer: str | None = None,
+    request_headers: dict | None = None,
 ) -> dict:
     init_reviews_db(db_path)
     ip_digest = hash_ip(ip_address)
@@ -185,6 +244,24 @@ def create_review(
             )
         }
         data = _validate_payload(payload, set(managers_by_code))
+        device_json = json.dumps(
+            data["device"], ensure_ascii=False, separators=(",", ":")
+        )
+        if len(device_json) > DEVICE_DATA_LIMIT:
+            raise ReviewValidationError("device_data_too_large")
+        clean_headers = {
+            str(key)[:100]: str(value)[:500]
+            for key, value in list((request_headers or {}).items())[:30]
+        }
+        headers_json = json.dumps(
+            clean_headers, ensure_ascii=False, separators=(",", ":")
+        )
+        if len(headers_json) > HEADERS_LIMIT:
+            headers_json = json.dumps(
+                {key: value[:200] for key, value in clean_headers.items()},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
 
         if ip_digest:
             recent_count = connection.execute(
@@ -201,15 +278,24 @@ def create_review(
             """
             INSERT INTO reviews (
                 created_at, language, final_comment, customer_phone,
-                ip_hash, user_agent, source, is_delivery_used, needs_attention
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ip_hash, user_agent, accept_language, referer,
+                request_headers_json, device_data_json, device_data_updated_at,
+                source, is_delivery_used, needs_attention, should_notify,
+                notification_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 now.isoformat(), data["language"], data["final_comment"],
                 data["customer_phone"], ip_digest,
                 (user_agent or "")[:USER_AGENT_LIMIT] or None,
+                (accept_language or "")[:500] or None,
+                (referer or "")[:2000] or None,
+                headers_json or None,
+                device_json if data["device"] else None,
+                now.isoformat() if data["device"] else None,
                 data["source"], data["is_delivery_used"],
-                int(data["needs_attention"]),
+                int(data["needs_attention"]), int(data["should_notify"]),
+                "pending" if data["should_notify"] else "not_required",
             ),
         )
         review_id = cursor.lastrowid
@@ -236,11 +322,21 @@ def create_review(
             ],
         )
         manager_rows = []
+        selected_manager_names = []
         for code in data["managers"]:
             if code in {"other", "unknown"}:
                 manager_rows.append((review_id, None, code))
+                selected_manager_names.append(
+                    "Другой менеджер" if code == "other" else "Не знаю / не помню"
+                )
             else:
                 manager_rows.append((review_id, managers_by_code[code], "manager"))
+                selected_manager_names.append(
+                    connection.execute(
+                        "SELECT name FROM managers WHERE id = ?",
+                        (managers_by_code[code],),
+                    ).fetchone()[0]
+                )
         connection.executemany(
             """
             INSERT INTO review_managers (review_id, manager_id, selection_type)
@@ -251,16 +347,26 @@ def create_review(
 
     data["id"] = review_id
     data["created_at"] = now.isoformat()
+    data["manager_names"] = selected_manager_names
     return data
 
 
-def send_critical_review_notification(review: dict) -> bool:
+def send_review_notification(review: dict, db_path: Path | str) -> bool:
     if not REVIEWS_TELEGRAM_BOT_TOKEN or not REVIEWS_TELEGRAM_CHAT_ID:
+        with connect_reviews_db(db_path) as connection:
+            connection.execute(
+                """
+                UPDATE reviews SET notification_status = ?, notification_error = ?
+                WHERE id = ?
+                """,
+                ("not_configured", "Telegram variables are not configured", review["id"]),
+            )
         return False
-    lines = ["⚠️ Низкая оценка клиента", ""]
+    lines = ["⚠️ Новый отзыв клиента", ""]
     for category, answer in review["scores"].items():
-        label = CATEGORIES[category]["ru"].replace("Как вы оцениваете ", "").rstrip("?")
-        lines.append(f"{label}: {'⭐' * answer['rating']}")
+        lines.append(f"{CATEGORY_LABELS[category]}: {'⭐' * answer['rating']}")
+    if review["manager_names"]:
+        lines.extend(["", "Менеджеры: " + ", ".join(review["manager_names"])])
     selected_reasons = [
         f"• {REASONS[category][code][0]}"
         for category, codes in review["reasons"].items()
@@ -268,19 +374,56 @@ def send_critical_review_notification(review: dict) -> bool:
     ]
     if selected_reasons:
         lines.extend(["", "Причины:", *selected_reasons])
+    category_comments = [
+        f"• {CATEGORY_LABELS[category]}: {answer['comment']}"
+        for category, answer in review["scores"].items()
+        if answer.get("comment")
+    ]
+    if category_comments:
+        lines.extend(["", "Комментарии по категориям:", *category_comments])
     lines.extend([
         "",
         "Телефон клиента:",
         review["customer_phone"] or "Телефон не указан",
     ])
     if review["final_comment"]:
-        lines.extend(["", "Комментарий:", review["final_comment"]])
-    lines.extend(["", "Дата:", review["created_at"]])
+        lines.extend(["", "Общий комментарий:", review["final_comment"]])
+    lines.extend([
+        "", f"Источник: {review['source']}",
+        f"Дата: {review['created_at']}", f"ID: {review['id']}",
+    ])
 
-    response = requests.post(
-        f"https://api.telegram.org/bot{REVIEWS_TELEGRAM_BOT_TOKEN}/sendMessage",
-        json={"chat_id": REVIEWS_TELEGRAM_CHAT_ID, "text": "\n".join(lines)},
-        timeout=10,
-    )
-    response.raise_for_status()
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{REVIEWS_TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": REVIEWS_TELEGRAM_CHAT_ID, "text": "\n".join(lines)[:4096]},
+            timeout=10,
+        )
+        response.raise_for_status()
+    except Exception as exc:
+        with connect_reviews_db(db_path) as connection:
+            connection.execute(
+                """
+                UPDATE reviews SET notification_status = ?, notification_error = ?
+                WHERE id = ?
+                """,
+                ("error", type(exc).__name__, review["id"]),
+            )
+        print("REVIEWS TELEGRAM ERROR:", review["id"], type(exc).__name__)
+        return False
+
+    with connect_reviews_db(db_path) as connection:
+        connection.execute(
+            """
+            UPDATE reviews
+            SET notification_status = 'sent', notified_at = ?, notification_error = NULL
+            WHERE id = ?
+            """,
+            (datetime.now(timezone.utc).isoformat(), review["id"]),
+        )
+    print("REVIEWS TELEGRAM SENT:", review["id"])
     return True
+
+
+# Совместимость с ранним именем функции.
+send_critical_review_notification = send_review_notification

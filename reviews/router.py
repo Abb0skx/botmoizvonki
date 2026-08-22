@@ -1,37 +1,98 @@
+import base64
 import json
 import secrets
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse
 
 from .catalog import CATEGORIES, REASONS
 from .config import (
+    REVIEWS_ADMIN_PASSWORD,
+    REVIEWS_ADMIN_USERNAME,
     REVIEWS_COMPLAINT_PHONE,
     REVIEWS_COMPLAINT_TELEGRAM,
     REVIEWS_INSTAGRAM_URL,
     REVIEWS_DB_PATH,
     REVIEWS_SITE_URL,
     REVIEWS_TELEGRAM_URL,
+    REVIEWS_TELEGRAM_BOT_TOKEN,
+    REVIEWS_TELEGRAM_CHAT_ID,
+)
+from .analytics import (
+    AnalyticsFilterError,
+    get_review_detail,
+    get_reviews_dashboard,
 )
 from .database import list_active_managers
 from .service import (
     ReviewRateLimitError,
     ReviewValidationError,
     create_review,
-    send_critical_review_notification,
+    send_review_notification,
 )
 
 
 router = APIRouter(tags=["customer-reviews"])
 TEMPLATE_PATH = Path(__file__).parent / "templates" / "rating.html"
+ADMIN_TEMPLATE_PATH = Path(__file__).parent / "templates" / "admin_reviews.html"
+METADATA_HEADERS = (
+    "user-agent", "accept-language", "referer", "sec-ch-ua",
+    "sec-ch-ua-mobile", "sec-ch-ua-platform", "sec-ch-ua-model",
+    "sec-ch-ua-platform-version", "sec-ch-ua-arch", "sec-ch-ua-bitness",
+    "sec-ch-ua-form-factors", "sec-ch-device-memory", "sec-ch-dpr",
+    "sec-ch-viewport-width", "sec-ch-viewport-height", "save-data",
+    "downlink", "ect", "rtt",
+)
 
 
 def _client_ip(request: Request) -> str | None:
     forwarded = request.headers.get("x-forwarded-for", "")
     if forwarded:
         return forwarded.split(",", 1)[0].strip() or None
+    connecting = request.headers.get("cf-connecting-ip", "")
+    if connecting:
+        return connecting[:100]
     return request.client.host if request.client else None
+
+
+def _request_headers(request: Request) -> dict:
+    return {
+        name: request.headers[name][:1000]
+        for name in METADATA_HEADERS
+        if request.headers.get(name)
+    }
+
+
+def _require_admin(request: Request) -> None:
+    if not REVIEWS_ADMIN_PASSWORD:
+        raise HTTPException(
+            status_code=503,
+            detail="reviews_admin_password_not_configured",
+        )
+    authorization = request.headers.get("authorization", "")
+    if not authorization.startswith("Basic "):
+        raise HTTPException(
+            status_code=401,
+            detail="authentication_required",
+            headers={"WWW-Authenticate": 'Basic realm="Texnikach Reviews"'},
+        )
+    try:
+        decoded = base64.b64decode(
+            authorization[6:].strip(), validate=True
+        ).decode("utf-8")
+        username, password = decoded.split(":", 1)
+    except (ValueError, UnicodeDecodeError):
+        username = password = ""
+    if not (
+        secrets.compare_digest(username, REVIEWS_ADMIN_USERNAME)
+        and secrets.compare_digest(password, REVIEWS_ADMIN_PASSWORD)
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="invalid_credentials",
+            headers={"WWW-Authenticate": 'Basic realm="Texnikach Reviews"'},
+        )
 
 
 def _page_response(request: Request) -> HTMLResponse:
@@ -104,17 +165,74 @@ async def submit_review(request: Request, background_tasks: BackgroundTasks):
             ip_address=_client_ip(request),
             user_agent=request.headers.get("user-agent"),
             db_path=REVIEWS_DB_PATH,
+            accept_language=request.headers.get("accept-language"),
+            referer=request.headers.get("referer"),
+            request_headers=_request_headers(request),
         )
     except ReviewRateLimitError:
         raise HTTPException(status_code=429, detail="rate_limit") from None
     except ReviewValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
 
-    if review["needs_attention"]:
-        background_tasks.add_task(send_critical_review_notification, review)
+    if review["should_notify"]:
+        background_tasks.add_task(
+            send_review_notification, review, REVIEWS_DB_PATH
+        )
     return {"ok": True, "review_id": review["id"]}
 
 
 @router.get("/reviews/status")
 def reviews_status():
-    return {"ok": True, "module": "customer-reviews"}
+    return {
+        "ok": True,
+        "module": "customer-reviews",
+        "telegram_configured": bool(
+            REVIEWS_TELEGRAM_BOT_TOKEN and REVIEWS_TELEGRAM_CHAT_ID
+        ),
+        "admin_configured": bool(REVIEWS_ADMIN_PASSWORD),
+    }
+
+
+@router.get("/admin/reviews", response_class=HTMLResponse)
+def reviews_admin_page(request: Request):
+    _require_admin(request)
+    config = {
+        "categories": {
+            code: item["ru"] for code, item in CATEGORIES.items()
+        },
+        "reasons": {
+            category: {
+                code: labels[0] for code, labels in items.items()
+            }
+            for category, items in REASONS.items()
+        },
+    }
+    html = ADMIN_TEMPLATE_PATH.read_text(encoding="utf-8").replace(
+        "__ADMIN_CONFIG__",
+        json.dumps(config, ensure_ascii=False).replace("<", "\\u003c"),
+    )
+    response = HTMLResponse(html)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
+
+
+@router.get("/api/admin/reviews/stats")
+def reviews_admin_stats(request: Request, response: Response):
+    _require_admin(request)
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return get_reviews_dashboard(request.query_params, REVIEWS_DB_PATH)
+    except AnalyticsFilterError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+
+
+@router.get("/api/admin/reviews/{review_id}")
+def reviews_admin_detail(review_id: int, request: Request, response: Response):
+    _require_admin(request)
+    response.headers["Cache-Control"] = "no-store"
+    review = get_review_detail(review_id, REVIEWS_DB_PATH)
+    if not review:
+        raise HTTPException(status_code=404, detail="review_not_found")
+    return review

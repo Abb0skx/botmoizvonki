@@ -17,9 +17,18 @@ CREATE TABLE IF NOT EXISTS reviews (
     customer_phone TEXT,
     ip_hash TEXT,
     user_agent TEXT,
+    accept_language TEXT,
+    referer TEXT,
+    request_headers_json TEXT,
+    device_data_json TEXT,
+    device_data_updated_at TEXT,
     source TEXT NOT NULL DEFAULT 'website',
     is_delivery_used INTEGER CHECK (is_delivery_used IN (0, 1)),
-    needs_attention INTEGER NOT NULL DEFAULT 0 CHECK (needs_attention IN (0, 1))
+    needs_attention INTEGER NOT NULL DEFAULT 0 CHECK (needs_attention IN (0, 1)),
+    should_notify INTEGER NOT NULL DEFAULT 0 CHECK (should_notify IN (0, 1)),
+    notification_status TEXT NOT NULL DEFAULT 'not_required',
+    notified_at TEXT,
+    notification_error TEXT
 );
 
 CREATE TABLE IF NOT EXISTS review_scores (

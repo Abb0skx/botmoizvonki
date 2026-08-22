@@ -24,6 +24,12 @@ REVIEWS_SITE_URL = os.getenv(
 ).rstrip("/")
 REVIEWS_INSTAGRAM_URL = os.getenv("REVIEWS_INSTAGRAM_URL", "").strip()
 REVIEWS_TELEGRAM_URL = os.getenv("REVIEWS_TELEGRAM_URL", "").strip()
+REVIEWS_ADMIN_USERNAME = os.getenv(
+    "REVIEWS_ADMIN_USERNAME", "admin"
+).strip() or "admin"
+REVIEWS_ADMIN_PASSWORD = os.getenv(
+    "REVIEWS_ADMIN_PASSWORD", ""
+)
 REVIEWS_IP_HASH_SECRET = (
     os.getenv("REVIEWS_IP_HASH_SECRET", "").strip()
     or secrets.token_hex(32)

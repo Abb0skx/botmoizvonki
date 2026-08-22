@@ -15,6 +15,8 @@
 - `REVIEWS_COMPLAINT_TELEGRAM`
 - `REVIEWS_TELEGRAM_BOT_TOKEN`
 - `REVIEWS_TELEGRAM_CHAT_ID`
+- `REVIEWS_ADMIN_USERNAME` (default: `admin`)
+- `REVIEWS_ADMIN_PASSWORD` (required for `/admin/reviews`)
 - `REVIEWS_SITE_URL`
 - `REVIEWS_CRITICAL_RATING` (default: `2`)
 - `REVIEWS_RATE_LIMIT` (default: `5`)
@@ -29,6 +31,9 @@
 - нормализация телефона, honeypot, CSRF и мягкий IP rate limit;
 - структурированное сохранение и флаг `needs_attention`;
 - фоновое Telegram-уведомление для критических оценок;
+- Telegram-уведомление при любой оценке ниже 5 или любом комментарии;
+- защищённая статистика `/admin/reviews` с фильтрами и деталями;
+- технические данные устройства в том же формате, что и оценка звонка;
 - минимальное подключение `reviews_router` к основному FastAPI.
 
 Перед production deployment нужно задать ENV в Coolify и убедиться, что
