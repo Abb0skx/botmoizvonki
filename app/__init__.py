@@ -1,0 +1,1 @@
+"""TEXNIKACH delivery bot package."""

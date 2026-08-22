@@ -10,7 +10,7 @@ pandas
 openpyxl
 gspread
 google-auth
-python-telegram-bot
+python-telegram-bot>=22.0,<23.0
 pandas
 gspread
 google-auth
