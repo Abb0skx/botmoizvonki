@@ -5,12 +5,15 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from app.bot.keyboards import courier_keyboard, location_channel_keyboard, manager_sent_keyboard
+from app.bot.keyboards import (
+    courier_cancelled_keyboard, courier_keyboard, location_channel_keyboard,
+    manager_cancelled_keyboard, manager_sent_keyboard,
+)
 from app.database import OrderRepository
 from app.database.repository import MIGRATION_COLUMNS, SCHEMA
 from app.handlers.orders import (
     DETAILS, PAYMENT, SECOND_LOCATION, _publish_location, delivery_input,
-    details, second_location,
+    details, save_edit, second_location,
 )
 from app.utils.formatters import (
     all_locations_card, courier_card, manager_card, short_address,
@@ -205,6 +208,50 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state, PAYMENT)
         self.assertEqual(context.user_data["draft"]["second_latitude"], 41.32)
         self.assertEqual(context.user_data["draft"]["second_longitude"], 69.25)
+
+    async def test_edit_amount_saves_and_confirms_new_price(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = OrderRepository(Path(tempdir) / "delivery.db")
+            repo.initialize()
+            order = repo.create(
+                manager_id=1,
+                manager_name="Manager",
+                data={
+                    "seller_name": "Ali",
+                    "client_phone": "+998901333999",
+                    "product": "A7 Pro",
+                    "amount_usd": 100,
+                },
+            )
+            message = SimpleNamespace(
+                text="120$ 1 536 000",
+                location=None,
+                reply_text=AsyncMock(),
+            )
+            update = SimpleNamespace(
+                effective_chat=SimpleNamespace(id=1),
+                message=message,
+            )
+            bot = SimpleNamespace(edit_message_text=AsyncMock())
+            context = SimpleNamespace(
+                user_data={
+                    "edit": {
+                        "order_id": order.id,
+                        "field": "amount",
+                        "message_id": 50,
+                        "chat_id": 1,
+                    }
+                },
+                application=SimpleNamespace(bot_data={"repo": repo}),
+                bot=bot,
+            )
+
+            await save_edit(update, context)
+
+            updated = repo.get(order.id)
+            self.assertEqual((updated.amount_usd, updated.amount_uzs), (120, 1536000))
+            self.assertNotIn("edit", context.user_data)
+            self.assertIn("Новая цена сохранена", message.reply_text.await_args.args[0])
 
     async def test_paid_at_assembly_completes_after_photo(self):
         with tempfile.TemporaryDirectory() as tempdir:
@@ -511,6 +558,35 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(returned.status, "pending")
         self.assertIsNone(returned.courier_id)
         self.assertIsNone(returned.time_started)
+
+    def test_cancelled_order_can_be_restored(self):
+        order = self.repo.create(manager_id=1, manager_name="A", data=self.data)
+        cancelled = self.repo.update(
+            order.id,
+            status="cancelled",
+            courier_id=10,
+            courier_name="Courier",
+        )
+        restored = self.repo.transition(
+            cancelled.id,
+            {"cancelled"},
+            status="pending",
+            courier_id=None,
+            courier_name=None,
+            guard_courier_id=10,
+            require_unassigned_or_same=True,
+        )
+        self.assertEqual(restored.status, "pending")
+        self.assertIsNone(restored.courier_id)
+
+    def test_cancelled_keyboards_have_back_button(self):
+        order = self.repo.create(manager_id=1, manager_name="A", data=self.data)
+        manager_button = manager_cancelled_keyboard(order.id).inline_keyboard[0][0]
+        courier_button = courier_cancelled_keyboard(order).inline_keyboard[-1][0]
+        self.assertEqual(manager_button.text, "↩️ Назад")
+        self.assertEqual(manager_button.callback_data, f"manager_restore:{order.id}")
+        self.assertEqual(courier_button.text, "↩️ Назад")
+        self.assertEqual(courier_button.callback_data, f"undo_cancel:{order.id}")
 
     def test_active_locations_map_contains_models(self):
         first = self.repo.create(

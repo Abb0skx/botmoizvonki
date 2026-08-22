@@ -5,16 +5,18 @@ from zoneinfo import ZoneInfo
 
 from telegram import ReplyKeyboardRemove, Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes,
     ConversationHandler, MessageHandler, filters,
 )
 
 from app.bot.keyboards import (
-    all_locations_keyboard, courier_keyboard, delivery_pending_keyboard,
-    location_channel_keyboard, main_keyboard, manager_sent_keyboard,
-    on_way_keyboard, payment_keyboard, review_keyboard, seller_keyboard,
-    second_location_keyboard, skip_keyboard,
+    all_locations_keyboard, courier_cancelled_keyboard, courier_keyboard,
+    delivery_pending_keyboard, location_channel_keyboard, main_keyboard,
+    manager_cancelled_keyboard, manager_sent_keyboard, on_way_keyboard,
+    payment_keyboard, review_keyboard, seller_keyboard, second_location_keyboard,
+    skip_keyboard,
 )
 from app.config import Settings
 from app.database import OrderRepository
@@ -23,7 +25,7 @@ from app.utils import (
     normalize_payment, normalize_seller, PAID_AT_ASSEMBLY, parse_amount,
     parse_order_details,
 )
-from app.utils.formatters import all_locations_card, short_address
+from app.utils.formatters import all_locations_card, money, short_address
 
 logger = logging.getLogger(__name__)
 SELLER, PRODUCT, DETAILS, SECOND_LOCATION, PAYMENT, DELIVERY_TIME, COMMENT = range(7)
@@ -36,6 +38,10 @@ LOCATION_STATUS_MARKERS = {
     "completed": "✅",
     "cancelled": "❌",
 }
+
+
+def _message_is_not_modified(error: Exception) -> bool:
+    return isinstance(error, BadRequest) and "message is not modified" in str(error).casefold()
 
 
 def _name(user) -> str:
@@ -103,7 +109,9 @@ async def _refresh_delivery_message(context: ContextTypes.DEFAULT_TYPE, order) -
             reply_markup=keyboard,
         )
         return True
-    except Exception:
+    except Exception as error:
+        if _message_is_not_modified(error):
+            return True
         logger.exception("Could not refresh delivery message for order %s", order.id)
         return False
 
@@ -135,7 +143,9 @@ async def _set_location_marker(
                     number,
                 ),
             )
-        except Exception:
+        except Exception as error:
+            if _message_is_not_modified(error):
+                continue
             success = False
             logger.exception(
                 "Could not update location %s channel message for order %s",
@@ -407,7 +417,7 @@ async def begin_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "phone": "Введите новый номер:",
         "location": "Отправьте новую основную локацию или ссылку:",
         "second_location": "Отправьте дополнительную локацию или ссылку:",
-        "amount": "Введите новую сумму:",
+        "amount": "Введите новую сумму. Например: 120$ 1 536 000",
         "delivery_time": "Введите новое время (или Пропустить):",
         "comment": "Введите новый комментарий (или Пропустить):",
     }
@@ -468,13 +478,30 @@ async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     elif sent:
         await _set_location_marker(context, order)
     keyboard = manager_sent_keyboard(order) if sent else review_keyboard(order.id)
-    await context.bot.edit_message_text(chat_id=edit["chat_id"], message_id=edit["message_id"], text=manager_card(order, sent=sent), parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=keyboard)
+    manager_refreshed = True
+    try:
+        await context.bot.edit_message_text(
+            chat_id=edit["chat_id"],
+            message_id=edit["message_id"],
+            text=manager_card(order, sent=sent),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=keyboard,
+        )
+    except Exception as error:
+        if not _message_is_not_modified(error):
+            manager_refreshed = False
+            logger.exception("Could not refresh manager message for order %s", order.id)
     refreshed = await _refresh_delivery_message(context, order) if sent else True
     context.user_data.pop("edit", None)
     if not location_published:
         result = "⚠️ Данные сохранены, но новую Telegram Location отправить не удалось. Проверьте права бота в канале локаций."
+    elif not manager_refreshed:
+        result = "⚠️ Данные сохранены в базе, но карточку менеджера обновить не удалось."
     elif not refreshed:
         result = "⚠️ Данные сохранены, но карточку в группе обновить не удалось."
+    elif field == "amount":
+        result = f"✅ Новая цена сохранена:\n{money(order.amount_usd, order.amount_uzs)}"
     else:
         result = "✅ Данные обновлены у менеджера и курьера."
     await update.message.reply_text(result, reply_markup=main_keyboard())
@@ -485,12 +512,31 @@ async def manager_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     action, raw_id = query.data.split(":")
     repo: OrderRepository = context.application.bot_data["repo"]
     order = repo.get(int(raw_id))
-    if not order or order.manager_id != query.from_user.id or order.status != "draft":
+    if not order or order.manager_id != query.from_user.id:
+        await query.answer("Заказ недоступен", show_alert=True); return
+    if action == "manager_restore":
+        if order.delivery_message_id is not None:
+            await query.answer("Отменённый курьером заказ возвращается из группы доставки", show_alert=True); return
+        restored = repo.transition(order.id, {"cancelled"}, status="draft")
+        if not restored:
+            await query.answer("Заказ уже нельзя вернуть", show_alert=True); return
+        await query.edit_message_text(
+            manager_card(restored),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=review_keyboard(restored.id),
+        )
+        await query.answer("Заказ возвращён")
+        return
+    if order.status != "draft":
         await query.answer("Заказ уже обработан или недоступен", show_alert=True); return
     if action == "manager_cancel":
         if not repo.transition(order.id, {"draft"}, status="cancelled"):
             await query.answer("Заказ уже обработан", show_alert=True); return
-        await query.edit_message_text(f"❌ Заказ №{order.order_number} отменён менеджером")
+        await query.edit_message_text(
+            f"❌ Заказ №{order.order_number} отменён менеджером",
+            reply_markup=manager_cancelled_keyboard(order.id),
+        )
         await query.answer(); return
     settings: Settings = context.application.bot_data["settings"]
     sent = await context.bot.send_message(settings.delivery_group_id, courier_card(order), parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=courier_keyboard(order))
@@ -527,7 +573,42 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.answer("Нет доступа", show_alert=True); return
     action, raw_id = query.data.split(":"); repo: OrderRepository = context.application.bot_data["repo"]
     order = repo.get(int(raw_id))
-    if not order or order.status in {"completed", "cancelled"}:
+    if not order:
+        await query.answer("Заказ не найден", show_alert=True); return
+    if action == "undo_cancel":
+        if order.status != "cancelled" or order.courier_id != query.from_user.id:
+            await query.answer("Этот заказ уже нельзя вернуть", show_alert=True); return
+        order = repo.transition(
+            order.id,
+            {"cancelled"},
+            status="pending",
+            courier_id=None,
+            courier_name=None,
+            time_started=None,
+            delivery_photo=None,
+            received_usd=None,
+            received_uzs=None,
+            delivered_at=None,
+            guard_courier_id=query.from_user.id,
+            require_unassigned_or_same=True,
+        )
+        if not order:
+            await query.answer("Этот заказ уже нельзя вернуть", show_alert=True); return
+        await query.edit_message_text(
+            courier_card(order, "↩️ <b>Отмена снята, заказ снова активен</b>"),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=courier_keyboard(order),
+        )
+        await query.answer("Заказ возвращён")
+        await _set_location_marker(context, order)
+        await _notify_manager(
+            context,
+            order.manager_id,
+            f"↩️ Отмена заказа №{order.order_number} снята. Заказ снова ожидает курьера.",
+        )
+        return
+    if order.status in {"completed", "cancelled"}:
         await query.answer("Заказ уже закрыт", show_alert=True); return
     if order.courier_id and order.courier_id != query.from_user.id:
         await query.answer(f"Заказ уже взял {order.courier_name}", show_alert=True); return
@@ -579,7 +660,11 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         if not order:
             await query.answer("Заказ уже обработан другим курьером", show_alert=True); return
-        await query.edit_message_text(f"❌ <b>Заказ №{order.order_number} отменён</b>\n\n👤 Курьер: {escape(_name(query.from_user))}", parse_mode=ParseMode.HTML)
+        await query.edit_message_text(
+            f"❌ <b>Заказ №{order.order_number} отменён</b>\n\n👤 Курьер: {escape(_name(query.from_user))}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=courier_cancelled_keyboard(order),
+        )
         await query.answer("Заказ отменён")
         await _set_location_marker(context, order)
         await _notify_manager(context, order.manager_id, f"❌ <b>Заказ №{order.order_number} отменён</b>\n\n👤 Курьер: {escape(_name(query.from_user))}")
@@ -767,8 +852,8 @@ def register_handlers(application: Application) -> None:
     application.add_handler(conversation)
     application.add_handler(CommandHandler("cancel", cancel_conversation))
     application.add_handler(CallbackQueryHandler(begin_edit, pattern=r"^edit:\d+:"))
-    application.add_handler(CallbackQueryHandler(manager_action, pattern=r"^(send|manager_cancel):\d+$"))
+    application.add_handler(CallbackQueryHandler(manager_action, pattern=r"^(send|manager_cancel|manager_restore):\d+$"))
     application.add_handler(CallbackQueryHandler(location_info, pattern=r"^location_info:\d+:[12]$"))
-    application.add_handler(CallbackQueryHandler(courier_action, pattern=r"^(onway|undo_onway|complete|cancel):\d+$"))
+    application.add_handler(CallbackQueryHandler(courier_action, pattern=r"^(onway|undo_onway|complete|cancel|undo_cancel):\d+$"))
     application.add_handler(MessageHandler((filters.LOCATION | filters.TEXT) & ~filters.COMMAND, save_edit), group=1)
     application.add_handler(MessageHandler(filters.PHOTO | (filters.TEXT & ~filters.COMMAND), delivery_input), group=2)

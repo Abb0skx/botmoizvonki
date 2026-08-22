@@ -43,6 +43,12 @@ def review_keyboard(order_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
+def manager_cancelled_keyboard(order_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("↩️ Назад", callback_data=f"manager_restore:{order_id}"),
+    ]])
+
+
 def _edit_rows(order_id: int) -> list[list[InlineKeyboardButton]]:
     rows = [
         [("👤 Изменить владельца", "seller"), ("💳 Изменить оплату", "payment_status")],
@@ -122,6 +128,12 @@ def delivery_pending_keyboard(order: Order) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("❌ Отменён", callback_data=f"cancel:{order.id}")],
     ]
     return InlineKeyboardMarkup(rows)
+
+
+def courier_cancelled_keyboard(order: Order) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(_location_rows(order) + [[
+        InlineKeyboardButton("↩️ Назад", callback_data=f"undo_cancel:{order.id}"),
+    ]])
 
 
 def all_locations_keyboard(map_url: str | None) -> InlineKeyboardMarkup | None:
