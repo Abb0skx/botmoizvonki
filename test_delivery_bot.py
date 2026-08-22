@@ -6,15 +6,15 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from app.bot.keyboards import (
-    courier_cancelled_keyboard, courier_keyboard, delivery_pending_keyboard,
-    location_channel_keyboard, manager_cancelled_keyboard, manager_sent_keyboard,
-    review_keyboard,
+    completed_keyboard, courier_cancelled_keyboard, courier_keyboard,
+    delivery_pending_keyboard, location_channel_keyboard, manager_cancelled_keyboard,
+    manager_sent_keyboard, review_keyboard,
 )
 from app.database import OrderRepository
 from app.database.repository import MIGRATION_COLUMNS, SCHEMA
 from app.handlers.orders import (
-    DETAILS, PAYMENT, SECOND_LOCATION, _publish_location, delivery_input,
-    details, save_edit, second_location,
+    DETAILS, PAYMENT, SECOND_LOCATION, _publish_location, courier_action,
+    delivery_input, details, save_edit, second_location,
 )
 from app.utils.formatters import (
     all_locations_card, courier_card, manager_card, short_address,
@@ -45,6 +45,9 @@ class ParserTests(unittest.TestCase):
             "100 1920000": (100, 1920000),
             "1 920 000 сум": (None, 1920000),
             "1920000": (None, 1920000),
+            "9000": (9000, None),
+            "9001": (None, 9001),
+            "7️⃣\nA56\n375$": (375, None),
         }
         for raw, expected in cases.items():
             self.assertEqual(parse_amount(raw), expected)
@@ -344,6 +347,48 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
             collect_message.reply_text.assert_awaited_once_with("✅ Доставка подтверждена.")
             self.assertEqual(bot.send_photo.await_count, 2)
 
+    async def test_delivered_button_completes_immediately_without_prompt(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = OrderRepository(Path(tempdir) / "delivery.db")
+            repo.initialize()
+            order = repo.create(
+                manager_id=1,
+                manager_name="Manager",
+                data={
+                    "seller_name": "Abbos",
+                    "client_phone": "+998998904713",
+                    "product": "A56",
+                    "amount_usd": 375,
+                },
+            )
+            repo.update(order.id, status="pending")
+            query = SimpleNamespace(
+                data=f"complete:{order.id}",
+                from_user=SimpleNamespace(id=2, full_name="Courier", username=None),
+                message=SimpleNamespace(chat_id=-100),
+                answer=AsyncMock(),
+                edit_message_text=AsyncMock(),
+            )
+            update = SimpleNamespace(callback_query=query)
+            bot = SimpleNamespace(send_message=AsyncMock())
+            settings = SimpleNamespace(delivery_group_id=-100, courier_ids=frozenset({2}))
+            context = SimpleNamespace(
+                application=SimpleNamespace(bot_data={"settings": settings, "repo": repo}),
+                bot=bot,
+            )
+
+            await courier_action(update, context)
+
+            completed = repo.get(order.id)
+            self.assertEqual(completed.status, "completed")
+            self.assertIsNone(completed.delivery_photo)
+            query.answer.assert_awaited_once_with("Заказ доставлен")
+            self.assertEqual(
+                query.edit_message_text.await_args.kwargs["reply_markup"].inline_keyboard[-1][0].callback_data,
+                f"undo_complete:{order.id}",
+            )
+            bot.send_message.assert_awaited_once()
+
     async def test_publish_location_saves_channel_message(self):
         with tempfile.TemporaryDirectory() as tempdir:
             repo = OrderRepository(Path(tempdir) / "delivery.db")
@@ -560,6 +605,8 @@ class RepositoryTests(unittest.TestCase):
             button for row in delivery_pending_keyboard(order).inline_keyboard for button in row
         ]
         self.assertTrue(any(button.callback_data == f"undo_complete:{order.id}" for button in pending_buttons))
+        completed_button = completed_keyboard(order).inline_keyboard[-1][0]
+        self.assertEqual(completed_button.callback_data, f"undo_complete:{order.id}")
         compact = review_keyboard(order.id)
         self.assertEqual(compact.inline_keyboard[0][0].text, "✏️ Изменить")
         expanded = review_keyboard(order.id, expanded=True)

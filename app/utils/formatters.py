@@ -126,15 +126,17 @@ def courier_card(order: Order, state: str = "") -> str:
 
 
 def completed_card(order: Order, local_time: str) -> str:
-    payment_result = (
-        f"✅ Оплачено:\n{money(order.amount_usd, order.amount_uzs)}"
-        if order.payment_status == PAID_AT_ASSEMBLY
-        else f"💰 Получено:\n{money(order.received_usd, order.received_uzs)}"
-    )
+    if order.payment_status == PAID_AT_ASSEMBLY:
+        payment_result = f"✅ Оплачено: {money(order.amount_usd, order.amount_uzs)}"
+    elif order.received_usd is not None or order.received_uzs is not None:
+        payment_result = f"💰 Получено: {money(order.received_usd, order.received_uzs)}"
+    else:
+        payment_result = f"💰 {money(order.amount_usd, order.amount_uzs)}"
+    photo_result = "\n📸 Фото получено" if order.delivery_photo else ""
     return (
-        f"✅ <b>Заказ №{order.order_number} доставлен</b>\n\n📸 Фото получено\n\n"
-        f"{payment_result}\n\n"
-        f"👤 Курьер:\n{escape(order.courier_name or '—')}\n\n🕒 Время:\n{local_time}"
+        f"✅ <b>Заказ №{order.order_number} доставлен</b>{photo_result}\n"
+        f"{payment_result}\n"
+        f"👤 {escape(order.courier_name or '—')}\n🕒 {local_time}"
     )
 
 

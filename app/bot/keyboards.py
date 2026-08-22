@@ -140,6 +140,12 @@ def delivery_pending_keyboard(order: Order) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def completed_keyboard(order: Order) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(_location_rows(order) + [[
+        InlineKeyboardButton("↩️ Назад", callback_data=f"undo_complete:{order.id}"),
+    ]])
+
+
 def courier_cancelled_keyboard(order: Order) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(_location_rows(order) + [[
         InlineKeyboardButton("↩️ Назад", callback_data=f"undo_cancel:{order.id}"),

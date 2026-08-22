@@ -35,26 +35,44 @@ def parse_amount(value: str) -> tuple[int | None, int | None]:
         raise ValueError("Введите сумму, например: 100$ 1920000")
     if re.search(r"-\s*\d", clean):
         raise ValueError("Сумма не может быть отрицательной")
-    has_uzs_marker = bool(re.search(r"(?:сум|so['’]?m|uzs)", clean, re.I))
-    usd = uzs = None
+    usd_values: list[int] = []
+    uzs_values: list[int] = []
+    amount_pattern = r"\d(?:[\d.,]|[ \t](?=\d))*"
 
-    usd_match = re.search(r"(\d[\d\s.,]*)\s*\$", clean)
-    if usd_match:
-        usd = int(re.sub(r"\D", "", usd_match.group(1)))
-        clean = clean[:usd_match.start()] + " " + clean[usd_match.end():]
+    def take_usd(match: re.Match) -> str:
+        usd_values.append(int(re.sub(r"\D", "", match.group(1))))
+        return " "
 
-    groups = re.findall(r"\d+", clean)
-    if groups:
-        if has_uzs_marker or usd is not None:
-            uzs = int("".join(groups))
-        elif len(groups) >= 2 and len(groups[0]) <= 5 and len("".join(groups[1:])) >= 6:
-            usd, uzs = int(groups[0]), int("".join(groups[1:]))
+    def take_uzs(match: re.Match) -> str:
+        uzs_values.append(int(re.sub(r"\D", "", match.group(1))))
+        return " "
+
+    # A currency marker always wins. Horizontal whitespace is allowed inside
+    # an amount, but a newline never joins a model number with the price.
+    clean = re.sub(rf"({amount_pattern})[ \t]*\$", take_usd, clean)
+    clean = re.sub(
+        rf"({amount_pattern})[ \t]*(?:сум|so['’]?m|uzs)",
+        take_uzs,
+        clean,
+        flags=re.I,
+    )
+
+    candidates: list[int] = []
+    for raw in re.findall(amount_pattern, clean):
+        groups = re.findall(r"\d+", raw)
+        if len(groups) > 1 and all(len(group) == 3 for group in groups[1:]):
+            candidates.append(int("".join(groups)))
         else:
-            number = int("".join(groups))
-            if number < 100_000:
-                usd = number
-            else:
+            candidates.extend(int(group) for group in groups)
+
+    usd = usd_values[-1] if usd_values else None
+    uzs = uzs_values[-1] if uzs_values else None
+    for number in candidates:
+        if number > 9_000:
+            if not uzs_values:
                 uzs = number
+        elif not usd_values:
+            usd = number
     if (usd is None or usd <= 0) and (uzs is None or uzs <= 0):
         raise ValueError("Введите положительную сумму, например: 100$ 1920000")
     if usd is not None and usd <= 0:

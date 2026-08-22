@@ -12,8 +12,8 @@ from telegram.ext import (
 )
 
 from app.bot.keyboards import (
-    all_locations_keyboard, courier_cancelled_keyboard, courier_keyboard,
-    delivery_pending_keyboard, location_channel_keyboard, main_keyboard,
+    all_locations_keyboard, completed_keyboard, courier_cancelled_keyboard,
+    courier_keyboard, delivery_pending_keyboard, location_channel_keyboard, main_keyboard,
     manager_cancelled_keyboard, manager_sent_keyboard, on_way_keyboard,
     payment_keyboard, review_keyboard, seller_keyboard, second_location_keyboard,
     skip_keyboard,
@@ -637,7 +637,7 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
     if action == "undo_complete":
-        if order.status not in {"awaiting_photo", "awaiting_amount"} or order.courier_id != query.from_user.id:
+        if order.status not in {"awaiting_photo", "awaiting_amount", "completed"} or order.courier_id != query.from_user.id:
             await query.answer("Подтверждение уже нельзя отменить", show_alert=True); return
         target_status = "on_way" if order.time_started else "pending"
         reset = {
@@ -651,7 +651,7 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             reset.update(courier_id=None, courier_name=None)
         order = repo.transition(
             order.id,
-            {"awaiting_photo", "awaiting_amount"},
+            {"awaiting_photo", "awaiting_amount", "completed"},
             guard_courier_id=query.from_user.id,
             require_unassigned_or_same=True,
             **reset,
@@ -729,31 +729,28 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.answer("Заказ отменён")
         await _set_location_marker(context, order)
     else:
-        active = repo.get_active_delivery(query.from_user.id)
-        if active and active.id != order.id:
-            await query.answer(f"Сначала завершите заказ №{active.order_number}", show_alert=True); return
-        if order.status in {"awaiting_photo", "awaiting_amount"} and order.courier_id == query.from_user.id:
-            prompt = "Отправьте фото и цену в подписи к фото 📸"
-            await query.answer(prompt, show_alert=True); return
+        timestamp = datetime.now().astimezone()
         order = repo.transition(
-            order.id, {"pending", "on_way"}, status="awaiting_photo",
+            order.id,
+            {"pending", "on_way"},
+            status="completed",
+            delivered_at=timestamp.isoformat(timespec="seconds"),
             guard_courier_id=query.from_user.id, require_unassigned_or_same=True, **courier,
         )
         if not order:
             await query.answer("Заказ уже обрабатывает другой курьер", show_alert=True); return
-        await query.answer()
+        result_text = completed_card(
+            order,
+            timestamp.astimezone(ZoneInfo("Asia/Tashkent")).strftime("%H:%M"),
+        )
         await query.edit_message_text(
-            courier_card(order, "📸 <b>Курьер подтверждает доставку</b>"),
+            result_text,
             parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-            reply_markup=delivery_pending_keyboard(order),
+            reply_markup=completed_keyboard(order),
         )
-        prompt = (
-            f"Заказ №{order.order_number}: отправьте фото и укажите полученную цену в подписи к фото.\n"
-            "Пример подписи: 100$ 1 920 000"
-        )
-        await query.message.reply_text(prompt)
+        await query.answer("Заказ доставлен")
         await _set_location_marker(context, order)
+        await _notify_manager(context, order.manager_id, result_text)
 
 
 async def _publish_completed(
