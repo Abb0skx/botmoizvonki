@@ -13,8 +13,8 @@ from app.models import Order
 
 
 TILE_SIZE = 256
-MAP_WIDTH = 1200
-MAP_HEIGHT = 800
+MAP_WIDTH = 1280
+MAP_HEIGHT = 960
 TILE_CACHE_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 TILE_USER_AGENT = "TEXNIKACH-DeliveryBot/1.0 (contact: texnikach@gmail.com)"
@@ -23,8 +23,8 @@ TILE_USER_AGENT = "TEXNIKACH-DeliveryBot/1.0 (contact: texnikach@gmail.com)"
 # one neighbourhood. Points outside these bounds are still included by the
 # viewport calculation.
 TASHKENT_BOUNDS = (
-    (41.180000, 68.980000),
-    (41.430000, 69.500000),
+    (41.200000, 69.100000),
+    (41.400000, 69.450000),
 )
 WAREHOUSE_LATITUDE = 41.337420
 WAREHOUSE_LONGITUDE = 69.272104

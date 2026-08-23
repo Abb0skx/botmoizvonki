@@ -1,6 +1,7 @@
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app.database import OrderRepository
@@ -221,6 +222,26 @@ class DeliveryRepositoryEventTests(unittest.TestCase):
         self.assertEqual(events[2].to_status, "pending")
         self.assertEqual(events[2].actor_id, 202)
         self.assertEqual(events[2].actor_role, "courier")
+
+    def test_events_can_be_selected_for_a_timezone_aware_day(self) -> None:
+        order = self.create_order()
+        self.repo.transition(order.id, {"draft"}, status="pending")
+        center = datetime.now(timezone.utc)
+
+        events = self.repo.list_events_between(
+            center - timedelta(minutes=1),
+            center + timedelta(minutes=1),
+        )
+
+        self.assertEqual(
+            [event.event_type for event in events],
+            ["order_created", "status_changed"],
+        )
+        with self.assertRaises(ValueError):
+            self.repo.list_events_between(
+                center.replace(tzinfo=None),
+                center + timedelta(minutes=1),
+            )
 
     def test_explicit_event_helper_and_append_only_guards(self) -> None:
         order = self.create_order()

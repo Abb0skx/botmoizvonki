@@ -1,9 +1,9 @@
 from html import escape
-from datetime import datetime
+from datetime import date, datetime
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
-from app.models import Order
+from app.models import Order, OrderEvent
 from .parsers import display_phone
 from .payments import PAID_AT_ASSEMBLY
 
@@ -105,6 +105,156 @@ def short_address(order: Order, location_number: int = 1) -> str:
             order.second_mahalla,
         )
     return _short_address_parts(order.address_text, order.district, order.mahalla)
+
+
+def _tashkent_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    tashkent = ZoneInfo("Asia/Tashkent")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=tashkent)
+    return parsed.astimezone(tashkent)
+
+
+def daily_delivery_report(
+    orders: list[Order],
+    report_day: date,
+    events: list[OrderEvent] | None = None,
+) -> list[str]:
+    """Build compact chronological Telegram messages for one local day."""
+    timeline: list[tuple[datetime, str, int]] = []
+    arrived_orders: set[int] = set()
+    delivered_orders: set[int] = set()
+    event_created_orders: set[int] = set()
+    event_started_orders: set[int] = set()
+    event_delivered_orders: set[int] = set()
+    orders_by_id = {order.id: order for order in orders}
+
+    for event in events or []:
+        occurred = _tashkent_datetime(event.created_at)
+        order = orders_by_id.get(event.order_id)
+        if not occurred or occurred.date() != report_day or not order:
+            continue
+        product = escape(" ".join(order.product.split())[:80])
+        seller = escape(order.seller_name or "—")
+        courier = escape(
+            event.actor_name
+            or order.courier_name
+            or order.assigned_courier_name
+            or "Курьер не назначен"
+        )
+        address = escape(short_address(order))
+
+        if event.event_type == "order_created":
+            event_created_orders.add(order.id)
+            arrived_orders.add(order.id)
+            line = (
+                f"📥 <b>{occurred:%H:%M}</b> · Пришёл заказ №{order.order_number}"
+                f" · {product} · продавец {seller}"
+            )
+            priority = 0
+        elif event.from_status == "completed" and event.to_status in {"pending", "on_way"}:
+            line = (
+                f"↩️ <b>{occurred:%H:%M}</b> · {courier} отменил завершение"
+                f" заказа №{order.order_number}"
+            )
+            priority = 4
+        elif event.from_status == "cancelled" and event.to_status == "pending":
+            line = (
+                f"↩️ <b>{occurred:%H:%M}</b> · Заказ №{order.order_number}"
+                " возвращён в доставку"
+            )
+            priority = 4
+        elif event.from_status == "on_way" and event.to_status == "pending":
+            line = (
+                f"↩️ <b>{occurred:%H:%M}</b> · {courier} отменил выезд"
+                f" к заказу №{order.order_number}"
+            )
+            priority = 4
+        elif event.to_status == "on_way":
+            event_started_orders.add(order.id)
+            line = (
+                f"🚗 <b>{occurred:%H:%M}</b> · {courier} выехал к заказу"
+                f" №{order.order_number} → {address}"
+            )
+            priority = 1
+        elif event.to_status == "completed":
+            event_delivered_orders.add(order.id)
+            delivered_orders.add(order.id)
+            line = (
+                f"✅ <b>{occurred:%H:%M}</b> · {courier} приехал и доставил заказ"
+                f" №{order.order_number} · {address}"
+            )
+            priority = 2
+        elif event.to_status == "cancelled":
+            line = (
+                f"❌ <b>{occurred:%H:%M}</b> · {courier} отменил заказ"
+                f" №{order.order_number}"
+            )
+            priority = 3
+        else:
+            continue
+        timeline.append((occurred, line, priority))
+
+    for order in orders:
+        product = escape(" ".join(order.product.split())[:80])
+        seller = escape(order.seller_name or "—")
+        courier = escape(order.courier_name or order.assigned_courier_name or "Курьер не назначен")
+        address = escape(short_address(order))
+
+        created = _tashkent_datetime(order.created_at)
+        if created and created.date() == report_day and order.id not in event_created_orders:
+            arrived_orders.add(order.id)
+            timeline.append((
+                created,
+                f"📥 <b>{created:%H:%M}</b> · Пришёл заказ №{order.order_number}"
+                f" · {product} · продавец {seller}",
+                0,
+            ))
+
+        started = _tashkent_datetime(order.time_started)
+        if started and started.date() == report_day and order.id not in event_started_orders:
+            timeline.append((
+                started,
+                f"🚗 <b>{started:%H:%M}</b> · {courier} выехал к заказу"
+                f" №{order.order_number} → {address}",
+                1,
+            ))
+
+        delivered = _tashkent_datetime(order.delivered_at)
+        if delivered and delivered.date() == report_day and order.id not in event_delivered_orders:
+            delivered_orders.add(order.id)
+            timeline.append((
+                delivered,
+                f"✅ <b>{delivered:%H:%M}</b> · {courier} приехал и доставил заказ"
+                f" №{order.order_number} · {address}",
+                2,
+            ))
+
+    timeline.sort(key=lambda item: (item[0], item[2], item[1]))
+    heading = (
+        f"📅 <b>Хронология доставок за {report_day:%d.%m.%Y}</b>\n"
+        f"📥 Пришло заказов: <b>{len(arrived_orders)}</b> · "
+        f"✅ Доставлено: <b>{len(delivered_orders)}</b>"
+    )
+    if not timeline:
+        return [heading + "\n\nЗа этот день действий пока нет."]
+
+    messages: list[str] = []
+    current = heading
+    for _, line, _ in timeline:
+        candidate = current + "\n\n" + line
+        if len(candidate) > 3800 and current != heading:
+            messages.append(current)
+            current = f"📅 <b>{report_day:%d.%m.%Y} · продолжение</b>\n\n{line}"
+        else:
+            current = candidate
+    messages.append(current)
+    return messages
 
 
 def locations_text(order: Order) -> str:

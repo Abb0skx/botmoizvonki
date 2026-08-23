@@ -1,6 +1,7 @@
 import unittest
 
-from app.bot.keyboards import edit_input_keyboard, orders_page_keyboard
+from app.bot.keyboards import edit_input_keyboard, orders_channel_keyboard, orders_page_keyboard
+from app.models import Order
 from app.utils.payments import PAYMENT_LABELS
 from app.utils.sellers import SELLERS
 
@@ -78,6 +79,26 @@ class OrdersPageKeyboardTests(unittest.TestCase):
         ):
             with self.subTest(arguments=arguments), self.assertRaises(ValueError):
                 orders_page_keyboard(*arguments)
+
+
+class OrdersChannelKeyboardTests(unittest.TestCase):
+    def test_journal_card_has_today_delivery_log_button(self):
+        order = Order(
+            id=7,
+            order_number=7,
+            manager_id=11,
+            manager_name="Abbos",
+            client_phone="+998901333999",
+            product="A57",
+        )
+
+        callbacks = [
+            button.callback_data
+            for row in orders_channel_keyboard(order).inline_keyboard
+            for button in row
+        ]
+
+        self.assertIn("daily_log:today", callbacks)
 
 
 if __name__ == "__main__":

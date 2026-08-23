@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from html import escape
 from math import ceil
 from types import SimpleNamespace
@@ -18,7 +18,8 @@ from telegram.ext import (
 
 from app.bot.keyboards import (
     all_locations_keyboard, completed_keyboard, courier_cancelled_keyboard,
-    courier_keyboard, courier_selection_keyboard, delivery_pending_keyboard, edit_input_keyboard,
+    courier_keyboard, courier_selection_keyboard, delivery_day_log_keyboard,
+    delivery_pending_keyboard, edit_input_keyboard,
     location_channel_keyboard, main_keyboard,
     manager_cancelled_keyboard, manager_sent_keyboard, on_way_keyboard,
     orders_channel_keyboard, orders_page_keyboard, payment_keyboard, review_keyboard, seller_keyboard,
@@ -32,7 +33,8 @@ from app.utils import (
     parse_order_details,
 )
 from app.utils.formatters import (
-    STATUS_LABELS, all_locations_card, amount_text, money, orders_channel_card,
+    STATUS_LABELS, all_locations_card, amount_text, daily_delivery_report,
+    money, orders_channel_card,
 )
 from app.utils.couriers import (
     courier_group_id, courier_group_ids, courier_ids, courier_option,
@@ -185,6 +187,7 @@ async def _send_courier_map_log(
                     photo=image,
                     caption=caption,
                     parse_mode=ParseMode.HTML,
+                    reply_markup=delivery_day_log_keyboard(now_tashkent.date().isoformat()),
                 )
             else:
                 suffix = "\n\nНе удалось создать фотографию карты."
@@ -192,6 +195,7 @@ async def _send_courier_map_log(
                     chat_id=channel_id,
                     text=caption + suffix,
                     parse_mode=ParseMode.HTML,
+                    reply_markup=delivery_day_log_keyboard(now_tashkent.date().isoformat()),
                 )
             return
         except asyncio.CancelledError:
@@ -229,6 +233,78 @@ def _schedule_courier_map_log(context: ContextTypes.DEFAULT_TYPE, order) -> None
         ),
         name=f"delivery-map-log-{order.id}",
     )
+
+
+async def _send_post_delivery_prompt(
+    context: ContextTypes.DEFAULT_TYPE,
+    order,
+) -> None:
+    """Ask for optional evidence without reopening or blocking the order."""
+    if not order.delivery_chat_id:
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=order.delivery_chat_id,
+            text=f"{order.courier_name or order.assigned_courier_name or 'Курьер'}, "
+            "отправьте фото и цену товара 📸💰",
+        )
+    except Exception:
+        logger.exception("Could not send optional delivery prompt for order %s", order.id)
+
+
+async def daily_delivery_log_action(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+    settings: Settings = context.application.bot_data["settings"]
+    if not _allowed(
+        query.from_user.id,
+        settings.manager_ids | _allowed_courier_ids(settings),
+    ):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    if query.message.chat_id != settings.orders_channel_id:
+        await query.answer("Кнопка работает только в канале Log", show_alert=True)
+        return
+
+    raw_day = query.data.partition(":")[2]
+    try:
+        report_day = (
+            datetime.now(ZoneInfo("Asia/Tashkent")).date()
+            if raw_day == "today"
+            else datetime.strptime(raw_day, "%Y-%m-%d").date()
+        )
+    except ValueError:
+        await query.answer("Неверная дата", show_alert=True)
+        return
+
+    await query.answer("Формирую хронологию…")
+    repo: OrderRepository = context.application.bot_data["repo"]
+    tashkent = ZoneInfo("Asia/Tashkent")
+    day_start = datetime(
+        report_day.year,
+        report_day.month,
+        report_day.day,
+        tzinfo=tashkent,
+    )
+    reports = daily_delivery_report(
+        repo.list_all(),
+        report_day,
+        repo.list_events_between(day_start, day_start + timedelta(days=1)),
+    )
+    try:
+        for report in reports:
+            await context.bot.send_message(
+                chat_id=settings.orders_channel_id,
+                text=report,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+    except Exception:
+        # A timeout can mean that Telegram accepted a report. Blind retries
+        # would create duplicate journal messages.
+        logger.exception("Could not publish daily delivery log for %s", report_day)
 
 
 async def _location_values(message) -> dict:
@@ -2311,6 +2387,7 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             completed_keyboard(order),
         )
         await _notify_manager(context, order.manager_id, result_text)
+        await _send_post_delivery_prompt(context, order)
         _schedule_courier_map_log(context, order)
 
 
@@ -2525,6 +2602,10 @@ def register_handlers(application: Application) -> None:
     application.add_handler(MessageHandler(filters.Regex(r"^(?:📋|📚) Все заказы$") & filters.ChatType.PRIVATE, my_orders))
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("cancel", cancel_conversation))
+    application.add_handler(CallbackQueryHandler(
+        daily_delivery_log_action,
+        pattern=r"^daily_log:(?:today|\d{4}-\d{2}-\d{2})$",
+    ))
     application.add_handler(CallbackQueryHandler(orders_page, pattern=r"^orders_page:(?:active|all):\d+$"))
     application.add_handler(CallbackQueryHandler(
         location_label_action,

@@ -357,7 +357,7 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
             collect_message.reply_text.assert_awaited_once_with("✅ Доставка подтверждена.")
             self.assertEqual(bot.send_photo.await_count, 2)
 
-    async def test_delivered_button_completes_immediately_without_prompt(self):
+    async def test_delivered_button_completes_and_sends_optional_photo_prompt(self):
         with tempfile.TemporaryDirectory() as tempdir:
             repo = OrderRepository(Path(tempdir) / "delivery.db")
             repo.initialize()
@@ -371,11 +371,16 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
                     "amount_usd": 375,
                 },
             )
-            repo.update(order.id, status="pending")
+            repo.update(
+                order.id,
+                status="pending",
+                delivery_chat_id=-100,
+                delivery_message_id=50,
+            )
             query = SimpleNamespace(
                 data=f"complete:{order.id}",
                 from_user=SimpleNamespace(id=2, full_name="Courier", username=None),
-                message=SimpleNamespace(chat_id=-100),
+                message=SimpleNamespace(chat_id=-100, message_id=50),
                 answer=AsyncMock(),
                 edit_message_text=AsyncMock(),
             )
@@ -398,7 +403,16 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
                 query.edit_message_text.await_args.kwargs["reply_markup"].inline_keyboard[-1][0].callback_data,
                 f"undo_complete:{order.id}",
             )
-            bot.send_message.assert_awaited_once()
+            self.assertEqual(bot.send_message.await_count, 2)
+            prompt = next(
+                call
+                for call in bot.send_message.await_args_list
+                if call.kwargs.get("chat_id") == -100
+            )
+            self.assertEqual(
+                prompt.kwargs["text"],
+                "Courier, отправьте фото и цену товара 📸💰",
+            )
 
     async def test_publish_location_saves_channel_message(self):
         with tempfile.TemporaryDirectory() as tempdir:

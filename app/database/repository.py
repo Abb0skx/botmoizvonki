@@ -746,3 +746,24 @@ class OrderRepository:
                 (order_id,),
             ).fetchall()
         return [OrderEvent.from_row(row) for row in rows]
+
+    def list_events_between(
+        self,
+        start: datetime,
+        end: datetime,
+    ) -> list[OrderEvent]:
+        """Return append-only audit events in one timezone-aware interval."""
+        if start.tzinfo is None or end.tzinfo is None:
+            raise ValueError("event interval must be timezone-aware")
+        if end <= start:
+            raise ValueError("event interval end must be after start")
+        start_utc = start.astimezone(timezone.utc).isoformat(timespec="microseconds")
+        end_utc = end.astimezone(timezone.utc).isoformat(timespec="microseconds")
+        with self.connect() as db:
+            rows = db.execute(
+                """SELECT * FROM order_events
+                   WHERE created_at>=? AND created_at<?
+                   ORDER BY created_at, id""",
+                (start_utc, end_utc),
+            ).fetchall()
+        return [OrderEvent.from_row(row) for row in rows]
