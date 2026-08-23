@@ -17,7 +17,7 @@ from app.handlers.orders import (
     delivery_input, details, save_edit, second_location,
 )
 from app.utils.formatters import (
-    all_locations_card, courier_card, location_post_text, manager_card, short_address,
+    all_locations_card, completed_card, courier_card, location_post_text, manager_card, short_address,
     telegram_location_url, telegram_message_url, yandex_map_url,
     yandex_route_url,
 )
@@ -466,6 +466,14 @@ class RepositoryTests(unittest.TestCase):
     def test_order_numbers_are_incremental(self):
         self.assertEqual(self.repo.create(manager_id=1, manager_name="A", data=self.data).order_number, 1)
         self.assertEqual(self.repo.create(manager_id=1, manager_name="A", data=self.data).order_number, 2)
+
+    def test_completed_card_starts_with_a_clear_green_marker(self):
+        order = self.repo.create(manager_id=1, manager_name="A", data=self.data)
+
+        text = completed_card(order, "15:42")
+
+        self.assertTrue(text.startswith("✅✅✅✅✅✅✅\n✅ "))
+        self.assertIn("📦 A7 Pro", text)
 
     def test_existing_database_gets_delivery_migrations(self):
         legacy_path = Path(self.tempdir.name) / "legacy.db"
