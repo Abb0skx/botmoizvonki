@@ -15,6 +15,7 @@ from app.handlers.orders import (
     save_edit,
     toggle_edit_menu,
 )
+from app.utils.couriers import courier_group_id, courier_option
 
 
 def _order_data(index: int = 1) -> dict:
@@ -24,6 +25,15 @@ def _order_data(index: int = 1) -> dict:
         "product": f"Model {index}",
         "amount_usd": 100 + index,
     }
+
+
+class CourierConfigurationTests(unittest.TestCase):
+    def test_muzrob_is_authorized_and_routed_to_his_group(self):
+        courier = courier_option(1799690992)
+
+        self.assertIsNotNone(courier)
+        self.assertEqual(courier.name, "Muzrob Oka")
+        self.assertEqual(courier_group_id(1799690992), -5125237049)
 
 
 class OrderListUxTests(unittest.IsolatedAsyncioTestCase):
@@ -153,8 +163,8 @@ class CallbackAcknowledgementTests(unittest.IsolatedAsyncioTestCase):
         query.answer.assert_awaited_once_with("Выберите курьера")
         keyboard = query.edit_message_reply_markup.await_args.kwargs["reply_markup"]
         self.assertEqual(
-            [row[0].text for row in keyboard.inline_keyboard[:2]],
-            ["🚚 Olmas", "🚚 Abbos"],
+            [row[0].text for row in keyboard.inline_keyboard[:3]],
+            ["🚚 Olmas", "🚚 Abbos", "🚚 Muzrob Oka"],
         )
 
     async def test_manager_assigns_draft_to_selected_courier_group(self):
