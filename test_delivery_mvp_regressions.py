@@ -154,7 +154,10 @@ class LocationPublicationTests(unittest.IsolatedAsyncioTestCase):
                     chat_id=-1004398605075,
                     message_id=10,
                 )),
-                send_message=AsyncMock(),
+                send_message=AsyncMock(side_effect=[
+                    SimpleNamespace(chat_id=-1004398605075, message_id=9),
+                    SimpleNamespace(chat_id=-1004398605075, message_id=11),
+                ]),
             )
             context = SimpleNamespace(
                 bot=bot,
@@ -166,8 +169,13 @@ class LocationPublicationTests(unittest.IsolatedAsyncioTestCase):
             fields = await _send_location_messages(context, order, 1)
 
             self.assertEqual(fields["location_message_id"], 10)
-            self.assertIsNone(fields["location_details_message_id"])
-            bot.send_message.assert_not_awaited()
+            self.assertEqual(fields["location_details_message_id"], 9)
+            self.assertEqual(fields["location_footer_message_id"], 11)
+            self.assertEqual(bot.send_message.await_count, 2)
+            self.assertTrue(all(
+                call.kwargs["text"].count("📍") == 33
+                for call in bot.send_message.await_args_list
+            ))
             buttons = bot.send_location.await_args.kwargs["reply_markup"].inline_keyboard
             self.assertEqual(len(buttons), 3)
             self.assertTrue(buttons[0][0].text.startswith("📍 Яшнабадский район"))

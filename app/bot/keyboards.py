@@ -7,6 +7,7 @@ from app.utils.formatters import (
     telegram_location_url,
 )
 from app.utils.parsers import display_phone
+from app.utils.couriers import COURIERS
 from app.utils.payments import PAYMENT_LABELS
 from app.utils.sellers import SELLERS
 
@@ -88,9 +89,22 @@ def manager_sent_keyboard(order: Order, *, expanded: bool = False) -> InlineKeyb
         edit_rows.append([InlineKeyboardButton("↩️ Назад", callback_data=f"edit_close:{order.id}")])
     return InlineKeyboardMarkup(
         _location_rows(order)
+        + [[InlineKeyboardButton("🚚 Изменить курьера", callback_data=f"courier_menu:{order.id}")]]
         + edit_rows
         + [[InlineKeyboardButton("🔄 Синхронизировать", callback_data=f"sync:{order.id}")]]
     )
+
+
+def courier_selection_keyboard(order: Order) -> InlineKeyboardMarkup:
+    rows = []
+    for courier in COURIERS:
+        selected = "✅ " if order.assigned_courier_id == courier.user_id else "🚚 "
+        rows.append([InlineKeyboardButton(
+            selected + courier.name,
+            callback_data=f"courier_assign:{order.id}:{courier.user_id}",
+        )])
+    rows.append([InlineKeyboardButton("↩️ Назад", callback_data=f"courier_close:{order.id}")])
+    return InlineKeyboardMarkup(rows)
 
 
 def _location_rows(order: Order) -> list[list[InlineKeyboardButton]]:

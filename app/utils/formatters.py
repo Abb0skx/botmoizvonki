@@ -130,6 +130,8 @@ def _compact_order(order: Order, *, status: str | None = None) -> str:
     ]
     if status:
         lines.append(f"🏷 {escape(status)}")
+    if order.assigned_courier_name:
+        lines.append(f"🚚 Курьер: {escape(order.assigned_courier_name)}")
     lines.extend([
         f"📦 {escape(order.product)}",
         amount_text(order),

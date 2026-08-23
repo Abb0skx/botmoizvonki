@@ -258,12 +258,18 @@ class ConcurrentPublicationTests(unittest.IsolatedAsyncioTestCase):
             update=Mock(return_value=None),
             enqueue_cleanup_messages=Mock(return_value=1),
             list_cleanup_messages=Mock(return_value=[
-                {"id": 1, "chat_id": -1002, "message_id": 70},
+                {"id": 1, "chat_id": -1002, "message_id": 69},
+                {"id": 2, "chat_id": -1002, "message_id": 70},
+                {"id": 3, "chat_id": -1002, "message_id": 71},
             ]),
             mark_cleanup_done=Mock(return_value=True),
             mark_cleanup_failed=Mock(return_value=True),
         )
         bot = SimpleNamespace(
+            send_message=AsyncMock(side_effect=[
+                SimpleNamespace(chat_id=-1002, message_id=69),
+                SimpleNamespace(chat_id=-1002, message_id=71),
+            ]),
             send_location=AsyncMock(
                 return_value=SimpleNamespace(chat_id=-1002, message_id=70)
             ),
@@ -282,14 +288,19 @@ class ConcurrentPublicationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             bot.delete_message.await_args_list,
-            [call(chat_id=-1002, message_id=70)],
+            [
+                call(chat_id=-1002, message_id=69),
+                call(chat_id=-1002, message_id=70),
+                call(chat_id=-1002, message_id=71),
+            ],
         )
         repo.update.assert_called_once_with(
             1,
             expected_updated_at="version-1",
             location_chat_id=-1002,
             location_message_id=70,
-            location_details_message_id=None,
+            location_details_message_id=69,
+            location_footer_message_id=71,
         )
 
     async def test_same_order_sync_calls_are_serialized(self):
@@ -348,7 +359,10 @@ class StartupLegacyRecoveryTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-        with patch("app.handlers.orders._sync_order", AsyncMock()) as sync:
+        with (
+            patch("app.handlers.orders._known_delivery_groups", return_value=frozenset({-1001})),
+            patch("app.handlers.orders._sync_order", AsyncMock()) as sync,
+        ):
             await reconcile_orders_on_start(application)
 
         sync.assert_awaited_once()

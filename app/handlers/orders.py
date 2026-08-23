@@ -18,7 +18,7 @@ from telegram.ext import (
 
 from app.bot.keyboards import (
     all_locations_keyboard, completed_keyboard, courier_cancelled_keyboard,
-    courier_keyboard, delivery_pending_keyboard, edit_input_keyboard,
+    courier_keyboard, courier_selection_keyboard, delivery_pending_keyboard, edit_input_keyboard,
     location_channel_keyboard, main_keyboard,
     manager_cancelled_keyboard, manager_sent_keyboard, on_way_keyboard,
     orders_page_keyboard, payment_keyboard, review_keyboard, seller_keyboard,
@@ -34,12 +34,16 @@ from app.utils import (
 from app.utils.formatters import (
     STATUS_LABELS, all_locations_card, amount_text, money,
 )
+from app.utils.couriers import (
+    courier_group_id, courier_group_ids, courier_ids, courier_option,
+)
 from app.utils.parsers import display_phone
 
 logger = logging.getLogger(__name__)
 SELLER, PRODUCT, DETAILS, SECOND_LOCATION, PAYMENT, DELIVERY_TIME, COMMENT, EDIT_VALUE = range(8)
 MANAGER_EDITABLE_STATUSES = {"draft", "pending", "on_way"}
 DELIVERY_ACTIVE_STATUSES = {"pending", "on_way", "awaiting_photo", "awaiting_amount"}
+LOCATION_SEPARATOR = "\n".join(["📍" * 11] * 3)
 ORDER_PAGE_SIZE = 10
 EDIT_CANCEL_TEXT = "❌ Отменить изменение"
 MAIN_MENU_TEXTS = {
@@ -268,7 +272,7 @@ async def _set_location_marker(
     order,
     location_number: int | None = None,
 ) -> bool:
-    """Put compact order buttons directly under each native Telegram Location."""
+    """Refresh the pin buttons and the two visual separator messages."""
     numbers = (location_number,) if location_number else (1, 2)
     success = True
     repo: OrderRepository = context.application.bot_data["repo"]
@@ -280,12 +284,16 @@ async def _set_location_marker(
             chat_id = order.second_location_chat_id
             message_id = order.second_location_message_id
             details_message_id = order.second_location_details_message_id
+            footer_message_id = order.second_location_footer_message_id
             details_field = "second_location_details_message_id"
+            footer_field = "second_location_footer_message_id"
         else:
             chat_id = order.location_chat_id
             message_id = order.location_message_id
             details_message_id = order.location_details_message_id
+            footer_message_id = order.location_footer_message_id
             details_field = "location_details_message_id"
+            footer_field = "location_footer_message_id"
         if not chat_id or not message_id:
             continue
 
@@ -304,7 +312,7 @@ async def _set_location_marker(
                     prefix = "second_" if number == 2 else ""
                     cleanup_messages = [
                         (chat_id, cleanup_id)
-                        for cleanup_id in (details_message_id, message_id)
+                        for cleanup_id in (details_message_id, message_id, footer_message_id)
                         if cleanup_id
                     ]
                     cleared = repo.transition(
@@ -316,6 +324,7 @@ async def _set_location_marker(
                             f"{prefix}location_chat_id": None,
                             f"{prefix}location_message_id": None,
                             f"{prefix}location_details_message_id": None,
+                            f"{prefix}location_footer_message_id": None,
                         },
                     )
                     if cleared:
@@ -333,7 +342,11 @@ async def _set_location_marker(
                     )
                 success = False
                 continue
-        if details_message_id:
+
+        # Rows created before the separator feature used the details field for
+        # an explanatory reply below the pin. Without a footer it is legacy
+        # text, so remove it instead of turning it into a misplaced separator.
+        if details_message_id and not footer_message_id:
             cleaned = repo.transition(
                 order.id,
                 {order.status},
@@ -346,6 +359,38 @@ async def _set_location_marker(
                 continue
             if not await _process_cleanup_messages(context, order_id=order.id):
                 success = False
+            details_message_id = None
+
+        for separator_id, separator_field in (
+            (details_message_id, details_field),
+            (footer_message_id, footer_field),
+        ):
+            if not separator_id:
+                continue
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=separator_id,
+                    text=LOCATION_SEPARATOR,
+                )
+            except Exception as error:
+                if _message_is_not_modified(error):
+                    continue
+                if _message_is_missing(error):
+                    latest = repo.get(order.id)
+                    if latest:
+                        repo.update(
+                            latest.id,
+                            expected_updated_at=latest.updated_at,
+                            **{separator_field: None},
+                        )
+                else:
+                    logger.exception(
+                        "Could not refresh location separator %s for order %s",
+                        separator_field,
+                        order.id,
+                    )
+                success = False
     return success
 
 
@@ -355,12 +400,14 @@ def _location_publication_fields(
     chat_id: int,
     message_id: int,
     details_message_id: int | None = None,
+    footer_message_id: int | None = None,
 ) -> dict:
     prefix = "second_" if location_number == 2 else ""
     return {
         f"{prefix}location_chat_id": chat_id,
         f"{prefix}location_message_id": message_id,
         f"{prefix}location_details_message_id": details_message_id,
+        f"{prefix}location_footer_message_id": footer_message_id,
     }
 
 
@@ -376,16 +423,40 @@ async def _send_location_messages(
     if latitude is None or longitude is None:
         raise ValueError("Order has no coordinates")
     settings: Settings = context.application.bot_data["settings"]
-    pin = await context.bot.send_location(
-        chat_id=settings.location_channel_id,
-        latitude=latitude,
-        longitude=longitude,
-        reply_markup=location_channel_keyboard(order, location_number=location_number),
-    )
+    published: list[tuple[int, int]] = []
+    try:
+        header = await context.bot.send_message(
+            chat_id=settings.location_channel_id,
+            text=LOCATION_SEPARATOR,
+        )
+        published.append((header.chat_id, header.message_id))
+        pin = await context.bot.send_location(
+            chat_id=settings.location_channel_id,
+            latitude=latitude,
+            longitude=longitude,
+            reply_markup=location_channel_keyboard(order, location_number=location_number),
+        )
+        published.append((pin.chat_id, pin.message_id))
+        footer = await context.bot.send_message(
+            chat_id=settings.location_channel_id,
+            text=LOCATION_SEPARATOR,
+        )
+        published.append((footer.chat_id, footer.message_id))
+    except Exception:
+        repo: OrderRepository | None = context.application.bot_data.get("repo")
+        if repo and published:
+            repo.enqueue_cleanup_messages(order.id, published)
+            await _process_cleanup_messages(context, order_id=order.id)
+        else:
+            for chat_id, message_id in published:
+                await _delete_message_quietly(context, chat_id, message_id)
+        raise
     return _location_publication_fields(
         location_number,
         chat_id=pin.chat_id,
         message_id=pin.message_id,
+        details_message_id=header.message_id,
+        footer_message_id=footer.message_id,
     )
 
 
@@ -410,6 +481,7 @@ async def _publish_location(
             for message_id in (
                 update_fields[f"{'second_' if location_number == 2 else ''}location_details_message_id"],
                 update_fields[f"{'second_' if location_number == 2 else ''}location_message_id"],
+                update_fields[f"{'second_' if location_number == 2 else ''}location_footer_message_id"],
             )
         ],
     )
@@ -460,6 +532,22 @@ def _order_should_be_in_delivery_group(order) -> bool:
     )
 
 
+def _target_delivery_group(settings: Settings, order) -> int:
+    """Resolve the assigned courier group while preserving legacy orders."""
+    assigned_group = courier_group_id(order.assigned_courier_id)
+    if assigned_group is not None:
+        return assigned_group
+    return settings.delivery_group_id
+
+
+def _allowed_courier_ids(settings: Settings) -> frozenset[int]:
+    return settings.courier_ids | courier_ids()
+
+
+def _known_delivery_groups(settings: Settings) -> frozenset[int]:
+    return courier_group_ids() | frozenset({settings.delivery_group_id})
+
+
 async def _sync_order(context: ContextTypes.DEFAULT_TYPE, order_id: int) -> tuple[object | None, bool]:
     async with _order_sync_lock(context.application, order_id):
         return await _sync_order_locked(context, order_id)
@@ -473,14 +561,19 @@ def _reset_mismatched_publications(
     """Clear references that belong to chats replaced in environment config."""
     fields: dict[str, None] = {}
     cleanup: list[tuple[int, int]] = []
-    if order.delivery_chat_id and order.delivery_chat_id != settings.delivery_group_id:
+    expected_delivery_chat_id = _target_delivery_group(settings, order)
+    if order.delivery_chat_id and order.delivery_chat_id != expected_delivery_chat_id:
         if order.delivery_message_id:
             cleanup.append((order.delivery_chat_id, order.delivery_message_id))
         fields.update(delivery_chat_id=None, delivery_message_id=None)
     for prefix in ("", "second_"):
         chat_id = getattr(order, f"{prefix}location_chat_id")
         if chat_id and chat_id != settings.location_channel_id:
-            for suffix in ("location_details_message_id", "location_message_id"):
+            for suffix in (
+                "location_details_message_id",
+                "location_message_id",
+                "location_footer_message_id",
+            ):
                 message_id = getattr(order, f"{prefix}{suffix}")
                 if message_id:
                     cleanup.append((chat_id, message_id))
@@ -488,6 +581,7 @@ def _reset_mismatched_publications(
                 f"{prefix}location_chat_id": None,
                 f"{prefix}location_message_id": None,
                 f"{prefix}location_details_message_id": None,
+                f"{prefix}location_footer_message_id": None,
             })
     if not fields:
         return order
@@ -530,7 +624,7 @@ async def _sync_order_locked(context: ContextTypes.DEFAULT_TYPE, order_id: int) 
         text, keyboard = _delivery_message(order)
         try:
             sent = await context.bot.send_message(
-                settings.delivery_group_id,
+                _target_delivery_group(settings, order),
                 text,
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
@@ -667,10 +761,25 @@ async def _finish_status_change_locked(
 async def validate_delivery_configuration(application: Application) -> None:
     """Validate chats and the concrete Telegram rights required by the bot."""
     settings: Settings = application.bot_data["settings"]
-    delivery_chat = await application.bot.get_chat(settings.delivery_group_id)
+    for delivery_group_id in sorted(_known_delivery_groups(settings)):
+        delivery_chat = await application.bot.get_chat(delivery_group_id)
+        if delivery_chat.type not in {"group", "supergroup"}:
+            raise RuntimeError(
+                f"Delivery chat {delivery_group_id} must be a Telegram group or supergroup"
+            )
+        delivery_member = await application.bot.get_chat_member(
+            delivery_group_id,
+            application.bot.id,
+        )
+        if delivery_member.status in {"left", "kicked"}:
+            raise RuntimeError(f"The delivery bot must be a member of group {delivery_group_id}")
+        if delivery_member.status == "restricted" and not getattr(
+            delivery_member,
+            "can_send_messages",
+            False,
+        ):
+            raise RuntimeError(f"The delivery bot cannot send to group {delivery_group_id}")
     location_chat = await application.bot.get_chat(settings.location_channel_id)
-    if delivery_chat.type not in {"group", "supergroup"}:
-        raise RuntimeError("DELIVERY_GROUP_ID must point to a Telegram group or supergroup")
     if location_chat.type not in {"channel", "supergroup"}:
         raise RuntimeError("DELIVERY_LOCATION_CHANNEL_ID must point to a channel or supergroup")
     location_member = await application.bot.get_chat_member(
@@ -691,18 +800,6 @@ async def validate_delivery_configuration(application: Application) -> None:
     ):
         raise RuntimeError("The delivery bot must be allowed to delete obsolete location posts")
 
-    delivery_member = await application.bot.get_chat_member(
-        settings.delivery_group_id,
-        application.bot.id,
-    )
-    if delivery_member.status in {"left", "kicked"}:
-        raise RuntimeError("The delivery bot must be a member of the delivery group")
-    if delivery_member.status == "restricted" and not getattr(
-        delivery_member,
-        "can_send_messages",
-        False,
-    ):
-        raise RuntimeError("The delivery bot must be allowed to send messages in the delivery group")
 
 
 async def reconcile_orders_on_start(application: Application) -> None:
@@ -1377,6 +1474,11 @@ async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             if location_number == 2
             else previous.location_details_message_id
         )
+        old_footer_id = (
+            previous.second_location_footer_message_id
+            if location_number == 2
+            else previous.location_footer_message_id
+        )
         old_pin_id = (
             previous.second_location_message_id
             if location_number == 2
@@ -1385,7 +1487,7 @@ async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         if old_chat_id:
             cleanup_messages = [
                 (old_chat_id, message_id)
-                for message_id in (old_details_id, old_pin_id)
+                for message_id in (old_details_id, old_pin_id, old_footer_id)
                 if message_id
             ]
     order = repo.transition(
@@ -1411,6 +1513,11 @@ async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 if location_number == 2
                 else new_publication.location_details_message_id
             )
+            new_footer_id = (
+                new_publication.second_location_footer_message_id
+                if location_number == 2
+                else new_publication.location_footer_message_id
+            )
             new_pin_id = (
                 new_publication.second_location_message_id
                 if location_number == 2
@@ -1420,7 +1527,7 @@ async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 previous.id,
                 [
                     (new_chat_id, message_id)
-                    for message_id in (new_details_id, new_pin_id)
+                    for message_id in (new_details_id, new_pin_id, new_footer_id)
                     if new_chat_id and message_id
                 ],
             )
@@ -1537,29 +1644,132 @@ async def manager_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         repo.mark_synced(cancelled.id, expected_updated_at=cancelled.updated_at)
         await query.answer(); return
-    updated = repo.transition(
-        order.id,
-        {"draft"},
+    await query.edit_message_reply_markup(reply_markup=courier_selection_keyboard(order))
+    await query.answer("Выберите курьера")
+
+
+async def courier_assignment_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    settings: Settings = context.application.bot_data["settings"]
+    if not _allowed(query.from_user.id, settings.manager_ids):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    parts = query.data.split(":")
+    action, order_id = parts[0], int(parts[1])
+    repo: OrderRepository = context.application.bot_data["repo"]
+    order = repo.get(order_id)
+    if not order:
+        await query.answer("Заказ не найден", show_alert=True)
+        return
+    if (
+        order.manager_message_id
+        and (
+            query.message.chat_id != order.manager_chat_id
+            or query.message.message_id != order.manager_message_id
+        )
+    ):
+        await query.answer("Эта карточка устарела. Откройте актуальную карточку заказа.", show_alert=True)
+        return
+    if order.status not in {"draft", "pending", "on_way"}:
+        await query.answer("Для закрытого заказа курьера изменить нельзя", show_alert=True)
+        return
+    if action == "courier_menu":
+        await query.edit_message_reply_markup(reply_markup=courier_selection_keyboard(order))
+        await query.answer("Выберите курьера")
+        return
+    if action == "courier_close":
+        keyboard = review_keyboard(order.id) if order.status == "draft" else manager_sent_keyboard(order)
+        await query.edit_message_reply_markup(reply_markup=keyboard)
+        await query.answer()
+        return
+
+    selected = courier_option(int(parts[2])) if len(parts) == 3 else None
+    if not selected:
+        await query.answer("Курьер не найден", show_alert=True)
+        return
+    if order.status != "draft" and order.assigned_courier_id == selected.user_id:
+        await query.edit_message_reply_markup(reply_markup=manager_sent_keyboard(order))
+        await query.answer(f"Курьер {selected.name} уже выбран")
+        return
+
+    # Publish first. Only after Telegram confirms the new card do we switch
+    # SQLite and enqueue the previous group's card for deletion atomically.
+    candidate = replace(
+        order,
         status="pending",
-        manager_chat_id=query.message.chat_id,
-        manager_message_id=query.message.message_id,
-        actor_id=query.from_user.id,
-        actor_name=_name(query.from_user),
-        actor_role="manager",
+        assigned_courier_id=selected.user_id,
+        assigned_courier_name=selected.name,
+        courier_id=None,
+        courier_name=None,
+        time_started=None,
+        delivery_photo=None,
+        received_usd=None,
+        received_uzs=None,
+        delivered_at=None,
     )
-    if not updated:
-        await query.answer("Заказ уже обработан", show_alert=True); return
-    # Acknowledge the button before publishing the group card and locations.
-    # Those Telegram calls can take several seconds during a transient outage.
-    await query.answer("Заказ сохранён. Отправляю курьеру…")
-    updated, synchronized = await _sync_order(context, updated.id)
-    if not synchronized:
-        _schedule_sync_retry(context, order.id)
+    text, keyboard = _delivery_message(candidate)
+    await query.answer(f"Отправляю заказ курьеру {selected.name}…")
+    try:
+        sent = await context.bot.send_message(
+            selected.group_id,
+            text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=keyboard,
+        )
+    except Exception:
+        logger.exception("Could not assign order %s to courier %s", order.id, selected.name)
         await _notify_manager(
             context,
             query.from_user.id,
-            "⚠️ Заказ сохранён. Часть сообщений Telegram временно не обновилась — "
-            "бот повторит автоматически.",
+            f"⚠️ Не удалось отправить заказ №{order.order_number} курьеру {selected.name}. "
+            "Старый курьер не изменён.",
+        )
+        return
+
+    cleanup_messages = []
+    if order.delivery_chat_id and order.delivery_message_id:
+        cleanup_messages.append((order.delivery_chat_id, order.delivery_message_id))
+    updated = repo.transition(
+        order.id,
+        {"draft", "pending", "on_way"},
+        expected_updated_at=order.updated_at,
+        actor_id=query.from_user.id,
+        actor_name=_name(query.from_user),
+        actor_role="manager",
+        cleanup_messages=cleanup_messages,
+        status="pending",
+        assigned_courier_id=selected.user_id,
+        assigned_courier_name=selected.name,
+        courier_id=None,
+        courier_name=None,
+        time_started=None,
+        delivery_photo=None,
+        received_usd=None,
+        received_uzs=None,
+        delivered_at=None,
+        delivery_chat_id=sent.chat_id,
+        delivery_message_id=sent.message_id,
+    )
+    if not updated:
+        repo.enqueue_cleanup_messages(order.id, [(sent.chat_id, sent.message_id)])
+        await _process_cleanup_messages(context, order_id=order.id)
+        await _notify_manager(
+            context,
+            query.from_user.id,
+            "⚠️ Заказ уже изменился. Новая карточка курьера удалена; откройте актуальный заказ.",
+        )
+        return
+
+    await _process_cleanup_messages(context, order_id=updated.id)
+    updated, synchronized = await _sync_order(context, updated.id)
+    if not synchronized:
+        _schedule_sync_retry(context, updated.id)
+        await _notify_manager(
+            context,
+            query.from_user.id,
+            "⚠️ Курьер изменён, но часть сообщений Telegram временно не обновилась. "
+            "Бот повторит автоматически.",
         )
 
 
@@ -1589,12 +1799,16 @@ async def manager_sync_action(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     settings: Settings = context.application.bot_data["settings"]
-    if query.message.chat_id != settings.delivery_group_id or not _allowed(query.from_user.id, settings.courier_ids):
+    if not _allowed(query.from_user.id, _allowed_courier_ids(settings)):
         await query.answer("Нет доступа", show_alert=True); return
     action, raw_id = query.data.split(":"); repo: OrderRepository = context.application.bot_data["repo"]
     order = repo.get(int(raw_id))
     if not order:
         await query.answer("Заказ не найден", show_alert=True); return
+    if order.delivery_chat_id and query.message.chat_id != order.delivery_chat_id:
+        await query.answer("Этот заказ находится в другой группе курьера", show_alert=True); return
+    if order.assigned_courier_id and order.assigned_courier_id != query.from_user.id:
+        await query.answer(f"Заказ назначен курьеру {order.assigned_courier_name}", show_alert=True); return
     clicked_message_id = getattr(query.message, "message_id", None)
     if clicked_message_id and not order.delivery_message_id:
         adopted = repo.update(
@@ -1659,7 +1873,7 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "delivered_at": None,
         }
         if target_status == "pending":
-            reset.update(courier_id=None, courier_name=None)
+            reset.update(courier_id=None, courier_name=None, time_started=None)
         order = repo.transition(
             order.id,
             {"awaiting_photo", "awaiting_amount", "completed"},
@@ -1689,7 +1903,11 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.answer("Заказ уже закрыт", show_alert=True); return
     if order.courier_id and order.courier_id != query.from_user.id:
         await query.answer(f"Заказ уже взял {order.courier_name}", show_alert=True); return
-    courier = {"courier_id": query.from_user.id, "courier_name": _name(query.from_user)}
+    configured_courier = courier_option(query.from_user.id)
+    courier = {
+        "courier_id": query.from_user.id,
+        "courier_name": configured_courier.name if configured_courier else _name(query.from_user),
+    }
     if action == "undo_onway":
         order = repo.transition(
             order.id,
@@ -1820,11 +2038,13 @@ async def _publish_completed(
 
 async def delivery_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings: Settings = context.application.bot_data["settings"]
-    if update.effective_chat.id != settings.delivery_group_id or update.effective_user.id not in settings.courier_ids:
+    if update.effective_user.id not in _allowed_courier_ids(settings):
         return
     repo: OrderRepository = context.application.bot_data["repo"]
     order = repo.get_active_delivery(update.effective_user.id)
     if not order:
+        return
+    if update.effective_chat.id != order.delivery_chat_id:
         return
     if order.status == "awaiting_photo":
         if not update.message.photo:
@@ -1979,6 +2199,7 @@ def register_handlers(application: Application) -> None:
                 _end_edit_on_global_command,
                 pattern=(
                     r"^(?:(?:edit_(?:menu|close)|send|manager_cancel|manager_restore|sync):\d+"
+                    r"|courier_(?:menu|close|assign):\d+(?::\d+)?"
                     r"|orders_page:(?:active|all):\d+)$"
                 ),
             ),
@@ -2000,6 +2221,10 @@ def register_handlers(application: Application) -> None:
     ))
     application.add_handler(CallbackQueryHandler(toggle_edit_menu, pattern=r"^edit_(?:menu|close):\d+$"))
     application.add_handler(CallbackQueryHandler(manager_action, pattern=r"^(send|manager_cancel|manager_restore):\d+$"))
+    application.add_handler(CallbackQueryHandler(
+        courier_assignment_action,
+        pattern=r"^courier_(?:menu|close|assign):\d+(?::\d+)?$",
+    ))
     application.add_handler(CallbackQueryHandler(manager_sync_action, pattern=r"^sync:\d+$"))
     application.add_handler(CallbackQueryHandler(courier_action, pattern=r"^(onway|undo_onway|complete|cancel|undo_cancel|undo_complete):\d+$"))
     application.add_handler(edit_conversation, group=1)

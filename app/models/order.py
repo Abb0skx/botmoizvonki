@@ -31,6 +31,8 @@ class Order:
     delivery_time: str | None = None
     comment: str | None = None
     status: str = "draft"
+    assigned_courier_id: int | None = None
+    assigned_courier_name: str | None = None
     courier_id: int | None = None
     courier_name: str | None = None
     delivery_photo: str | None = None
@@ -45,9 +47,11 @@ class Order:
     location_chat_id: int | None = None
     location_message_id: int | None = None
     location_details_message_id: int | None = None
+    location_footer_message_id: int | None = None
     second_location_chat_id: int | None = None
     second_location_message_id: int | None = None
     second_location_details_message_id: int | None = None
+    second_location_footer_message_id: int | None = None
     manager_chat_id: int | None = None
     manager_message_id: int | None = None
     creation_token: str | None = None

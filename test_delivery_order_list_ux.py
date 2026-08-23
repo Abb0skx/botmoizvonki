@@ -8,6 +8,7 @@ from app.database import OrderRepository
 from app.handlers.orders import (
     _show_orders,
     begin_edit,
+    courier_assignment_action,
     courier_action,
     manager_action,
     manager_sync_action,
@@ -127,23 +128,15 @@ class CallbackAcknowledgementTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         self.tempdir.cleanup()
 
-    async def test_manager_send_answers_before_order_sync(self):
+    async def test_manager_send_opens_courier_selection_without_publishing(self):
         order = self.repo.create(manager_id=11, manager_name="Manager", data=_order_data())
-        events: list[str] = []
-
-        async def answer(*_args, **_kwargs):
-            events.append("answer")
-
-        async def sync(context, order_id):
-            self.assertEqual(events, ["answer"])
-            events.append("sync")
-            return self.repo.get(order_id), True
 
         query = SimpleNamespace(
             data=f"send:{order.id}",
             from_user=SimpleNamespace(id=11, full_name="Manager", username=None),
             message=SimpleNamespace(chat_id=11, message_id=90),
-            answer=AsyncMock(side_effect=answer),
+            answer=AsyncMock(),
+            edit_message_reply_markup=AsyncMock(),
         )
         update = SimpleNamespace(callback_query=query)
         context = SimpleNamespace(
@@ -154,11 +147,159 @@ class CallbackAcknowledgementTests(unittest.IsolatedAsyncioTestCase):
             bot=SimpleNamespace(),
         )
 
-        with patch("app.handlers.orders._sync_order", side_effect=sync):
-            await manager_action(update, context)
+        await manager_action(update, context)
 
-        self.assertEqual(events, ["answer", "sync"])
-        query.answer.assert_awaited_once_with("Заказ сохранён. Отправляю курьеру…")
+        self.assertEqual(self.repo.get(order.id).status, "draft")
+        query.answer.assert_awaited_once_with("Выберите курьера")
+        keyboard = query.edit_message_reply_markup.await_args.kwargs["reply_markup"]
+        self.assertEqual(
+            [row[0].text for row in keyboard.inline_keyboard[:2]],
+            ["🚚 Olmas", "🚚 Abbos"],
+        )
+
+    async def test_manager_assigns_draft_to_selected_courier_group(self):
+        order = self.repo.create(manager_id=11, manager_name="Manager", data=_order_data())
+        order = self.repo.update(
+            order.id,
+            manager_chat_id=11,
+            manager_message_id=90,
+        )
+        query = SimpleNamespace(
+            data=f"courier_assign:{order.id}:7636344727",
+            from_user=SimpleNamespace(id=11, full_name="Manager", username=None),
+            message=SimpleNamespace(chat_id=11, message_id=90),
+            answer=AsyncMock(),
+        )
+        bot = SimpleNamespace(
+            send_message=AsyncMock(return_value=SimpleNamespace(
+                chat_id=-5111626405,
+                message_id=50,
+            )),
+            delete_message=AsyncMock(),
+        )
+        context = SimpleNamespace(
+            bot=bot,
+            application=SimpleNamespace(bot_data={
+                "settings": SimpleNamespace(
+                    manager_ids=frozenset({11}),
+                    courier_ids=frozenset(),
+                    delivery_group_id=-100,
+                    location_channel_id=-1002,
+                ),
+                "repo": self.repo,
+            }),
+        )
+
+        async def synchronized(_context, order_id):
+            return self.repo.get(order_id), True
+
+        with patch("app.handlers.orders._sync_order", side_effect=synchronized):
+            await courier_assignment_action(SimpleNamespace(callback_query=query), context)
+
+        assigned = self.repo.get(order.id)
+        self.assertEqual(assigned.status, "pending")
+        self.assertEqual(assigned.assigned_courier_id, 7636344727)
+        self.assertEqual(assigned.assigned_courier_name, "Olmas")
+        self.assertIsNone(assigned.courier_id)
+        self.assertEqual(assigned.delivery_chat_id, -5111626405)
+        self.assertEqual(bot.send_message.await_args.args[0], -5111626405)
+        self.assertIn("🚚 Курьер: Olmas", bot.send_message.await_args.args[1])
+
+    async def test_reassignment_publishes_new_card_then_deletes_old_card(self):
+        order = self.repo.create(manager_id=11, manager_name="Manager", data=_order_data())
+        order = self.repo.update(
+            order.id,
+            status="on_way",
+            assigned_courier_id=7636344727,
+            assigned_courier_name="Olmas",
+            courier_id=7636344727,
+            courier_name="Olmas",
+            time_started="2026-08-23T10:00:00+05:00",
+            delivery_chat_id=-5111626405,
+            delivery_message_id=50,
+            manager_chat_id=11,
+            manager_message_id=90,
+        )
+        query = SimpleNamespace(
+            data=f"courier_assign:{order.id}:202134293",
+            from_user=SimpleNamespace(id=11, full_name="Manager", username=None),
+            message=SimpleNamespace(chat_id=11, message_id=90),
+            answer=AsyncMock(),
+        )
+        bot = SimpleNamespace(
+            send_message=AsyncMock(return_value=SimpleNamespace(
+                chat_id=-5216093690,
+                message_id=60,
+            )),
+            delete_message=AsyncMock(),
+        )
+        context = SimpleNamespace(
+            bot=bot,
+            application=SimpleNamespace(bot_data={
+                "settings": SimpleNamespace(
+                    manager_ids=frozenset({11}),
+                    courier_ids=frozenset(),
+                    delivery_group_id=-100,
+                    location_channel_id=-1002,
+                ),
+                "repo": self.repo,
+            }),
+        )
+
+        async def synchronized(_context, order_id):
+            return self.repo.get(order_id), True
+
+        with patch("app.handlers.orders._sync_order", side_effect=synchronized):
+            await courier_assignment_action(SimpleNamespace(callback_query=query), context)
+
+        assigned = self.repo.get(order.id)
+        self.assertEqual(assigned.status, "pending")
+        self.assertEqual(assigned.assigned_courier_id, 202134293)
+        self.assertEqual(assigned.assigned_courier_name, "Abbos")
+        self.assertIsNone(assigned.courier_id)
+        self.assertIsNone(assigned.time_started)
+        self.assertEqual(assigned.delivery_chat_id, -5216093690)
+        bot.delete_message.assert_awaited_once_with(chat_id=-5111626405, message_id=50)
+
+    async def test_failed_reassignment_keeps_old_courier_and_card(self):
+        order = self.repo.create(manager_id=11, manager_name="Manager", data=_order_data())
+        order = self.repo.update(
+            order.id,
+            status="pending",
+            assigned_courier_id=7636344727,
+            assigned_courier_name="Olmas",
+            delivery_chat_id=-5111626405,
+            delivery_message_id=50,
+            manager_chat_id=11,
+            manager_message_id=90,
+        )
+        query = SimpleNamespace(
+            data=f"courier_assign:{order.id}:202134293",
+            from_user=SimpleNamespace(id=11, full_name="Manager", username=None),
+            message=SimpleNamespace(chat_id=11, message_id=90),
+            answer=AsyncMock(),
+        )
+        bot = SimpleNamespace(
+            send_message=AsyncMock(side_effect=RuntimeError("telegram unavailable")),
+            delete_message=AsyncMock(),
+        )
+        context = SimpleNamespace(
+            bot=bot,
+            application=SimpleNamespace(bot_data={
+                "settings": SimpleNamespace(manager_ids=frozenset({11})),
+                "repo": self.repo,
+            }),
+        )
+
+        with patch("app.handlers.orders._notify_manager", new=AsyncMock()) as notify:
+            await courier_assignment_action(SimpleNamespace(callback_query=query), context)
+
+        unchanged = self.repo.get(order.id)
+        self.assertEqual(unchanged.assigned_courier_id, 7636344727)
+        self.assertEqual(unchanged.delivery_chat_id, -5111626405)
+        self.assertEqual(unchanged.delivery_message_id, 50)
+        bot.delete_message.assert_not_awaited()
+        notify.assert_awaited_once()
 
     async def test_manual_sync_answers_before_order_sync(self):
         order = self.repo.create(manager_id=11, manager_name="Manager", data=_order_data())

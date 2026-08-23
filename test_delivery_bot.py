@@ -422,6 +422,12 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
                 delivery_message_id=50,
             )
             bot = SimpleNamespace(
+                send_message=AsyncMock(side_effect=[
+                    SimpleNamespace(chat_id=-1004398605075, message_id=87),
+                    SimpleNamespace(chat_id=-1004398605075, message_id=89),
+                    SimpleNamespace(chat_id=-1004398605075, message_id=90),
+                    SimpleNamespace(chat_id=-1004398605075, message_id=92),
+                ]),
                 send_location=AsyncMock(
                     return_value=SimpleNamespace(chat_id=-1004398605075, message_id=88)
                 ),
@@ -438,7 +444,8 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
             bot.send_location.assert_awaited_once()
             self.assertEqual(published.location_chat_id, -1004398605075)
             self.assertEqual(published.location_message_id, 88)
-            self.assertIsNone(published.location_details_message_id)
+            self.assertEqual(published.location_details_message_id, 87)
+            self.assertEqual(published.location_footer_message_id, 89)
             location_buttons = bot.send_location.await_args.kwargs["reply_markup"].inline_keyboard
             self.assertEqual(len(location_buttons), 3)
             self.assertEqual(
@@ -464,7 +471,9 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
                 telegram_location_url(published, 2),
                 "https://t.me/c/4398605075/89",
             )
-            self.assertIsNone(published.second_location_details_message_id)
+            self.assertEqual(published.second_location_details_message_id, 90)
+            self.assertEqual(published.second_location_footer_message_id, 92)
+            self.assertEqual(bot.send_message.await_count, 4)
 
 
 class RepositoryTests(unittest.TestCase):
