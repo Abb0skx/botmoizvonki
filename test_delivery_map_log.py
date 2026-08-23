@@ -12,7 +12,16 @@ from PIL import Image
 from app.database import OrderRepository
 from app.handlers.orders import _send_courier_map_log
 from app.models import Order
-from app.utils.static_map import MAP_HEIGHT, MAP_WIDTH, render_active_orders_map
+from app.utils.static_map import (
+    MAP_HEIGHT,
+    MAP_WIDTH,
+    TASHKENT_BOUNDS,
+    WAREHOUSE_LATITUDE,
+    WAREHOUSE_LONGITUDE,
+    _viewport,
+    _world_pixel,
+    render_active_orders_map,
+)
 
 
 class StaticMapTests(unittest.IsolatedAsyncioTestCase):
@@ -49,8 +58,91 @@ class StaticMapTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertGreater(red_pixels, 100)
 
+    async def test_map_always_shows_full_tashkent_and_warehouse(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch(
+                "app.utils.static_map._load_tile",
+                AsyncMock(return_value=Image.new("RGB", (256, 256), "#dbeafe")),
+            ):
+                result = await render_active_orders_map(
+                    [],
+                    cache_dir=Path(directory),
+                )
+
+        self.assertIsNotNone(result)
+        zoom, center_x, center_y = _viewport([])
+        left = center_x - MAP_WIDTH / 2
+        top = center_y - MAP_HEIGHT / 2
+        for latitude, longitude in (*TASHKENT_BOUNDS, (WAREHOUSE_LATITUDE, WAREHOUSE_LONGITUDE)):
+            world_x, world_y = _world_pixel(latitude, longitude, zoom)
+            self.assertGreaterEqual(world_x - left, 0)
+            self.assertLess(world_x - left, MAP_WIDTH)
+            self.assertGreaterEqual(world_y - top, 0)
+            self.assertLess(world_y - top, MAP_HEIGHT)
+
+        with Image.open(result) as image:
+            orange_pixels = sum(
+                1
+                for red, green, blue in image.convert("RGB").get_flattened_data()
+                if red > 200 and 90 < green < 190 and blue < 80
+            )
+        self.assertGreater(orange_pixels, 100)
+
 
 class CourierMapLogTests(unittest.IsolatedAsyncioTestCase):
+    async def test_delivery_log_sends_city_and_warehouse_map_without_active_coordinates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "delivery.db"
+            repo = OrderRepository(database_path)
+            repo.initialize()
+            completed = repo.create(
+                manager_id=11,
+                manager_name="Manager",
+                data={
+                    "seller_name": "Ali",
+                    "client_phone": "+998901333999",
+                    "product": "Delivered",
+                    "amount_usd": 100,
+                },
+            )
+            completed = repo.update(
+                completed.id,
+                status="completed",
+                courier_id=202134293,
+                courier_name="Abbos",
+                delivered_at=datetime.now(ZoneInfo("Asia/Tashkent")).isoformat(),
+            )
+            image = BytesIO(b"city-and-warehouse-map")
+            image.name = "active-deliveries.png"
+            bot = SimpleNamespace(send_photo=AsyncMock(), send_message=AsyncMock())
+            application = SimpleNamespace(
+                bot=bot,
+                bot_data={
+                    "repo": repo,
+                    "settings": SimpleNamespace(
+                        orders_channel_id=-1004459657817,
+                        database_path=database_path,
+                    ),
+                },
+            )
+
+            renderer = AsyncMock(return_value=image)
+            with patch("app.handlers.orders.render_active_orders_map", renderer):
+                await _send_courier_map_log(
+                    application,
+                    completed_order_id=completed.id,
+                    courier_id=202134293,
+                    courier_name="Abbos",
+                )
+
+        renderer.assert_awaited_once_with(
+            [],
+            cache_dir=database_path.parent / "map-tiles",
+        )
+        bot.send_photo.assert_awaited_once()
+        bot.send_message.assert_not_awaited()
+        self.assertIn("На карте: <b>0</b>", bot.send_photo.await_args.kwargs["caption"])
+
     async def test_delivery_log_contains_daily_and_active_counts_with_map(self):
         with tempfile.TemporaryDirectory() as directory:
             database_path = Path(directory) / "delivery.db"

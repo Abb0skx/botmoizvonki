@@ -1,4 +1,5 @@
 import asyncio
+from functools import lru_cache
 from io import BytesIO
 import math
 import os
@@ -12,11 +13,39 @@ from app.models import Order
 
 
 TILE_SIZE = 256
-MAP_WIDTH = 900
-MAP_HEIGHT = 600
+MAP_WIDTH = 1200
+MAP_HEIGHT = 800
 TILE_CACHE_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 TILE_USER_AGENT = "TEXNIKACH-DeliveryBot/1.0 (contact: texnikach@gmail.com)"
+
+# Keep the whole city visible even when the current orders are concentrated in
+# one neighbourhood. Points outside these bounds are still included by the
+# viewport calculation.
+TASHKENT_BOUNDS = (
+    (41.180000, 68.980000),
+    (41.430000, 69.500000),
+)
+WAREHOUSE_LATITUDE = 41.337420
+WAREHOUSE_LONGITUDE = 69.272104
+
+
+@lru_cache(maxsize=16)
+def _font(size: int, *, bold: bool = False) -> ImageFont.ImageFont:
+    configured = os.getenv("DELIVERY_MAP_FONT_PATH", "").strip()
+    candidates = [
+        configured,
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+        if bold
+        else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf"
+        if bold
+        else "/System/Library/Fonts/Supplemental/Arial.ttf",
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return ImageFont.truetype(candidate, size=size)
+    return ImageFont.load_default(size=size)
 
 
 def _world_pixel(latitude: float, longitude: float, zoom: int) -> tuple[float, float]:
@@ -44,17 +73,126 @@ def _order_points(orders: list[Order]) -> list[tuple[Order, int, float, float]]:
 def _viewport(
     points: list[tuple[Order, int, float, float]],
 ) -> tuple[int, float, float]:
-    for zoom in range(15, 5, -1):
-        pixels = [_world_pixel(latitude, longitude, zoom) for _, _, latitude, longitude in points]
+    coordinates = [
+        TASHKENT_BOUNDS[0],
+        TASHKENT_BOUNDS[1],
+        (WAREHOUSE_LATITUDE, WAREHOUSE_LONGITUDE),
+        *((latitude, longitude) for _, _, latitude, longitude in points),
+    ]
+    for zoom in range(15, 4, -1):
+        pixels = [_world_pixel(latitude, longitude, zoom) for latitude, longitude in coordinates]
         xs = [pixel[0] for pixel in pixels]
         ys = [pixel[1] for pixel in pixels]
-        if max(xs) - min(xs) <= MAP_WIDTH - 180 and max(ys) - min(ys) <= MAP_HEIGHT - 180:
+        if max(xs) - min(xs) <= MAP_WIDTH - 220 and max(ys) - min(ys) <= MAP_HEIGHT - 180:
             return zoom, (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
-    pixels = [_world_pixel(latitude, longitude, 5) for _, _, latitude, longitude in points]
+    pixels = [_world_pixel(latitude, longitude, 4) for latitude, longitude in coordinates]
     return (
-        5,
+        4,
         (min(pixel[0] for pixel in pixels) + max(pixel[0] for pixel in pixels)) / 2,
         (min(pixel[1] for pixel in pixels) + max(pixel[1] for pixel in pixels)) / 2,
+    )
+
+
+def _label_box(
+    draw: ImageDraw.ImageDraw,
+    *,
+    x: int,
+    y: int,
+    text: str,
+    font: ImageFont.ImageFont,
+    fill: str,
+) -> None:
+    bounds = draw.textbbox((0, 0), text, font=font)
+    width = bounds[2] - bounds[0]
+    height = bounds[3] - bounds[1]
+    left = max(8, min(MAP_WIDTH - width - 24, x - width / 2 - 10))
+    top = max(8, min(MAP_HEIGHT - height - 18, y))
+    box = (left, top, left + width + 20, top + height + 10)
+    draw.rounded_rectangle(
+        box,
+        radius=8,
+        fill=(255, 255, 255, 242),
+        outline=(17, 24, 39, 180),
+        width=2,
+    )
+    draw.text((left + 10, top + 4), text, fill=fill, font=font)
+
+
+def _draw_order_marker(
+    draw: ImageDraw.ImageDraw,
+    *,
+    x: int,
+    y: int,
+    order_number: int,
+    location_number: int,
+    marker_font: ImageFont.ImageFont,
+) -> None:
+    radius = 29 if location_number == 1 else 25
+    fill = "#dc2626" if location_number == 1 else "#2563eb"
+
+    # A large white halo and pin tail stay visible over both light and dark map
+    # tiles, including in Telegram's reduced channel preview.
+    draw.ellipse(
+        (x - radius - 6, y - radius - 6, x + radius + 6, y + radius + 6),
+        fill=(255, 255, 255, 230),
+        outline=(17, 24, 39, 150),
+        width=2,
+    )
+    draw.polygon(
+        ((x - 13, y + radius - 3), (x + 13, y + radius - 3), (x, y + radius + 24)),
+        fill=fill,
+        outline="white",
+    )
+    draw.ellipse(
+        (x - radius, y - radius, x + radius, y + radius),
+        fill=fill,
+        outline="white",
+        width=4,
+    )
+    label = str(order_number)
+    bounds = draw.textbbox((0, 0), label, font=marker_font)
+    draw.text(
+        (x - (bounds[2] - bounds[0]) / 2, y - (bounds[3] - bounds[1]) / 2 - 2),
+        label,
+        fill="white",
+        stroke_width=1,
+        stroke_fill="#7f1d1d" if location_number == 1 else "#1e3a8a",
+        font=marker_font,
+    )
+def _draw_warehouse_marker(
+    draw: ImageDraw.ImageDraw,
+    *,
+    x: int,
+    y: int,
+) -> None:
+    radius = 28
+    fill = "#f59e0b"
+    draw.ellipse(
+        (x - radius - 6, y - radius - 6, x + radius + 6, y + radius + 6),
+        fill=(255, 255, 255, 235),
+        outline=(17, 24, 39, 160),
+        width=2,
+    )
+    draw.ellipse(
+        (x - radius, y - radius, x + radius, y + radius),
+        fill=fill,
+        outline="white",
+        width=4,
+    )
+    # Simple warehouse pictogram that does not depend on an emoji font.
+    draw.polygon(
+        ((x - 17, y - 5), (x, y - 17), (x + 17, y - 5)),
+        fill="white",
+    )
+    draw.rectangle((x - 15, y - 5, x + 15, y + 15), fill="white")
+    draw.rectangle((x - 6, y + 3, x + 6, y + 15), fill=fill)
+    _label_box(
+        draw,
+        x=x,
+        y=y + radius + 10,
+        text="СКЛАД",
+        font=_font(18, bold=True),
+        fill="#92400e",
     )
 
 
@@ -99,10 +237,8 @@ async def render_active_orders_map(
     cache_dir: Path,
     tile_url: str | None = None,
 ) -> BytesIO | None:
-    """Render the current active delivery viewport as a Telegram-ready PNG."""
+    """Render Tashkent, the warehouse and current active orders as a PNG."""
     points = _order_points(orders)
-    if not points:
-        return None
 
     zoom, center_x, center_y = _viewport(points)
     left = center_x - MAP_WIDTH / 2
@@ -158,32 +294,41 @@ async def render_active_orders_map(
         raise RuntimeError("No map tiles could be downloaded")
 
     draw = ImageDraw.Draw(image, "RGBA")
-    marker_font = ImageFont.load_default(size=18)
-    small_font = ImageFont.load_default(size=14)
+    marker_font = _font(23, bold=True)
+
+    warehouse_world_x, warehouse_world_y = _world_pixel(
+        WAREHOUSE_LATITUDE,
+        WAREHOUSE_LONGITUDE,
+        zoom,
+    )
+    _draw_warehouse_marker(
+        draw,
+        x=round(warehouse_world_x - left),
+        y=round(warehouse_world_y - top),
+    )
+
     for order, location_number, latitude, longitude in points:
         world_x, world_y = _world_pixel(latitude, longitude, zoom)
         x = round(world_x - left)
         y = round(world_y - top)
-        radius = 19 if location_number == 1 else 15
-        fill = "#dc2626" if location_number == 1 else "#2563eb"
-        draw.ellipse(
-            (x - radius, y - radius, x + radius, y + radius),
-            fill=fill,
-            outline="white",
-            width=3,
-        )
-        label = str(order.order_number)
-        font = marker_font if len(label) <= 2 else small_font
-        bounds = draw.textbbox((0, 0), label, font=font)
-        draw.text(
-            (x - (bounds[2] - bounds[0]) / 2, y - (bounds[3] - bounds[1]) / 2 - 1),
-            label,
-            fill="white",
-            font=font,
+        _draw_order_marker(
+            draw,
+            x=x,
+            y=y,
+            order_number=order.order_number,
+            location_number=location_number,
+            marker_font=marker_font,
         )
 
+    legend_font = _font(18, bold=True)
+    legend = f"Ташкент · активных точек: {len(points)} · красные — заказы · синие — доп. адреса"
+    legend_bounds = draw.textbbox((0, 0), legend, font=legend_font)
+    legend_box = (10, 10, legend_bounds[2] - legend_bounds[0] + 30, 48)
+    draw.rounded_rectangle(legend_box, radius=8, fill=(255, 255, 255, 235))
+    draw.text((20, 18), legend, fill="#111827", font=legend_font)
+
     attribution = "© OpenStreetMap contributors"
-    attribution_font = ImageFont.load_default(size=14)
+    attribution_font = _font(14)
     bounds = draw.textbbox((0, 0), attribution, font=attribution_font)
     padding = 6
     box = (

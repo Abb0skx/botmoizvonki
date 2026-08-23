@@ -164,14 +164,13 @@ async def _send_courier_map_log(
     )
 
     image = None
-    if mapped_orders:
-        try:
-            image = await render_active_orders_map(
-                active_orders,
-                cache_dir=settings.database_path.parent / "map-tiles",
-            )
-        except Exception:
-            logger.exception("Could not render active-order map after order %s", completed_order_id)
+    try:
+        image = await render_active_orders_map(
+            active_orders,
+            cache_dir=settings.database_path.parent / "map-tiles",
+        )
+    except Exception:
+        logger.exception("Could not render active-order map after order %s", completed_order_id)
 
     latest = repo.get(completed_order_id)
     if not latest or latest.status != "completed":
@@ -188,7 +187,7 @@ async def _send_courier_map_log(
                     parse_mode=ParseMode.HTML,
                 )
             else:
-                suffix = "\n\nНет активных заказов с координатами для карты."
+                suffix = "\n\nНе удалось создать фотографию карты."
                 await application.bot.send_message(
                     chat_id=channel_id,
                     text=caption + suffix,
