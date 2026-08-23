@@ -102,13 +102,24 @@ def amount_text(order: Order) -> str:
     return f"{title} {money(order.amount_usd, order.amount_uzs)}"
 
 
-def _compact_order(order: Order) -> str:
+def phones_text(order: Order) -> str:
+    phones = [display_phone(order.client_phone)]
+    if order.client_phone_2 and order.client_phone_2 != order.client_phone:
+        phones.append(display_phone(order.client_phone_2))
+    return "\n".join(f"📱 {phone}" for phone in phones)
+
+
+def _compact_order(order: Order, *, status: str | None = None) -> str:
     lines = [
         f"🚚 <b>Заказ №{order.order_number}</b> · <b>{escape(order.seller_name or '—')}</b>",
+    ]
+    if status:
+        lines.append(f"🏷 {escape(status)}")
+    lines.extend([
         f"📦 {escape(order.product)}",
         amount_text(order),
-        f"📱 {display_phone(order.client_phone)}",
-    ]
+        phones_text(order),
+    ])
     if order.delivery_time:
         lines.append(f"🕒 {escape(order.delivery_time)}")
     if order.comment:
@@ -117,7 +128,8 @@ def _compact_order(order: Order) -> str:
 
 
 def manager_card(order: Order, *, sent: bool = False) -> str:
-    return _compact_order(order)
+    status = STATUS_LABELS.get(order.status, order.status)
+    return _compact_order(order, status=status)
 
 
 def courier_card(order: Order, state: str = "") -> str:
@@ -142,46 +154,57 @@ def completed_card(order: Order, local_time: str) -> str:
 
 
 STATUS_LABELS = {
+    "draft": "📝 Черновик",
     "pending": "🆕 Ожидает курьера",
     "on_way": "🚗 Курьер едет",
     "awaiting_photo": "📸 Подтверждается",
     "awaiting_amount": "💰 Ожидается сумма",
+    "completed": "✅ Доставлен",
+    "cancelled": "❌ Отменён",
 }
 
 
 def all_locations_card(orders: list[Order]) -> tuple[str, str | None]:
-    located = [order for order in orders if order.latitude is not None and order.longitude is not None]
-    visible = located[:25]
-    marker_numbers = {order.id: index for index, order in enumerate(visible, start=1)}
     if not orders:
         return "📦 <b>Активных заказов сейчас нет.</b>", None
 
-    lines = [f"📦 <b>Активные заказы: {len(orders)}</b>"]
-    for order in orders[:20]:
-        area = short_address(order)
-        point_url = telegram_location_url(order) or yandex_map_url(order)
-        model = escape(order.product[:100])
-        model_text = f'<a href="{escape(point_url, quote=True)}">{model}</a>' if point_url else model
-        marker = f"📌 {marker_numbers[order.id]} · " if order.id in marker_numbers else ""
-        lines.append(
-            f"\n{marker}<b>№{order.order_number}</b> · {model_text}\n"
-            f"{STATUS_LABELS.get(order.status, order.status)} · {escape(area)} · "
-            f"{escape(order.seller_name or 'владелец не указан')}"
-        )
-        second_url = telegram_location_url(order, 2)
-        if second_url:
-            lines.append(f'<a href="{escape(second_url, quote=True)}">📍 Доп. локация</a>')
-    if len(orders) > 20:
-        lines.append(f"\n…и ещё {len(orders) - 20}")
-
-    if not located:
-        return "\n".join(lines), None
-    map_points: list[tuple[float, float]] = []
-    for order in visible:
-        map_points.append((order.latitude, order.longitude))
+    points: list[tuple[Order, int, float, float]] = []
+    for order in orders:
+        if order.latitude is not None and order.longitude is not None:
+            points.append((order, 1, order.latitude, order.longitude))
         if order.second_latitude is not None and order.second_longitude is not None:
-            map_points.append((order.second_latitude, order.second_longitude))
-    map_points = map_points[:25]
+            points.append((order, 2, order.second_latitude, order.second_longitude))
+
+    lines = [f"📦 <b>Активные заказы: {len(orders)}</b>"]
+    if not points:
+        lines.append("\nНет заказов с координатами.")
+        return "\n".join(lines), None
+
+    visible: list[tuple[Order, int, float, float]] = []
+    legend: list[str] = []
+    # Keep enough room for the heading and the final truncation note. Telegram
+    # limits a text message to 4096 characters, including HTML markup.
+    legend_budget = 3400
+    for order, location_number, latitude, longitude in points[:25]:
+        marker_number = len(visible) + 1
+        location_name = "основная" if location_number == 1 else "доп."
+        point_url = telegram_location_url(order, location_number)
+        model = escape(" ".join(order.product.split())[:32])
+        model_text = f'<a href="{escape(point_url, quote=True)}">{model}</a>' if point_url else model
+        area = escape(short_address(order, location_number)[:55])
+        owner = escape((order.seller_name or "—")[:18])
+        line = (
+            f"📌 <b>{marker_number}</b> · №{order.order_number} · {location_name} · {model_text}\n"
+            f"{STATUS_LABELS.get(order.status, escape(order.status))} · {area} · {owner}"
+        )
+        if sum(len(item) + 2 for item in legend) + len(line) > legend_budget:
+            break
+        visible.append((order, location_number, latitude, longitude))
+        legend.append(line)
+
+    lines.extend(f"\n{line}" for line in legend)
+
+    map_points = [(latitude, longitude) for _order, _number, latitude, longitude in visible]
     center_lat = sum(point[0] for point in map_points) / len(map_points)
     center_lon = sum(point[1] for point in map_points) / len(map_points)
     span = max(
@@ -189,20 +212,35 @@ def all_locations_card(orders: list[Order]) -> tuple[str, str | None]:
         max(point[1] for point in map_points) - min(point[1] for point in map_points),
     )
     zoom = 14 if span < 0.02 else 12 if span < 0.05 else 10 if span < 0.15 else 8 if span < 0.5 else 6
-    points = "~".join(
+    encoded_points = "~".join(
         f"{longitude:.6f},{latitude:.6f},pm2rdm{index}"
         for index, (latitude, longitude) in enumerate(map_points, start=1)
     )
     map_url = "https://yandex.uz/maps/?" + urlencode({
         "ll": f"{center_lon:.6f},{center_lat:.6f}",
         "z": str(zoom),
-        "pt": points,
+        "pt": encoded_points,
     })
-    lines.append(f'\n<a href="{escape(map_url, quote=True)}">📌 Показать все точки на одной карте</a>')
-    total_points = sum(
-        1 + int(order.second_latitude is not None and order.second_longitude is not None)
-        for order in located
-    )
-    if total_points > 25:
-        lines.append("На общей карте показаны первые 25 точек.")
+    if len(visible) < len(points):
+        lines.append(f"\nНа общей карте показаны {len(visible)} из {len(points)} точек.")
     return "\n".join(lines), map_url
+
+
+def location_post_text(order: Order, location_number: int = 1) -> str:
+    """Compact order details shown next to a published Telegram Location."""
+    location_name = "Основная локация" if location_number == 1 else "Доп. локация"
+    lines = [
+        f"🚚 <b>Заказ №{order.order_number}</b> · <b>{escape(order.seller_name or '—')}</b>",
+        f"🏷 {STATUS_LABELS.get(order.status, escape(order.status))}",
+        f"📦 {escape(order.product)}",
+        amount_text(order),
+        phones_text(order),
+    ]
+    if order.delivery_time:
+        lines.append(f"🕒 {escape(order.delivery_time)}")
+    if order.comment:
+        lines.append(f"💬 {escape(order.comment)}")
+    if order.courier_name:
+        lines.append(f"🚗 {escape(order.courier_name)}")
+    lines.append(f"\n📍 <b>{location_name}:</b> {escape(short_address(order, location_number))}")
+    return "\n".join(lines)

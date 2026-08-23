@@ -33,6 +33,20 @@ def payment_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+def edit_input_keyboard(field: str | None = None) -> ReplyKeyboardMarkup:
+    """Keyboard for a single edit value with an always-visible cancel action."""
+    rows: list[list[KeyboardButton]] = []
+    if field == "seller":
+        rows.extend([
+            [KeyboardButton(SELLERS[0]), KeyboardButton(SELLERS[1])],
+            [KeyboardButton(SELLERS[2]), KeyboardButton(SELLERS[3])],
+        ])
+    elif field in {"payment", "payment_status"}:
+        rows.extend([[KeyboardButton(label)] for label in PAYMENT_LABELS.values()])
+    rows.append([KeyboardButton("❌ Отменить изменение")])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
 def review_keyboard(order_id: int, *, expanded: bool = False) -> InlineKeyboardMarkup:
     keyboard = _edit_rows(order_id) if expanded else [[
         InlineKeyboardButton("✏️ Изменить", callback_data=f"edit_menu:{order_id}"),
@@ -67,7 +81,11 @@ def manager_sent_keyboard(order: Order, *, expanded: bool = False) -> InlineKeyb
     ]]
     if expanded:
         edit_rows.append([InlineKeyboardButton("↩️ Назад", callback_data=f"edit_close:{order.id}")])
-    return InlineKeyboardMarkup(_location_rows(order) + edit_rows)
+    return InlineKeyboardMarkup(
+        _location_rows(order)
+        + edit_rows
+        + [[InlineKeyboardButton("🔄 Синхронизировать", callback_data=f"sync:{order.id}")]]
+    )
 
 
 def _location_rows(order: Order) -> list[list[InlineKeyboardButton]]:
@@ -86,29 +104,13 @@ def location_channel_keyboard(
     marker: str = "🆕",
     location_number: int = 1,
 ) -> InlineKeyboardMarkup:
-    product = " ".join(order.product.split())
-    if len(product) > 36:
-        product = product[:33] + "…"
-    has_second = order.second_latitude is not None and order.second_longitude is not None
-    location_label = f" · Локация {location_number}" if has_second else ""
-    label = f"{marker} №{order.order_number}{location_label} · {product}"
     phone_digits = "".join(character for character in order.client_phone if character.isdigit())
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            label,
-            callback_data=f"location_info:{order.id}:{location_number}",
-        )],
-        [
-            InlineKeyboardButton(
-                "📞 Позвонить",
-                url=f"https://bot.texnikach.uz/call#{phone_digits}",
-            ),
-            InlineKeyboardButton(
-                "💬 Telegram клиента",
-                url=f"tg://resolve?phone={phone_digits}",
-            ),
-        ],
-    ])
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "💬 Telegram клиента",
+            url=f"tg://resolve?phone={phone_digits}",
+        ),
+    ]])
 
 
 def courier_keyboard(order: Order) -> InlineKeyboardMarkup:
@@ -158,6 +160,45 @@ def all_locations_keyboard(map_url: str | None) -> InlineKeyboardMarkup | None:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("🗺 Все локации на карте", url=map_url),
     ]])
+
+
+def orders_page_keyboard(
+    kind: str,
+    page: int,
+    total_pages: int,
+    map_url: str | None = None,
+) -> InlineKeyboardMarkup:
+    """Navigation for zero-based active/all order-list pages."""
+    if kind not in {"active", "all"}:
+        raise ValueError("kind must be 'active' or 'all'")
+    if total_pages < 1:
+        raise ValueError("total_pages must be positive")
+    if page < 0 or page >= total_pages:
+        raise ValueError("page is outside total_pages")
+
+    rows: list[list[InlineKeyboardButton]] = []
+    if map_url:
+        rows.append([
+            InlineKeyboardButton("🗺 Все локации на карте", url=map_url),
+        ])
+
+    navigation: list[InlineKeyboardButton] = []
+    if page > 0:
+        navigation.append(InlineKeyboardButton(
+            "⬅️",
+            callback_data=f"orders_page:{kind}:{page - 1}",
+        ))
+    navigation.append(InlineKeyboardButton(
+        f"{page + 1}/{total_pages}",
+        callback_data=f"orders_page:{kind}:{page}",
+    ))
+    if page + 1 < total_pages:
+        navigation.append(InlineKeyboardButton(
+            "➡️",
+            callback_data=f"orders_page:{kind}:{page + 1}",
+        ))
+    rows.append(navigation)
+    return InlineKeyboardMarkup(rows)
 
 
 def skip_keyboard() -> ReplyKeyboardMarkup:

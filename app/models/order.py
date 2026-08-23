@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -10,6 +11,7 @@ class Order:
     manager_name: str
     client_phone: str
     product: str
+    client_phone_2: str | None = None
     seller_name: str | None = None
     payment_status: str = "collect_on_delivery"
     amount_usd: int | None = None
@@ -42,10 +44,45 @@ class Order:
     delivery_message_id: int | None = None
     location_chat_id: int | None = None
     location_message_id: int | None = None
+    location_details_message_id: int | None = None
     second_location_chat_id: int | None = None
     second_location_message_id: int | None = None
+    second_location_details_message_id: int | None = None
+    manager_chat_id: int | None = None
+    manager_message_id: int | None = None
+    creation_token: str | None = None
+    sync_needed: int = 0
+    sync_attempted_at: str | None = None
 
     @classmethod
     def from_row(cls, row: Any) -> "Order":
         values = dict(row)
+        return cls(**{name: values.get(name) for name in cls.__dataclass_fields__})
+
+
+@dataclass(slots=True)
+class OrderEvent:
+    id: int
+    order_id: int
+    order_number: int
+    event_type: str
+    actor_id: int | None = None
+    actor_name: str | None = None
+    actor_role: str | None = None
+    from_status: str | None = None
+    to_status: str | None = None
+    changed_fields: tuple[str, ...] = field(default_factory=tuple)
+    created_at: str | None = None
+
+    @classmethod
+    def from_row(cls, row: Any) -> "OrderEvent":
+        values = dict(row)
+        raw_fields = values.get("changed_fields") or "[]"
+        try:
+            parsed_fields = json.loads(raw_fields)
+        except (TypeError, json.JSONDecodeError):
+            parsed_fields = []
+        if not isinstance(parsed_fields, list):
+            parsed_fields = []
+        values["changed_fields"] = tuple(str(value) for value in parsed_fields)
         return cls(**{name: values.get(name) for name in cls.__dataclass_fields__})

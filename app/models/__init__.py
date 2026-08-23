@@ -1,3 +1,3 @@
-from .order import Order
+from .order import Order, OrderEvent
 
-__all__ = ["Order"]
+__all__ = ["Order", "OrderEvent"]

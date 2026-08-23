@@ -2,7 +2,7 @@ import asyncio
 import logging
 import time
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 
@@ -62,17 +62,28 @@ async def resolve_map_url(url: str) -> tuple[float | None, float | None, str]:
         return latitude, longitude, original
     try:
         async with httpx.AsyncClient(
-            follow_redirects=True,
-            max_redirects=5,
+            follow_redirects=False,
             timeout=8,
             headers={"User-Agent": "TEXNIKACH-Delivery-Bot/1.0"},
         ) as client:
-            response = await client.get(original)
-            response.raise_for_status()
-            resolved = str(response.url)
+            resolved = original
+            for _ in range(6):
+                if not _allowed_map_url(resolved):
+                    raise ValueError("Map redirect host is not allowed")
+                response = await client.get(resolved)
+                if response.is_redirect:
+                    target = response.headers.get("location")
+                    if not target:
+                        raise ValueError("Map redirect has no target")
+                    resolved = urljoin(resolved, target)
+                    continue
+                response.raise_for_status()
+                resolved = str(response.url)
+                break
+            else:
+                raise ValueError("Too many map redirects")
         if not _allowed_map_url(resolved):
-            logger.warning("Map redirect was rejected: %s", urlsplit(resolved).hostname)
-            return None, None, original
+            raise ValueError("Map redirect host is not allowed")
         latitude, longitude, _ = parse_location_url(resolved)
         return latitude, longitude, resolved
     except (httpx.HTTPError, ValueError) as error:

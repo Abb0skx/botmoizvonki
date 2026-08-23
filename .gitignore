@@ -1,4 +1,6 @@
 .env
+.env.*
+!.env.example
 data/.env
 __pycache__/
 *.pyc
@@ -10,3 +12,8 @@ data/Data/sheets-auto-update-484813-fe0f96f83d38.json
 data/reviews.db
 data/reviews.db-shm
 data/reviews.db-wal
+data/delivery.db
+data/delivery.db-shm
+data/delivery.db-wal
+data/delivery-state.pickle*
+data/delivery-heartbeat

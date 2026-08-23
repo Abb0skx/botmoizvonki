@@ -17,7 +17,7 @@ from app.handlers.orders import (
     delivery_input, details, save_edit, second_location,
 )
 from app.utils.formatters import (
-    all_locations_card, courier_card, manager_card, short_address,
+    all_locations_card, courier_card, location_post_text, manager_card, short_address,
     telegram_location_url, telegram_message_url, yandex_map_url,
     yandex_route_url,
 )
@@ -166,7 +166,7 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
         }
         with patch("app.handlers.orders.enrich_location", AsyncMock(return_value=location)):
             state = await details(update, context)
-        self.assertEqual(state, SECOND_LOCATION)
+        self.assertEqual(state, PAYMENT)
         self.assertEqual(context.user_data["draft"]["client_phone"], "+998901333999")
         self.assertEqual(context.user_data["draft"]["amount_uzs"], 1920000)
 
@@ -188,7 +188,7 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
         }
         with patch("app.handlers.orders.enrich_location", AsyncMock(return_value=location)):
             state = await details(map_update, context)
-        self.assertEqual(state, SECOND_LOCATION)
+        self.assertEqual(state, PAYMENT)
 
     async def test_optional_second_location_is_saved(self):
         context = self.context()
@@ -409,7 +409,11 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
             bot = SimpleNamespace(
                 send_location=AsyncMock(
                     return_value=SimpleNamespace(chat_id=-1004398605075, message_id=88)
-                )
+                ),
+                send_message=AsyncMock(
+                    return_value=SimpleNamespace(chat_id=-1004398605075, message_id=188)
+                ),
+                delete_message=AsyncMock(),
             )
             settings = SimpleNamespace(location_channel_id=-1004398605075)
             context = SimpleNamespace(
@@ -422,6 +426,7 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
             bot.send_location.assert_awaited_once()
             self.assertEqual(published.location_chat_id, -1004398605075)
             self.assertEqual(published.location_message_id, 88)
+            self.assertEqual(published.location_details_message_id, 188)
             self.assertEqual(
                 telegram_location_url(published),
                 "https://t.me/c/4398605075/88",
@@ -436,11 +441,16 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
                 chat_id=-1004398605075,
                 message_id=89,
             )
+            bot.send_message.return_value = SimpleNamespace(
+                chat_id=-1004398605075,
+                message_id=189,
+            )
             published = await _publish_location(context, repo, published, 2)
             self.assertEqual(
                 telegram_location_url(published, 2),
                 "https://t.me/c/4398605075/89",
             )
+            self.assertEqual(published.second_location_details_message_id, 189)
 
 
 class RepositoryTests(unittest.TestCase):
@@ -587,18 +597,14 @@ class RepositoryTests(unittest.TestCase):
             "https://t.me/c/4398605075/79",
         )
 
-    def test_location_channel_has_phone_actions(self):
+    def test_location_channel_only_opens_client_telegram(self):
         order = self.repo.create(manager_id=1, manager_name="A", data=self.data)
         keyboard = location_channel_keyboard(order)
-        button_texts = [button.text for row in keyboard.inline_keyboard for button in row]
-        self.assertIn("📞 Позвонить", button_texts)
-        self.assertIn("💬 Telegram клиента", button_texts)
-        self.assertNotIn("📋 Скопировать номер", button_texts)
-        call_button = keyboard.inline_keyboard[1][0]
-        self.assertEqual(
-            call_button.url,
-            "https://bot.texnikach.uz/call#998901333999",
-        )
+        buttons = [button for row in keyboard.inline_keyboard for button in row]
+        self.assertEqual(len(buttons), 1)
+        self.assertEqual(buttons[0].text, "💬 Telegram клиента")
+        self.assertEqual(buttons[0].url, "tg://resolve?phone=998901333999")
+        self.assertIsNone(buttons[0].callback_data)
 
     def test_delivery_confirmation_and_compact_edit_buttons_have_back(self):
         order = self.repo.create(manager_id=1, manager_name="A", data=self.data)
@@ -682,6 +688,89 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(map_button.url, map_url)
         self.assertIn("rtext", yandex_route_url(self.repo.get(first.id)))
         self.assertIn("pt", yandex_map_url(self.repo.get(first.id)))
+
+    def test_active_locations_map_numbers_every_location_in_order(self):
+        first = self.repo.create(
+            manager_id=1,
+            manager_name="A",
+            data={
+                **self.data,
+                "latitude": 41.31,
+                "longitude": 69.24,
+                "second_latitude": 41.32,
+                "second_longitude": 69.25,
+                "second_address_text": "Чиланзар",
+            },
+        )
+        second = self.repo.create(
+            manager_id=1,
+            manager_name="A",
+            data={
+                **self.data,
+                "product": "S25 Ultra",
+                "latitude": 41.33,
+                "longitude": 69.26,
+            },
+        )
+        self.repo.update(first.id, status="pending")
+        self.repo.update(second.id, status="pending")
+
+        text, map_url = all_locations_card(self.repo.list_active())
+
+        self.assertIn("📌 <b>1</b> · №1 · основная", text)
+        self.assertIn("📌 <b>2</b> · №1 · доп.", text)
+        self.assertIn("📌 <b>3</b> · №2 · основная", text)
+        self.assertEqual(map_url.count("pm2rdm"), 3)
+
+    def test_active_locations_map_legend_matches_25_point_limit(self):
+        for index in range(14):
+            order = self.repo.create(
+                manager_id=1,
+                manager_name="A",
+                data={
+                    **self.data,
+                    "product": f"Model {index + 1}",
+                    "latitude": 41.30 + index / 1000,
+                    "longitude": 69.20 + index / 1000,
+                    "second_latitude": 41.40 + index / 1000,
+                    "second_longitude": 69.30 + index / 1000,
+                },
+            )
+            self.repo.update(order.id, status="pending")
+
+        text, map_url = all_locations_card(self.repo.list_active())
+
+        self.assertEqual(map_url.count("pm2rdm"), 25)
+        self.assertIn("📌 <b>25</b> · №13 · основная", text)
+        self.assertNotIn("· №14 ·", text)
+        self.assertIn("показаны 25 из 28 точек", text)
+
+    def test_manager_card_shows_status(self):
+        order = self.repo.create(manager_id=1, manager_name="A", data=self.data)
+        self.assertIn("📝 Черновик", manager_card(order))
+        completed = self.repo.update(order.id, status="completed")
+        self.assertIn("✅ Доставлен", manager_card(completed))
+
+    def test_location_post_text_contains_compact_order_details(self):
+        order = self.repo.create(
+            manager_id=1,
+            manager_name="A",
+            data={
+                **self.data,
+                "seller_name": "Abbos",
+                "delivery_time": "До 17:00",
+                "comment": "Позвонить",
+                "latitude": 41.31,
+                "longitude": 69.24,
+                "address_text": "Чиланзар, Ташкент",
+            },
+        )
+        text = location_post_text(order)
+        for expected in (
+            "Заказ №1", "Abbos", "📝 Черновик", "A7 Pro", "100$",
+            "+998 90 133 39 99", "До 17:00", "Позвонить", "Чиланзар",
+        ):
+            self.assertIn(expected, text)
 
     def test_cards_escape_employee_text(self):
         order = self.repo.create(

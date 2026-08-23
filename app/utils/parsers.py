@@ -13,6 +13,9 @@ _PHONE_RE = re.compile(
     r"[\s()\-]*(?:\d[\s()\-]*){7}"
     r")(?!\d)"
 )
+_AMOUNT_PATTERN = r"(?:\d{1,3}(?:[ \t.,]\d{3})+|\d+)"
+_USD_MARKER = r"(?:\$|usd\b|доллар(?:а|ов)?\b|дол(?:л)?\.?(?!\w))"
+_UZS_MARKER = r"(?:uzs\b|с[уў]м(?:а|ов)?\b|so['ʻ’`]?m\b)"
 
 
 def normalize_phone(value: str) -> str:
@@ -37,7 +40,6 @@ def parse_amount(value: str) -> tuple[int | None, int | None]:
         raise ValueError("Сумма не может быть отрицательной")
     usd_values: list[int] = []
     uzs_values: list[int] = []
-    amount_pattern = r"\d(?:[\d.,]|[ \t](?=\d))*"
 
     def take_usd(match: re.Match) -> str:
         usd_values.append(int(re.sub(r"\D", "", match.group(1))))
@@ -47,23 +49,22 @@ def parse_amount(value: str) -> tuple[int | None, int | None]:
         uzs_values.append(int(re.sub(r"\D", "", match.group(1))))
         return " "
 
-    # A currency marker always wins. Horizontal whitespace is allowed inside
-    # an amount, but a newline never joins a model number with the price.
-    clean = re.sub(rf"({amount_pattern})[ \t]*\$", take_usd, clean)
-    clean = re.sub(
-        rf"({amount_pattern})[ \t]*(?:сум|so['’]?m|uzs)",
-        take_uzs,
-        clean,
-        flags=re.I,
+    # A currency marker always wins. The start boundary prevents digits that
+    # belong to a model name (e.g. ``A56 375$``) from joining the price.
+    # A grouped amount only accepts proper three-digit groups, so
+    # ``100 1 920 000 сум`` is parsed as USD 100 + UZS 1,920,000.
+    explicit_patterns = (
+        (rf"(?<!\w)({_AMOUNT_PATTERN})[ \t]*{_USD_MARKER}", take_usd),
+        (rf"(?<!\w){_USD_MARKER}[ \t:]*({_AMOUNT_PATTERN})(?!\w)", take_usd),
+        (rf"(?<!\w)({_AMOUNT_PATTERN})[ \t]*{_UZS_MARKER}", take_uzs),
+        (rf"(?<!\w){_UZS_MARKER}[ \t:]*({_AMOUNT_PATTERN})(?!\w)", take_uzs),
     )
+    for pattern, callback in explicit_patterns:
+        clean = re.sub(pattern, callback, clean, flags=re.I)
 
     candidates: list[int] = []
-    for raw in re.findall(amount_pattern, clean):
-        groups = re.findall(r"\d+", raw)
-        if len(groups) > 1 and all(len(group) == 3 for group in groups[1:]):
-            candidates.append(int("".join(groups)))
-        else:
-            candidates.extend(int(group) for group in groups)
+    for match in re.finditer(rf"(?<!\w){_AMOUNT_PATTERN}(?!\w)", clean):
+        candidates.append(int(re.sub(r"\D", "", match.group(0))))
 
     usd = usd_values[-1] if usd_values else None
     uzs = uzs_values[-1] if uzs_values else None
@@ -82,41 +83,63 @@ def parse_amount(value: str) -> tuple[int | None, int | None]:
     return usd, uzs
 
 
-def parse_order_details(value: str) -> dict[str, str | int | None]:
-    """Extract phone, amount and a map URL from one free-form message."""
+def parse_order_details(value: str) -> dict[str, str | int | None | list[str]]:
+    """Extract phones, amount and up to two map URLs from free-form text.
+
+    ``client_phone`` remains the primary phone for backwards compatibility;
+    ``client_phones`` contains every distinct recognized phone in priority
+    order (labelled phone lines first, then other occurrences).
+    """
     if not value.strip() or len(value) > 4096:
         raise ValueError("Сообщение пустое или слишком длинное")
 
-    result: dict[str, str | int | None] = {}
+    result: dict[str, str | int | None | list[str]] = {}
     remaining = value
 
-    url_match = _URL_RE.search(remaining)
-    if url_match:
+    location_urls: list[str] = []
+    url_spans: list[tuple[int, int]] = []
+    for url_match in _URL_RE.finditer(remaining):
         location_url = url_match.group(0).rstrip(".,;:!?)>]}")
-        result["location_url"] = location_url
-        remaining = remaining[:url_match.start()] + " " + remaining[url_match.end():]
+        if location_url not in location_urls:
+            location_urls.append(location_url)
+        url_spans.append((url_match.start(), url_match.end()))
+    if location_urls:
+        result["location_url"] = location_urls[0]
+        result["location_urls"] = location_urls[:2]
+        for start, end in reversed(url_spans):
+            remaining = remaining[:start] + " " + remaining[end:]
 
-    phone_match = None
-    phone_span = None
-    labelled = _PHONE_LABEL_RE.search(remaining)
-    if labelled:
-        phone_match = _PHONE_RE.search(labelled.group(1))
-        if phone_match:
-            phone_span = (
-                labelled.start(1) + phone_match.start(),
-                labelled.start(1) + phone_match.end(),
-            )
-    if phone_match is None:
-        phone_match = _PHONE_RE.search(remaining)
-        if phone_match:
-            phone_span = phone_match.span()
-    if phone_match:
+    phone_spans: set[tuple[int, int]] = set()
+    phones: list[str] = []
+
+    def remember_phone(match: re.Match, offset: int = 0) -> None:
+        # ``_PHONE_RE`` permits whitespace between digits and can therefore
+        # include a trailing newline. Do not let that make the labelled and
+        # global scans look like two overlapping phone occurrences.
+        raw_phone = match.group(0)
+        trimmed_phone = raw_phone.rstrip()
+        span = (offset + match.start(), offset + match.start() + len(trimmed_phone))
+        phone_spans.add(span)
         try:
-            result["client_phone"] = normalize_phone(phone_match.group(0))
+            phone = normalize_phone(trimmed_phone)
         except ValueError:
-            pass
-        else:
-            start, end = phone_span
+            return
+        if phone not in phones:
+            phones.append(phone)
+
+    # Preserve the old preference for explicitly labelled phone lines while
+    # allowing more than one phone on the same or on separate lines.
+    for labelled in _PHONE_LABEL_RE.finditer(remaining):
+        for phone_match in _PHONE_RE.finditer(labelled.group(1)):
+            remember_phone(phone_match, labelled.start(1))
+    for phone_match in _PHONE_RE.finditer(remaining):
+        if phone_match.span() not in phone_spans:
+            remember_phone(phone_match)
+
+    if phones:
+        result["client_phone"] = phones[0]
+        result["client_phones"] = phones
+        for start, end in sorted(phone_spans, reverse=True):
             remaining = remaining[:start] + " " + remaining[end:]
 
     if re.search(r"\d", remaining):

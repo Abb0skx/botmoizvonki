@@ -5,11 +5,23 @@ services:
       dockerfile: Dockerfile.delivery
     container_name: texnikach-delivery-bot
     restart: unless-stopped
+    stop_grace_period: 1m
     init: true
     env_file:
       - .env.delivery
     volumes:
       - delivery-data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sqlite3,time; from pathlib import Path; from urllib.parse import quote; p=Path(os.getenv('DELIVERY_DB_PATH','/app/data/delivery.db')).resolve(); assert p.is_file(); db=sqlite3.connect('file:'+quote(str(p))+'?mode=ro',uri=True); assert db.execute(\"SELECT 1 FROM sqlite_master WHERE type='table' AND name='orders'\").fetchone(); assert db.execute('PRAGMA quick_check').fetchone()[0]=='ok'; h=p.with_name('delivery-heartbeat'); assert h.is_file() and time.time()-h.stat().st_mtime<180"]
+      interval: 1m
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   delivery-data:
