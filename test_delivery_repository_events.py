@@ -76,6 +76,37 @@ class DeliveryRepositoryEventTests(unittest.TestCase):
             columns = {row[1] for row in db.execute("PRAGMA table_info(orders)")}
         self.assertIn("client_phone_2", columns)
 
+    def test_pickup_timestamp_is_migrated_and_keeps_order_open(self) -> None:
+        legacy_path = Path(self.tempdir.name) / "legacy-pickup.db"
+        legacy_schema = "\n".join(
+            line
+            for line in SCHEMA.splitlines()
+            if not line.strip().startswith("picked_up_at ")
+        )
+        with sqlite3.connect(legacy_path) as db:
+            db.executescript(legacy_schema)
+        legacy = OrderRepository(legacy_path)
+        legacy.initialize()
+        order = legacy.create(
+            manager_id=101,
+            manager_name="Manager",
+            data={
+                "client_phone": "+998901111111",
+                "product": "A7 Pro",
+                "amount_usd": 100,
+            },
+        )
+        picked_up = legacy.transition(
+            order.id,
+            {"draft"},
+            status="picked_up",
+            picked_up_at="2026-08-23T10:30:00+05:00",
+        )
+
+        self.assertEqual(picked_up.picked_up_at, "2026-08-23T10:30:00+05:00")
+        self.assertEqual(legacy.count_open(), 1)
+        self.assertEqual(legacy.list_active()[0].status, "picked_up")
+
     def test_pagination_and_counts_preserve_existing_list_methods(self) -> None:
         orders = [self.create_order(product=f"Model {number}") for number in range(5)]
         self.repo.transition(orders[0].id, {"draft"}, status="completed")

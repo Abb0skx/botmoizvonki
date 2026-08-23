@@ -44,8 +44,8 @@ from app.utils.static_map import render_active_orders_map
 
 logger = logging.getLogger(__name__)
 SELLER, PRODUCT, DETAILS, SECOND_LOCATION, PAYMENT, DELIVERY_TIME, COMMENT, EDIT_VALUE = range(8)
-MANAGER_EDITABLE_STATUSES = {"draft", "pending", "on_way"}
-DELIVERY_ACTIVE_STATUSES = {"pending", "on_way", "awaiting_photo", "awaiting_amount"}
+MANAGER_EDITABLE_STATUSES = {"draft", "pending", "picked_up", "on_way"}
+DELIVERY_ACTIVE_STATUSES = {"pending", "picked_up", "on_way", "awaiting_photo", "awaiting_amount"}
 LOCATION_SEPARATOR = "\n".join(["📍" * 11] * 3)
 ORDER_PAGE_SIZE = 10
 EDIT_CANCEL_TEXT = "❌ Отменить изменение"
@@ -346,6 +346,8 @@ def _delivery_message(order):
         )
     if order.status == "on_way":
         return courier_card(order, "🚗 <b>Курьер едет</b>"), on_way_keyboard(order)
+    if order.status == "picked_up":
+        return courier_card(order, "📦 <b>Товар у курьера</b>"), courier_keyboard(order)
     if order.status == "awaiting_photo":
         return courier_card(order, "📸 <b>Курьер подтверждает доставку</b>"), delivery_pending_keyboard(order)
     if order.status == "awaiting_amount":
@@ -2087,7 +2089,7 @@ async def courier_assignment_action(update: Update, context: ContextTypes.DEFAUL
     if not source_is_current:
         await query.answer("Эта карточка устарела. Откройте актуальную карточку заказа.", show_alert=True)
         return
-    if order.status not in {"draft", "pending", "on_way"}:
+    if order.status not in {"draft", "pending", "picked_up", "on_way"}:
         await query.answer("Для закрытого заказа курьера изменить нельзя", show_alert=True)
         return
     if action == "courier_menu":
@@ -2125,6 +2127,7 @@ async def courier_assignment_action(update: Update, context: ContextTypes.DEFAUL
         assigned_courier_name=selected.name,
         courier_id=None,
         courier_name=None,
+        picked_up_at=None,
         time_started=None,
         delivery_photo=None,
         received_usd=None,
@@ -2156,7 +2159,7 @@ async def courier_assignment_action(update: Update, context: ContextTypes.DEFAUL
         cleanup_messages.append((order.delivery_chat_id, order.delivery_message_id))
     updated = repo.transition(
         order.id,
-        {"draft", "pending", "on_way"},
+        {"draft", "pending", "picked_up", "on_way"},
         expected_updated_at=order.updated_at,
         actor_id=query.from_user.id,
         actor_name=_name(query.from_user),
@@ -2167,6 +2170,7 @@ async def courier_assignment_action(update: Update, context: ContextTypes.DEFAUL
         assigned_courier_name=selected.name,
         courier_id=None,
         courier_name=None,
+        picked_up_at=None,
         time_started=None,
         delivery_photo=None,
         received_usd=None,
@@ -2220,6 +2224,88 @@ async def manager_sync_action(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
 
 
+async def manager_pickup_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    action, raw_id = query.data.split(":")
+    settings: Settings = context.application.bot_data["settings"]
+    if not _allowed(query.from_user.id, settings.manager_ids):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    repo: OrderRepository = context.application.bot_data["repo"]
+    order = repo.get(int(raw_id))
+    if not order:
+        await query.answer("Заказ не найден", show_alert=True)
+        return
+    manager_source = bool(
+        order.manager_chat_id
+        and order.manager_message_id
+        and query.message.chat_id == order.manager_chat_id
+        and query.message.message_id == order.manager_message_id
+    )
+    journal_source = bool(
+        order.orders_channel_chat_id
+        and order.orders_channel_message_id
+        and query.message.chat_id == order.orders_channel_chat_id
+        and query.message.message_id == order.orders_channel_message_id
+        and query.message.chat_id == getattr(settings, "orders_channel_id", None)
+    )
+    if not (manager_source or journal_source):
+        await query.answer(
+            "Эта карточка устарела. Откройте актуальную карточку заказа.",
+            show_alert=True,
+        )
+        return
+
+    if action == "pickup":
+        if order.status != "pending" or not order.assigned_courier_id:
+            await query.answer("Заказ уже изменился или курьер не выбран", show_alert=True)
+            return
+        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        updated = repo.transition(
+            order.id,
+            {"pending"},
+            expected_updated_at=order.updated_at,
+            status="picked_up",
+            picked_up_at=timestamp,
+            courier_id=order.assigned_courier_id,
+            courier_name=order.assigned_courier_name,
+            actor_id=query.from_user.id,
+            actor_name=_name(query.from_user),
+            actor_role="manager",
+        )
+        message = f"Товар у курьера {order.assigned_courier_name}"
+    else:
+        if order.status != "picked_up":
+            await query.answer("Отметку уже нельзя отменить", show_alert=True)
+            return
+        updated = repo.transition(
+            order.id,
+            {"picked_up"},
+            expected_updated_at=order.updated_at,
+            status="pending",
+            picked_up_at=None,
+            courier_id=None,
+            courier_name=None,
+            time_started=None,
+            actor_id=query.from_user.id,
+            actor_name=_name(query.from_user),
+            actor_role="manager",
+        )
+        message = "Отметка «товар забран» снята"
+    if not updated:
+        await query.answer("Заказ уже изменился. Откройте свежую карточку.", show_alert=True)
+        return
+    await query.answer(message)
+    _, success = await _sync_order(context, updated.id)
+    if not success:
+        _schedule_sync_retry(context, updated.id)
+        await _notify_manager(
+            context,
+            query.from_user.id,
+            "⚠️ Статус сохранён, но часть сообщений Telegram обновится автоматически позже.",
+        )
+
+
 async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     settings: Settings = context.application.bot_data["settings"]
@@ -2255,19 +2341,23 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if action == "undo_cancel":
         if order.status != "cancelled" or order.courier_id != query.from_user.id:
             await query.answer("Этот заказ уже нельзя вернуть", show_alert=True); return
+        target_status = "picked_up" if order.picked_up_at else "pending"
+        reset = {
+            "status": target_status,
+            "time_started": None,
+            "delivery_photo": None,
+            "received_usd": None,
+            "received_uzs": None,
+            "delivered_at": None,
+        }
+        if target_status == "pending":
+            reset.update(courier_id=None, courier_name=None)
         order = repo.transition(
             order.id,
             {"cancelled"},
-            status="pending",
-            courier_id=None,
-            courier_name=None,
-            time_started=None,
-            delivery_photo=None,
-            received_usd=None,
-            received_uzs=None,
-            delivered_at=None,
             guard_courier_id=query.from_user.id,
             require_unassigned_or_same=True,
+            **reset,
         )
         if not order:
             await query.answer("Этот заказ уже нельзя вернуть", show_alert=True); return
@@ -2282,13 +2372,17 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _notify_manager(
             context,
             order.manager_id,
-            f"↩️ Отмена заказа №{order.order_number} снята. Заказ снова ожидает курьера.",
+            f"↩️ Отмена заказа №{order.order_number} снята. Заказ снова активен.",
         )
         return
     if action == "undo_complete":
         if order.status not in {"awaiting_photo", "awaiting_amount", "completed"} or order.courier_id != query.from_user.id:
             await query.answer("Подтверждение уже нельзя отменить", show_alert=True); return
-        target_status = "on_way" if order.time_started else "pending"
+        target_status = (
+            "on_way"
+            if order.time_started
+            else ("picked_up" if order.picked_up_at else "pending")
+        )
         reset = {
             "status": target_status,
             "delivery_photo": None,
@@ -2333,15 +2427,19 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "courier_name": configured_courier.name if configured_courier else _name(query.from_user),
     }
     if action == "undo_onway":
+        target_status = "picked_up" if order.picked_up_at else "pending"
+        reset = {
+            "status": target_status,
+            "time_started": None,
+        }
+        if target_status == "pending":
+            reset.update(courier_id=None, courier_name=None)
         order = repo.transition(
             order.id,
             {"on_way"},
-            status="pending",
-            courier_id=None,
-            courier_name=None,
-            time_started=None,
             guard_courier_id=query.from_user.id,
             require_unassigned_or_same=True,
+            **reset,
         )
         if not order:
             await query.answer("Выезд уже нельзя отменить", show_alert=True); return
@@ -2350,20 +2448,32 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             context,
             query,
             order,
-            courier_card(order, "↩️ <b>Выезд отменён, заказ снова свободен</b>"),
+            courier_card(order, "↩️ <b>Выезд отменён</b>"),
             courier_keyboard(order),
         )
         await _notify_manager(
             context,
             order.manager_id,
-            f"↩️ Курьер отменил выезд к заказу №{order.order_number}. Заказ снова ожидает курьера.",
+            f"↩️ Курьер отменил выезд к заказу №{order.order_number}.",
         )
     elif action == "onway":
         if order.status == "on_way" and order.courier_id == query.from_user.id:
             await query.answer("Вы уже едете к этому заказу"); return
+        current = repo.get_on_way_for_courier(
+            query.from_user.id,
+            exclude_order_id=order.id,
+        )
+        if current:
+            await query.answer(
+                f"Сначала завершите заказ №{current.order_number}",
+                show_alert=True,
+            )
+            return
+        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
         order = repo.transition(
-            order.id, {"pending"}, status="on_way",
-            time_started=datetime.now().astimezone().isoformat(timespec="seconds"),
+            order.id, {"pending", "picked_up"}, status="on_way",
+            picked_up_at=order.picked_up_at or timestamp,
+            time_started=timestamp,
             guard_courier_id=query.from_user.id, require_unassigned_or_same=True, **courier,
         )
         if not order:
@@ -2383,7 +2493,7 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
     elif action == "cancel":
         order = repo.transition(
-            order.id, {"pending", "on_way", "awaiting_photo", "awaiting_amount"},
+            order.id, {"pending", "picked_up", "on_way", "awaiting_photo", "awaiting_amount"},
             status="cancelled", guard_courier_id=query.from_user.id,
             require_unassigned_or_same=True, **courier,
         )
@@ -2406,8 +2516,9 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         timestamp = datetime.now().astimezone()
         order = repo.transition(
             order.id,
-            {"pending", "on_way"},
+            {"pending", "picked_up", "on_way"},
             status="completed",
+            picked_up_at=order.picked_up_at or timestamp.isoformat(timespec="seconds"),
             delivered_at=timestamp.isoformat(timespec="seconds"),
             guard_courier_id=query.from_user.id, require_unassigned_or_same=True, **courier,
         )
@@ -2629,7 +2740,7 @@ def register_handlers(application: Application) -> None:
             CallbackQueryHandler(
                 _end_edit_on_global_command,
                 pattern=(
-                    r"^(?:(?:edit_(?:menu|close)|send|manager_cancel|manager_restore|sync):\d+"
+                    r"^(?:(?:edit_(?:menu|close)|send|manager_cancel|manager_restore|sync|pickup|undo_pickup):\d+"
                     r"|courier_(?:menu|close|assign):\d+(?::\d+)?"
                     r"|orders_page:(?:active|all):\d+)$"
                 ),
@@ -2662,6 +2773,10 @@ def register_handlers(application: Application) -> None:
         pattern=r"^(?:control_)?courier_(?:menu|close|assign):\d+(?::\d+)?$",
     ))
     application.add_handler(CallbackQueryHandler(manager_sync_action, pattern=r"^sync:\d+$"))
+    application.add_handler(CallbackQueryHandler(
+        manager_pickup_action,
+        pattern=r"^(?:pickup|undo_pickup):\d+$",
+    ))
     application.add_handler(CallbackQueryHandler(courier_action, pattern=r"^(onway|undo_onway|complete|cancel|undo_cancel|undo_complete):\d+$"))
     application.add_handler(edit_conversation, group=1)
     application.add_handler(MessageHandler(filters.PHOTO | (filters.TEXT & ~filters.COMMAND), delivery_input), group=2)

@@ -40,6 +40,18 @@ class DeliverySequenceStop:
     courier_id: int | None
     courier_name: str
     color: str
+    state: str = "remaining"
+
+
+def _darken_hex(color: str, factor: float = 0.55) -> str:
+    try:
+        red, green, blue = (
+            int(color[index:index + 2], 16)
+            for index in (1, 3, 5)
+        )
+    except (TypeError, ValueError):
+        return "#334155"
+    return f"#{round(red * factor):02x}{round(green * factor):02x}{round(blue * factor):02x}"
 
 
 def _spread_marker_positions(
@@ -475,15 +487,35 @@ async def render_delivery_sequence_map(
         grouped.setdefault(stop.courier_id, []).append(stop)
     for route_stops in grouped.values():
         route_stops.sort(key=lambda stop: stop.sequence)
-        route_points = [
-            warehouse,
-            *(pixel(stop.latitude, stop.longitude) for stop in route_stops),
-            warehouse,
-        ]
         route_color = route_stops[0].color
-        if len(route_points) >= 3:
-            draw.line(route_points, fill=(255, 255, 255, 220), width=13, joint="curve")
-            draw.line(route_points, fill=route_color, width=7, joint="curve")
+        completed = [stop for stop in route_stops if stop.state == "completed"]
+        current = [stop for stop in route_stops if stop.state == "on_way"]
+        remaining = [
+            stop for stop in route_stops
+            if stop.state in {"picked_up", "remaining"}
+        ]
+        completed_points = [
+            warehouse,
+            *(pixel(stop.latitude, stop.longitude) for stop in completed),
+        ]
+        if completed and not current and not remaining:
+            completed_points.append(warehouse)
+        if len(completed_points) >= 2:
+            draw.line(completed_points, fill=(255, 255, 255, 225), width=13, joint="curve")
+            draw.line(
+                completed_points,
+                fill=_darken_hex(route_color),
+                width=7,
+                joint="curve",
+            )
+        if current:
+            origin = completed_points[-1] if completed else warehouse
+            current_points = [
+                origin,
+                *(pixel(stop.latitude, stop.longitude) for stop in current),
+            ]
+            draw.line(current_points, fill=(255, 255, 255, 240), width=15, joint="curve")
+            draw.line(current_points, fill=route_color, width=8, joint="curve")
 
     ordered_stops = sorted(stops, key=lambda item: item.sequence)
     actual_pixels = {
@@ -516,6 +548,11 @@ async def render_delivery_sequence_map(
     for stop in ordered_stops:
         x, y = marker_pixels[stop.sequence]
         radius = 28
+        completed = stop.state == "completed"
+        remaining = stop.state in {"picked_up", "remaining"}
+        marker_fill = _darken_hex(stop.color) if completed else ("white" if remaining else stop.color)
+        text_fill = stop.color if remaining else "white"
+        outline = stop.color if remaining else "white"
         draw.ellipse(
             (x - radius - 6, y - radius - 6, x + radius + 6, y + radius + 6),
             fill=(255, 255, 255, 235),
@@ -524,8 +561,8 @@ async def render_delivery_sequence_map(
         )
         draw.ellipse(
             (x - radius, y - radius, x + radius, y + radius),
-            fill=stop.color,
-            outline="white",
+            fill=marker_fill,
+            outline=outline,
             width=4,
         )
         label = str(stop.sequence)
@@ -533,8 +570,8 @@ async def render_delivery_sequence_map(
         draw.text(
             (x - (bounds[2] - bounds[0]) / 2, y - (bounds[3] - bounds[1]) / 2 - 2),
             label,
-            fill="white",
-            stroke_width=1,
+            fill=text_fill,
+            stroke_width=1 if not remaining else 0,
             stroke_fill="#111827",
             font=number_font,
         )
@@ -542,7 +579,7 @@ async def render_delivery_sequence_map(
     legend_font = _font(18, bold=True)
     legend = (
         f"Очередность доставок · {report_day_label} · "
-        f"остановок: {len(stops)} · склад → заказы → склад"
+        f"точек: {len(stops)} · тёмная линия — доставлено · яркая — сейчас"
     )
     bounds = draw.textbbox((0, 0), legend, font=legend_font)
     legend_box = (10, 10, min(MAP_WIDTH - 10, bounds[2] - bounds[0] + 30), 48)

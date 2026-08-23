@@ -14,13 +14,18 @@ from app.utils.parsers import display_phone
 
 
 TASHKENT = ZoneInfo("Asia/Tashkent")
-ACTIVE_STATUSES = {"draft", "pending", "on_way", "awaiting_photo", "awaiting_amount"}
+ACTIVE_STATUSES = {"draft", "pending", "picked_up", "on_way", "awaiting_photo", "awaiting_amount"}
 COURIER_COLORS = {
     7636344727: "#ef4444",
     202134293: "#2563eb",
     1799690992: "#10b981",
 }
 UNKNOWN_COURIER_COLOR = "#7c3aed"
+COURIER_DARK_COLORS = {
+    7636344727: "#991b1b",
+    202134293: "#1e3a8a",
+    1799690992: "#065f46",
+}
 
 
 def parse_report_day(value: str | None, *, today: date | None = None) -> date:
@@ -85,7 +90,7 @@ def _courier_color(courier_id: int | None) -> str:
 
 
 def _event_courier_id(event: OrderEvent, order: Order) -> int | None:
-    if event.actor_id in COURIERS_BY_ID:
+    if event.actor_role == "courier" and event.actor_id in COURIERS_BY_ID:
         return event.actor_id
     return _courier_id(order)
 
@@ -93,7 +98,9 @@ def _event_courier_id(event: OrderEvent, order: Order) -> int | None:
 def _event_courier_name(event: OrderEvent, order: Order) -> str:
     courier_id = _event_courier_id(event, order)
     configured = COURIERS_BY_ID.get(courier_id)
-    return event.actor_name or (configured.name if configured else None) or _courier_name(order)
+    if event.actor_role == "courier" and event.actor_name:
+        return event.actor_name
+    return (configured.name if configured else None) or _courier_name(order)
 
 
 def _report_courier(
@@ -103,10 +110,10 @@ def _report_courier(
     courier_events = [
         event
         for event in events
-        if event.actor_id in COURIERS_BY_ID
+        if event.actor_role == "courier" and event.actor_id in COURIERS_BY_ID
         and (
-            event.to_status in {"on_way", "completed", "cancelled"}
-            or event.from_status in {"on_way", "completed"}
+            event.to_status in {"picked_up", "on_way", "completed", "cancelled"}
+            or event.from_status in {"picked_up", "on_way", "completed"}
         )
     ]
     if courier_events:
@@ -133,10 +140,10 @@ def _status_at_day_end(
 def _activity_event(event: OrderEvent) -> bool:
     return bool(
         event.event_type == "order_created"
-        or event.to_status in {"on_way", "completed", "cancelled"}
+        or event.to_status in {"picked_up", "on_way", "completed", "cancelled"}
         or (
-            event.from_status in {"on_way", "completed", "cancelled"}
-            and event.to_status == "pending"
+            event.from_status in {"picked_up", "on_way", "completed", "cancelled"}
+            and event.to_status in {"pending", "picked_up"}
         )
     )
 
@@ -180,26 +187,40 @@ def _timeline_item(event: OrderEvent, order: Order) -> dict[str, Any] | None:
                 f" · продавец {order.seller_name or '—'}"
             ),
         }
-    if event.from_status == "completed" and event.to_status in {"pending", "on_way"}:
+    if event.from_status == "completed" and event.to_status in {"pending", "picked_up", "on_way"}:
         return {
             **base,
             "kind": "completion_undone",
             "icon": "↩️",
             "text": f"{courier_name} отменил завершение заказа №{order.order_number}",
         }
-    if event.from_status == "on_way" and event.to_status == "pending":
+    if event.from_status == "on_way" and event.to_status in {"pending", "picked_up"}:
         return {
             **base,
             "kind": "departure_undone",
             "icon": "↩️",
             "text": f"{courier_name} отменил выезд к заказу №{order.order_number}",
         }
-    if event.from_status == "cancelled" and event.to_status == "pending":
+    if event.from_status == "cancelled" and event.to_status in {"pending", "picked_up"}:
         return {
             **base,
             "kind": "restored",
             "icon": "↩️",
             "text": f"Заказ №{order.order_number} возвращён в доставку",
+        }
+    if event.from_status == "picked_up" and event.to_status == "pending":
+        return {
+            **base,
+            "kind": "pickup_undone",
+            "icon": "↩️",
+            "text": f"Снята отметка «товар забран» с заказа №{order.order_number}",
+        }
+    if event.to_status == "picked_up":
+        return {
+            **base,
+            "kind": "picked_up",
+            "icon": "📦",
+            "text": f"{courier_name} забрал товар для заказа №{order.order_number}",
         }
     if event.to_status == "on_way":
         return {
@@ -229,8 +250,13 @@ def _order_times(
     order: Order,
     events: list[OrderEvent],
     report_day: date,
-) -> tuple[datetime | None, datetime | None, datetime | None]:
+) -> tuple[datetime | None, datetime | None, datetime | None, datetime | None]:
     created = local_datetime(order.created_at)
+    pickups = [
+        occurred
+        for event in events
+        if event.to_status == "picked_up" and (occurred := _event_time(event))
+    ]
     starts = [
         occurred
         for event in events
@@ -241,15 +267,18 @@ def _order_times(
         for event in events
         if event.to_status == "completed" and (occurred := _event_time(event))
     ]
+    picked_up = pickups[-1] if pickups else local_datetime(order.picked_up_at)
     started = starts[-1] if starts else local_datetime(order.time_started)
     completed = completions[-1] if completions else local_datetime(order.delivered_at)
     if created and created.date() != report_day:
         created = None
+    if picked_up and picked_up.date() != report_day:
+        picked_up = None
     if started and started.date() != report_day:
         started = None
     if completed and completed.date() != report_day:
         completed = None
-    return created, started, completed
+    return created, picked_up, started, completed
 
 
 def _duration_minutes(started: datetime | None, completed: datetime | None) -> int | None:
@@ -286,11 +315,12 @@ def build_delivery_stats(
     relevant: list[Order] = []
     for order in all_orders:
         created = local_datetime(order.created_at)
+        picked_up = local_datetime(order.picked_up_at)
         started = local_datetime(order.time_started)
         delivered = local_datetime(order.delivered_at)
         has_day_field = any(
             value and value.date() == report_day
-            for value in (created, started, delivered)
+            for value in (created, picked_up, started, delivered)
         )
         activity_events = activity_events_by_order.get(order.id, [])
         if not has_day_field and not activity_events:
@@ -299,7 +329,7 @@ def build_delivery_stats(
             event_couriers = {
                 _event_courier_id(event, order)
                 for event in activity_events
-                if event.actor_role == "courier" or event.actor_id in COURIERS_BY_ID
+                if event.actor_role == "courier"
             }
             if courier_id not in {_courier_id(order), *event_couriers}:
                 continue
@@ -310,12 +340,13 @@ def build_delivery_stats(
     cancelled_ids: set[int] = set()
     created_ids: set[int] = set()
     durations: list[int] = []
+    pickup_durations: list[int] = []
     total_usd = total_uzs = received_usd = received_uzs = 0
 
     for order in relevant:
         day_events = all_day_events_by_order.get(order.id, [])
         activity_events = activity_events_by_order.get(order.id, [])
-        created, started, completed = _order_times(order, day_events, report_day)
+        created, picked_up, started, completed = _order_times(order, day_events, report_day)
         created_today = bool(created) or any(
             event.event_type == "order_created" for event in activity_events
         )
@@ -332,8 +363,11 @@ def build_delivery_stats(
         if cancelled_today:
             cancelled_ids.add(order.id)
         duration = _duration_minutes(started, completed)
+        pickup_duration = _duration_minutes(picked_up, completed)
         if duration is not None:
             durations.append(duration)
+        if pickup_duration is not None:
+            pickup_durations.append(pickup_duration)
 
         total_usd += order.amount_usd or 0
         total_uzs += order.amount_uzs or 0
@@ -346,7 +380,7 @@ def build_delivery_stats(
         phones = [display_phone(order.client_phone)]
         if order.client_phone_2 and order.client_phone_2 != order.client_phone:
             phones.append(display_phone(order.client_phone_2))
-        sort_time = completed or started or created or local_datetime(order.updated_at) or start
+        sort_time = completed or started or picked_up or created or local_datetime(order.updated_at) or start
         rows.append({
             "id": order.id,
             "order_number": order.order_number,
@@ -359,9 +393,11 @@ def build_delivery_stats(
             "phones": phones,
             "address": short_address(order),
             "created_time": created.strftime("%H:%M") if created else None,
+            "picked_up_time": picked_up.strftime("%H:%M") if picked_up else None,
             "started_time": started.strftime("%H:%M") if started else None,
             "completed_time": completed.strftime("%H:%M") if completed else None,
             "duration_minutes": duration,
+            "pickup_duration_minutes": pickup_duration,
             "amount_usd": order.amount_usd or 0,
             "amount_uzs": order.amount_uzs or 0,
             "amount_text": _money_text(order.amount_usd or 0, order.amount_uzs or 0),
@@ -374,19 +410,28 @@ def build_delivery_stats(
     rows.sort(key=lambda item: (item["sort_timestamp"], item["order_number"]))
     row_by_id = {row["id"]: row for row in rows}
 
-    stop_candidates: list[tuple[tuple[Any, ...], Order, int, float, float]] = []
+    stop_candidates: list[
+        tuple[tuple[Any, ...], Order, int, float, float, str]
+    ] = []
     for order in relevant:
         row = row_by_id[order.id]
-        priority = 0 if row["completed_today"] else (1 if row["started_time"] else 2)
+        if row["completed_today"]:
+            route_state, priority = "completed", 0
+        elif row["status"] == "on_way":
+            route_state, priority = "on_way", 1
+        elif row["status"] == "picked_up":
+            route_state, priority = "picked_up", 2
+        else:
+            route_state, priority = "remaining", 3
         base_key = (priority, row["sort_timestamp"], order.order_number)
         if order.latitude is not None and order.longitude is not None:
-            stop_candidates.append((base_key + (1,), order, 1, order.latitude, order.longitude))
+            stop_candidates.append((base_key + (1,), order, 1, order.latitude, order.longitude, route_state))
         if order.second_latitude is not None and order.second_longitude is not None:
-            stop_candidates.append((base_key + (2,), order, 2, order.second_latitude, order.second_longitude))
+            stop_candidates.append((base_key + (2,), order, 2, order.second_latitude, order.second_longitude, route_state))
     stop_candidates.sort(key=lambda item: item[0])
 
     stops: list[dict[str, Any]] = []
-    for sequence, (_, order, location_number, latitude, longitude) in enumerate(stop_candidates, 1):
+    for sequence, (_, order, location_number, latitude, longitude, route_state) in enumerate(stop_candidates, 1):
         row = row_by_id[order.id]
         address = short_address(order, location_number)
         stops.append({
@@ -403,7 +448,8 @@ def build_delivery_stats(
             "courier_name": row["courier_name"],
             "color": row["courier_color"],
             "completed": row["completed_today"],
-            "time": row["completed_time"] or row["started_time"] or row["created_time"],
+            "state": route_state,
+            "time": row["completed_time"] or row["started_time"] or row["picked_up_time"] or row["created_time"],
             "map_url": _order_map_url(order, location_number),
         })
 
@@ -417,7 +463,18 @@ def build_delivery_stats(
             "courier_id": route_courier_id,
             "courier_name": configured.name if configured else route_stops[0]["courier_name"],
             "color": _courier_color(route_courier_id),
+            "dark_color": COURIER_DARK_COLORS.get(route_courier_id, "#4c1d95"),
             "sequences": [stop["sequence"] for stop in route_stops],
+            "completed_sequences": [
+                stop["sequence"] for stop in route_stops if stop["state"] == "completed"
+            ],
+            "current_sequences": [
+                stop["sequence"] for stop in route_stops if stop["state"] == "on_way"
+            ],
+            "remaining_sequences": [
+                stop["sequence"] for stop in route_stops
+                if stop["state"] in {"picked_up", "remaining"}
+            ],
         })
 
     timeline = []
@@ -445,6 +502,8 @@ def build_delivery_stats(
             "orders": len(courier_rows),
             "completed": sum(1 for row in courier_rows if row["completed_today"]),
             "active": sum(1 for row in courier_rows if row["status"] in ACTIVE_STATUSES),
+            "picked_up": sum(1 for row in courier_rows if row["status"] == "picked_up"),
+            "on_way": sum(1 for row in courier_rows if row["status"] == "on_way"),
             "cancelled": sum(1 for row in courier_rows if row["cancelled_today"]),
             "average_minutes": (
                 round(sum(courier_durations) / len(courier_durations))
@@ -464,8 +523,15 @@ def build_delivery_stats(
             "completed": len(completed_ids),
             "cancelled": len(cancelled_ids),
             "active": sum(1 for row in rows if row["status"] in ACTIVE_STATUSES),
+            "picked_up": sum(1 for row in rows if row["status"] == "picked_up"),
+            "on_way": sum(1 for row in rows if row["status"] == "on_way"),
             "mapped": len(stops),
             "average_minutes": round(sum(durations) / len(durations)) if durations else None,
+            "average_pickup_minutes": (
+                round(sum(pickup_durations) / len(pickup_durations))
+                if pickup_durations
+                else None
+            ),
             "amount_usd": total_usd,
             "amount_uzs": total_uzs,
             "amount_text": _money_text(total_usd, total_uzs),

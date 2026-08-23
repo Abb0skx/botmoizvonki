@@ -131,6 +131,10 @@ class StatisticsKeyboardTests(unittest.TestCase):
             urls,
         )
         self.assertTrue(any("courier_id=1799690992" in url for url in urls))
+        self.assertIn(
+            "https://bot.texnikach.uz/delivery/monitor",
+            urls,
+        )
 
 
 if __name__ == "__main__":

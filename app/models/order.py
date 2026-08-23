@@ -41,6 +41,7 @@ class Order:
     created_at: str | None = None
     updated_at: str | None = None
     delivered_at: str | None = None
+    picked_up_at: str | None = None
     time_started: str | None = None
     delivery_chat_id: int | None = None
     delivery_message_id: int | None = None

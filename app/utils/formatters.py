@@ -130,6 +130,7 @@ def daily_delivery_report(
     arrived_orders: set[int] = set()
     delivered_orders: set[int] = set()
     event_created_orders: set[int] = set()
+    event_picked_orders: set[int] = set()
     event_started_orders: set[int] = set()
     event_delivered_orders: set[int] = set()
     orders_by_id = {order.id: order for order in orders}
@@ -157,31 +158,49 @@ def daily_delivery_report(
                 f" · {product} · продавец {seller}"
             )
             priority = 0
-        elif event.from_status == "completed" and event.to_status in {"pending", "on_way"}:
+        elif event.from_status == "completed" and event.to_status in {"pending", "picked_up", "on_way"}:
             line = (
                 f"↩️ <b>{occurred:%H:%M}</b> · {courier} отменил завершение"
                 f" заказа №{order.order_number}"
             )
             priority = 4
-        elif event.from_status == "cancelled" and event.to_status == "pending":
+        elif event.from_status == "cancelled" and event.to_status in {"pending", "picked_up"}:
             line = (
                 f"↩️ <b>{occurred:%H:%M}</b> · Заказ №{order.order_number}"
                 " возвращён в доставку"
             )
             priority = 4
-        elif event.from_status == "on_way" and event.to_status == "pending":
+        elif event.from_status == "picked_up" and event.to_status == "pending":
+            line = (
+                f"↩️ <b>{occurred:%H:%M}</b> · Отметка «товар забран» снята"
+                f" с заказа №{order.order_number}"
+            )
+            priority = 4
+        elif event.from_status == "on_way" and event.to_status in {"pending", "picked_up"}:
             line = (
                 f"↩️ <b>{occurred:%H:%M}</b> · {courier} отменил выезд"
                 f" к заказу №{order.order_number}"
             )
             priority = 4
+        elif event.to_status == "picked_up":
+            event_picked_orders.add(order.id)
+            pickup_courier = escape(
+                order.courier_name
+                or order.assigned_courier_name
+                or "Курьер не назначен"
+            )
+            line = (
+                f"📦 <b>{occurred:%H:%M}</b> · {pickup_courier} забрал товар"
+                f" для заказа №{order.order_number}"
+            )
+            priority = 1
         elif event.to_status == "on_way":
             event_started_orders.add(order.id)
             line = (
                 f"🚗 <b>{occurred:%H:%M}</b> · {courier} выехал к заказу"
                 f" №{order.order_number} → {address}"
             )
-            priority = 1
+            priority = 2
         elif event.to_status == "completed":
             event_delivered_orders.add(order.id)
             delivered_orders.add(order.id)
@@ -189,13 +208,13 @@ def daily_delivery_report(
                 f"✅ <b>{occurred:%H:%M}</b> · {courier} приехал и доставил заказ"
                 f" №{order.order_number} · {address}"
             )
-            priority = 2
+            priority = 3
         elif event.to_status == "cancelled":
             line = (
                 f"❌ <b>{occurred:%H:%M}</b> · {courier} отменил заказ"
                 f" №{order.order_number}"
             )
-            priority = 3
+            priority = 4
         else:
             continue
         timeline.append((occurred, line, priority))
@@ -216,13 +235,22 @@ def daily_delivery_report(
                 0,
             ))
 
+        picked_up = _tashkent_datetime(order.picked_up_at)
+        if picked_up and picked_up.date() == report_day and order.id not in event_picked_orders:
+            timeline.append((
+                picked_up,
+                f"📦 <b>{picked_up:%H:%M}</b> · {courier} забрал товар"
+                f" для заказа №{order.order_number}",
+                1,
+            ))
+
         started = _tashkent_datetime(order.time_started)
         if started and started.date() == report_day and order.id not in event_started_orders:
             timeline.append((
                 started,
                 f"🚗 <b>{started:%H:%M}</b> · {courier} выехал к заказу"
                 f" №{order.order_number} → {address}",
-                1,
+                2,
             ))
 
         delivered = _tashkent_datetime(order.delivered_at)
@@ -232,7 +260,7 @@ def daily_delivery_report(
                 delivered,
                 f"✅ <b>{delivered:%H:%M}</b> · {courier} приехал и доставил заказ"
                 f" №{order.order_number} · {address}",
-                2,
+                3,
             ))
 
     timeline.sort(key=lambda item: (item[0], item[2], item[1]))
@@ -346,6 +374,9 @@ def orders_channel_card(order: Order) -> str:
         lines.append(f"🚚 Назначен курьер: <b>{escape(order.assigned_courier_name)}</b>")
     if order.courier_name:
         lines.append(f"👤 Принял заказ: {escape(order.courier_name)}")
+    picked_up = _local_datetime(order.picked_up_at)
+    if picked_up:
+        lines.append(f"📦 Курьер забрал товар: {escape(picked_up)}")
     started = _local_datetime(order.time_started)
     if started:
         lines.append(f"🚗 Начал доставку: {escape(started)}")
@@ -394,6 +425,7 @@ def completed_card(order: Order, local_time: str) -> str:
 STATUS_LABELS = {
     "draft": "📝 Черновик",
     "pending": "🆕 Ожидает курьера",
+    "picked_up": "📦 Товар у курьера",
     "on_way": "🚗 Курьер едет",
     "awaiting_photo": "📸 Подтверждается",
     "awaiting_amount": "💰 Ожидается сумма",

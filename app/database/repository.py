@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS orders (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     delivered_at TEXT,
+    picked_up_at TEXT,
     time_started TEXT,
     delivery_chat_id INTEGER,
     delivery_message_id INTEGER,
@@ -141,6 +142,7 @@ MIGRATION_COLUMNS = {
     "creation_token": "TEXT",
     "sync_needed": "INTEGER NOT NULL DEFAULT 0",
     "sync_attempted_at": "TEXT",
+    "picked_up_at": "TEXT",
 }
 
 
@@ -157,7 +159,7 @@ class OrderRepository:
         "delivery_time", "comment", "status",
         "assigned_courier_id", "assigned_courier_name",
         "courier_id", "courier_name", "delivery_photo", "received_usd",
-        "received_uzs", "delivered_at", "time_started", "delivery_chat_id",
+        "received_uzs", "delivered_at", "picked_up_at", "time_started", "delivery_chat_id",
         "delivery_message_id", "location_chat_id", "location_message_id",
         "location_details_message_id", "second_location_chat_id",
         "location_footer_message_id", "second_location_message_id",
@@ -327,7 +329,7 @@ class OrderRepository:
         with self.connect() as db:
             rows = db.execute(
                 """SELECT * FROM orders
-                   WHERE status IN ('pending', 'on_way', 'awaiting_photo', 'awaiting_amount')
+                   WHERE status IN ('pending', 'picked_up', 'on_way', 'awaiting_photo', 'awaiting_amount')
                    ORDER BY order_number"""
             ).fetchall()
         return [Order.from_row(row) for row in rows]
@@ -359,7 +361,7 @@ class OrderRepository:
             rows = db.execute(
                 """SELECT * FROM orders
                    WHERE manager_id=?
-                     AND status IN ('draft', 'pending', 'on_way', 'awaiting_photo', 'awaiting_amount')
+                     AND status IN ('draft', 'pending', 'picked_up', 'on_way', 'awaiting_photo', 'awaiting_amount')
                    ORDER BY order_number DESC LIMIT 20""",
                 (manager_id,),
             ).fetchall()
@@ -398,7 +400,7 @@ class OrderRepository:
         with self.connect() as db:
             rows = db.execute(
                 """SELECT * FROM orders
-                   WHERE status IN ('draft', 'pending', 'on_way', 'awaiting_photo', 'awaiting_amount')
+                   WHERE status IN ('draft', 'pending', 'picked_up', 'on_way', 'awaiting_photo', 'awaiting_amount')
                    ORDER BY order_number DESC"""
             ).fetchall()
         return [Order.from_row(row) for row in rows]
@@ -420,7 +422,7 @@ class OrderRepository:
         with self.connect() as db:
             row = db.execute(
                 """SELECT COUNT(*) FROM orders
-                   WHERE status IN ('draft', 'pending', 'on_way', 'awaiting_photo', 'awaiting_amount')"""
+                   WHERE status IN ('draft', 'pending', 'picked_up', 'on_way', 'awaiting_photo', 'awaiting_amount')"""
             ).fetchone()
         return int(row[0])
 
@@ -429,11 +431,31 @@ class OrderRepository:
         with self.connect() as db:
             rows = db.execute(
                 """SELECT * FROM orders
-                   WHERE status IN ('draft', 'pending', 'on_way', 'awaiting_photo', 'awaiting_amount')
+                   WHERE status IN ('draft', 'pending', 'picked_up', 'on_way', 'awaiting_photo', 'awaiting_amount')
                    ORDER BY order_number DESC LIMIT ? OFFSET ?""",
                 (limit, offset),
             ).fetchall()
         return [Order.from_row(row) for row in rows]
+
+    def get_on_way_for_courier(
+        self,
+        courier_id: int,
+        *,
+        exclude_order_id: int | None = None,
+    ) -> Order | None:
+        """Return the courier's canonical current destination, if any."""
+        query = (
+            "SELECT * FROM orders "
+            "WHERE status='on_way' AND COALESCE(courier_id, assigned_courier_id)=?"
+        )
+        parameters: list[Any] = [courier_id]
+        if exclude_order_id is not None:
+            query += " AND id!=?"
+            parameters.append(exclude_order_id)
+        query += " ORDER BY time_started DESC, order_number DESC LIMIT 1"
+        with self.connect() as db:
+            row = db.execute(query, parameters).fetchone()
+        return Order.from_row(row) if row else None
 
     def update(
         self,

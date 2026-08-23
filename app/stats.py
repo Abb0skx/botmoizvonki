@@ -7,6 +7,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
 from app.database import OrderRepository
+from app.monitor_service import build_delivery_monitor
 from app.stats_service import build_delivery_stats, parse_report_day
 from app.utils.couriers import COURIERS_BY_ID
 from app.utils.static_map import DeliverySequenceStop, render_delivery_sequence_map
@@ -23,7 +24,9 @@ STATS_PASSWORD = (
     or os.getenv("REVIEWS_ADMIN_PASSWORD")
     or ""
 )
-TEMPLATE_PATH = Path(__file__).parent / "templates" / "delivery_stats.html"
+TEMPLATE_DIR = Path(__file__).parent / "templates"
+STATS_TEMPLATE_PATH = TEMPLATE_DIR / "delivery_stats.html"
+MONITOR_TEMPLATE_PATH = TEMPLATE_DIR / "delivery_monitor.html"
 
 app = FastAPI(
     title="TEXNIKACH Delivery Statistics",
@@ -86,7 +89,7 @@ def _report(day: str, courier_id: int | None) -> dict:
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     response = await call_next(request)
-    if request.url.path.startswith("/delivery/stats"):
+    if request.url.path.startswith("/delivery/"):
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
@@ -104,6 +107,7 @@ async def security_headers(request: Request, call_next):
 
 @app.get("/healthz")
 @app.get("/delivery/stats/healthz")
+@app.get("/delivery/monitor/healthz")
 def health():
     if not STATS_PASSWORD:
         return JSONResponse({"ok": False, "reason": "password"}, status_code=503)
@@ -120,7 +124,18 @@ def robots():
 @app.get("/delivery/stats", response_class=HTMLResponse)
 @app.get("/delivery/stats/", response_class=HTMLResponse, include_in_schema=False)
 def statistics_page(_username: str = Depends(require_stats_auth)):
-    return HTMLResponse(TEMPLATE_PATH.read_text(encoding="utf-8"))
+    return HTMLResponse(STATS_TEMPLATE_PATH.read_text(encoding="utf-8"))
+
+
+@app.get("/delivery/monitor", response_class=HTMLResponse)
+@app.get("/delivery/monitor/", response_class=HTMLResponse, include_in_schema=False)
+def monitor_page(_username: str = Depends(require_stats_auth)):
+    return HTMLResponse(MONITOR_TEMPLATE_PATH.read_text(encoding="utf-8"))
+
+
+@app.get("/delivery/monitor/api/state")
+def monitor_state(_username: str = Depends(require_stats_auth)):
+    return build_delivery_monitor(_repository())
 
 
 @app.get("/delivery/stats/api/report")
@@ -148,6 +163,7 @@ async def statistics_map(
             courier_id=stop["courier_id"],
             courier_name=stop["courier_name"],
             color=stop["color"],
+            state=stop["state"],
         )
         for stop in report["stops"]
     ]

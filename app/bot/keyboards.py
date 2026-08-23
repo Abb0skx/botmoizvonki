@@ -99,6 +99,7 @@ def manager_sent_keyboard(order: Order, *, expanded: bool = False) -> InlineKeyb
         edit_rows.append([InlineKeyboardButton("↩️ Назад", callback_data=f"edit_close:{order.id}")])
     return InlineKeyboardMarkup(
         _location_rows(order)
+        + _pickup_rows(order)
         + [[InlineKeyboardButton("🚚 Изменить курьера", callback_data=f"courier_menu:{order.id}")]]
         + edit_rows
         + [[InlineKeyboardButton("🔄 Синхронизировать", callback_data=f"sync:{order.id}")]]
@@ -131,12 +132,26 @@ def _location_rows(order: Order) -> list[list[InlineKeyboardButton]]:
     return [row] if row else []
 
 
+def _pickup_rows(order: Order) -> list[list[InlineKeyboardButton]]:
+    if order.status == "pending" and order.assigned_courier_id:
+        return [[InlineKeyboardButton(
+            "📦 Курьер забрал товар",
+            callback_data=f"pickup:{order.id}",
+        )]]
+    if order.status == "picked_up":
+        return [[InlineKeyboardButton(
+            "↩️ Отменить «товар забран»",
+            callback_data=f"undo_pickup:{order.id}",
+        )]]
+    return []
+
+
 def orders_channel_keyboard(order: Order) -> InlineKeyboardMarkup:
-    rows = _location_rows(order)
+    rows = _location_rows(order) + _pickup_rows(order)
     delivery_url = delivery_order_message_url(order)
     if delivery_url:
         rows.append([InlineKeyboardButton("📦 Карточка в группе курьера", url=delivery_url)])
-    if order.status in {"draft", "pending", "on_way"}:
+    if order.status in {"draft", "pending", "picked_up", "on_way"}:
         courier_name = order.assigned_courier_name or "не выбран"
         rows.append([InlineKeyboardButton(
             f"🚚 Курьер: {courier_name}",
@@ -161,6 +176,7 @@ def delivery_day_log_keyboard(day: str) -> InlineKeyboardMarkup:
 
 def statistics_keyboard(base_url: str) -> InlineKeyboardMarkup:
     base = base_url.rstrip("/")
+    monitor = base.rsplit("/", 1)[0] + "/monitor"
 
     def report_url(day: str, courier_id: int | None = None) -> str:
         query = {"day": day}
@@ -181,6 +197,7 @@ def statistics_keyboard(base_url: str) -> InlineKeyboardMarkup:
     ]
     rows.append(courier_buttons[:2])
     rows.append(courier_buttons[2:])
+    rows.append([InlineKeyboardButton("🚦 Мониторинг курьеров", url=monitor)])
     rows.append([InlineKeyboardButton("🌐 Открыть всю статистику", url=base)])
     return InlineKeyboardMarkup(rows)
 
