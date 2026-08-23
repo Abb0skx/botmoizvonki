@@ -50,7 +50,9 @@ def _spread_marker_positions(
 ) -> dict[int, tuple[int, int]]:
     """Spread dense numbered markers while keeping a leader to the true point."""
     placed: dict[int, tuple[int, int]] = {}
-    margin = 40
+    horizontal_margin = 40
+    top_margin = 90
+    bottom_margin = 72
     for sequence, actual_x, actual_y in points:
         candidates = [(actual_x, actual_y)]
         phase = sequence * 2.399963229728653
@@ -64,8 +66,8 @@ def _spread_marker_positions(
 
         valid = [
             (
-                min(max(x, margin), MAP_WIDTH - margin),
-                min(max(y, margin + 16), MAP_HEIGHT - margin),
+                min(max(x, horizontal_margin), MAP_WIDTH - horizontal_margin),
+                min(max(y, top_margin), MAP_HEIGHT - bottom_margin),
             )
             for x, y in candidates
         ]

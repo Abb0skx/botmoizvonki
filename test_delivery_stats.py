@@ -181,8 +181,8 @@ class DeliverySequenceMapTests(unittest.IsolatedAsyncioTestCase):
         for x, y in positions.values():
             self.assertGreaterEqual(x, 40)
             self.assertLessEqual(x, MAP_WIDTH - 40)
-            self.assertGreaterEqual(y, 56)
-            self.assertLessEqual(y, MAP_HEIGHT - 40)
+            self.assertGreaterEqual(y, 90)
+            self.assertLessEqual(y, MAP_HEIGHT - 72)
         values = list(positions.values())
         for index, (x, y) in enumerate(values):
             for other_x, other_y in values[index + 1:]:
