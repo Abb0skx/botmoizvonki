@@ -174,8 +174,8 @@ class LocationPublicationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(buttons[1][0].text, "📦 A56 · №1 · Ali")
             self.assertEqual(buttons[2][0].text, "📱 +998 90 133 39 99")
             self.assertEqual(
-                {row[0].url for row in buttons},
-                {"tg://openmessage?chat_id=5125237049&message_id=25"},
+                {row[0].callback_data for row in buttons},
+                {f"location_order:{order.id}"},
             )
 
 

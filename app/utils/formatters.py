@@ -44,11 +44,10 @@ def telegram_message_url(chat_id: int | None, message_id: int | None) -> str | N
 
 
 def delivery_order_message_url(order: Order) -> str | None:
-    """Open the canonical delivery-group post from a location button.
+    """Return a supported direct link to the canonical delivery-group post.
 
-    Telegram exposes stable HTTPS message links for supergroups. The current
-    TEXNIKACH delivery chat is still a basic group, so it needs Telegram's
-    native ``openmessage`` URI with the positive MTProto chat identifier.
+    Telegram only exposes message links for channels and supergroups. Basic
+    groups use a callback fallback handled by the bot instead.
     """
     if not order.delivery_chat_id or not order.delivery_message_id:
         return None
@@ -56,12 +55,7 @@ def delivery_order_message_url(order: Order) -> str | None:
         order.delivery_chat_id,
         order.delivery_message_id,
     )
-    if public_link:
-        return public_link
-    return (
-        "tg://openmessage?"
-        f"chat_id={abs(order.delivery_chat_id)}&message_id={order.delivery_message_id}"
-    )
+    return public_link
 
 
 def telegram_location_url(order: Order, location_number: int = 1) -> str | None:

@@ -1917,6 +1917,67 @@ async def show_all_locations(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
+async def location_order_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle order buttons when the delivery chat is still a basic group.
+
+    Telegram has no direct message links for basic groups. The button therefore
+    shows the phone immediately and forwards the canonical group post to the
+    employee's private chat. Supergroups use a normal URL button instead.
+    """
+    query = update.callback_query
+    settings: Settings = context.application.bot_data["settings"]
+    allowed_ids = settings.manager_ids | settings.courier_ids
+    if query.from_user.id not in allowed_ids:
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    if not query.message or query.message.chat_id != settings.location_channel_id:
+        await query.answer("Эта кнопка доступна только в канале локаций", show_alert=True)
+        return
+
+    try:
+        order_id = int(query.data.split(":", 1)[1])
+    except (AttributeError, IndexError, ValueError):
+        await query.answer("Некорректная кнопка", show_alert=True)
+        return
+    repo: OrderRepository = context.application.bot_data["repo"]
+    order = repo.get(order_id)
+    if not order:
+        await query.answer("Заказ не найден", show_alert=True)
+        return
+    if query.message.message_id not in {
+        order.location_message_id,
+        order.second_location_message_id,
+    }:
+        await query.answer("Эта локация уже неактуальна", show_alert=True)
+        return
+
+    phone_lines = [display_phone(order.client_phone)]
+    if order.client_phone_2 and order.client_phone_2 != order.client_phone:
+        phone_lines.append(display_phone(order.client_phone_2))
+    alert = (
+        f"Заказ №{order.order_number} · {order.seller_name or '—'}\n"
+        f"{order.product}\nТелефон: {', '.join(phone_lines)}\n"
+        "Карточка отправлена в личный чат."
+    )
+    await query.answer(alert[:200], show_alert=True)
+
+    if not order.delivery_chat_id or not order.delivery_message_id:
+        return
+    try:
+        await context.bot.forward_message(
+            chat_id=query.from_user.id,
+            from_chat_id=order.delivery_chat_id,
+            message_id=order.delivery_message_id,
+        )
+    except Exception as error:
+        logger.warning(
+            "Could not forward delivery order %s to employee %s: %s",
+            order.id,
+            query.from_user.id,
+            error,
+        )
+
+
 def register_handlers(application: Application) -> None:
     creation_menu = MessageHandler(
         filters.Regex(
@@ -1974,6 +2035,7 @@ def register_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("cancel", cancel_conversation))
     application.add_handler(CallbackQueryHandler(orders_page, pattern=r"^orders_page:(?:active|all):\d+$"))
+    application.add_handler(CallbackQueryHandler(location_order_action, pattern=r"^location_order:\d+$"))
     application.add_handler(CallbackQueryHandler(toggle_edit_menu, pattern=r"^edit_(?:menu|close):\d+$"))
     application.add_handler(CallbackQueryHandler(manager_action, pattern=r"^(send|manager_cancel|manager_restore):\d+$"))
     application.add_handler(CallbackQueryHandler(manager_sync_action, pattern=r"^sync:\d+$"))

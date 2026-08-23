@@ -110,7 +110,7 @@ def location_channel_keyboard(
     location_number: int = 1,
 ) -> InlineKeyboardMarkup:
     target_url = delivery_order_message_url(order)
-    if not target_url:
+    if not order.delivery_chat_id or not order.delivery_message_id:
         raise ValueError("The delivery-group message must be published before its location")
 
     def label(value: str) -> str:
@@ -122,10 +122,16 @@ def location_channel_keyboard(
         f"📦 {order.product} · №{order.order_number} · {order.seller_name or '—'}"
     )
     phone = label(f"📱 {display_phone(order.client_phone)}")
+
+    def order_button(text: str) -> InlineKeyboardButton:
+        if target_url:
+            return InlineKeyboardButton(text, url=target_url)
+        return InlineKeyboardButton(text, callback_data=f"location_order:{order.id}")
+
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(address, url=target_url)],
-        [InlineKeyboardButton(order_line, url=target_url)],
-        [InlineKeyboardButton(phone, url=target_url)],
+        [order_button(address)],
+        [order_button(order_line)],
+        [order_button(phone)],
     ])
 
 

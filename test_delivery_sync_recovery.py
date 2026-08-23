@@ -67,8 +67,8 @@ class DeletedMessageRecoveryTests(unittest.IsolatedAsyncioTestCase):
             keyboard = bot.edit_message_reply_markup.await_args.kwargs["reply_markup"]
             self.assertEqual(len(keyboard.inline_keyboard), 3)
             self.assertEqual(
-                {row[0].url for row in keyboard.inline_keyboard},
-                {"tg://openmessage?chat_id=5125237049&message_id=55"},
+                {row[0].callback_data for row in keyboard.inline_keyboard},
+                {f"location_order:{order.id}"},
             )
             bot.delete_message.assert_awaited_once_with(chat_id=-1002, message_id=61)
 
