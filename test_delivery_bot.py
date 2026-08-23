@@ -17,7 +17,7 @@ from app.handlers.orders import (
     delivery_input, details, save_edit, second_location,
 )
 from app.utils.formatters import (
-    all_locations_card, completed_card, courier_card, location_post_text, manager_card, short_address,
+    all_locations_card, completed_card, courier_card, manager_card, short_address,
     telegram_location_url, telegram_message_url, yandex_map_url,
     yandex_route_url,
 )
@@ -405,13 +405,15 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
                     "longitude": 69.240562,
                 },
             )
-            repo.update(order.id, status="pending")
+            repo.update(
+                order.id,
+                status="pending",
+                delivery_chat_id=-5125237049,
+                delivery_message_id=50,
+            )
             bot = SimpleNamespace(
                 send_location=AsyncMock(
                     return_value=SimpleNamespace(chat_id=-1004398605075, message_id=88)
-                ),
-                send_message=AsyncMock(
-                    return_value=SimpleNamespace(chat_id=-1004398605075, message_id=188)
                 ),
                 delete_message=AsyncMock(),
             )
@@ -426,7 +428,13 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
             bot.send_location.assert_awaited_once()
             self.assertEqual(published.location_chat_id, -1004398605075)
             self.assertEqual(published.location_message_id, 88)
-            self.assertEqual(published.location_details_message_id, 188)
+            self.assertIsNone(published.location_details_message_id)
+            location_buttons = bot.send_location.await_args.kwargs["reply_markup"].inline_keyboard
+            self.assertEqual(len(location_buttons), 3)
+            self.assertEqual(
+                {row[0].url for row in location_buttons},
+                {"tg://openmessage?chat_id=5125237049&message_id=50"},
+            )
             self.assertEqual(
                 telegram_location_url(published),
                 "https://t.me/c/4398605075/88",
@@ -441,16 +449,12 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
                 chat_id=-1004398605075,
                 message_id=89,
             )
-            bot.send_message.return_value = SimpleNamespace(
-                chat_id=-1004398605075,
-                message_id=189,
-            )
             published = await _publish_location(context, repo, published, 2)
             self.assertEqual(
                 telegram_location_url(published, 2),
                 "https://t.me/c/4398605075/89",
             )
-            self.assertEqual(published.second_location_details_message_id, 189)
+            self.assertIsNone(published.second_location_details_message_id)
 
 
 class RepositoryTests(unittest.TestCase):
@@ -605,14 +609,28 @@ class RepositoryTests(unittest.TestCase):
             "https://t.me/c/4398605075/79",
         )
 
-    def test_location_channel_only_opens_client_telegram(self):
-        order = self.repo.create(manager_id=1, manager_name="A", data=self.data)
+    def test_location_channel_buttons_return_to_delivery_post(self):
+        order = self.repo.create(
+            manager_id=1,
+            manager_name="A",
+            data={**self.data, "seller_name": "Ali", "address_text": "Яшнабадский район"},
+        )
+        order = self.repo.update(
+            order.id,
+            delivery_chat_id=-5125237049,
+            delivery_message_id=50,
+        )
         keyboard = location_channel_keyboard(order)
         buttons = [button for row in keyboard.inline_keyboard for button in row]
-        self.assertEqual(len(buttons), 1)
-        self.assertEqual(buttons[0].text, "💬 Telegram клиента")
-        self.assertEqual(buttons[0].url, "tg://resolve?phone=998901333999")
-        self.assertIsNone(buttons[0].callback_data)
+        self.assertEqual(len(buttons), 3)
+        self.assertEqual(buttons[0].text, "📍 Яшнабадский район")
+        self.assertEqual(buttons[1].text, "📦 A7 Pro · №1 · Ali")
+        self.assertEqual(buttons[2].text, "📱 +998 90 133 39 99")
+        self.assertEqual(
+            {button.url for button in buttons},
+            {"tg://openmessage?chat_id=5125237049&message_id=50"},
+        )
+        self.assertTrue(all(button.callback_data is None for button in buttons))
 
     def test_delivery_confirmation_and_compact_edit_buttons_have_back(self):
         order = self.repo.create(manager_id=1, manager_name="A", data=self.data)
@@ -758,27 +776,6 @@ class RepositoryTests(unittest.TestCase):
         self.assertIn("📝 Черновик", manager_card(order))
         completed = self.repo.update(order.id, status="completed")
         self.assertIn("✅ Доставлен", manager_card(completed))
-
-    def test_location_post_text_contains_compact_order_details(self):
-        order = self.repo.create(
-            manager_id=1,
-            manager_name="A",
-            data={
-                **self.data,
-                "seller_name": "Abbos",
-                "delivery_time": "До 17:00",
-                "comment": "Позвонить",
-                "latitude": 41.31,
-                "longitude": 69.24,
-                "address_text": "Чиланзар, Ташкент",
-            },
-        )
-        text = location_post_text(order)
-        for expected in (
-            "Заказ №1", "Abbos", "📝 Черновик", "A7 Pro", "100$",
-            "+998 90 133 39 99", "До 17:00", "Позвонить", "Чиланзар",
-        ):
-            self.assertIn(expected, text)
 
     def test_cards_escape_employee_text(self):
         order = self.repo.create(

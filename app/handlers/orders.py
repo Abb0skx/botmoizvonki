@@ -32,7 +32,7 @@ from app.utils import (
     parse_order_details,
 )
 from app.utils.formatters import (
-    STATUS_LABELS, all_locations_card, amount_text, location_post_text, money,
+    STATUS_LABELS, all_locations_card, amount_text, money,
 )
 from app.utils.parsers import display_phone
 
@@ -261,12 +261,7 @@ async def _set_location_marker(
     order,
     location_number: int | None = None,
 ) -> bool:
-    """Refresh the text next to each native Telegram Location.
-
-    Telegram Location messages do not support captions. New publications are
-    therefore a native pin followed by a reply containing all order data.
-    Older pins are upgraded lazily the next time an order is synchronized.
-    """
+    """Put compact order buttons directly under each native Telegram Location."""
     numbers = (location_number,) if location_number else (1, 2)
     success = True
     repo: OrderRepository = context.application.bot_data["repo"]
@@ -287,14 +282,14 @@ async def _set_location_marker(
         if not chat_id or not message_id:
             continue
 
-        # Touch the native pin first.  Without this check Telegram can accept a
-        # details message with allow_sending_without_reply and silently leave
-        # it orphaned after somebody deleted the pin.
         try:
             await context.bot.edit_message_reply_markup(
                 chat_id=chat_id,
                 message_id=message_id,
-                reply_markup=None,
+                reply_markup=location_channel_keyboard(
+                    order,
+                    location_number=number,
+                ),
             )
         except Exception as error:
             if not _message_is_not_modified(error):
@@ -331,75 +326,19 @@ async def _set_location_marker(
                     )
                 success = False
                 continue
-
-        try:
-            if details_message_id:
-                try:
-                    await context.bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=details_message_id,
-                        text=location_post_text(order, number),
-                        parse_mode=ParseMode.HTML,
-                        disable_web_page_preview=True,
-                        reply_markup=location_channel_keyboard(order, location_number=number),
-                    )
-                    continue
-                except Exception as error:
-                    if _message_is_not_modified(error):
-                        continue
-                    if not _message_is_missing(error):
-                        raise
-                    cleared = repo.update(
-                        order.id,
-                        expected_updated_at=order.updated_at,
-                        **{details_field: None},
-                    )
-                    if not cleared:
-                        success = False
-                        continue
-                    order = cleared
-
-            try:
-                details = await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=location_post_text(order, number),
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
-                    reply_to_message_id=message_id,
-                    allow_sending_without_reply=False,
-                    reply_markup=location_channel_keyboard(order, location_number=number),
-                )
-            except Exception as error:
-                if _message_is_missing(error):
-                    prefix = "second_" if number == 2 else ""
-                    repo.update(
-                        order.id,
-                        expected_updated_at=order.updated_at,
-                        **{
-                            f"{prefix}location_chat_id": None,
-                            f"{prefix}location_message_id": None,
-                            f"{prefix}location_details_message_id": None,
-                        },
-                    )
-                raise
-            updated = repo.update(
+        if details_message_id:
+            cleaned = repo.transition(
                 order.id,
+                {order.status},
                 expected_updated_at=order.updated_at,
-                **{details_field: details.message_id},
+                cleanup_messages=[(chat_id, details_message_id)],
+                **{details_field: None},
             )
-            if not updated:
-                repo.enqueue_cleanup_messages(order.id, [(details.chat_id, details.message_id)])
-                await _process_cleanup_messages(context, order_id=order.id)
+            if not cleaned:
                 success = False
-        except Exception as error:
-            if _message_is_not_modified(error):
                 continue
-            success = False
-            logger.exception(
-                "Could not update location %s channel message for order %s",
-                number,
-                order.id,
-            )
+            if not await _process_cleanup_messages(context, order_id=order.id):
+                success = False
     return success
 
 
@@ -408,7 +347,7 @@ def _location_publication_fields(
     *,
     chat_id: int,
     message_id: int,
-    details_message_id: int,
+    details_message_id: int | None = None,
 ) -> dict:
     prefix = "second_" if location_number == 2 else ""
     return {
@@ -434,30 +373,12 @@ async def _send_location_messages(
         chat_id=settings.location_channel_id,
         latitude=latitude,
         longitude=longitude,
+        reply_markup=location_channel_keyboard(order, location_number=location_number),
     )
-    try:
-        details = await context.bot.send_message(
-            chat_id=settings.location_channel_id,
-            text=location_post_text(order, location_number),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-            reply_to_message_id=pin.message_id,
-            allow_sending_without_reply=False,
-            reply_markup=location_channel_keyboard(order, location_number=location_number),
-        )
-    except Exception:
-        repo: OrderRepository | None = context.application.bot_data.get("repo")
-        if repo:
-            repo.enqueue_cleanup_messages(order.id, [(pin.chat_id, pin.message_id)])
-            await _process_cleanup_messages(context, order_id=order.id)
-        else:
-            await _delete_message_quietly(context, pin.chat_id, pin.message_id)
-        raise
     return _location_publication_fields(
         location_number,
         chat_id=pin.chat_id,
         message_id=pin.message_id,
-        details_message_id=details.message_id,
     )
 
 

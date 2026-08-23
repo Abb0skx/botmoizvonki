@@ -8,7 +8,7 @@ from telegram.ext import ConversationHandler
 
 from app.database import OrderRepository
 from app.handlers.orders import DETAILS, PAYMENT, _send_location_messages, details, payment, save_edit
-from app.utils.formatters import all_locations_card, location_post_text, manager_card
+from app.utils.formatters import all_locations_card, manager_card
 from app.utils.parsers import parse_order_details
 
 
@@ -125,7 +125,7 @@ class EditSafetyTests(unittest.IsolatedAsyncioTestCase):
 
 
 class LocationPublicationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_native_pin_is_followed_by_full_text_and_one_telegram_button(self):
+    async def test_native_pin_contains_compact_buttons_without_reply_text(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = OrderRepository(Path(directory) / "delivery.db")
             repo.initialize()
@@ -143,16 +143,18 @@ class LocationPublicationTests(unittest.IsolatedAsyncioTestCase):
                     "address_text": "Яшнабадский район",
                 },
             )
+            order = repo.update(
+                order.id,
+                status="pending",
+                delivery_chat_id=-5125237049,
+                delivery_message_id=25,
+            )
             bot = SimpleNamespace(
                 send_location=AsyncMock(return_value=SimpleNamespace(
                     chat_id=-1004398605075,
                     message_id=10,
                 )),
-                send_message=AsyncMock(return_value=SimpleNamespace(
-                    chat_id=-1004398605075,
-                    message_id=11,
-                )),
-                delete_message=AsyncMock(),
+                send_message=AsyncMock(),
             )
             context = SimpleNamespace(
                 bot=bot,
@@ -164,15 +166,17 @@ class LocationPublicationTests(unittest.IsolatedAsyncioTestCase):
             fields = await _send_location_messages(context, order, 1)
 
             self.assertEqual(fields["location_message_id"], 10)
-            self.assertEqual(fields["location_details_message_id"], 11)
-            sent_text = bot.send_message.await_args.kwargs["text"]
-            self.assertIn("+998 90 133 39 99", sent_text)
-            self.assertIn("+998 91 222 33 44", sent_text)
-            self.assertIn("A56", sent_text)
-            buttons = bot.send_message.await_args.kwargs["reply_markup"].inline_keyboard
-            self.assertEqual(len(buttons), 1)
-            self.assertEqual(len(buttons[0]), 1)
-            self.assertEqual(buttons[0][0].text, "💬 Telegram клиента")
+            self.assertIsNone(fields["location_details_message_id"])
+            bot.send_message.assert_not_awaited()
+            buttons = bot.send_location.await_args.kwargs["reply_markup"].inline_keyboard
+            self.assertEqual(len(buttons), 3)
+            self.assertTrue(buttons[0][0].text.startswith("📍 Яшнабадский район"))
+            self.assertEqual(buttons[1][0].text, "📦 A56 · №1 · Ali")
+            self.assertEqual(buttons[2][0].text, "📱 +998 90 133 39 99")
+            self.assertEqual(
+                {row[0].url for row in buttons},
+                {"tg://openmessage?chat_id=5125237049&message_id=25"},
+            )
 
 
 class MapAndCardLimitsTests(unittest.TestCase):
@@ -202,10 +206,8 @@ class MapAndCardLimitsTests(unittest.TestCase):
             self.assertLessEqual(len(text), 4096)
             self.assertEqual(map_url.count("pm2rdm"), text.count("📌 <b>"))
             card = manager_card(orders[0])
-            location_text = location_post_text(orders[0])
             for value in ("+998 90 133 39 99", "+998 91 222 33 44"):
                 self.assertIn(value, card)
-                self.assertIn(value, location_text)
 
 
 class ParserMultipleUrlTests(unittest.TestCase):

@@ -36,6 +36,42 @@ def create_order(repo: OrderRepository):
 
 
 class DeletedMessageRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_existing_location_moves_buttons_to_pin_and_removes_reply_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = OrderRepository(Path(directory) / "delivery.db")
+            repo.initialize()
+            order = create_order(repo)
+            order = repo.update(
+                order.id,
+                status="pending",
+                delivery_chat_id=-5125237049,
+                delivery_message_id=55,
+                location_chat_id=-1002,
+                location_message_id=60,
+                location_details_message_id=61,
+            )
+            bot = SimpleNamespace(
+                edit_message_reply_markup=AsyncMock(),
+                delete_message=AsyncMock(),
+            )
+            context = SimpleNamespace(
+                bot=bot,
+                application=SimpleNamespace(bot_data={"repo": repo}),
+            )
+
+            self.assertTrue(await _set_location_marker(context, order, 1))
+
+            recovered = repo.get(order.id)
+            self.assertEqual(recovered.location_message_id, 60)
+            self.assertIsNone(recovered.location_details_message_id)
+            keyboard = bot.edit_message_reply_markup.await_args.kwargs["reply_markup"]
+            self.assertEqual(len(keyboard.inline_keyboard), 3)
+            self.assertEqual(
+                {row[0].url for row in keyboard.inline_keyboard},
+                {"tg://openmessage?chat_id=5125237049&message_id=55"},
+            )
+            bot.delete_message.assert_awaited_once_with(chat_id=-1002, message_id=61)
+
     async def test_deleted_delivery_message_reference_is_cleared_for_recreation(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = OrderRepository(Path(directory) / "delivery.db")
@@ -73,6 +109,8 @@ class DeletedMessageRecoveryTests(unittest.IsolatedAsyncioTestCase):
             order = repo.update(
                 order.id,
                 status="pending",
+                delivery_chat_id=-1001,
+                delivery_message_id=55,
                 location_chat_id=-1002,
                 location_message_id=60,
                 location_details_message_id=61,
@@ -111,6 +149,8 @@ class DeletedMessageRecoveryTests(unittest.IsolatedAsyncioTestCase):
             order = repo.update(
                 order.id,
                 status="pending",
+                delivery_chat_id=-1001,
+                delivery_message_id=55,
                 location_chat_id=-1002,
                 location_message_id=60,
                 location_details_message_id=61,
@@ -173,14 +213,15 @@ class ConcurrentPublicationTests(unittest.IsolatedAsyncioTestCase):
             product="A56",
             latitude=41.31,
             longitude=69.24,
+            delivery_chat_id=-1001,
+            delivery_message_id=55,
             updated_at="version-1",
         )
         repo = SimpleNamespace(
             update=Mock(return_value=None),
-            enqueue_cleanup_messages=Mock(return_value=2),
+            enqueue_cleanup_messages=Mock(return_value=1),
             list_cleanup_messages=Mock(return_value=[
-                {"id": 1, "chat_id": -1002, "message_id": 71},
-                {"id": 2, "chat_id": -1002, "message_id": 70},
+                {"id": 1, "chat_id": -1002, "message_id": 70},
             ]),
             mark_cleanup_done=Mock(return_value=True),
             mark_cleanup_failed=Mock(return_value=True),
@@ -188,9 +229,6 @@ class ConcurrentPublicationTests(unittest.IsolatedAsyncioTestCase):
         bot = SimpleNamespace(
             send_location=AsyncMock(
                 return_value=SimpleNamespace(chat_id=-1002, message_id=70)
-            ),
-            send_message=AsyncMock(
-                return_value=SimpleNamespace(chat_id=-1002, message_id=71)
             ),
             delete_message=AsyncMock(),
         )
@@ -207,17 +245,14 @@ class ConcurrentPublicationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             bot.delete_message.await_args_list,
-            [
-                call(chat_id=-1002, message_id=71),
-                call(chat_id=-1002, message_id=70),
-            ],
+            [call(chat_id=-1002, message_id=70)],
         )
         repo.update.assert_called_once_with(
             1,
             expected_updated_at="version-1",
             location_chat_id=-1002,
             location_message_id=70,
-            location_details_message_id=71,
+            location_details_message_id=None,
         )
 
     async def test_same_order_sync_calls_are_serialized(self):

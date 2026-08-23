@@ -43,6 +43,27 @@ def telegram_message_url(chat_id: int | None, message_id: int | None) -> str | N
     return f"https://t.me/c/{raw_chat_id[4:]}/{message_id}"
 
 
+def delivery_order_message_url(order: Order) -> str | None:
+    """Open the canonical delivery-group post from a location button.
+
+    Telegram exposes stable HTTPS message links for supergroups. The current
+    TEXNIKACH delivery chat is still a basic group, so it needs Telegram's
+    native ``openmessage`` URI with the positive MTProto chat identifier.
+    """
+    if not order.delivery_chat_id or not order.delivery_message_id:
+        return None
+    public_link = telegram_message_url(
+        order.delivery_chat_id,
+        order.delivery_message_id,
+    )
+    if public_link:
+        return public_link
+    return (
+        "tg://openmessage?"
+        f"chat_id={abs(order.delivery_chat_id)}&message_id={order.delivery_message_id}"
+    )
+
+
 def telegram_location_url(order: Order, location_number: int = 1) -> str | None:
     if location_number == 2:
         return telegram_message_url(
@@ -225,23 +246,3 @@ def all_locations_card(orders: list[Order]) -> tuple[str, str | None]:
     if len(visible) < len(points):
         lines.append(f"\nНа общей карте показаны {len(visible)} из {len(points)} точек.")
     return "\n".join(lines), map_url
-
-
-def location_post_text(order: Order, location_number: int = 1) -> str:
-    """Compact order details shown next to a published Telegram Location."""
-    location_name = "Основная локация" if location_number == 1 else "Доп. локация"
-    lines = [
-        f"🚚 <b>Заказ №{order.order_number}</b> · <b>{escape(order.seller_name or '—')}</b>",
-        f"🏷 {STATUS_LABELS.get(order.status, escape(order.status))}",
-        f"📦 {escape(order.product)}",
-        amount_text(order),
-        phones_text(order),
-    ]
-    if order.delivery_time:
-        lines.append(f"🕒 {escape(order.delivery_time)}")
-    if order.comment:
-        lines.append(f"💬 {escape(order.comment)}")
-    if order.courier_name:
-        lines.append(f"🚗 {escape(order.courier_name)}")
-    lines.append(f"\n📍 <b>{location_name}:</b> {escape(short_address(order, location_number))}")
-    return "\n".join(lines)

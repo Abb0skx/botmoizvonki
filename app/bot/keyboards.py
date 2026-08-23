@@ -1,7 +1,12 @@
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 
 from app.models import Order
-from app.utils.formatters import telegram_location_url
+from app.utils.formatters import (
+    delivery_order_message_url,
+    short_address,
+    telegram_location_url,
+)
+from app.utils.parsers import display_phone
 from app.utils.payments import PAYMENT_LABELS
 from app.utils.sellers import SELLERS
 
@@ -104,13 +109,24 @@ def location_channel_keyboard(
     marker: str = "🆕",
     location_number: int = 1,
 ) -> InlineKeyboardMarkup:
-    phone_digits = "".join(character for character in order.client_phone if character.isdigit())
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            "💬 Telegram клиента",
-            url=f"tg://resolve?phone={phone_digits}",
-        ),
-    ]])
+    target_url = delivery_order_message_url(order)
+    if not target_url:
+        raise ValueError("The delivery-group message must be published before its location")
+
+    def label(value: str) -> str:
+        compact = " ".join(value.split())
+        return compact if len(compact) <= 64 else compact[:63].rstrip() + "…"
+
+    address = label(f"📍 {short_address(order, location_number)}")
+    order_line = label(
+        f"📦 {order.product} · №{order.order_number} · {order.seller_name or '—'}"
+    )
+    phone = label(f"📱 {display_phone(order.client_phone)}")
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(address, url=target_url)],
+        [InlineKeyboardButton(order_line, url=target_url)],
+        [InlineKeyboardButton(phone, url=target_url)],
+    ])
 
 
 def courier_keyboard(order: Order) -> InlineKeyboardMarkup:
