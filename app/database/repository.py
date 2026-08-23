@@ -58,6 +58,8 @@ CREATE TABLE IF NOT EXISTS orders (
     second_location_footer_message_id INTEGER,
     manager_chat_id INTEGER,
     manager_message_id INTEGER,
+    orders_channel_chat_id INTEGER,
+    orders_channel_message_id INTEGER,
     creation_token TEXT,
     sync_needed INTEGER NOT NULL DEFAULT 0,
     sync_attempted_at TEXT
@@ -134,6 +136,8 @@ MIGRATION_COLUMNS = {
     "second_location_footer_message_id": "INTEGER",
     "manager_chat_id": "INTEGER",
     "manager_message_id": "INTEGER",
+    "orders_channel_chat_id": "INTEGER",
+    "orders_channel_message_id": "INTEGER",
     "creation_token": "TEXT",
     "sync_needed": "INTEGER NOT NULL DEFAULT 0",
     "sync_attempted_at": "TEXT",
@@ -158,7 +162,8 @@ class OrderRepository:
         "location_details_message_id", "second_location_chat_id",
         "location_footer_message_id", "second_location_message_id",
         "second_location_details_message_id", "second_location_footer_message_id",
-        "manager_chat_id", "manager_message_id", "sync_needed",
+        "manager_chat_id", "manager_message_id", "orders_channel_chat_id",
+        "orders_channel_message_id", "sync_needed",
     }
 
     def __init__(self, path: Path):
@@ -373,6 +378,19 @@ class OrderRepository:
                 """SELECT * FROM orders
                    WHERE status IN ('draft', 'pending', 'on_way', 'awaiting_photo', 'awaiting_amount')
                    ORDER BY order_number DESC"""
+            ).fetchall()
+        return [Order.from_row(row) for row in rows]
+
+    def list_orders_channel_reconcile(self, channel_id: int) -> list[Order]:
+        """Rows that have never been published to the configured order journal."""
+        with self.connect() as db:
+            rows = db.execute(
+                """SELECT * FROM orders
+                   WHERE orders_channel_chat_id IS NULL
+                      OR orders_channel_message_id IS NULL
+                      OR orders_channel_chat_id != ?
+                   ORDER BY order_number""",
+                (channel_id,),
             ).fetchall()
         return [Order.from_row(row) for row in rows]
 

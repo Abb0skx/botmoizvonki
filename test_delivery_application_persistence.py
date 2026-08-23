@@ -19,6 +19,7 @@ class DeliveryApplicationPersistenceTests(unittest.IsolatedAsyncioTestCase):
             bot_token="123456:TEST_TOKEN",
             delivery_group_id=-1001234567890,
             location_channel_id=-1009876543210,
+            orders_channel_id=-1004459657817,
             database_path=Path(directory) / "delivery.db",
             manager_ids=frozenset({1}),
             courier_ids=frozenset({2}),

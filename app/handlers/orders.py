@@ -21,7 +21,7 @@ from app.bot.keyboards import (
     courier_keyboard, courier_selection_keyboard, delivery_pending_keyboard, edit_input_keyboard,
     location_channel_keyboard, main_keyboard,
     manager_cancelled_keyboard, manager_sent_keyboard, on_way_keyboard,
-    orders_page_keyboard, payment_keyboard, review_keyboard, seller_keyboard,
+    orders_channel_keyboard, orders_page_keyboard, payment_keyboard, review_keyboard, seller_keyboard,
     skip_keyboard,
 )
 from app.config import Settings
@@ -32,7 +32,7 @@ from app.utils import (
     parse_order_details,
 )
 from app.utils.formatters import (
-    STATUS_LABELS, all_locations_card, amount_text, money,
+    STATUS_LABELS, all_locations_card, amount_text, money, orders_channel_card,
 )
 from app.utils.couriers import (
     courier_group_id, courier_group_ids, courier_ids, courier_option,
@@ -54,6 +54,13 @@ MAIN_MENU_TEXTS = {
     "📚 Все заказы",
     "📋 Все заказы",
 }
+
+
+def _orders_channel_id(context: ContextTypes.DEFAULT_TYPE) -> int | None:
+    settings = context.application.bot_data.get("settings")
+    return getattr(settings, "orders_channel_id", None)
+
+
 def _message_is_not_modified(error: Exception) -> bool:
     return isinstance(error, BadRequest) and "message is not modified" in str(error).casefold()
 
@@ -264,6 +271,70 @@ async def _refresh_manager_message(context: ContextTypes.DEFAULT_TYPE, order) ->
                 return await _refresh_manager_message(context, cleared)
             return False
         logger.exception("Could not refresh manager message for order %s", order.id)
+        return False
+
+
+async def _refresh_orders_channel_message(context: ContextTypes.DEFAULT_TYPE, order) -> bool:
+    """Create or update the single shared manager-journal card for an order."""
+    settings: Settings = context.application.bot_data["settings"]
+    channel_id = getattr(settings, "orders_channel_id", None)
+    if not channel_id:
+        return True
+    repo: OrderRepository = context.application.bot_data["repo"]
+    text = orders_channel_card(order)
+    keyboard = orders_channel_keyboard(order)
+    if not order.orders_channel_chat_id or not order.orders_channel_message_id:
+        try:
+            sent = await context.bot.send_message(
+                chat_id=channel_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=keyboard,
+            )
+        except Exception:
+            logger.exception("Could not publish orders-channel card for order %s", order.id)
+            return False
+        if not isinstance(getattr(sent, "chat_id", None), int) or not isinstance(
+            getattr(sent, "message_id", None), int
+        ):
+            logger.error("Telegram returned an invalid orders-channel reference for order %s", order.id)
+            return False
+        updated = repo.update(
+            order.id,
+            expected_updated_at=order.updated_at,
+            orders_channel_chat_id=sent.chat_id,
+            orders_channel_message_id=sent.message_id,
+        )
+        if updated:
+            return True
+        repo.enqueue_cleanup_messages(order.id, [(sent.chat_id, sent.message_id)])
+        await _process_cleanup_messages(context, order_id=order.id)
+        return False
+    try:
+        await context.bot.edit_message_text(
+            chat_id=order.orders_channel_chat_id,
+            message_id=order.orders_channel_message_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=keyboard,
+        )
+        return True
+    except Exception as error:
+        if _message_is_not_modified(error):
+            return True
+        if _message_is_missing(error):
+            cleared = repo.update(
+                order.id,
+                expected_updated_at=order.updated_at,
+                orders_channel_chat_id=None,
+                orders_channel_message_id=None,
+            )
+            if cleared:
+                return await _refresh_orders_channel_message(context, cleared)
+            return False
+        logger.exception("Could not refresh orders-channel card for order %s", order.id)
         return False
 
 
@@ -566,6 +637,15 @@ def _reset_mismatched_publications(
         if order.delivery_message_id:
             cleanup.append((order.delivery_chat_id, order.delivery_message_id))
         fields.update(delivery_chat_id=None, delivery_message_id=None)
+    orders_channel_id = getattr(settings, "orders_channel_id", None)
+    if (
+        orders_channel_id
+        and order.orders_channel_chat_id
+        and order.orders_channel_chat_id != orders_channel_id
+    ):
+        if order.orders_channel_message_id:
+            cleanup.append((order.orders_channel_chat_id, order.orders_channel_message_id))
+        fields.update(orders_channel_chat_id=None, orders_channel_message_id=None)
     for prefix in ("", "second_"):
         chat_id = getattr(order, f"{prefix}location_chat_id")
         if chat_id and chat_id != settings.location_channel_id:
@@ -675,6 +755,9 @@ async def _sync_order_locked(context: ContextTypes.DEFAULT_TYPE, order_id: int) 
     if not order or not await _refresh_manager_message(context, order):
         success = False
     order = repo.get(order_id)
+    if not order or not await _refresh_orders_channel_message(context, order):
+        success = False
+    order = repo.get(order_id)
     if success and order.sync_needed:
         repo.mark_synced(order.id, expected_updated_at=order.updated_at)
         order = repo.get(order_id)
@@ -748,6 +831,9 @@ async def _finish_status_change_locked(
     if not await _refresh_manager_message(context, latest):
         success = False
     latest = context.application.bot_data["repo"].get(order.id)
+    if not await _refresh_orders_channel_message(context, latest):
+        success = False
+    latest = context.application.bot_data["repo"].get(order.id)
     if success and latest.sync_needed:
         context.application.bot_data["repo"].mark_synced(
             latest.id,
@@ -800,6 +886,29 @@ async def validate_delivery_configuration(application: Application) -> None:
     ):
         raise RuntimeError("The delivery bot must be allowed to delete obsolete location posts")
 
+    orders_channel_id = getattr(settings, "orders_channel_id", None)
+    if orders_channel_id:
+        orders_chat = await application.bot.get_chat(orders_channel_id)
+        if orders_chat.type not in {"channel", "supergroup"}:
+            raise RuntimeError("DELIVERY_ORDERS_CHANNEL_ID must point to a channel or supergroup")
+        orders_member = await application.bot.get_chat_member(
+            orders_channel_id,
+            application.bot.id,
+        )
+        if orders_member.status not in {"administrator", "creator"}:
+            raise RuntimeError("The delivery bot must be an administrator in the orders channel")
+        if orders_chat.type == "channel" and orders_member.status != "creator":
+            if not getattr(orders_member, "can_post_messages", False):
+                raise RuntimeError("The delivery bot must be allowed to post in the orders channel")
+            if not getattr(orders_member, "can_edit_messages", False):
+                raise RuntimeError("The delivery bot must be allowed to edit orders channel posts")
+        if orders_member.status != "creator" and not getattr(
+            orders_member,
+            "can_delete_messages",
+            False,
+        ):
+            raise RuntimeError("The delivery bot must be allowed to delete obsolete orders posts")
+
 
 
 async def reconcile_orders_on_start(application: Application) -> None:
@@ -813,6 +922,11 @@ async def reconcile_orders_on_start(application: Application) -> None:
     # send failed after the SQLite insert.
     for order in repo.list_open():
         candidates[order.id] = order
+    orders_channel_id = getattr(application.bot_data["settings"], "orders_channel_id", None)
+    list_channel_reconcile = getattr(repo, "list_orders_channel_reconcile", None)
+    if orders_channel_id and callable(list_channel_reconcile):
+        for order in list_channel_reconcile(orders_channel_id):
+            candidates[order.id] = order
     context = SimpleNamespace(application=application, bot=application.bot)
     for order_id in sorted(candidates):
         try:
@@ -1300,8 +1414,12 @@ async def comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                     manager_chat_id=card_message.chat_id,
                     manager_message_id=card_message.message_id,
                 )
-                if order:
+                if order and not _orders_channel_id(context):
                     repo.mark_synced(order.id, expected_updated_at=order.updated_at)
+    if order and _orders_channel_id(context):
+        order, synchronized = await _sync_order(context, order.id)
+        if not synchronized:
+            _schedule_sync_retry(context, order.id)
     await update.message.reply_text("Проверьте данные заказа.", reply_markup=main_keyboard())
     context.user_data.pop("draft", None)
     return ConversationHandler.END
@@ -1556,7 +1674,7 @@ async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         if not _message_is_not_modified(error):
             manager_refreshed = False
             logger.exception("Could not refresh manager message for order %s", order.id)
-    if sent:
+    if sent or _orders_channel_id(context):
         order, refreshed = await _sync_order(context, order.id)
         if not refreshed:
             _schedule_sync_retry(context, order.id)
@@ -1622,8 +1740,13 @@ async def manager_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             reply_markup=review_keyboard(restored.id),
         )
         await query.answer("Заказ возвращён")
-        latest = repo.get(restored.id)
-        repo.mark_synced(latest.id, expected_updated_at=latest.updated_at)
+        if getattr(settings, "orders_channel_id", None):
+            latest, success = await _sync_order(context, restored.id)
+            if not success:
+                _schedule_sync_retry(context, restored.id)
+        else:
+            latest = repo.get(restored.id)
+            repo.mark_synced(latest.id, expected_updated_at=latest.updated_at)
         return
     if order.status != "draft":
         await query.answer("Заказ уже обработан или недоступен", show_alert=True); return
@@ -1642,8 +1765,14 @@ async def manager_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"❌ Заказ №{order.order_number} отменён менеджером",
             reply_markup=manager_cancelled_keyboard(order.id),
         )
-        repo.mark_synced(cancelled.id, expected_updated_at=cancelled.updated_at)
-        await query.answer(); return
+        await query.answer()
+        if getattr(settings, "orders_channel_id", None):
+            latest, success = await _sync_order(context, cancelled.id)
+            if not success:
+                _schedule_sync_retry(context, cancelled.id)
+        else:
+            repo.mark_synced(cancelled.id, expected_updated_at=cancelled.updated_at)
+        return
     await query.edit_message_reply_markup(reply_markup=courier_selection_keyboard(order))
     await query.answer("Выберите курьера")
 
@@ -1655,30 +1784,48 @@ async def courier_assignment_action(update: Update, context: ContextTypes.DEFAUL
         await query.answer("Нет доступа", show_alert=True)
         return
     parts = query.data.split(":")
-    action, order_id = parts[0], int(parts[1])
+    raw_action, order_id = parts[0], int(parts[1])
+    orders_channel_source = raw_action.startswith("control_")
+    action = raw_action.removeprefix("control_")
     repo: OrderRepository = context.application.bot_data["repo"]
     order = repo.get(order_id)
     if not order:
         await query.answer("Заказ не найден", show_alert=True)
         return
-    if (
-        order.manager_message_id
-        and (
-            query.message.chat_id != order.manager_chat_id
-            or query.message.message_id != order.manager_message_id
+    if orders_channel_source:
+        source_is_current = bool(
+            order.orders_channel_chat_id
+            and order.orders_channel_message_id
+            and query.message.chat_id == order.orders_channel_chat_id
+            and query.message.message_id == order.orders_channel_message_id
+            and query.message.chat_id == getattr(settings, "orders_channel_id", None)
         )
-    ):
+    else:
+        source_is_current = bool(
+            not order.manager_message_id
+            or (
+                query.message.chat_id == order.manager_chat_id
+                and query.message.message_id == order.manager_message_id
+            )
+        )
+    if not source_is_current:
         await query.answer("Эта карточка устарела. Откройте актуальную карточку заказа.", show_alert=True)
         return
     if order.status not in {"draft", "pending", "on_way"}:
         await query.answer("Для закрытого заказа курьера изменить нельзя", show_alert=True)
         return
     if action == "courier_menu":
-        await query.edit_message_reply_markup(reply_markup=courier_selection_keyboard(order))
+        source = "orders_channel" if orders_channel_source else "manager"
+        await query.edit_message_reply_markup(
+            reply_markup=courier_selection_keyboard(order, source=source)
+        )
         await query.answer("Выберите курьера")
         return
     if action == "courier_close":
-        keyboard = review_keyboard(order.id) if order.status == "draft" else manager_sent_keyboard(order)
+        if orders_channel_source:
+            keyboard = orders_channel_keyboard(order)
+        else:
+            keyboard = review_keyboard(order.id) if order.status == "draft" else manager_sent_keyboard(order)
         await query.edit_message_reply_markup(reply_markup=keyboard)
         await query.answer()
         return
@@ -1688,7 +1835,8 @@ async def courier_assignment_action(update: Update, context: ContextTypes.DEFAUL
         await query.answer("Курьер не найден", show_alert=True)
         return
     if order.status != "draft" and order.assigned_courier_id == selected.user_id:
-        await query.edit_message_reply_markup(reply_markup=manager_sent_keyboard(order))
+        keyboard = orders_channel_keyboard(order) if orders_channel_source else manager_sent_keyboard(order)
+        await query.edit_message_reply_markup(reply_markup=keyboard)
         await query.answer(f"Курьер {selected.name} уже выбран")
         return
 
@@ -2223,7 +2371,7 @@ def register_handlers(application: Application) -> None:
     application.add_handler(CallbackQueryHandler(manager_action, pattern=r"^(send|manager_cancel|manager_restore):\d+$"))
     application.add_handler(CallbackQueryHandler(
         courier_assignment_action,
-        pattern=r"^courier_(?:menu|close|assign):\d+(?::\d+)?$",
+        pattern=r"^(?:control_)?courier_(?:menu|close|assign):\d+(?::\d+)?$",
     ))
     application.add_handler(CallbackQueryHandler(manager_sync_action, pattern=r"^sync:\d+$"))
     application.add_handler(CallbackQueryHandler(courier_action, pattern=r"^(onway|undo_onway|complete|cancel|undo_cancel|undo_complete):\d+$"))

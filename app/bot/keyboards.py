@@ -95,15 +95,18 @@ def manager_sent_keyboard(order: Order, *, expanded: bool = False) -> InlineKeyb
     )
 
 
-def courier_selection_keyboard(order: Order) -> InlineKeyboardMarkup:
+def courier_selection_keyboard(order: Order, *, source: str = "manager") -> InlineKeyboardMarkup:
+    if source not in {"manager", "orders_channel"}:
+        raise ValueError("unsupported courier selection source")
+    prefix = "control_courier" if source == "orders_channel" else "courier"
     rows = []
     for courier in COURIERS:
         selected = "✅ " if order.assigned_courier_id == courier.user_id else "🚚 "
         rows.append([InlineKeyboardButton(
             selected + courier.name,
-            callback_data=f"courier_assign:{order.id}:{courier.user_id}",
+            callback_data=f"{prefix}_assign:{order.id}:{courier.user_id}",
         )])
-    rows.append([InlineKeyboardButton("↩️ Назад", callback_data=f"courier_close:{order.id}")])
+    rows.append([InlineKeyboardButton("↩️ Назад", callback_data=f"{prefix}_close:{order.id}")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -116,6 +119,21 @@ def _location_rows(order: Order) -> list[list[InlineKeyboardButton]]:
     if second_url:
         row.append(InlineKeyboardButton("📍 Доп. локация", url=second_url))
     return [row] if row else []
+
+
+def orders_channel_keyboard(order: Order) -> InlineKeyboardMarkup:
+    rows = _location_rows(order)
+    delivery_url = delivery_order_message_url(order)
+    if delivery_url:
+        rows.append([InlineKeyboardButton("📦 Карточка в группе курьера", url=delivery_url)])
+    if order.status in {"draft", "pending", "on_way"}:
+        courier_name = order.assigned_courier_name or "не выбран"
+        rows.append([InlineKeyboardButton(
+            f"🚚 Курьер: {courier_name}",
+            callback_data=f"control_courier_menu:{order.id}",
+        )])
+    rows.append([InlineKeyboardButton("🔄 Обновить карточку", callback_data=f"sync:{order.id}")])
+    return InlineKeyboardMarkup(rows)
 
 
 def location_channel_keyboard(

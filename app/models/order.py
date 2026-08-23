@@ -54,6 +54,8 @@ class Order:
     second_location_footer_message_id: int | None = None
     manager_chat_id: int | None = None
     manager_message_id: int | None = None
+    orders_channel_chat_id: int | None = None
+    orders_channel_message_id: int | None = None
     creation_token: str | None = None
     sync_needed: int = 0
     sync_attempted_at: str | None = None

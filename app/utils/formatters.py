@@ -1,5 +1,7 @@
 from html import escape
+from datetime import datetime
 from urllib.parse import urlencode
+from zoneinfo import ZoneInfo
 
 from app.models import Order
 from .parsers import display_phone
@@ -147,6 +149,74 @@ def _compact_order(order: Order, *, status: str | None = None) -> str:
 def manager_card(order: Order, *, sent: bool = False) -> str:
     status = STATUS_LABELS.get(order.status, order.status)
     return _compact_order(order, status=status)
+
+
+def _local_datetime(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return value[:40]
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(ZoneInfo("Asia/Tashkent"))
+    return parsed.strftime("%d.%m.%Y %H:%M")
+
+
+def orders_channel_card(order: Order) -> str:
+    """Full, durable manager overview shown in the shared order journal."""
+    status = STATUS_LABELS.get(order.status, order.status)
+    heading = (
+        f"✅✅✅✅✅✅✅\n✅ <b>Заказ №{order.order_number}</b>"
+        if order.status == "completed"
+        else f"📋 <b>Заказ №{order.order_number}</b>"
+    )
+    lines = [
+        heading,
+        f"🏷 Статус: <b>{escape(status)}</b>",
+        f"👤 Продавец: <b>{escape(order.seller_name or '—')}</b>",
+        f"🧑‍💼 Создал: {escape(order.manager_name or '—')}",
+        "",
+        f"📦 Товар: <b>{escape(order.product)}</b>",
+        f"💰 Сумма: {money(order.amount_usd, order.amount_uzs)}",
+        (
+            "✅ Оплата: <b>оплачено при сборе товара</b>"
+            if order.payment_status == PAID_AT_ASSEMBLY
+            else "💵 Оплата: при доставке"
+        ),
+        phones_text(order),
+    ]
+    if order.delivery_time:
+        lines.append(f"🕒 Время доставки: {escape(order.delivery_time)}")
+    if order.comment:
+        lines.append(f"💬 Комментарий: {escape(order.comment)}")
+
+    lines.append("")
+    if order.assigned_courier_name:
+        lines.append(f"🚚 Назначен курьер: <b>{escape(order.assigned_courier_name)}</b>")
+    if order.courier_name:
+        lines.append(f"👤 Принял заказ: {escape(order.courier_name)}")
+    started = _local_datetime(order.time_started)
+    if started:
+        lines.append(f"🚗 Начал доставку: {escape(started)}")
+    delivered = _local_datetime(order.delivered_at)
+    if delivered:
+        lines.append(f"✅ Доставлено: {escape(delivered)}")
+    if order.received_usd is not None or order.received_uzs is not None:
+        lines.append(f"💵 Получено: {money(order.received_usd, order.received_uzs)}")
+
+    lines.extend(["", f"📍 Основная: {escape(short_address(order))}"])
+    if order.second_latitude is not None and order.second_longitude is not None:
+        lines.append(f"📍 Дополнительная: {escape(short_address(order, 2))}")
+
+    created = _local_datetime(order.created_at)
+    updated = _local_datetime(order.updated_at)
+    lines.append("")
+    if created:
+        lines.append(f"🗓 Создан: {escape(created)}")
+    if updated:
+        lines.append(f"🔄 Обновлён: {escape(updated)}")
+    return "\n".join(lines)
 
 
 def courier_card(order: Order, state: str = "") -> str:
