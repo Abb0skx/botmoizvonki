@@ -14,7 +14,7 @@ from app.database import OrderRepository
 from app.database.repository import MIGRATION_COLUMNS, SCHEMA
 from app.handlers.orders import (
     DETAILS, PAYMENT, SECOND_LOCATION, _publish_location, courier_action,
-    delivery_input, details, location_order_action, save_edit, second_location,
+    delivery_input, details, location_label_action, save_edit, second_location,
 )
 from app.utils.formatters import (
     all_locations_card, completed_card, courier_card, manager_card, short_address,
@@ -213,56 +213,15 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(context.user_data["draft"]["second_latitude"], 41.32)
         self.assertEqual(context.user_data["draft"]["second_longitude"], 69.25)
 
-    async def test_basic_group_location_button_shows_phone_and_forwards_order(self):
-        with tempfile.TemporaryDirectory() as tempdir:
-            repo = OrderRepository(Path(tempdir) / "delivery.db")
-            repo.initialize()
-            order = repo.create(
-                manager_id=1,
-                manager_name="Manager",
-                data={
-                    "seller_name": "Ali",
-                    "client_phone": "+998901333999",
-                    "product": "A7 Pro",
-                    "amount_usd": 100,
-                    "latitude": 41.31,
-                    "longitude": 69.24,
-                },
-            )
-            order = repo.update(
-                order.id,
-                delivery_chat_id=-5125237049,
-                delivery_message_id=50,
-                location_chat_id=-1004398605075,
-                location_message_id=77,
-            )
-            query = SimpleNamespace(
-                data=f"location_order:{order.id}",
-                from_user=SimpleNamespace(id=202134293),
-                message=SimpleNamespace(chat_id=-1004398605075, message_id=77),
-                answer=AsyncMock(),
-            )
-            bot = SimpleNamespace(forward_message=AsyncMock())
-            settings = SimpleNamespace(
-                location_channel_id=-1004398605075,
-                manager_ids=frozenset({202134293}),
-                courier_ids=frozenset({202134293}),
-            )
-            context = SimpleNamespace(
-                bot=bot,
-                application=SimpleNamespace(bot_data={"settings": settings, "repo": repo}),
-            )
+    async def test_basic_group_location_button_is_silent(self):
+        query = SimpleNamespace(answer=AsyncMock())
 
-            await location_order_action(SimpleNamespace(callback_query=query), context)
+        await location_label_action(
+            SimpleNamespace(callback_query=query),
+            SimpleNamespace(),
+        )
 
-            alert = query.answer.await_args.args[0]
-            self.assertIn("+998 90 133 39 99", alert)
-            self.assertTrue(query.answer.await_args.kwargs["show_alert"])
-            bot.forward_message.assert_awaited_once_with(
-                chat_id=202134293,
-                from_chat_id=-5125237049,
-                message_id=50,
-            )
+        query.answer.assert_awaited_once_with()
 
     async def test_edit_amount_saves_and_confirms_new_price(self):
         with tempfile.TemporaryDirectory() as tempdir:
@@ -484,7 +443,7 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(location_buttons), 3)
             self.assertEqual(
                 {row[0].callback_data for row in location_buttons},
-                {f"location_order:{order.id}"},
+                {f"location_label:{order.id}"},
             )
             self.assertEqual(
                 telegram_location_url(published),
@@ -680,7 +639,7 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual({button.url for button in buttons}, {None})
         self.assertEqual(
             {button.callback_data for button in buttons},
-            {f"location_order:{order.id}"},
+            {f"location_label:{order.id}"},
         )
 
     def test_location_channel_buttons_link_directly_for_supergroup(self):

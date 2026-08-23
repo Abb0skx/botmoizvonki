@@ -68,7 +68,7 @@ class DeletedMessageRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(keyboard.inline_keyboard), 3)
             self.assertEqual(
                 {row[0].callback_data for row in keyboard.inline_keyboard},
-                {f"location_order:{order.id}"},
+                {f"location_label:{order.id}"},
             )
             bot.delete_message.assert_awaited_once_with(chat_id=-1002, message_id=61)
 
@@ -100,6 +100,43 @@ class DeletedMessageRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(recovered.delivery_chat_id)
             self.assertIsNone(recovered.delivery_message_id)
             self.assertEqual(recovered.sync_needed, 1)
+
+    async def test_deleted_completed_delivery_message_is_never_republished(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = OrderRepository(Path(directory) / "delivery.db")
+            repo.initialize()
+            order = create_order(repo)
+            order = repo.update(
+                order.id,
+                status="completed",
+                delivery_chat_id=-5125237049,
+                delivery_message_id=55,
+                delivered_at="2026-08-23T10:00:00+05:00",
+            )
+            bot = SimpleNamespace(
+                edit_message_text=AsyncMock(
+                    side_effect=BadRequest("Message to edit not found")
+                ),
+                send_message=AsyncMock(),
+            )
+            context = SimpleNamespace(
+                bot=bot,
+                application=SimpleNamespace(bot_data={
+                    "repo": repo,
+                    "settings": SimpleNamespace(
+                        delivery_group_id=-5125237049,
+                        location_channel_id=-1004398605075,
+                    ),
+                }),
+            )
+
+            recovered, success = await _sync_order(context, order.id)
+
+            self.assertTrue(success)
+            self.assertIsNone(recovered.delivery_chat_id)
+            self.assertIsNone(recovered.delivery_message_id)
+            self.assertEqual(recovered.sync_needed, 0)
+            bot.send_message.assert_not_awaited()
 
     async def test_deleted_native_pin_clears_pin_and_details_references(self):
         with tempfile.TemporaryDirectory() as directory:

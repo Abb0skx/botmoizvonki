@@ -175,7 +175,7 @@ class LocationPublicationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(buttons[2][0].text, "📱 +998 90 133 39 99")
             self.assertEqual(
                 {row[0].callback_data for row in buttons},
-                {f"location_order:{order.id}"},
+                {f"location_label:{order.id}"},
             )
 
 

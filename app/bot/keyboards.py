@@ -126,7 +126,9 @@ def location_channel_keyboard(
     def order_button(text: str) -> InlineKeyboardButton:
         if target_url:
             return InlineKeyboardButton(text, url=target_url)
-        return InlineKeyboardButton(text, callback_data=f"location_order:{order.id}")
+        # Telegram has no disabled inline buttons. A silent callback keeps the
+        # compact button-like layout without showing alerts or sending posts.
+        return InlineKeyboardButton(text, callback_data=f"location_label:{order.id}")
 
     return InlineKeyboardMarkup([
         [order_button(address)],

@@ -39,6 +39,7 @@ from app.utils.parsers import display_phone
 logger = logging.getLogger(__name__)
 SELLER, PRODUCT, DETAILS, SECOND_LOCATION, PAYMENT, DELIVERY_TIME, COMMENT, EDIT_VALUE = range(8)
 MANAGER_EDITABLE_STATUSES = {"draft", "pending", "on_way"}
+DELIVERY_ACTIVE_STATUSES = {"pending", "on_way", "awaiting_photo", "awaiting_amount"}
 ORDER_PAGE_SIZE = 10
 EDIT_CANCEL_TEXT = "❌ Отменить изменение"
 MAIN_MENU_TEXTS = {
@@ -172,12 +173,18 @@ async def _refresh_delivery_message(context: ContextTypes.DEFAULT_TYPE, order) -
             return True
         if _message_is_missing(error):
             repo: OrderRepository = context.application.bot_data["repo"]
-            repo.update(
+            cleared = repo.update(
                 order.id,
                 expected_updated_at=order.updated_at,
                 delivery_chat_id=None,
                 delivery_message_id=None,
             )
+            if order.status in {"completed", "cancelled"}:
+                logger.info(
+                    "Closed delivery message disappeared for order %s; it will not be recreated",
+                    order.id,
+                )
+                return cleared is not None
             logger.warning("Delivery message disappeared for order %s; it will be recreated", order.id)
             return False
         logger.exception("Could not refresh delivery message for order %s", order.id)
@@ -443,9 +450,14 @@ async def _process_cleanup_messages(
 
 
 def _order_should_be_in_delivery_group(order) -> bool:
-    if order.status in {"pending", "on_way", "awaiting_photo", "awaiting_amount", "completed"}:
+    if order.status in DELIVERY_ACTIVE_STATUSES:
         return True
-    return order.status == "cancelled" and order.courier_id is not None
+    # A closed card may still be edited in place, but a deleted/missing old
+    # card must never be published again during deploy reconciliation.
+    return (
+        order.status in {"completed", "cancelled"}
+        and bool(order.delivery_chat_id and order.delivery_message_id)
+    )
 
 
 async def _sync_order(context: ContextTypes.DEFAULT_TYPE, order_id: int) -> tuple[object | None, bool]:
@@ -512,8 +524,9 @@ async def _sync_order_locked(context: ContextTypes.DEFAULT_TYPE, order_id: int) 
         return order, False
     success = True
     should_publish = _order_should_be_in_delivery_group(order)
+    may_create_publications = order.status in DELIVERY_ACTIVE_STATUSES
 
-    if should_publish and (not order.delivery_chat_id or not order.delivery_message_id):
+    if may_create_publications and (not order.delivery_chat_id or not order.delivery_message_id):
         text, keyboard = _delivery_message(order)
         try:
             sent = await context.bot.send_message(
@@ -549,6 +562,8 @@ async def _sync_order_locked(context: ContextTypes.DEFAULT_TYPE, order_id: int) 
             if not has_coordinates:
                 continue
             if not has_pin:
+                if not may_create_publications:
+                    continue
                 try:
                     order = await _publish_location(context, repo, order, location_number)
                 except Exception:
@@ -1917,65 +1932,9 @@ async def show_all_locations(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
-async def location_order_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle order buttons when the delivery chat is still a basic group.
-
-    Telegram has no direct message links for basic groups. The button therefore
-    shows the phone immediately and forwards the canonical group post to the
-    employee's private chat. Supergroups use a normal URL button instead.
-    """
-    query = update.callback_query
-    settings: Settings = context.application.bot_data["settings"]
-    allowed_ids = settings.manager_ids | settings.courier_ids
-    if query.from_user.id not in allowed_ids:
-        await query.answer("Нет доступа", show_alert=True)
-        return
-    if not query.message or query.message.chat_id != settings.location_channel_id:
-        await query.answer("Эта кнопка доступна только в канале локаций", show_alert=True)
-        return
-
-    try:
-        order_id = int(query.data.split(":", 1)[1])
-    except (AttributeError, IndexError, ValueError):
-        await query.answer("Некорректная кнопка", show_alert=True)
-        return
-    repo: OrderRepository = context.application.bot_data["repo"]
-    order = repo.get(order_id)
-    if not order:
-        await query.answer("Заказ не найден", show_alert=True)
-        return
-    if query.message.message_id not in {
-        order.location_message_id,
-        order.second_location_message_id,
-    }:
-        await query.answer("Эта локация уже неактуальна", show_alert=True)
-        return
-
-    phone_lines = [display_phone(order.client_phone)]
-    if order.client_phone_2 and order.client_phone_2 != order.client_phone:
-        phone_lines.append(display_phone(order.client_phone_2))
-    alert = (
-        f"Заказ №{order.order_number} · {order.seller_name or '—'}\n"
-        f"{order.product}\nТелефон: {', '.join(phone_lines)}\n"
-        "Карточка отправлена в личный чат."
-    )
-    await query.answer(alert[:200], show_alert=True)
-
-    if not order.delivery_chat_id or not order.delivery_message_id:
-        return
-    try:
-        await context.bot.forward_message(
-            chat_id=query.from_user.id,
-            from_chat_id=order.delivery_chat_id,
-            message_id=order.delivery_message_id,
-        )
-    except Exception as error:
-        logger.warning(
-            "Could not forward delivery order %s to employee %s: %s",
-            order.id,
-            query.from_user.id,
-            error,
-        )
+async def location_label_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Acknowledge label-like location buttons without any visible action."""
+    await update.callback_query.answer()
 
 
 def register_handlers(application: Application) -> None:
@@ -2035,7 +1994,10 @@ def register_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("cancel", cancel_conversation))
     application.add_handler(CallbackQueryHandler(orders_page, pattern=r"^orders_page:(?:active|all):\d+$"))
-    application.add_handler(CallbackQueryHandler(location_order_action, pattern=r"^location_order:\d+$"))
+    application.add_handler(CallbackQueryHandler(
+        location_label_action,
+        pattern=r"^location_(?:label|order):\d+$",
+    ))
     application.add_handler(CallbackQueryHandler(toggle_edit_menu, pattern=r"^edit_(?:menu|close):\d+$"))
     application.add_handler(CallbackQueryHandler(manager_action, pattern=r"^(send|manager_cancel|manager_restore):\d+$"))
     application.add_handler(CallbackQueryHandler(manager_sync_action, pattern=r"^sync:\d+$"))
