@@ -6,8 +6,10 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
+from app.analytics_service import build_delivery_analytics
 from app.database import OrderRepository
 from app.monitor_service import build_delivery_monitor
+from app.routing_service import RoutingService, enrich_monitor_routes, enrich_stats_routes
 from app.stats_service import build_delivery_stats, parse_report_day
 from app.utils.couriers import COURIERS_BY_ID
 from app.utils.static_map import DeliverySequenceStop, render_delivery_sequence_map
@@ -27,6 +29,8 @@ STATS_PASSWORD = (
 TEMPLATE_DIR = Path(__file__).parent / "templates"
 STATS_TEMPLATE_PATH = TEMPLATE_DIR / "delivery_stats.html"
 MONITOR_TEMPLATE_PATH = TEMPLATE_DIR / "delivery_monitor.html"
+_ROUTING_SERVICE: RoutingService | None = None
+_ROUTING_CACHE_PATH: Path | None = None
 
 app = FastAPI(
     title="TEXNIKACH Delivery Statistics",
@@ -70,6 +74,15 @@ def _repository() -> OrderRepository:
     if not DATABASE_PATH.is_file():
         raise HTTPException(status_code=503, detail="delivery_database_not_found")
     return OrderRepository(DATABASE_PATH)
+
+
+def _routing_service() -> RoutingService:
+    global _ROUTING_SERVICE, _ROUTING_CACHE_PATH
+    cache_path = DATABASE_PATH.parent / "routing-cache.db"
+    if _ROUTING_SERVICE is None or _ROUTING_CACHE_PATH != cache_path:
+        _ROUTING_SERVICE = RoutingService(cache_path)
+        _ROUTING_CACHE_PATH = cache_path
+    return _ROUTING_SERVICE
 
 
 def _report(day: str, courier_id: int | None) -> dict:
@@ -134,17 +147,35 @@ def monitor_page(_username: str = Depends(require_stats_auth)):
 
 
 @app.get("/delivery/monitor/api/state")
-def monitor_state(_username: str = Depends(require_stats_auth)):
-    return build_delivery_monitor(_repository())
+async def monitor_state(_username: str = Depends(require_stats_auth)):
+    state = build_delivery_monitor(_repository())
+    return await enrich_monitor_routes(state, _routing_service())
 
 
 @app.get("/delivery/stats/api/report")
-def statistics_report(
+async def statistics_report(
     day: str = Query("today", max_length=20),
     courier_id: int | None = Query(None),
     _username: str = Depends(require_stats_auth),
 ):
-    return _report(day, courier_id)
+    report = _report(day, courier_id)
+    return await enrich_stats_routes(report, _routing_service())
+
+
+@app.get("/delivery/stats/api/analytics")
+def statistics_analytics(
+    month: str | None = Query(None, max_length=7),
+    week: str | None = Query(None, max_length=8),
+    _username: str = Depends(require_stats_auth),
+):
+    try:
+        return build_delivery_analytics(
+            _repository(),
+            month=month,
+            week=week,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
 
 
 @app.get("/delivery/stats/map.png")
@@ -153,7 +184,10 @@ async def statistics_map(
     courier_id: int | None = Query(None),
     _username: str = Depends(require_stats_auth),
 ):
-    report = _report(day, courier_id)
+    report = await enrich_stats_routes(
+        _report(day, courier_id),
+        _routing_service(),
+    )
     stops = [
         DeliverySequenceStop(
             sequence=stop["sequence"],
@@ -172,6 +206,7 @@ async def statistics_map(
             stops,
             report_day_label=report["day_label"],
             cache_dir=DATABASE_PATH.parent / "map-tiles",
+            road_routes=report["routes"],
         )
     except Exception as error:
         raise HTTPException(status_code=503, detail="map_temporarily_unavailable") from error

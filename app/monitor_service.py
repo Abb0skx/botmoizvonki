@@ -148,6 +148,7 @@ def _courier_route(
 
     dark_paths: list[list[list[float]]] = []
     current_path: list[list[float]] = []
+    return_path: list[list[float]] = []
     last_completed_at = None
     last_completed_point = [WAREHOUSE["latitude"], WAREHOUSE["longitude"]]
     path: list[list[float]] = [[WAREHOUSE["latitude"], WAREHOUSE["longitude"]]]
@@ -180,10 +181,23 @@ def _courier_route(
             [location["latitude"], location["longitude"]]
             for location in _locations(current)
         ])
-    elif not active and dark_paths:
+    elif last_completed_at:
         warehouse_point = [WAREHOUSE["latitude"], WAREHOUSE["longitude"]]
-        if dark_paths[-1][-1] != warehouse_point:
-            dark_paths[-1].append(warehouse_point)
+        latest_active_pickup = max(
+            (
+                parsed
+                for order in active
+                if (parsed := local_datetime(order.picked_up_at))
+            ),
+            default=None,
+        )
+        if latest_active_pickup and latest_active_pickup > last_completed_at:
+            # A later pickup at the warehouse proves that the return leg has
+            # already happened, so it belongs to the completed history.
+            if dark_paths and dark_paths[-1][-1] != warehouse_point:
+                dark_paths[-1].append(warehouse_point)
+        elif last_completed_point != warehouse_point:
+            return_path = [last_completed_point, warehouse_point]
 
     stops: list[dict[str, Any]] = []
     sequence = 0
@@ -216,7 +230,14 @@ def _courier_route(
         "dark_color": COURIER_DARK_COLORS[courier_id],
         "dark_paths": dark_paths,
         "current_path": current_path,
-        "courier_marker": _midpoint(current_path),
+        "return_path": return_path,
+        "movement_kind": "delivery" if current_path else ("return" if return_path else None),
+        "movement_started_at": (
+            current.time_started
+            if current
+            else (last_completed_at.isoformat() if return_path and last_completed_at else None)
+        ),
+        "courier_marker": _midpoint(current_path or return_path),
         "current_target": current_target,
     }
     return route, stops
@@ -310,7 +331,7 @@ def build_delivery_monitor(repo: OrderRepository) -> dict[str, Any]:
         "routes": routes,
         "stops": map_stops,
         "disclaimer": (
-            "Значок курьера показывает расчётную позицию на прямом отрезке к текущему заказу. "
-            "GPS-геолокация курьера не используется."
+            "Значок курьера показывает расчётную позицию на дорожном маршруте по времени "
+            "от нажатия «Еду к заказу». GPS-геолокация и текущие пробки не используются."
         ),
     }

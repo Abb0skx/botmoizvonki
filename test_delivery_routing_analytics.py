@@ -1,0 +1,244 @@
+import base64
+import tempfile
+import unittest
+from collections import Counter
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock, patch
+
+from fastapi.testclient import TestClient
+
+from app.analytics_service import _forecast, build_delivery_analytics, parse_month, parse_week
+from app.database import OrderRepository
+from app.routing_service import RoutingService, enrich_monitor_routes, enrich_stats_routes
+from app.stats_service import TASHKENT
+
+
+ABBOS_ID = 202134293
+
+
+def _road_result(points, *, distance=4_200, duration=600):
+    return {
+        "provider": "osrm",
+        "approximate": True,
+        "geometry": [points[0], [41.325, 69.275], points[-1]],
+        "legs": [],
+        "distance_m": distance,
+        "duration_s": duration,
+    }
+
+
+class RoutingServiceTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.cache_path = Path(self.tempdir.name) / "routing.db"
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+
+    def test_route_is_persistently_cached(self):
+        points = [[41.33742, 69.272104], [41.311, 69.279]]
+        service = RoutingService(self.cache_path, "https://router.invalid")
+        response = _road_result(points)
+        with patch.object(service, "_fetch", Mock(return_value=response)) as fetch:
+            first = service._route_sync(points)
+            second = service._route_sync(points)
+
+        self.assertEqual(first, response)
+        self.assertEqual(second, response)
+        fetch.assert_called_once_with(points)
+
+        restarted = RoutingService(self.cache_path, "https://router.invalid")
+        with patch.object(restarted, "_fetch") as fetch_after_restart:
+            self.assertEqual(restarted._route_sync(points), response)
+        fetch_after_restart.assert_not_called()
+
+    def test_router_failure_uses_safe_road_estimate(self):
+        points = [[41.33742, 69.272104], [41.311, 69.279]]
+        service = RoutingService(self.cache_path, "https://router.invalid")
+        with patch.object(service, "_fetch", side_effect=OSError("offline")):
+            route = service._route_sync(points)
+
+        self.assertEqual(route["provider"], "fallback")
+        self.assertGreater(route["distance_m"], 0)
+        self.assertGreater(route["duration_s"], 0)
+
+    async def test_monitor_enrichment_adds_eta_movement_and_mileage(self):
+        started = (datetime.now(TASHKENT) - timedelta(minutes=5)).isoformat()
+        points = [[41.33742, 69.272104], [41.311, 69.279]]
+        routing = Mock()
+        routing.route = AsyncMock(side_effect=lambda value: _road_result(value))
+        state = {
+            "summary": {},
+            "couriers": [{"id": ABBOS_ID}],
+            "routes": [{
+                "courier_id": ABBOS_ID,
+                "dark_paths": [],
+                "current_path": points,
+                "return_path": [],
+                "movement_kind": "delivery",
+                "movement_started_at": started,
+            }],
+        }
+
+        result = await enrich_monitor_routes(state, routing)
+        movement = result["routes"][0]["movement"]
+
+        self.assertEqual(movement["kind"], "delivery")
+        self.assertEqual(movement["distance_km"], 4.2)
+        self.assertEqual(movement["duration_minutes"], 10)
+        self.assertGreater(movement["progress"], 0.45)
+        self.assertLess(movement["progress"], 0.55)
+        self.assertIsNotNone(movement["eta_at"])
+        self.assertGreater(result["summary"]["distance_today_km"], 2)
+
+    async def test_stats_enrichment_counts_completed_return_and_planned_roads(self):
+        routing = Mock()
+        routing.route = AsyncMock(side_effect=lambda points: _road_result(points))
+        report = {
+            "summary": {},
+            "couriers": [{"id": ABBOS_ID}],
+            "routes": [{
+                "courier_id": ABBOS_ID,
+                "completed_paths": [[[41.33742, 69.272104], [41.311, 69.279]]],
+                "current_path": [[41.311, 69.279], [41.35, 69.31]],
+                "return_path": [],
+            }],
+        }
+
+        result = await enrich_stats_routes(report, routing)
+
+        self.assertEqual(result["summary"]["distance_km"], 4.2)
+        self.assertEqual(result["summary"]["planned_distance_km"], 4.2)
+        self.assertEqual(result["couriers"][0]["distance_km"], 4.2)
+        self.assertEqual(result["couriers"][0]["route_minutes"], 10)
+        self.assertEqual(result["routes"][0]["completed_road_segments"][0]["duration_minutes"], 10)
+        self.assertEqual(result["routes"][0]["estimated_minutes"], 10)
+
+
+class DeliveryAnalyticsTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.database_path = Path(self.tempdir.name) / "delivery.db"
+        self.repo = OrderRepository(self.database_path)
+        self.repo.initialize()
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+
+    def _create(self, when: datetime, district: str, product: str):
+        timestamp = when.astimezone(timezone.utc).isoformat(timespec="microseconds")
+        with patch("app.database.repository.now", return_value=timestamp):
+            return self.repo.create(
+                manager_id=11,
+                manager_name="Abbos",
+                data={
+                    "seller_name": "Ali",
+                    "client_phone": "+998901333999",
+                    "product": product,
+                    "amount_usd": 100,
+                    "latitude": 41.31,
+                    "longitude": 69.27,
+                    "district": district,
+                },
+            )
+
+    def test_month_week_districts_and_forecasts(self):
+        today = datetime.now(TASHKENT).date()
+        month_start = today.replace(day=1)
+        previous_month_end = month_start - timedelta(days=1)
+        current_day = min(today.day, 15)
+        selected_day = month_start.replace(day=current_day)
+        self._create(
+            datetime.combine(selected_day, datetime.min.time(), TASHKENT) + timedelta(hours=12),
+            "Юнусабадский район",
+            "A57",
+        )
+        self._create(
+            datetime.combine(selected_day, datetime.min.time(), TASHKENT) + timedelta(hours=13),
+            "Юнусабадский район",
+            "A56",
+        )
+        self._create(
+            datetime.combine(previous_month_end, datetime.min.time(), TASHKENT) + timedelta(hours=12),
+            "Чиланзарский район",
+            "A55",
+        )
+        week = today - timedelta(days=today.weekday())
+        result = build_delivery_analytics(
+            self.repo,
+            month=month_start.strftime("%Y-%m"),
+            week=f"{week.isocalendar().year}-W{week.isocalendar().week:02d}",
+        )
+
+        self.assertEqual(result["month"]["orders"], 2)
+        self.assertEqual(result["month"]["previous_orders"], 1)
+        self.assertEqual(result["month"]["districts"][0]["name"], "Юнусабадский район")
+        self.assertEqual(result["month"]["districts"][0]["orders"], 2)
+        self.assertEqual(len(result["week"]["series"]), 7)
+        self.assertTrue(all("baseline" in item for item in result["week"]["series"]))
+        self.assertEqual(len(result["next_7_days"]), 7)
+        self.assertTrue(all(0 <= item["probability"] <= 100 for item in result["next_7_days"]))
+
+    def test_future_forecast_does_not_treat_unobserved_future_as_history(self):
+        today = date(2026, 8, 24)
+        counts = Counter({today - timedelta(days=7 * offset): 4 for offset in range(1, 9)})
+
+        near = _forecast(today + timedelta(days=7), counts, min(counts), as_of=today)
+        far = _forecast(today + timedelta(days=70), counts, min(counts), as_of=today)
+
+        self.assertEqual(near["expected"], far["expected"])
+        self.assertGreater(near["expected"], 0)
+
+    def test_month_and_week_validation(self):
+        today = date(2026, 8, 24)
+        self.assertEqual(parse_month("2026-08", today=today), date(2026, 8, 1))
+        self.assertEqual(parse_week("2026-W35", today=today), date(2026, 8, 24))
+        with self.assertRaises(ValueError):
+            parse_month("08-2026", today=today)
+        with self.assertRaises(ValueError):
+            parse_week("2026-W99", today=today)
+
+
+class DeliveryAnalyticsWebTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.database_path = Path(self.tempdir.name) / "delivery.db"
+        repo = OrderRepository(self.database_path)
+        repo.initialize()
+        from app import stats
+        self.stats = stats
+        self.patches = [
+            patch.object(stats, "DATABASE_PATH", self.database_path),
+            patch.object(stats, "STATS_USERNAME", "admin"),
+            patch.object(stats, "STATS_PASSWORD", "strong-secret"),
+        ]
+        for item in self.patches:
+            item.start()
+        self.client = TestClient(stats.app)
+
+    def tearDown(self):
+        self.client.close()
+        for item in reversed(self.patches):
+            item.stop()
+        self.tempdir.cleanup()
+
+    @staticmethod
+    def auth():
+        token = base64.b64encode(b"admin:strong-secret").decode()
+        return {"Authorization": f"Basic {token}"}
+
+    def test_analytics_endpoint_is_protected_and_navigable(self):
+        self.assertEqual(self.client.get("/delivery/stats/api/analytics").status_code, 401)
+        response = self.client.get(
+            "/delivery/stats/api/analytics?month=2026-08&week=2026-W35",
+            headers=self.auth(),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["month"]["value"], "2026-08")
+        self.assertEqual(response.json()["week"]["value"], "2026-W35")
+
+
+if __name__ == "__main__":
+    unittest.main()

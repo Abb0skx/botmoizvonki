@@ -26,7 +26,7 @@
     .top-actions { display:flex; align-items:center; gap:8px; flex-wrap:wrap; justify-content:flex-end }
     .secure,.nav-link { padding:8px 12px; border:1px solid #dfe5ef; background:#fff; border-radius:999px; color:#4f5a70; white-space:nowrap; text-decoration:none }
     .nav-link { color:var(--blue); font-weight:750 }
-    .panel { background:var(--panel); border:1px solid var(--line); border-radius:18px; box-shadow:0 5px 20px #26334d0b }
+    .panel { min-width:0; background:var(--panel); border:1px solid var(--line); border-radius:18px; box-shadow:0 5px 20px #26334d0b }
     .controls { display:grid; grid-template-columns:auto minmax(150px,1fr) minmax(180px,1fr) auto; gap:10px; padding:14px; position:sticky; top:8px; z-index:800; margin-bottom:16px }
     .segmented { display:flex; padding:4px; background:var(--soft); border-radius:12px }
     .segmented button { border:0; background:transparent; padding:9px 14px; border-radius:9px; color:#556078; cursor:pointer; font-weight:700 }
@@ -35,7 +35,7 @@
     .field input,.field select { width:100%; border:0; outline:0; color:var(--ink); background:transparent }
     .refresh { border:0; border-radius:12px; padding:0 18px; color:#fff; background:var(--ink); cursor:pointer; font-weight:750 }
     .refresh:disabled { opacity:.55 }
-    .metrics { display:grid; grid-template-columns:repeat(7,minmax(125px,1fr)); gap:12px; margin-bottom:16px }
+    .metrics { display:grid; grid-template-columns:repeat(8,minmax(115px,1fr)); gap:12px; margin-bottom:16px }
     .metric { padding:16px; min-height:107px }
     .metric .label { color:var(--muted); font-size:13px; font-weight:650 }
     .metric .value { margin-top:8px; font-size:clamp(22px,2.5vw,31px); font-weight:850; letter-spacing:-.035em }
@@ -68,6 +68,29 @@
     .event-text { font-size:13px }
     .section { margin-top:16px }
     .orders-wrap { overflow:auto; border-radius:0 0 18px 18px }
+    .analytics-grid { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:16px; margin-top:16px }
+    .analytics-grid > * { min-width:0; max-width:100% }
+    .analytics-wide { grid-column:1/-1 }
+    .chart-toolbar { display:flex; align-items:center; gap:8px; flex-wrap:wrap }
+    .chart-toolbar button { border:1px solid var(--line); background:#fff; border-radius:9px; padding:7px 10px; cursor:pointer; font-weight:750 }
+    .chart-label { min-width:155px; text-align:center; font-weight:850 }
+    .bar-chart { min-width:0; max-width:100%; display:flex; align-items:flex-end; gap:6px; height:255px; padding:18px 16px 12px; overflow-x:auto; border-top:1px solid var(--line) }
+    .bar-item { min-width:30px; height:100%; display:flex; flex-direction:column; justify-content:flex-end; align-items:center; gap:5px; color:var(--muted); font-size:10px }
+    .bar-value { font-size:11px; font-weight:800; color:var(--ink) }
+    .bar-stack { position:relative; width:22px; height:190px; display:flex; flex-direction:column; justify-content:flex-end; gap:2px }
+    .bar { width:100%; min-height:0; border-radius:6px 6px 2px 2px; background:linear-gradient(#ef625c,#c72c28) }
+    .bar.forecast { background:#fff3d6; border:2px dashed #e2a329 }
+    .baseline-mark { position:absolute; left:-4px; width:30px; height:3px; border-radius:3px; background:var(--blue); box-shadow:0 0 0 2px #ffffffcc }
+    .chart-legend { display:flex; gap:15px; flex-wrap:wrap; padding:0 16px 14px; color:var(--muted); font-size:12px }
+    .chart-legend i { width:13px; height:13px; display:inline-block; vertical-align:-2px; margin-right:5px; border-radius:3px; background:var(--accent) }
+    .chart-legend i.forecast { background:#fff3d6; border:2px dashed #e2a329 }
+    .chart-legend i.baseline { height:3px; border-radius:3px; background:var(--blue) }
+    .districts,.forecast-list { padding:0 16px 16px }
+    .district-row { display:grid; grid-template-columns:minmax(130px,1fr) 2fr auto; gap:10px; align-items:center; padding:8px 0 }
+    .district-bar { height:8px; background:#eef1f5; border-radius:8px; overflow:hidden }.district-bar i{display:block;height:100%;background:var(--blue);border-radius:8px}
+    .delta.up{color:var(--green)}.delta.down{color:var(--accent)}
+    .forecast-row { display:grid; grid-template-columns:1fr auto auto; gap:10px; padding:9px 0; border-bottom:1px solid var(--line) }
+    .forecast-note { margin:0 16px 16px; padding:10px 12px; background:#fff8e6; border:1px solid #f1deb0; border-radius:10px; color:#76530d; font-size:12px }
     table { width:100%; border-collapse:collapse; min-width:920px }
     th { text-align:left; color:var(--muted); font-size:12px; letter-spacing:.03em; text-transform:uppercase; background:#fafbfc }
     th,td { border-top:1px solid var(--line); padding:12px 14px; vertical-align:top }
@@ -79,7 +102,8 @@
     .loading.visible { display:grid }
     .error { display:none; margin-bottom:16px; padding:13px 15px; border-radius:12px; color:#8d1d19; background:#fff0ef; border:1px solid #f1c0bd }
     @media (max-width:1100px) { .metrics{grid-template-columns:repeat(3,1fr)} .layout{grid-template-columns:1fr} #map{height:520px} .side{grid-template-columns:1fr 1fr} }
-    @media (max-width:720px) { .shell{padding:12px} .secure{display:none} .controls{grid-template-columns:1fr 1fr;top:4px}.segmented{grid-column:1/-1}.refresh{min-height:46px}.metrics{grid-template-columns:repeat(2,1fr);gap:8px}.metric{min-height:94px;padding:13px}.side{grid-template-columns:1fr}#map{height:470px}.card-head{display:block}.map-tabs{margin-top:10px}.subtitle{font-size:13px} }
+    @media (max-width:820px) { .analytics-grid{grid-template-columns:1fr}.analytics-wide{grid-column:auto} }
+    @media (max-width:720px) { .shell{padding:12px} .secure{display:none} .controls{grid-template-columns:1fr 1fr;top:4px}.segmented{grid-column:1/-1}.refresh{min-height:46px}.metrics{grid-template-columns:repeat(2,1fr);gap:8px}.metric{min-height:94px;padding:13px}.side{grid-template-columns:1fr}#map{height:470px}.card-head{display:block}.map-tabs,.chart-toolbar{margin-top:10px}.subtitle{font-size:13px}.district-row{grid-template-columns:1fr auto}.district-bar{grid-column:1/-1;grid-row:2}.bar-chart{height:230px} }
   </style>
 </head>
 <body>
@@ -120,6 +144,13 @@
       <div class="card-head"><div><h2>Все заказы за день</h2><p id="ordersCaption"></p></div></div>
       <div class="orders-wrap" id="orders"></div>
     </section>
+
+    <section class="analytics-grid">
+      <article class="panel analytics-wide"><div class="card-head"><div><h2>Заказы по дням месяца</h2><p id="monthCaption">Факт и прогноз будущих дней.</p></div><div class="chart-toolbar"><button id="monthPrev">←</button><div class="chart-label" id="monthLabel">—</div><button id="monthNext">→</button></div></div><div class="bar-chart" id="monthChart"></div><div class="chart-legend"><span><i></i> Фактически</span><span><i class="forecast"></i> Прогноз</span></div></article>
+      <article class="panel analytics-wide"><div class="card-head"><div><h2>Неделя и привычные дни</h2><p>Столбец — выбранная неделя; синяя отметка — среднее этого дня недели за 12 недель.</p></div><div class="chart-toolbar"><button id="weekPrev">←</button><div class="chart-label" id="weekLabel">—</div><button id="weekNext">→</button></div></div><div class="bar-chart" id="weekChart"></div><div class="chart-legend"><span><i></i> Фактически</span><span><i class="forecast"></i> Вероятный объём</span><span><i class="baseline"></i> Обычная нагрузка</span></div></article>
+      <article class="panel"><div class="card-head"><div><h2>Заказы по районам</h2><p id="districtCaption">Распределение выбранного месяца.</p></div></div><div class="districts" id="districts"></div></article>
+      <article class="panel"><div class="card-head"><div><h2>Следующие 7 дней</h2><p>Вероятность хотя бы одного заказа и ожидаемое количество.</p></div></div><div class="forecast-list" id="forecast"></div><div class="forecast-note" id="forecastNote"></div></article>
+    </section>
   </main>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -128,6 +159,8 @@
     const params = new URLSearchParams(location.search);
     let requestedDay = params.get("day") || "today";
     let requestedCourier = params.get("courier_id") || "";
+    let requestedMonth = params.get("month") || "";
+    let requestedWeek = params.get("week") || "";
     let map, routeLayer;
     const $ = id => document.getElementById(id);
     const escapeHtml = value => String(value ?? "").replace(/[&<>'"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[c]));
@@ -142,13 +175,16 @@
     function mapUrl(path) {
       const q = new URLSearchParams({day:requestedDay});
       if (requestedCourier) q.set("courier_id", requestedCourier);
-      return `${BASE}/${path}?${q}`;
+      return new URL(`${BASE}/${path}?${q}`, location.origin).href;
     }
+    function analyticsUrl() { const q=new URLSearchParams();if(requestedMonth)q.set("month",requestedMonth);if(requestedWeek)q.set("week",requestedWeek);return new URL(`${BASE}/api/analytics?${q}`, location.origin).href; }
     function setLoading(value) { $("loading").classList.toggle("visible", value); $("refreshBtn").disabled = value; }
     function showError(message) { $("error").textContent = message; $("error").style.display = message ? "block" : "none"; }
     function updateLocation() {
       const q = new URLSearchParams({day:requestedDay});
       if (requestedCourier) q.set("courier_id", requestedCourier);
+      if (requestedMonth) q.set("month", requestedMonth);
+      if (requestedWeek) q.set("week", requestedWeek);
       history.replaceState(null, "", `${BASE}?${q}`);
     }
     function metric(label, value, hint="") { return `<article class="panel metric"><div class="label">${label}</div><div class="value">${escapeHtml(value)}</div><div class="hint">${escapeHtml(hint)}</div></article>`; }
@@ -161,6 +197,7 @@
         metric("Отменено", s.cancelled, "за выбранный день"),
         metric("Среднее время", s.average_minutes == null ? "—" : `${s.average_minutes} мин`, "от выезда до доставки"),
         metric("После забора", s.average_pickup_minutes == null ? "—" : `${s.average_pickup_minutes} мин`, "от получения товара до доставки"),
+        metric("Пробег", `${s.distance_km || 0} км`, s.planned_distance_km ? `ещё ~${s.planned_distance_km} км` : "по дорожной сети"),
         metric("Сумма заказов", s.amount_text, "по карточкам заказов"),
         metric("Получено", s.received_text, `точек на карте: ${s.mapped}`),
       ].join("");
@@ -169,7 +206,7 @@
     function renderCouriers(data) {
       $("courierSelect").innerHTML = `<option value="">Все курьеры</option>` + data.couriers.map(c => `<option value="${c.id}">${escapeHtml(c.name)}</option>`).join("");
       $("courierSelect").value = requestedCourier;
-      $("couriers").innerHTML = data.couriers.map(c => `<button class="courier" data-id="${c.id}"><div class="courier-top"><span><i class="dot" style="background:${c.color}"></i>${escapeHtml(c.name)}</span><span>${c.average_minutes == null ? "—" : `${c.average_minutes} мин`}</span></div><div class="courier-stats"><span><b>${c.orders}</b>заказов</span><span><b>${c.completed}</b>доставлено</span><span><b>${c.active}</b>активно</span></div></button>`).join("");
+      $("couriers").innerHTML = data.couriers.map(c => `<button class="courier" data-id="${c.id}"><div class="courier-top"><span><i class="dot" style="background:${c.color}"></i>${escapeHtml(c.name)}</span><span>~${c.distance_km || 0} км · ~${c.route_minutes || 0} мин</span></div><div class="courier-stats"><span><b>${c.orders}</b>заказов</span><span><b>${c.completed}</b>доставлено</span><span><b>${c.active}</b>активно</span></div></button>`).join("");
       document.querySelectorAll(".courier").forEach(button => button.onclick = () => { requestedCourier = button.dataset.id; $("courierSelect").value = requestedCourier; load(); });
     }
 
@@ -180,14 +217,27 @@
       const warehouseIcon = L.divIcon({className:"", html:`<div class="warehouse-marker">🏬</div>`, iconSize:[42,42], iconAnchor:[21,21]});
       L.marker(warehouse, {icon:warehouseIcon}).bindPopup(`<b>${escapeHtml(data.warehouse.name)}</b><br>Начало и конец маршрута`).addTo(routeLayer);
       bounds.push(warehouse);
-      const bySequence = new Map(data.stops.map(stop => [stop.sequence, stop]));
       data.routes.forEach(route => {
-        const completed = route.completed_sequences.map(number => { const stop=bySequence.get(number); return [stop.latitude,stop.longitude]; });
-        const current = route.current_sequences.map(number => { const stop=bySequence.get(number); return [stop.latitude,stop.longitude]; });
-        const past = [warehouse, ...completed];
-        if (completed.length && !current.length && !route.remaining_sequences.length) past.push(warehouse);
-        if (past.length > 1) L.polyline(past, {color:route.dark_color, weight:6, opacity:.88}).bindTooltip(`${route.courier_name} · доставлено`).addTo(routeLayer);
-        if (current.length) L.polyline([completed.at(-1) || warehouse, ...current], {color:route.color, weight:8, opacity:.92}).bindTooltip(`${route.courier_name} · текущий путь`).addTo(routeLayer);
+        const completedSegments = route.completed_road_segments?.length ? route.completed_road_segments : (route.completed_paths || []).map(geometry => ({geometry}));
+        completedSegments.forEach(segment => {
+          const path = segment.geometry;
+          if (path.length > 1) {
+            const details = segment.distance_km == null ? `${route.courier_name} · доставлено` : `${route.courier_name} · ~${segment.distance_km} км · ~${segment.duration_minutes} мин`;
+            L.polyline(path, {color:route.dark_color, weight:6, opacity:.88}).bindTooltip(details).addTo(routeLayer);
+            path.forEach(point => bounds.push(point));
+          }
+        });
+        const current = route.current_road_path || route.current_path || [];
+        if (current.length > 1) {
+          L.polyline(current, {color:"#fff", weight:11, opacity:.9}).addTo(routeLayer);
+          L.polyline(current, {color:route.color, weight:7, opacity:.95, dashArray:"12 8"}).bindTooltip(`${route.courier_name} · ~${route.estimated_minutes || "—"} мин`).addTo(routeLayer);
+          current.forEach(point => bounds.push(point));
+        }
+        const returning = route.return_road_path || route.return_path || [];
+        if (returning.length > 1) {
+          L.polyline(returning, {color:"#f59e0b", weight:6, opacity:.9, dashArray:"7 10"}).bindTooltip(`${route.courier_name} · возврат на склад`).addTo(routeLayer);
+          returning.forEach(point => bounds.push(point));
+        }
       });
       data.stops.forEach(stop => {
         const point = [stop.latitude, stop.longitude]; bounds.push(point);
@@ -214,10 +264,44 @@
       $("orders").innerHTML = `<table><thead><tr><th>Заказ</th><th>Курьер</th><th>Адрес</th><th>Время</th><th>Сумма</th><th>Статус</th></tr></thead><tbody>${data.orders.map(o => `<tr><td><strong>№${o.order_number} · ${escapeHtml(o.product)}</strong><small>${escapeHtml(o.seller_name)} · ${escapeHtml(o.phones.join(" / "))}</small></td><td><i class="dot" style="background:${o.courier_color}"></i>${escapeHtml(o.courier_name)}</td><td>${escapeHtml(o.address)}</td><td>📥 ${o.created_time || "—"}<br>📦 ${o.picked_up_time || "—"}<br>🚗 ${o.started_time || "—"}<br>✅ ${o.completed_time || "—"}${o.duration_minutes == null ? "" : `<br><small>${o.duration_minutes} мин в пути</small>`}</td><td>${escapeHtml(o.amount_text)}</td><td><span class="status">${escapeHtml(statusLabels[o.status] || o.status)}</span></td></tr>`).join("")}</tbody></table>`;
     }
 
+    function renderBars(target, series) {
+      const maximum = Math.max(1, ...series.map(item => Math.max(item.actual || 0, item.forecast || 0, item.baseline || 0)));
+      $(target).innerHTML = series.map(item => {
+        const actual = item.actual, forecast = item.forecast, value = actual ?? forecast ?? 0;
+        const baseText = item.baseline == null ? "" : `; обычно: ${item.baseline}`;
+        const title = (forecast != null ? `Прогноз: ${forecast}; вероятность: ${item.probability}%` : `Факт: ${actual || 0}`) + baseText;
+        const baseline = item.baseline == null ? "" : `<i class="baseline-mark" style="bottom:${item.baseline / maximum * 100}%"></i>`;
+        return `<div class="bar-item" title="${escapeHtml(title)}"><div class="bar-value">${value || ""}</div><div class="bar-stack">${baseline}<div class="bar ${actual == null ? "forecast" : ""}" style="height:${value / maximum * 100}%"></div></div><div>${escapeHtml(item.label)}</div></div>`;
+      }).join("");
+    }
+
+    function renderAnalytics(result) {
+      requestedMonth = result.month.value; requestedWeek = result.week.value;
+      $("monthLabel").textContent = result.month.label; $("weekLabel").textContent = result.week.label;
+      $("monthCaption").textContent = `${result.month.orders} заказов · к прошлому месяцу ${result.month.change >= 0 ? "+" : ""}${result.month.change}`;
+      renderBars("monthChart", result.month.series); renderBars("weekChart", result.week.series);
+      const max = Math.max(1, ...result.month.districts.map(item => item.orders));
+      $("districts").innerHTML = result.month.districts.length ? result.month.districts.map(item => `<div class="district-row"><span>${escapeHtml(item.name)}</span><div class="district-bar"><i style="width:${item.orders / max * 100}%"></i></div><b>${item.orders} <small class="delta ${item.change >= 0 ? "up" : "down"}">${item.change >= 0 ? "+" : ""}${item.change}</small></b></div>`).join("") : '<div class="empty">В этом месяце районов пока нет.</div>';
+      $("forecast").innerHTML = result.next_7_days.map(item => `<div class="forecast-row"><span>${escapeHtml(item.label)}<small style="display:block;color:var(--muted)">уверенность: ${escapeHtml(item.confidence)}</small></span><b>~${item.expected}</b><span>${item.probability}%</span></div>`).join("");
+      $("forecastNote").textContent = result.forecast_note;
+      $("monthPrev").dataset.value = result.month.previous_value; $("monthNext").dataset.value = result.month.next_value;
+      $("weekPrev").dataset.value = result.week.previous_value; $("weekNext").dataset.value = result.week.next_value;
+      updateLocation();
+    }
+
+    async function loadAnalytics() {
+      const response = await fetch(analyticsUrl(), {credentials:"same-origin", cache:"no-store"});
+      if (!response.ok) throw new Error(`Не удалось получить аналитику (${response.status}).`);
+      renderAnalytics(await response.json());
+    }
+
     async function load() {
       setLoading(true); showError("");
       try {
-        const response = await fetch(mapUrl("api/report"), {credentials:"same-origin", cache:"no-store"});
+        const [response] = await Promise.all([
+          fetch(mapUrl("api/report"), {credentials:"same-origin", cache:"no-store"}),
+          loadAnalytics(),
+        ]);
         if (!response.ok) throw new Error(response.status === 401 ? "Неверный логин или пароль." : `Не удалось получить статистику (${response.status}).`);
         const data = await response.json();
         $("dayInput").value = data.day;
@@ -234,6 +318,10 @@
     $("dayInput").onchange = event => { requestedDay=event.target.value; load(); };
     $("courierSelect").onchange = event => { requestedCourier=event.target.value; load(); };
     $("refreshBtn").onclick = load;
+    $("monthPrev").onclick = () => { requestedMonth=$("monthPrev").dataset.value; loadAnalytics().catch(error => showError(error.message)); };
+    $("monthNext").onclick = () => { requestedMonth=$("monthNext").dataset.value; loadAnalytics().catch(error => showError(error.message)); };
+    $("weekPrev").onclick = () => { requestedWeek=$("weekPrev").dataset.value; loadAnalytics().catch(error => showError(error.message)); };
+    $("weekNext").onclick = () => { requestedWeek=$("weekNext").dataset.value; loadAnalytics().catch(error => showError(error.message)); };
     $("interactiveBtn").onclick = () => { $("map").style.display="block"; $("mapPhoto").style.display="none"; $("interactiveBtn").classList.add("active"); $("photoBtn").classList.remove("active"); setTimeout(()=>map.invalidateSize(),50); };
     $("photoBtn").onclick = () => { $("map").style.display="none"; $("mapPhoto").style.display="block"; $("photoBtn").classList.add("active"); $("interactiveBtn").classList.remove("active"); };
     initMap(); load();

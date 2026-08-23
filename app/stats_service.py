@@ -396,6 +396,10 @@ def build_delivery_stats(
             "picked_up_time": picked_up.strftime("%H:%M") if picked_up else None,
             "started_time": started.strftime("%H:%M") if started else None,
             "completed_time": completed.strftime("%H:%M") if completed else None,
+            "created_at": created.isoformat() if created else None,
+            "picked_up_at": picked_up.isoformat() if picked_up else None,
+            "started_at": started.isoformat() if started else None,
+            "completed_at": completed.isoformat() if completed else None,
             "duration_minutes": duration,
             "pickup_duration_minutes": pickup_duration,
             "amount_usd": order.amount_usd or 0,
@@ -454,11 +458,65 @@ def build_delivery_stats(
         })
 
     routes: list[dict[str, Any]] = []
+    order_by_id = {order.id: order for order in relevant}
+    warehouse_point = [41.337420, 69.272104]
+
+    def location_points(order_id: int) -> list[list[float]]:
+        order = order_by_id[order_id]
+        points: list[list[float]] = []
+        if order.latitude is not None and order.longitude is not None:
+            points.append([order.latitude, order.longitude])
+        if order.second_latitude is not None and order.second_longitude is not None:
+            points.append([order.second_latitude, order.second_longitude])
+        return points
+
     grouped_stops: dict[int | None, list[dict[str, Any]]] = defaultdict(list)
     for stop in stops:
         grouped_stops[stop["courier_id"]].append(stop)
     for route_courier_id, route_stops in grouped_stops.items():
         configured = COURIERS_BY_ID.get(route_courier_id)
+        courier_rows = [row for row in rows if row["courier_id"] == route_courier_id]
+        completed_rows = sorted(
+            (row for row in courier_rows if row["completed_today"]),
+            key=lambda row: (row["completed_at"] or row["sort_timestamp"], row["order_number"]),
+        )
+        completed_paths: list[list[list[float]]] = []
+        completed_path: list[list[float]] = [warehouse_point]
+        last_completed: datetime | None = None
+        last_point = warehouse_point
+        for row in completed_rows:
+            pickup = local_datetime(row["picked_up_at"])
+            if last_completed and pickup and pickup > last_completed:
+                if completed_path[-1] != warehouse_point:
+                    completed_path.append(warehouse_point)
+                if len(completed_path) > 1:
+                    completed_paths.append(completed_path)
+                completed_path = [warehouse_point]
+                last_point = warehouse_point
+            for point in location_points(row["id"]):
+                completed_path.append(point)
+                last_point = point
+            completed_at = local_datetime(row["completed_at"])
+            if completed_at:
+                last_completed = completed_at
+        if len(completed_path) > 1:
+            completed_paths.append(completed_path)
+
+        current_rows = [row for row in courier_rows if row["status"] == "on_way"]
+        current_row = current_rows[-1] if current_rows else None
+        current_path: list[list[float]] = []
+        if current_row:
+            pickup = local_datetime(current_row["picked_up_at"])
+            current_origin = last_point
+            if not last_completed or (pickup and pickup > last_completed):
+                current_origin = warehouse_point
+                if completed_paths and completed_paths[-1][-1] != warehouse_point:
+                    completed_paths[-1].append(warehouse_point)
+            current_path = [current_origin, *location_points(current_row["id"])]
+
+        return_path: list[list[float]] = []
+        if last_completed and not current_path and last_point != warehouse_point:
+            return_path = [last_point, warehouse_point]
         routes.append({
             "courier_id": route_courier_id,
             "courier_name": configured.name if configured else route_stops[0]["courier_name"],
@@ -475,6 +533,9 @@ def build_delivery_stats(
                 stop["sequence"] for stop in route_stops
                 if stop["state"] in {"picked_up", "remaining"}
             ],
+            "completed_paths": completed_paths,
+            "current_path": current_path,
+            "return_path": return_path,
         })
 
     timeline = []

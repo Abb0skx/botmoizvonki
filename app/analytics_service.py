@@ -1,0 +1,267 @@
+from __future__ import annotations
+
+import calendar
+import math
+import re
+from collections import Counter
+from datetime import date, datetime, timedelta
+from typing import Any
+
+from app.database import OrderRepository
+from app.stats_service import TASHKENT, local_datetime
+
+
+MONTH_RE = re.compile(r"^(\d{4})-(\d{2})$")
+WEEK_RE = re.compile(r"^(\d{4})-W(\d{2})$")
+WEEKDAY_NAMES = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
+MONTH_NAMES = (
+    "",
+    "Январь",
+    "Февраль",
+    "Март",
+    "Апрель",
+    "Май",
+    "Июнь",
+    "Июль",
+    "Август",
+    "Сентябрь",
+    "Октябрь",
+    "Ноябрь",
+    "Декабрь",
+)
+
+
+def parse_month(value: str | None, *, today: date | None = None) -> date:
+    current = today or datetime.now(TASHKENT).date()
+    cleaned = (value or current.strftime("%Y-%m")).strip()
+    match = MONTH_RE.fullmatch(cleaned)
+    if not match:
+        raise ValueError("Неверный месяц. Используйте формат ГГГГ-ММ.")
+    year, month = map(int, match.groups())
+    if not 2024 <= year <= current.year + 1 or not 1 <= month <= 12:
+        raise ValueError("Месяц находится вне доступного диапазона.")
+    return date(year, month, 1)
+
+
+def parse_week(value: str | None, *, today: date | None = None) -> date:
+    current = today or datetime.now(TASHKENT).date()
+    default = current - timedelta(days=current.weekday())
+    cleaned = (value or f"{default.isocalendar().year}-W{default.isocalendar().week:02d}").strip()
+    match = WEEK_RE.fullmatch(cleaned)
+    if not match:
+        raise ValueError("Неверная неделя. Используйте формат ГГГГ-WНН.")
+    try:
+        monday = date.fromisocalendar(int(match.group(1)), int(match.group(2)), 1)
+    except ValueError as error:
+        raise ValueError("Такой недели не существует.") from error
+    if monday.year < 2023 or monday > current + timedelta(days=370):
+        raise ValueError("Неделя находится вне доступного диапазона.")
+    return monday
+
+
+def _month_shift(value: date, delta: int) -> date:
+    total = value.year * 12 + value.month - 1 + delta
+    return date(total // 12, total % 12 + 1, 1)
+
+
+def _week_value(monday: date) -> str:
+    iso = monday.isocalendar()
+    return f"{iso.year}-W{iso.week:02d}"
+
+
+def _forecast(
+    target: date,
+    daily_counts: Counter[date],
+    history_start: date | None,
+    *,
+    as_of: date,
+) -> dict[str, Any]:
+    # For a future target, walk back to the latest already observed occurrence
+    # of the same weekday. This prevents future zeroes from depressing forecasts
+    # when a manager opens a later month or week.
+    latest_same_weekday = target - timedelta(days=7)
+    while latest_same_weekday > as_of:
+        latest_same_weekday -= timedelta(days=7)
+    same_weekday_dates = [
+        latest_same_weekday - timedelta(days=7 * offset)
+        for offset in range(8)
+    ]
+    same_weekday = [
+        daily_counts[day]
+        for day in same_weekday_dates
+        if history_start is None or day >= history_start
+    ]
+    recent_days = [
+        daily_counts[as_of - timedelta(days=offset)]
+        for offset in range(28)
+        if history_start is None or as_of - timedelta(days=offset) >= history_start
+    ]
+    baseline = (
+        sum(same_weekday) / len(same_weekday)
+        if same_weekday
+        else (sum(recent_days) / len(recent_days) if recent_days else 0.0)
+    )
+    recent_window = recent_days[:14]
+    previous_window = recent_days[14:]
+    recent = sum(recent_window) / len(recent_window) if recent_window else 0.0
+    previous = sum(previous_window) / len(previous_window) if previous_window else recent
+    trend = (recent + 0.25) / (previous + 0.25)
+    trend = max(0.65, min(1.5, trend))
+    expected = max(0.0, baseline * trend)
+    probability = (1 - math.exp(-expected)) * 100
+    sample = len(same_weekday)
+    confidence = "низкая" if sample < 4 else ("средняя" if sample < 8 else "выше средней")
+    return {
+        "expected": round(expected, 1),
+        "probability": round(probability),
+        "sample": sample,
+        "confidence": confidence,
+    }
+
+
+def build_delivery_analytics(
+    repo: OrderRepository,
+    *,
+    month: str | None = None,
+    week: str | None = None,
+) -> dict[str, Any]:
+    today = datetime.now(TASHKENT).date()
+    month_start = parse_month(month, today=today)
+    week_start = parse_week(week, today=today)
+    orders = repo.list_all()
+    created_orders = [
+        (order, created.date())
+        for order in orders
+        if (created := local_datetime(order.created_at))
+    ]
+    daily_counts: Counter[date] = Counter(day for _, day in created_orders)
+    history_start = min(daily_counts, default=None)
+
+    month_days = calendar.monthrange(month_start.year, month_start.month)[1]
+    month_dates = [month_start + timedelta(days=index) for index in range(month_days)]
+    month_series = []
+    for day in month_dates:
+        forecast = (
+            _forecast(day, daily_counts, history_start, as_of=today)
+            if day > today
+            else None
+        )
+        month_series.append({
+            "date": day.isoformat(),
+            "label": str(day.day),
+            "weekday": WEEKDAY_NAMES[day.weekday()],
+            "actual": daily_counts[day] if day <= today else None,
+            "forecast": forecast["expected"] if forecast else None,
+            "probability": forecast["probability"] if forecast else None,
+        })
+
+    previous_month = _month_shift(month_start, -1)
+    next_month = _month_shift(month_start, 1)
+    previous_month_days = calendar.monthrange(previous_month.year, previous_month.month)[1]
+    current_total = sum(daily_counts[day] for day in month_dates)
+    previous_total = sum(
+        daily_counts[previous_month + timedelta(days=index)]
+        for index in range(previous_month_days)
+    )
+
+    districts = Counter(
+        (order.district or "Район не определён").strip()
+        for order, day in created_orders
+        if month_start <= day < next_month
+    )
+    previous_districts = Counter(
+        (order.district or "Район не определён").strip()
+        for order, day in created_orders
+        if previous_month <= day < month_start
+    )
+    district_rows = [
+        {
+            "name": name,
+            "orders": count,
+            "previous": previous_districts.get(name, 0),
+            "change": count - previous_districts.get(name, 0),
+            "share": round(count / current_total * 100, 1) if current_total else 0,
+        }
+        for name, count in districts.most_common()
+    ]
+
+    week_dates = [week_start + timedelta(days=index) for index in range(7)]
+    week_series = []
+    for day in week_dates:
+        forecast = (
+            _forecast(day, daily_counts, history_start, as_of=today)
+            if day > today
+            else None
+        )
+        week_series.append({
+            "date": day.isoformat(),
+            "label": WEEKDAY_NAMES[day.weekday()],
+            "day_label": day.strftime("%d.%m"),
+            "actual": daily_counts[day] if day <= today else None,
+            "forecast": forecast["expected"] if forecast else None,
+            "probability": forecast["probability"] if forecast else None,
+        })
+
+    weekday_history = []
+    for weekday, name in enumerate(WEEKDAY_NAMES):
+        samples = [
+            daily_counts[today - timedelta(days=offset)]
+            for offset in range(1, 85)
+            if (today - timedelta(days=offset)).weekday() == weekday
+            and (history_start is None or today - timedelta(days=offset) >= history_start)
+        ]
+        weekday_history.append({
+            "label": name,
+            "average": round(sum(samples) / len(samples), 1) if samples else 0,
+            "sample": len(samples),
+        })
+    for item, history in zip(week_series, weekday_history):
+        item["baseline"] = history["average"]
+        item["baseline_sample"] = history["sample"]
+
+    next_forecast = []
+    for offset in range(1, 8):
+        day = today + timedelta(days=offset)
+        forecast = _forecast(day, daily_counts, history_start, as_of=today)
+        next_forecast.append({
+            "date": day.isoformat(),
+            "label": f"{WEEKDAY_NAMES[day.weekday()]} · {day:%d.%m}",
+            **forecast,
+        })
+
+    current_week_total = sum(daily_counts[day] for day in week_dates)
+    previous_week_start = week_start - timedelta(days=7)
+    previous_week_total = sum(
+        daily_counts[previous_week_start + timedelta(days=index)]
+        for index in range(7)
+    )
+    return {
+        "generated_at": datetime.now(TASHKENT).isoformat(timespec="seconds"),
+        "month": {
+            "value": month_start.strftime("%Y-%m"),
+            "label": f"{MONTH_NAMES[month_start.month]} {month_start.year}",
+            "previous_value": previous_month.strftime("%Y-%m"),
+            "next_value": next_month.strftime("%Y-%m"),
+            "orders": current_total,
+            "previous_orders": previous_total,
+            "change": current_total - previous_total,
+            "series": month_series,
+            "districts": district_rows,
+        },
+        "week": {
+            "value": _week_value(week_start),
+            "label": f"{week_start:%d.%m}–{week_dates[-1]:%d.%m.%Y}",
+            "previous_value": _week_value(previous_week_start),
+            "next_value": _week_value(week_start + timedelta(days=7)),
+            "orders": current_week_total,
+            "previous_orders": previous_week_total,
+            "change": current_week_total - previous_week_total,
+            "series": week_series,
+            "weekday_history": weekday_history,
+        },
+        "next_7_days": next_forecast,
+        "forecast_note": (
+            "Прогноз экспериментальный: среднее по таким же дням недели за последние "
+            "8 недель с поправкой на динамику последних 28 дней. Это вероятность, а не гарантия."
+        ),
+    }

@@ -468,6 +468,7 @@ async def render_delivery_sequence_map(
     report_day_label: str,
     cache_dir: Path,
     tile_url: str | None = None,
+    road_routes: list[dict] | None = None,
 ) -> BytesIO:
     """Render numbered delivery order and per-courier warehouse routes."""
     image, zoom, left, top = await _render_base_map(
@@ -482,40 +483,58 @@ async def render_delivery_sequence_map(
         return round(world_x - left), round(world_y - top)
 
     warehouse = pixel(WAREHOUSE_LATITUDE, WAREHOUSE_LONGITUDE)
-    grouped: dict[int | None, list[DeliverySequenceStop]] = {}
-    for stop in stops:
-        grouped.setdefault(stop.courier_id, []).append(stop)
-    for route_stops in grouped.values():
-        route_stops.sort(key=lambda stop: stop.sequence)
-        route_color = route_stops[0].color
-        completed = [stop for stop in route_stops if stop.state == "completed"]
-        current = [stop for stop in route_stops if stop.state == "on_way"]
-        remaining = [
-            stop for stop in route_stops
-            if stop.state in {"picked_up", "remaining"}
-        ]
-        completed_points = [
-            warehouse,
-            *(pixel(stop.latitude, stop.longitude) for stop in completed),
-        ]
-        if completed and not current and not remaining:
-            completed_points.append(warehouse)
-        if len(completed_points) >= 2:
-            draw.line(completed_points, fill=(255, 255, 255, 225), width=13, joint="curve")
-            draw.line(
-                completed_points,
-                fill=_darken_hex(route_color),
-                width=7,
-                joint="curve",
-            )
-        if current:
-            origin = completed_points[-1] if completed else warehouse
-            current_points = [
-                origin,
-                *(pixel(stop.latitude, stop.longitude) for stop in current),
+    if road_routes:
+        for route in road_routes:
+            route_color = route.get("color") or "#7c3aed"
+            for path in route.get("completed_road_paths") or []:
+                points = [pixel(latitude, longitude) for latitude, longitude in path]
+                if len(points) >= 2:
+                    draw.line(points, fill=(255, 255, 255, 225), width=13, joint="curve")
+                    draw.line(points, fill=_darken_hex(route_color), width=7, joint="curve")
+            for field, color in (
+                ("current_road_path", route_color),
+                ("return_road_path", "#f59e0b"),
+            ):
+                path = route.get(field) or []
+                points = [pixel(latitude, longitude) for latitude, longitude in path]
+                if len(points) >= 2:
+                    draw.line(points, fill=(255, 255, 255, 240), width=15, joint="curve")
+                    draw.line(points, fill=color, width=8, joint="curve")
+    else:
+        grouped: dict[int | None, list[DeliverySequenceStop]] = {}
+        for stop in stops:
+            grouped.setdefault(stop.courier_id, []).append(stop)
+        for route_stops in grouped.values():
+            route_stops.sort(key=lambda stop: stop.sequence)
+            route_color = route_stops[0].color
+            completed = [stop for stop in route_stops if stop.state == "completed"]
+            current = [stop for stop in route_stops if stop.state == "on_way"]
+            remaining = [
+                stop for stop in route_stops
+                if stop.state in {"picked_up", "remaining"}
             ]
-            draw.line(current_points, fill=(255, 255, 255, 240), width=15, joint="curve")
-            draw.line(current_points, fill=route_color, width=8, joint="curve")
+            completed_points = [
+                warehouse,
+                *(pixel(stop.latitude, stop.longitude) for stop in completed),
+            ]
+            if completed and not current and not remaining:
+                completed_points.append(warehouse)
+            if len(completed_points) >= 2:
+                draw.line(completed_points, fill=(255, 255, 255, 225), width=13, joint="curve")
+                draw.line(
+                    completed_points,
+                    fill=_darken_hex(route_color),
+                    width=7,
+                    joint="curve",
+                )
+            if current:
+                origin = completed_points[-1] if completed else warehouse
+                current_points = [
+                    origin,
+                    *(pixel(stop.latitude, stop.longitude) for stop in current),
+                ]
+                draw.line(current_points, fill=(255, 255, 255, 240), width=15, joint="curve")
+                draw.line(current_points, fill=route_color, width=8, joint="curve")
 
     ordered_stops = sorted(stops, key=lambda item: item.sequence)
     actual_pixels = {
@@ -579,7 +598,7 @@ async def render_delivery_sequence_map(
     legend_font = _font(18, bold=True)
     legend = (
         f"Очередность доставок · {report_day_label} · "
-        f"точек: {len(stops)} · тёмная линия — доставлено · яркая — сейчас"
+        f"точек: {len(stops)} · тёмная — доставлено · яркая — сейчас · оранжевая — склад"
     )
     bounds = draw.textbbox((0, 0), legend, font=legend_font)
     legend_box = (10, 10, min(MAP_WIDTH - 10, bounds[2] - bounds[0] + 30), 48)
