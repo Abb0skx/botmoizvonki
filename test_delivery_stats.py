@@ -17,6 +17,7 @@ from app.utils.static_map import (
     DeliverySequenceStop,
     MAP_HEIGHT,
     MAP_WIDTH,
+    _spread_marker_positions,
     render_delivery_sequence_map,
 )
 
@@ -169,6 +170,27 @@ class DeliveryStatsServiceTests(unittest.TestCase):
 
 
 class DeliverySequenceMapTests(unittest.IsolatedAsyncioTestCase):
+    def test_dense_markers_are_spread_without_leaving_the_image(self):
+        positions = _spread_marker_positions(
+            [(sequence, 640 + sequence % 3, 480 + sequence % 2) for sequence in range(1, 13)],
+            obstacle=(640, 480),
+        )
+
+        self.assertEqual(len(positions), 12)
+        self.assertTrue(any(point != (640 + sequence % 3, 480 + sequence % 2) for sequence, point in positions.items()))
+        for x, y in positions.values():
+            self.assertGreaterEqual(x, 40)
+            self.assertLessEqual(x, MAP_WIDTH - 40)
+            self.assertGreaterEqual(y, 56)
+            self.assertLessEqual(y, MAP_HEIGHT - 40)
+        values = list(positions.values())
+        for index, (x, y) in enumerate(values):
+            for other_x, other_y in values[index + 1:]:
+                self.assertGreaterEqual(
+                    ((x - other_x) ** 2 + (y - other_y) ** 2) ** 0.5,
+                    72,
+                )
+
     async def test_png_uses_numbered_colored_stops_and_route(self):
         stops = [
             DeliverySequenceStop(1, 20, 41.31, 69.27, MUZROB_ID, "Muzrob Oka", "#10b981"),

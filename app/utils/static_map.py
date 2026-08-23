@@ -42,6 +42,64 @@ class DeliverySequenceStop:
     color: str
 
 
+def _spread_marker_positions(
+    points: list[tuple[int, int, int]],
+    *,
+    obstacle: tuple[int, int] | None = None,
+    min_distance: float = 72,
+) -> dict[int, tuple[int, int]]:
+    """Spread dense numbered markers while keeping a leader to the true point."""
+    placed: dict[int, tuple[int, int]] = {}
+    margin = 40
+    for sequence, actual_x, actual_y in points:
+        candidates = [(actual_x, actual_y)]
+        phase = sequence * 2.399963229728653
+        for radius in (52, 84, 118, 154, 192, 232):
+            for step in range(24):
+                angle = phase + (math.tau * step / 24)
+                candidates.append((
+                    round(actual_x + math.cos(angle) * radius),
+                    round(actual_y + math.sin(angle) * radius),
+                ))
+
+        valid = [
+            (
+                min(max(x, margin), MAP_WIDTH - margin),
+                min(max(y, margin + 16), MAP_HEIGHT - margin),
+            )
+            for x, y in candidates
+        ]
+
+        def clearance(candidate: tuple[int, int]) -> float:
+            distances = [
+                math.hypot(candidate[0] - x, candidate[1] - y)
+                for x, y in placed.values()
+            ]
+            if obstacle:
+                distances.append(
+                    math.hypot(
+                        candidate[0] - obstacle[0],
+                        candidate[1] - obstacle[1],
+                    ) - 10
+                )
+            return min(distances, default=float("inf"))
+
+        selected = next(
+            (candidate for candidate in valid if clearance(candidate) >= min_distance),
+            None,
+        )
+        if selected is None:
+            selected = max(
+                valid,
+                key=lambda candidate: (
+                    clearance(candidate),
+                    -math.hypot(candidate[0] - actual_x, candidate[1] - actual_y),
+                ),
+            )
+        placed[sequence] = selected
+    return placed
+
+
 @lru_cache(maxsize=16)
 def _font(size: int, *, bold: bool = False) -> ImageFont.ImageFont:
     configured = os.getenv("DELIVERY_MAP_FONT_PATH", "").strip()
@@ -425,10 +483,36 @@ async def render_delivery_sequence_map(
             draw.line(route_points, fill=(255, 255, 255, 220), width=13, joint="curve")
             draw.line(route_points, fill=route_color, width=7, joint="curve")
 
+    ordered_stops = sorted(stops, key=lambda item: item.sequence)
+    actual_pixels = {
+        stop.sequence: pixel(stop.latitude, stop.longitude)
+        for stop in ordered_stops
+    }
+    marker_pixels = _spread_marker_positions(
+        [
+            (stop.sequence, *actual_pixels[stop.sequence])
+            for stop in ordered_stops
+        ],
+        obstacle=warehouse,
+    )
+
+    for stop in ordered_stops:
+        actual = actual_pixels[stop.sequence]
+        displayed = marker_pixels[stop.sequence]
+        if math.hypot(displayed[0] - actual[0], displayed[1] - actual[1]) > 12:
+            draw.line((actual, displayed), fill=(255, 255, 255, 235), width=7)
+            draw.line((actual, displayed), fill=stop.color, width=3)
+            draw.ellipse(
+                (actual[0] - 5, actual[1] - 5, actual[0] + 5, actual[1] + 5),
+                fill=stop.color,
+                outline="white",
+                width=2,
+            )
+
     _draw_warehouse_marker(draw, x=warehouse[0], y=warehouse[1])
     number_font = _font(23, bold=True)
-    for stop in sorted(stops, key=lambda item: item.sequence):
-        x, y = pixel(stop.latitude, stop.longitude)
+    for stop in ordered_stops:
+        x, y = marker_pixels[stop.sequence]
         radius = 28
         draw.ellipse(
             (x - radius - 6, y - radius - 6, x + radius + 6, y + radius + 6),
