@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="robots" content="noindex,nofollow">
+  <title>TEXNIKACH · Статистика доставки</title>
+  <link rel="preconnect" href="https://tile.openstreetmap.org">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    :root {
+      --ink:#172033; --muted:#68728a; --line:#e5e9f2; --panel:#fff;
+      --accent:#e23b35; --accent-dark:#ae221f; --soft:#f4f6fa;
+      --green:#11986b; --amber:#d88a0a; --blue:#2563eb;
+      color-scheme:light;
+    }
+    * { box-sizing:border-box }
+    body { margin:0; background:#f2f4f8; color:var(--ink); font:15px/1.45 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif }
+    button,input,select { font:inherit }
+    .shell { max-width:1500px; margin:0 auto; padding:22px }
+    .topbar { display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:18px }
+    .brand { display:flex; align-items:center; gap:13px }
+    .logo { width:46px; height:46px; border-radius:14px; display:grid; place-items:center; background:linear-gradient(145deg,#f35b51,#bd201d); color:#fff; font-size:22px; box-shadow:0 8px 24px #d6332f35 }
+    h1 { margin:0; font-size:clamp(21px,3vw,30px); letter-spacing:-.03em }
+    .subtitle { color:var(--muted); margin-top:2px }
+    .secure { padding:8px 12px; border:1px solid #dfe5ef; background:#fff; border-radius:999px; color:#4f5a70; white-space:nowrap }
+    .panel { background:var(--panel); border:1px solid var(--line); border-radius:18px; box-shadow:0 5px 20px #26334d0b }
+    .controls { display:grid; grid-template-columns:auto minmax(150px,1fr) minmax(180px,1fr) auto; gap:10px; padding:14px; position:sticky; top:8px; z-index:800; margin-bottom:16px }
+    .segmented { display:flex; padding:4px; background:var(--soft); border-radius:12px }
+    .segmented button { border:0; background:transparent; padding:9px 14px; border-radius:9px; color:#556078; cursor:pointer; font-weight:700 }
+    .segmented button.active { background:#fff; color:var(--accent-dark); box-shadow:0 2px 9px #29375215 }
+    .field { display:flex; align-items:center; gap:8px; border:1px solid var(--line); border-radius:12px; padding:0 12px; min-height:46px; background:#fff }
+    .field input,.field select { width:100%; border:0; outline:0; color:var(--ink); background:transparent }
+    .refresh { border:0; border-radius:12px; padding:0 18px; color:#fff; background:var(--ink); cursor:pointer; font-weight:750 }
+    .refresh:disabled { opacity:.55 }
+    .metrics { display:grid; grid-template-columns:repeat(6,minmax(135px,1fr)); gap:12px; margin-bottom:16px }
+    .metric { padding:16px; min-height:107px }
+    .metric .label { color:var(--muted); font-size:13px; font-weight:650 }
+    .metric .value { margin-top:8px; font-size:clamp(22px,2.5vw,31px); font-weight:850; letter-spacing:-.035em }
+    .metric .hint { color:var(--muted); font-size:12px; margin-top:3px }
+    .layout { display:grid; grid-template-columns:minmax(0,1.75fr) minmax(330px,.75fr); gap:16px; align-items:start }
+    .card-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; padding:18px 18px 12px }
+    .card-head h2 { margin:0; font-size:19px }
+    .card-head p { margin:3px 0 0; color:var(--muted); font-size:13px }
+    .map-tabs { display:flex; gap:7px; flex-wrap:wrap }
+    .map-tabs button,.download { border:1px solid var(--line); background:#fff; color:#3f4a61; border-radius:10px; padding:8px 11px; cursor:pointer; text-decoration:none; font-weight:700 }
+    .map-tabs button.active { background:#fff0ef; color:var(--accent-dark); border-color:#f1b8b5 }
+    #map { height:600px; border-radius:0 0 18px 18px; background:#e7ecf3 }
+    #mapPhoto { display:none; width:100%; max-height:690px; object-fit:contain; background:#edf1f6; border-radius:0 0 18px 18px }
+    .sequence-marker { width:38px; height:38px; border:3px solid #fff; border-radius:50%; display:grid; place-items:center; color:#fff; font-weight:900; font-size:15px; box-shadow:0 2px 8px #11182766 }
+    .warehouse-marker { width:42px; height:42px; border:3px solid #fff; border-radius:13px; display:grid; place-items:center; background:#f59e0b; font-size:22px; box-shadow:0 2px 9px #11182755 }
+    .leaflet-div-icon { background:transparent; border:0 }
+    .side { display:grid; gap:16px }
+    .courier-list { display:grid; gap:9px; padding:0 14px 15px }
+    .courier { border:1px solid var(--line); border-radius:13px; padding:12px; background:#fff; cursor:pointer; text-align:left }
+    .courier:hover { border-color:#bdc7d8 }
+    .courier-top { display:flex; align-items:center; justify-content:space-between; gap:10px; font-weight:800 }
+    .dot { width:10px; height:10px; border-radius:50%; display:inline-block; margin-right:7px }
+    .courier-stats { display:grid; grid-template-columns:repeat(3,1fr); gap:5px; color:var(--muted); font-size:12px; margin-top:8px }
+    .courier-stats b { display:block; color:var(--ink); font-size:17px }
+    .timeline { max-height:540px; overflow:auto; padding:0 14px 14px }
+    .event { display:grid; grid-template-columns:48px 27px 1fr; gap:7px; position:relative; padding:9px 0 }
+    .event:not(:last-child):after { content:""; position:absolute; left:60px; top:36px; bottom:-8px; width:2px; background:#e7ebf2 }
+    .event-time { color:var(--muted); font-weight:750; padding-top:2px }
+    .event-icon { width:26px; height:26px; border-radius:8px; display:grid; place-items:center; background:var(--soft); z-index:1 }
+    .event-text { font-size:13px }
+    .section { margin-top:16px }
+    .orders-wrap { overflow:auto; border-radius:0 0 18px 18px }
+    table { width:100%; border-collapse:collapse; min-width:920px }
+    th { text-align:left; color:var(--muted); font-size:12px; letter-spacing:.03em; text-transform:uppercase; background:#fafbfc }
+    th,td { border-top:1px solid var(--line); padding:12px 14px; vertical-align:top }
+    td strong { display:block }
+    .status { display:inline-flex; align-items:center; padding:4px 8px; border-radius:8px; background:var(--soft); font-size:12px; font-weight:750 }
+    .order-link { color:var(--blue); text-decoration:none; font-weight:750 }
+    .empty { color:var(--muted); padding:24px; text-align:center }
+    .loading { position:fixed; inset:0; display:none; place-items:center; background:#f2f4f8cc; backdrop-filter:blur(3px); z-index:2000; font-weight:800 }
+    .loading.visible { display:grid }
+    .error { display:none; margin-bottom:16px; padding:13px 15px; border-radius:12px; color:#8d1d19; background:#fff0ef; border:1px solid #f1c0bd }
+    @media (max-width:1100px) { .metrics{grid-template-columns:repeat(3,1fr)} .layout{grid-template-columns:1fr} #map{height:520px} .side{grid-template-columns:1fr 1fr} }
+    @media (max-width:720px) { .shell{padding:12px} .secure{display:none} .controls{grid-template-columns:1fr 1fr;top:4px}.segmented{grid-column:1/-1}.refresh{min-height:46px}.metrics{grid-template-columns:repeat(2,1fr);gap:8px}.metric{min-height:94px;padding:13px}.side{grid-template-columns:1fr}#map{height:470px}.card-head{display:block}.map-tabs{margin-top:10px}.subtitle{font-size:13px} }
+  </style>
+</head>
+<body>
+  <div class="loading" id="loading">Обновляем статистику…</div>
+  <main class="shell">
+    <header class="topbar">
+      <div class="brand"><div class="logo">🚚</div><div><h1>Статистика доставки</h1><div class="subtitle">TEXNIKACH · фактическая очередь и маршрут курьеров</div></div></div>
+      <div class="secure">🔒 Защищённый раздел</div>
+    </header>
+
+    <div class="error" id="error"></div>
+    <section class="panel controls">
+      <div class="segmented"><button id="todayBtn">Сегодня</button><button id="yesterdayBtn">Вчера</button></div>
+      <label class="field">📅 <input type="date" id="dayInput"></label>
+      <label class="field">👤 <select id="courierSelect"><option value="">Все курьеры</option></select></label>
+      <button class="refresh" id="refreshBtn">Обновить</button>
+    </section>
+
+    <section class="metrics" id="metrics"></section>
+
+    <section class="layout">
+      <article class="panel">
+        <div class="card-head">
+          <div><h2>Карта очередности</h2><p>Цифры — порядок доставок; цвет — курьер. Каждый маршрут начинается и заканчивается на складе.</p></div>
+          <div class="map-tabs"><button class="active" id="interactiveBtn">Интерактивная</button><button id="photoBtn">Фото</button><a class="download" id="downloadBtn" target="_blank" rel="noopener">Скачать PNG</a></div>
+        </div>
+        <div id="map"></div>
+        <img id="mapPhoto" alt="Карта очередности доставок">
+      </article>
+
+      <aside class="side">
+        <section class="panel"><div class="card-head"><div><h2>Курьеры</h2><p>Нажмите, чтобы открыть отдельную статистику.</p></div></div><div class="courier-list" id="couriers"></div></section>
+        <section class="panel"><div class="card-head"><div><h2>Хронология дня</h2><p>События идут строго по времени.</p></div></div><div class="timeline" id="timeline"></div></section>
+      </aside>
+    </section>
+
+    <section class="panel section">
+      <div class="card-head"><div><h2>Все заказы за день</h2><p id="ordersCaption"></p></div></div>
+      <div class="orders-wrap" id="orders"></div>
+    </section>
+  </main>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const BASE = "/delivery/stats";
+    const params = new URLSearchParams(location.search);
+    let requestedDay = params.get("day") || "today";
+    let requestedCourier = params.get("courier_id") || "";
+    let map, routeLayer;
+    const $ = id => document.getElementById(id);
+    const escapeHtml = value => String(value ?? "").replace(/[&<>'"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[c]));
+    const statusLabels = {draft:"Черновик",pending:"Ожидает",on_way:"Курьер едет",awaiting_photo:"Подтверждается",awaiting_amount:"Ожидается сумма",completed:"Доставлен",cancelled:"Отменён"};
+
+    function initMap() {
+      map = L.map("map", {zoomControl:true}).setView([41.311,69.279], 12);
+      L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {maxZoom:19, attribution:"© OpenStreetMap contributors"}).addTo(map);
+      routeLayer = L.layerGroup().addTo(map);
+    }
+    function mapUrl(path) {
+      const q = new URLSearchParams({day:requestedDay});
+      if (requestedCourier) q.set("courier_id", requestedCourier);
+      return `${BASE}/${path}?${q}`;
+    }
+    function setLoading(value) { $("loading").classList.toggle("visible", value); $("refreshBtn").disabled = value; }
+    function showError(message) { $("error").textContent = message; $("error").style.display = message ? "block" : "none"; }
+    function updateLocation() {
+      const q = new URLSearchParams({day:requestedDay});
+      if (requestedCourier) q.set("courier_id", requestedCourier);
+      history.replaceState(null, "", `${BASE}?${q}`);
+    }
+    function metric(label, value, hint="") { return `<article class="panel metric"><div class="label">${label}</div><div class="value">${escapeHtml(value)}</div><div class="hint">${escapeHtml(hint)}</div></article>`; }
+
+    function renderMetrics(data) {
+      const s = data.summary;
+      $("metrics").innerHTML = [
+        metric("Все заказы", s.orders, `пришло: ${s.created}`),
+        metric("Доставлено", s.completed, `активных: ${s.active}`),
+        metric("Отменено", s.cancelled, "за выбранный день"),
+        metric("Среднее время", s.average_minutes == null ? "—" : `${s.average_minutes} мин`, "от выезда до доставки"),
+        metric("Сумма заказов", s.amount_text, "по карточкам заказов"),
+        metric("Получено", s.received_text, `точек на карте: ${s.mapped}`),
+      ].join("");
+    }
+
+    function renderCouriers(data) {
+      $("courierSelect").innerHTML = `<option value="">Все курьеры</option>` + data.couriers.map(c => `<option value="${c.id}">${escapeHtml(c.name)}</option>`).join("");
+      $("courierSelect").value = requestedCourier;
+      $("couriers").innerHTML = data.couriers.map(c => `<button class="courier" data-id="${c.id}"><div class="courier-top"><span><i class="dot" style="background:${c.color}"></i>${escapeHtml(c.name)}</span><span>${c.average_minutes == null ? "—" : `${c.average_minutes} мин`}</span></div><div class="courier-stats"><span><b>${c.orders}</b>заказов</span><span><b>${c.completed}</b>доставлено</span><span><b>${c.active}</b>активно</span></div></button>`).join("");
+      document.querySelectorAll(".courier").forEach(button => button.onclick = () => { requestedCourier = button.dataset.id; $("courierSelect").value = requestedCourier; load(); });
+    }
+
+    function renderMap(data) {
+      routeLayer.clearLayers();
+      const bounds = [];
+      const warehouse = [data.warehouse.latitude, data.warehouse.longitude];
+      const warehouseIcon = L.divIcon({className:"", html:`<div class="warehouse-marker">🏬</div>`, iconSize:[42,42], iconAnchor:[21,21]});
+      L.marker(warehouse, {icon:warehouseIcon}).bindPopup(`<b>${escapeHtml(data.warehouse.name)}</b><br>Начало и конец маршрута`).addTo(routeLayer);
+      bounds.push(warehouse);
+      const bySequence = new Map(data.stops.map(stop => [stop.sequence, stop]));
+      data.routes.forEach(route => {
+        const points = [warehouse, ...route.sequences.map(number => { const stop = bySequence.get(number); return [stop.latitude,stop.longitude]; }), warehouse];
+        if (points.length > 2) L.polyline(points, {color:route.color, weight:5, opacity:.72}).bindTooltip(route.courier_name).addTo(routeLayer);
+      });
+      data.stops.forEach(stop => {
+        const point = [stop.latitude, stop.longitude]; bounds.push(point);
+        const icon = L.divIcon({className:"", html:`<div class="sequence-marker" style="background:${stop.color}">${stop.sequence}</div>`, iconSize:[38,38], iconAnchor:[19,19]});
+        const link = stop.map_url ? `<br><a class="order-link" href="${escapeHtml(stop.map_url)}" target="_blank" rel="noopener">Открыть локацию</a>` : "";
+        L.marker(point, {icon}).bindPopup(`<b>${stop.sequence}. Заказ №${stop.order_number}</b><br>${escapeHtml(stop.product)}<br>${escapeHtml(stop.address)}<br>Курьер: ${escapeHtml(stop.courier_name)}${stop.time ? `<br>Время: ${escapeHtml(stop.time)}` : ""}${link}`).addTo(routeLayer);
+      });
+      if (bounds.length > 1) map.fitBounds(bounds, {padding:[55,55], maxZoom:14}); else map.setView(warehouse, 12);
+      $("mapPhoto").src = mapUrl("map.png") + `&v=${Date.now()}`;
+      $("downloadBtn").href = mapUrl("map.png");
+      setTimeout(() => map.invalidateSize(), 50);
+    }
+
+    function renderTimeline(data) {
+      $("timeline").innerHTML = data.timeline.length ? data.timeline.map(e => `<div class="event"><div class="event-time">${escapeHtml(e.time)}</div><div class="event-icon">${e.icon}</div><div class="event-text">${escapeHtml(e.text)}</div></div>`).join("") : `<div class="empty">Событий за этот день нет.</div>`;
+    }
+
+    function renderOrders(data) {
+      $("ordersCaption").textContent = `${data.day_label} · ${data.orders.length} заказов`;
+      if (!data.orders.length) { $("orders").innerHTML = `<div class="empty">Заказов за выбранный день нет.</div>`; return; }
+      $("orders").innerHTML = `<table><thead><tr><th>Заказ</th><th>Курьер</th><th>Адрес</th><th>Время</th><th>Сумма</th><th>Статус</th></tr></thead><tbody>${data.orders.map(o => `<tr><td><strong>№${o.order_number} · ${escapeHtml(o.product)}</strong><small>${escapeHtml(o.seller_name)} · ${escapeHtml(o.phones.join(" / "))}</small></td><td><i class="dot" style="background:${o.courier_color}"></i>${escapeHtml(o.courier_name)}</td><td>${escapeHtml(o.address)}</td><td>📥 ${o.created_time || "—"}<br>🚗 ${o.started_time || "—"}<br>✅ ${o.completed_time || "—"}${o.duration_minutes == null ? "" : `<br><small>${o.duration_minutes} мин</small>`}</td><td>${escapeHtml(o.amount_text)}</td><td><span class="status">${escapeHtml(statusLabels[o.status] || o.status)}</span></td></tr>`).join("")}</tbody></table>`;
+    }
+
+    async function load() {
+      setLoading(true); showError("");
+      try {
+        const response = await fetch(mapUrl("api/report"), {credentials:"same-origin", cache:"no-store"});
+        if (!response.ok) throw new Error(response.status === 401 ? "Неверный логин или пароль." : `Не удалось получить статистику (${response.status}).`);
+        const data = await response.json();
+        $("dayInput").value = data.day;
+        renderMetrics(data); renderCouriers(data); renderMap(data); renderTimeline(data); renderOrders(data);
+        $("todayBtn").classList.toggle("active", requestedDay === "today");
+        $("yesterdayBtn").classList.toggle("active", requestedDay === "yesterday");
+        updateLocation();
+      } catch (error) { showError(error.message || "Ошибка загрузки статистики."); }
+      finally { setLoading(false); }
+    }
+
+    $("todayBtn").onclick = () => { requestedDay="today"; load(); };
+    $("yesterdayBtn").onclick = () => { requestedDay="yesterday"; load(); };
+    $("dayInput").onchange = event => { requestedDay=event.target.value; load(); };
+    $("courierSelect").onchange = event => { requestedCourier=event.target.value; load(); };
+    $("refreshBtn").onclick = load;
+    $("interactiveBtn").onclick = () => { $("map").style.display="block"; $("mapPhoto").style.display="none"; $("interactiveBtn").classList.add("active"); $("photoBtn").classList.remove("active"); setTimeout(()=>map.invalidateSize(),50); };
+    $("photoBtn").onclick = () => { $("map").style.display="none"; $("mapPhoto").style.display="block"; $("photoBtn").classList.add("active"); $("interactiveBtn").classList.remove("active"); };
+    initMap(); load();
+  </script>
+</body>
+</html>

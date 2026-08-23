@@ -1,3 +1,5 @@
+from urllib.parse import urlencode
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 
 from app.models import Order
@@ -16,7 +18,7 @@ def main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("➕ Новый заказ"), KeyboardButton("📋 Активные заказы")],
-            [KeyboardButton("📚 Все заказы")],
+            [KeyboardButton("📚 Все заказы"), KeyboardButton("📊 Статистика")],
         ],
         resize_keyboard=True,
     )
@@ -155,6 +157,32 @@ def delivery_day_log_keyboard(day: str) -> InlineKeyboardMarkup:
             callback_data=f"daily_log:{day}",
         ),
     ]])
+
+
+def statistics_keyboard(base_url: str) -> InlineKeyboardMarkup:
+    base = base_url.rstrip("/")
+
+    def report_url(day: str, courier_id: int | None = None) -> str:
+        query = {"day": day}
+        if courier_id is not None:
+            query["courier_id"] = str(courier_id)
+        return f"{base}?{urlencode(query)}"
+
+    rows = [[
+        InlineKeyboardButton("📅 Все заказы сегодня", url=report_url("today")),
+        InlineKeyboardButton("⏮ Все заказы вчера", url=report_url("yesterday")),
+    ]]
+    courier_buttons = [
+        InlineKeyboardButton(
+            f"👤 {courier.name}",
+            url=report_url("today", courier.user_id),
+        )
+        for courier in COURIERS
+    ]
+    rows.append(courier_buttons[:2])
+    rows.append(courier_buttons[2:])
+    rows.append([InlineKeyboardButton("🌐 Открыть всю статистику", url=base)])
+    return InlineKeyboardMarkup(rows)
 
 
 def location_channel_keyboard(

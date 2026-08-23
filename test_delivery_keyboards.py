@@ -1,6 +1,12 @@
 import unittest
 
-from app.bot.keyboards import edit_input_keyboard, orders_channel_keyboard, orders_page_keyboard
+from app.bot.keyboards import (
+    edit_input_keyboard,
+    main_keyboard,
+    orders_channel_keyboard,
+    orders_page_keyboard,
+    statistics_keyboard,
+)
 from app.models import Order
 from app.utils.payments import PAYMENT_LABELS
 from app.utils.sellers import SELLERS
@@ -99,6 +105,32 @@ class OrdersChannelKeyboardTests(unittest.TestCase):
         ]
 
         self.assertIn("daily_log:today", callbacks)
+
+
+class StatisticsKeyboardTests(unittest.TestCase):
+    def test_main_menu_and_statistics_links_cover_days_and_couriers(self):
+        menu_labels = [
+            button.text
+            for row in main_keyboard().keyboard
+            for button in row
+        ]
+        self.assertIn("📊 Статистика", menu_labels)
+
+        keyboard = statistics_keyboard("https://bot.texnikach.uz/delivery/stats/")
+        urls = [
+            button.url
+            for row in keyboard.inline_keyboard
+            for button in row
+        ]
+        self.assertIn(
+            "https://bot.texnikach.uz/delivery/stats?day=today",
+            urls,
+        )
+        self.assertIn(
+            "https://bot.texnikach.uz/delivery/stats?day=yesterday",
+            urls,
+        )
+        self.assertTrue(any("courier_id=1799690992" in url for url in urls))
 
 
 if __name__ == "__main__":

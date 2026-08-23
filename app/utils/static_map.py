@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import dataclass
 from functools import lru_cache
 from io import BytesIO
 import math
@@ -28,6 +29,17 @@ TASHKENT_BOUNDS = (
 )
 WAREHOUSE_LATITUDE = 41.337420
 WAREHOUSE_LONGITUDE = 69.272104
+
+
+@dataclass(frozen=True, slots=True)
+class DeliverySequenceStop:
+    sequence: int
+    order_number: int
+    latitude: float
+    longitude: float
+    courier_id: int | None
+    courier_name: str
+    color: str
 
 
 @lru_cache(maxsize=16)
@@ -73,11 +85,20 @@ def _order_points(orders: list[Order]) -> list[tuple[Order, int, float, float]]:
 def _viewport(
     points: list[tuple[Order, int, float, float]],
 ) -> tuple[int, float, float]:
+    return _viewport_coordinates([
+        (latitude, longitude)
+        for _, _, latitude, longitude in points
+    ])
+
+
+def _viewport_coordinates(
+    extra_coordinates: list[tuple[float, float]],
+) -> tuple[int, float, float]:
     coordinates = [
         TASHKENT_BOUNDS[0],
         TASHKENT_BOUNDS[1],
         (WAREHOUSE_LATITUDE, WAREHOUSE_LONGITUDE),
-        *((latitude, longitude) for _, _, latitude, longitude in points),
+        *extra_coordinates,
     ]
     for zoom in range(15, 4, -1):
         pixels = [_world_pixel(latitude, longitude, zoom) for latitude, longitude in coordinates]
@@ -231,16 +252,13 @@ async def _load_tile(
     return tile
 
 
-async def render_active_orders_map(
-    orders: list[Order],
+async def _render_base_map(
+    coordinates: list[tuple[float, float]],
     *,
     cache_dir: Path,
-    tile_url: str | None = None,
-) -> BytesIO | None:
-    """Render Tashkent, the warehouse and current active orders as a PNG."""
-    points = _order_points(orders)
-
-    zoom, center_x, center_y = _viewport(points)
+    tile_url: str | None,
+) -> tuple[Image.Image, int, float, float]:
+    zoom, center_x, center_y = _viewport_coordinates(coordinates)
     left = center_x - MAP_WIDTH / 2
     top = center_y - MAP_HEIGHT / 2
     first_x = math.floor(left / TILE_SIZE)
@@ -292,6 +310,42 @@ async def render_active_orders_map(
         )
     if successful_tiles == 0:
         raise RuntimeError("No map tiles could be downloaded")
+    return image, zoom, left, top
+
+
+def _draw_attribution(draw: ImageDraw.ImageDraw) -> None:
+    attribution = "© OpenStreetMap contributors"
+    attribution_font = _font(14)
+    bounds = draw.textbbox((0, 0), attribution, font=attribution_font)
+    padding = 6
+    box = (
+        MAP_WIDTH - (bounds[2] - bounds[0]) - padding * 2 - 5,
+        MAP_HEIGHT - (bounds[3] - bounds[1]) - padding * 2 - 5,
+        MAP_WIDTH - 5,
+        MAP_HEIGHT - 5,
+    )
+    draw.rounded_rectangle(box, radius=4, fill=(255, 255, 255, 220))
+    draw.text(
+        (box[0] + padding, box[1] + padding),
+        attribution,
+        fill="#111827",
+        font=attribution_font,
+    )
+
+
+async def render_active_orders_map(
+    orders: list[Order],
+    *,
+    cache_dir: Path,
+    tile_url: str | None = None,
+) -> BytesIO | None:
+    """Render Tashkent, the warehouse and current active orders as a PNG."""
+    points = _order_points(orders)
+    image, zoom, left, top = await _render_base_map(
+        [(latitude, longitude) for _, _, latitude, longitude in points],
+        cache_dir=cache_dir,
+        tile_url=tile_url,
+    )
 
     draw = ImageDraw.Draw(image, "RGBA")
     marker_font = _font(23, bold=True)
@@ -327,26 +381,91 @@ async def render_active_orders_map(
     draw.rounded_rectangle(legend_box, radius=8, fill=(255, 255, 255, 235))
     draw.text((20, 18), legend, fill="#111827", font=legend_font)
 
-    attribution = "© OpenStreetMap contributors"
-    attribution_font = _font(14)
-    bounds = draw.textbbox((0, 0), attribution, font=attribution_font)
-    padding = 6
-    box = (
-        MAP_WIDTH - (bounds[2] - bounds[0]) - padding * 2 - 5,
-        MAP_HEIGHT - (bounds[3] - bounds[1]) - padding * 2 - 5,
-        MAP_WIDTH - 5,
-        MAP_HEIGHT - 5,
-    )
-    draw.rounded_rectangle(box, radius=4, fill=(255, 255, 255, 220))
-    draw.text(
-        (box[0] + padding, box[1] + padding),
-        attribution,
-        fill="#111827",
-        font=attribution_font,
-    )
+    _draw_attribution(draw)
 
     output = BytesIO()
     output.name = "active-deliveries.png"
+    image.save(output, format="PNG", optimize=True)
+    output.seek(0)
+    return output
+
+
+async def render_delivery_sequence_map(
+    stops: list[DeliverySequenceStop],
+    *,
+    report_day_label: str,
+    cache_dir: Path,
+    tile_url: str | None = None,
+) -> BytesIO:
+    """Render numbered delivery order and per-courier warehouse routes."""
+    image, zoom, left, top = await _render_base_map(
+        [(stop.latitude, stop.longitude) for stop in stops],
+        cache_dir=cache_dir,
+        tile_url=tile_url,
+    )
+    draw = ImageDraw.Draw(image, "RGBA")
+
+    def pixel(latitude: float, longitude: float) -> tuple[int, int]:
+        world_x, world_y = _world_pixel(latitude, longitude, zoom)
+        return round(world_x - left), round(world_y - top)
+
+    warehouse = pixel(WAREHOUSE_LATITUDE, WAREHOUSE_LONGITUDE)
+    grouped: dict[int | None, list[DeliverySequenceStop]] = {}
+    for stop in stops:
+        grouped.setdefault(stop.courier_id, []).append(stop)
+    for route_stops in grouped.values():
+        route_stops.sort(key=lambda stop: stop.sequence)
+        route_points = [
+            warehouse,
+            *(pixel(stop.latitude, stop.longitude) for stop in route_stops),
+            warehouse,
+        ]
+        route_color = route_stops[0].color
+        if len(route_points) >= 3:
+            draw.line(route_points, fill=(255, 255, 255, 220), width=13, joint="curve")
+            draw.line(route_points, fill=route_color, width=7, joint="curve")
+
+    _draw_warehouse_marker(draw, x=warehouse[0], y=warehouse[1])
+    number_font = _font(23, bold=True)
+    for stop in sorted(stops, key=lambda item: item.sequence):
+        x, y = pixel(stop.latitude, stop.longitude)
+        radius = 28
+        draw.ellipse(
+            (x - radius - 6, y - radius - 6, x + radius + 6, y + radius + 6),
+            fill=(255, 255, 255, 235),
+            outline=(17, 24, 39, 180),
+            width=2,
+        )
+        draw.ellipse(
+            (x - radius, y - radius, x + radius, y + radius),
+            fill=stop.color,
+            outline="white",
+            width=4,
+        )
+        label = str(stop.sequence)
+        bounds = draw.textbbox((0, 0), label, font=number_font)
+        draw.text(
+            (x - (bounds[2] - bounds[0]) / 2, y - (bounds[3] - bounds[1]) / 2 - 2),
+            label,
+            fill="white",
+            stroke_width=1,
+            stroke_fill="#111827",
+            font=number_font,
+        )
+
+    legend_font = _font(18, bold=True)
+    legend = (
+        f"Очередность доставок · {report_day_label} · "
+        f"остановок: {len(stops)} · склад → заказы → склад"
+    )
+    bounds = draw.textbbox((0, 0), legend, font=legend_font)
+    legend_box = (10, 10, min(MAP_WIDTH - 10, bounds[2] - bounds[0] + 30), 48)
+    draw.rounded_rectangle(legend_box, radius=8, fill=(255, 255, 255, 238))
+    draw.text((20, 18), legend, fill="#111827", font=legend_font)
+    _draw_attribution(draw)
+
+    output = BytesIO()
+    output.name = f"delivery-sequence-{report_day_label}.png"
     image.save(output, format="PNG", optimize=True)
     output.seek(0)
     return output

@@ -2,3 +2,5 @@ python-dotenv==1.2.2
 python-telegram-bot==22.8
 httpx==0.28.1
 pillow==12.3.0
+fastapi==0.141.1
+uvicorn==0.52.3

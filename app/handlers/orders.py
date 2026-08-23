@@ -23,7 +23,7 @@ from app.bot.keyboards import (
     location_channel_keyboard, main_keyboard,
     manager_cancelled_keyboard, manager_sent_keyboard, on_way_keyboard,
     orders_channel_keyboard, orders_page_keyboard, payment_keyboard, review_keyboard, seller_keyboard,
-    skip_keyboard, text_location_keyboard,
+    skip_keyboard, statistics_keyboard, text_location_keyboard,
 )
 from app.config import Settings
 from app.database import OrderRepository
@@ -57,6 +57,7 @@ MAIN_MENU_TEXTS = {
     "📦 Все активные заказы",
     "📚 Все заказы",
     "📋 Все заказы",
+    "📊 Статистика",
 }
 
 
@@ -1193,6 +1194,44 @@ async def _end_creation_with_map(
             _schedule_sync_retry(context, committed.id)
     await show_all_locations(update, context)
     return ConversationHandler.END
+
+
+async def _end_creation_with_statistics(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    draft = context.user_data.get("draft") or {}
+    repo: OrderRepository = context.application.bot_data["repo"]
+    committed = repo.get_by_creation_token(draft.get("creation_token"))
+    context.user_data.pop("draft", None)
+    if committed and committed.status == "draft":
+        _, recovered = await _sync_order(context, committed.id)
+        if not recovered:
+            _schedule_sync_retry(context, committed.id)
+    await show_statistics(update, context)
+    return ConversationHandler.END
+
+
+async def show_statistics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    if (
+        update.effective_chat.type != "private"
+        or update.effective_user.id not in settings.manager_ids
+    ):
+        if update.effective_message:
+            await update.effective_message.reply_text(
+                "Статистика доступна менеджерам в личном чате с ботом."
+            )
+        return
+    context.user_data.pop("edit", None)
+    await update.effective_message.reply_text(
+        "📊 <b>Статистика доставки TEXNIKACH</b>\n\n"
+        "Выберите день или курьера. На сайте доступны показатели, "
+        "хронология, интерактивная карта и PNG с очередностью доставок.\n\n"
+        "🔒 При открытии сайт запросит логин и пароль.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=statistics_keyboard(settings.stats_url),
+    )
 
 
 async def _show_orders(
@@ -2553,16 +2592,20 @@ def register_handlers(application: Application) -> None:
         & filters.ChatType.PRIVATE,
         _end_creation_with_order_list,
     )
+    creation_stats = MessageHandler(
+        filters.Regex(r"^📊 Статистика$") & filters.ChatType.PRIVATE,
+        _end_creation_with_statistics,
+    )
     conversation = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^➕ Новый заказ$") & filters.ChatType.PRIVATE, new_order)],
         states={
-            SELLER: [creation_menu, MessageHandler(filters.TEXT & ~filters.COMMAND, seller)],
-            PRODUCT: [creation_menu, MessageHandler(filters.TEXT & ~filters.COMMAND, product)],
-            DETAILS: [creation_menu, MessageHandler((filters.LOCATION | filters.TEXT) & ~filters.COMMAND, details)],
-            SECOND_LOCATION: [creation_menu, MessageHandler((filters.LOCATION | filters.TEXT) & ~filters.COMMAND, second_location)],
-            PAYMENT: [creation_menu, MessageHandler((filters.LOCATION | filters.TEXT) & ~filters.COMMAND, payment)],
-            DELIVERY_TIME: [creation_menu, MessageHandler(filters.TEXT & ~filters.COMMAND, delivery_time)],
-            COMMENT: [creation_menu, MessageHandler(filters.TEXT & ~filters.COMMAND, comment)],
+            SELLER: [creation_menu, creation_stats, MessageHandler(filters.TEXT & ~filters.COMMAND, seller)],
+            PRODUCT: [creation_menu, creation_stats, MessageHandler(filters.TEXT & ~filters.COMMAND, product)],
+            DETAILS: [creation_menu, creation_stats, MessageHandler((filters.LOCATION | filters.TEXT) & ~filters.COMMAND, details)],
+            SECOND_LOCATION: [creation_menu, creation_stats, MessageHandler((filters.LOCATION | filters.TEXT) & ~filters.COMMAND, second_location)],
+            PAYMENT: [creation_menu, creation_stats, MessageHandler((filters.LOCATION | filters.TEXT) & ~filters.COMMAND, payment)],
+            DELIVERY_TIME: [creation_menu, creation_stats, MessageHandler(filters.TEXT & ~filters.COMMAND, delivery_time)],
+            COMMENT: [creation_menu, creation_stats, MessageHandler(filters.TEXT & ~filters.COMMAND, comment)],
         },
         fallbacks=[
             CommandHandler("start", start),
@@ -2600,6 +2643,7 @@ def register_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("map", show_all_locations))
     application.add_handler(MessageHandler(filters.Regex(r"^(?:📋 (?:Мои|Активные) заказы|📦 Все активные заказы)$") & filters.ChatType.PRIVATE, active_orders))
     application.add_handler(MessageHandler(filters.Regex(r"^(?:📋|📚) Все заказы$") & filters.ChatType.PRIVATE, my_orders))
+    application.add_handler(MessageHandler(filters.Regex(r"^📊 Статистика$") & filters.ChatType.PRIVATE, show_statistics))
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("cancel", cancel_conversation))
     application.add_handler(CallbackQueryHandler(

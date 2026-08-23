@@ -23,6 +23,55 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  delivery-stats:
+    build:
+      context: .
+      dockerfile: Dockerfile.delivery
+    container_name: texnikach-delivery-stats
+    restart: unless-stopped
+    stop_grace_period: 30s
+    init: true
+    command: ["uvicorn", "app.stats:app", "--host", "0.0.0.0", "--port", "8080", "--proxy-headers", "--forwarded-allow-ips=*"]
+    env_file:
+      - .env.delivery
+    ports:
+      - "127.0.0.1:8011:8080"
+    networks:
+      - default
+      - coolify
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=coolify"
+      - "traefik.http.middlewares.delivery-stats-https.redirectscheme.scheme=https"
+      - "traefik.http.routers.delivery-stats-http.entrypoints=http"
+      - "traefik.http.routers.delivery-stats-http.rule=Host(`bot.texnikach.uz`) && PathPrefix(`/delivery/stats`)"
+      - "traefik.http.routers.delivery-stats-http.priority=100"
+      - "traefik.http.routers.delivery-stats-http.middlewares=delivery-stats-https"
+      - "traefik.http.routers.delivery-stats.entrypoints=https"
+      - "traefik.http.routers.delivery-stats.rule=Host(`bot.texnikach.uz`) && PathPrefix(`/delivery/stats`)"
+      - "traefik.http.routers.delivery-stats.priority=100"
+      - "traefik.http.routers.delivery-stats.tls=true"
+      - "traefik.http.routers.delivery-stats.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.delivery-stats.service=delivery-stats"
+      - "traefik.http.services.delivery-stats.loadbalancer.server.port=8080"
+    volumes:
+      - delivery-data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; assert urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=5).status == 200"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 volumes:
   delivery-data:
     name: texnikach-delivery-data
+
+networks:
+  coolify:
+    external: true
