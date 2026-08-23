@@ -39,6 +39,14 @@ def payment_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+def text_location_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("📝 Локация текстом")]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
 def edit_input_keyboard(field: str | None = None) -> ReplyKeyboardMarkup:
     """Keyboard for a single edit value with an always-visible cancel action."""
     rows: list[list[KeyboardButton]] = []

@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 from telegram import ReplyKeyboardRemove, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, RetryAfter
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes,
     ConversationHandler, MessageHandler, filters,
@@ -22,7 +22,7 @@ from app.bot.keyboards import (
     location_channel_keyboard, main_keyboard,
     manager_cancelled_keyboard, manager_sent_keyboard, on_way_keyboard,
     orders_channel_keyboard, orders_page_keyboard, payment_keyboard, review_keyboard, seller_keyboard,
-    skip_keyboard,
+    skip_keyboard, text_location_keyboard,
 )
 from app.config import Settings
 from app.database import OrderRepository
@@ -38,6 +38,7 @@ from app.utils.couriers import (
     courier_group_id, courier_group_ids, courier_ids, courier_option,
 )
 from app.utils.parsers import display_phone
+from app.utils.static_map import render_active_orders_map
 
 logger = logging.getLogger(__name__)
 SELLER, PRODUCT, DETAILS, SECOND_LOCATION, PAYMENT, DELIVERY_TIME, COMMENT, EDIT_VALUE = range(8)
@@ -46,6 +47,7 @@ DELIVERY_ACTIVE_STATUSES = {"pending", "on_way", "awaiting_photo", "awaiting_amo
 LOCATION_SEPARATOR = "\n".join(["📍" * 11] * 3)
 ORDER_PAGE_SIZE = 10
 EDIT_CANCEL_TEXT = "❌ Отменить изменение"
+TEXT_LOCATION_BUTTON = "📝 Локация текстом"
 MAIN_MENU_TEXTS = {
     "➕ Новый заказ",
     "📋 Активные заказы",
@@ -118,6 +120,116 @@ async def _notify_manager(context: ContextTypes.DEFAULT_TYPE, manager_id: int, t
         await context.bot.send_message(manager_id, text, parse_mode=ParseMode.HTML)
     except Exception:
         logger.exception("Could not notify manager %s", manager_id)
+
+
+async def _send_courier_map_log(
+    application: Application,
+    *,
+    completed_order_id: int,
+    courier_id: int,
+    courier_name: str,
+) -> None:
+    """Append a delivery summary and current active-order map to the journal."""
+    repo: OrderRepository = application.bot_data["repo"]
+    settings: Settings = application.bot_data["settings"]
+    channel_id = getattr(settings, "orders_channel_id", None)
+    if not channel_id:
+        return
+    completed_order = repo.get(completed_order_id)
+    if not completed_order or completed_order.status != "completed":
+        return
+
+    active_orders = repo.list_active()
+    courier_active = [
+        order
+        for order in active_orders
+        if order.assigned_courier_id == courier_id or order.courier_id == courier_id
+    ]
+    now_tashkent = datetime.now(ZoneInfo("Asia/Tashkent"))
+    today_start = now_tashkent.replace(hour=0, minute=0, second=0, microsecond=0)
+    delivered_today = repo.count_completed_for_courier_since(courier_id, today_start)
+    mapped_orders = [
+        order
+        for order in active_orders
+        if (order.latitude is not None and order.longitude is not None)
+        or (order.second_latitude is not None and order.second_longitude is not None)
+    ]
+    caption = (
+        f"🗺 <b>Карта после доставки заказа №{completed_order.order_number}</b>\n"
+        f"👤 Курьер: <b>{escape(courier_name)}</b>\n"
+        f"✅ Доставлено сегодня: <b>{delivered_today}</b>\n"
+        f"🚚 Осталось у курьера: <b>{len(courier_active)}</b>\n"
+        f"📦 Всего активных заказов: <b>{len(active_orders)}</b>\n"
+        f"📍 На карте: <b>{len(mapped_orders)}</b>"
+    )
+
+    image = None
+    if mapped_orders:
+        try:
+            image = await render_active_orders_map(
+                active_orders,
+                cache_dir=settings.database_path.parent / "map-tiles",
+            )
+        except Exception:
+            logger.exception("Could not render active-order map after order %s", completed_order_id)
+
+    latest = repo.get(completed_order_id)
+    if not latest or latest.status != "completed":
+        return
+
+    for attempt in range(2):
+        try:
+            if image is not None:
+                image.seek(0)
+                await application.bot.send_photo(
+                    chat_id=channel_id,
+                    photo=image,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                suffix = "\n\nНет активных заказов с координатами для карты."
+                await application.bot.send_message(
+                    chat_id=channel_id,
+                    text=caption + suffix,
+                    parse_mode=ParseMode.HTML,
+                )
+            return
+        except asyncio.CancelledError:
+            raise
+        except RetryAfter as error:
+            if attempt == 0:
+                retry_after = error.retry_after
+                delay = (
+                    retry_after.total_seconds()
+                    if hasattr(retry_after, "total_seconds")
+                    else float(retry_after)
+                )
+                await asyncio.sleep(max(1.0, delay))
+                continue
+            logger.exception("Courier map log remained rate-limited after order %s", completed_order_id)
+            return
+        except Exception:
+            # A network timeout can mean Telegram accepted the photo but the
+            # acknowledgement was lost. Do not blindly retry and create a
+            # duplicate journal post.
+            logger.exception("Could not publish courier map log after order %s", completed_order_id)
+            return
+
+
+def _schedule_courier_map_log(context: ContextTypes.DEFAULT_TYPE, order) -> None:
+    create_task = getattr(context.application, "create_task", None)
+    if not callable(create_task) or not order.courier_id:
+        return
+    create_task(
+        _send_courier_map_log(
+            context.application,
+            completed_order_id=order.id,
+            courier_id=order.courier_id,
+            courier_name=order.courier_name or "—",
+        ),
+        name=f"delivery-map-log-{order.id}",
+    )
 
 
 async def _location_values(message) -> dict:
@@ -1181,7 +1293,8 @@ async def product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "Цена: 100$ 1 920 000\n"
         "Локация: https://yandex.uz/maps/…\n\n"
         "Можно указать два телефона. Две Telegram Location отправьте подряд, "
-        "либо пришлите две ссылки в одном сообщении — бот сохранит обе без отдельного вопроса."
+        "либо пришлите две ссылки в одном сообщении — бот сохранит обе без отдельного вопроса. "
+        "Если координат нет, после телефона и цены появится кнопка «📝 Локация текстом»."
     )
     return DETAILS
 
@@ -1192,7 +1305,10 @@ def _missing_details(draft: dict) -> list[str]:
         missing.append("номер клиента")
     if draft.get("amount_usd") is None and draft.get("amount_uzs") is None:
         missing.append("цена")
-    if draft.get("latitude") is None or draft.get("longitude") is None:
+    if (
+        (draft.get("latitude") is None or draft.get("longitude") is None)
+        and not draft.get("address_text")
+    ):
         missing.append("локация")
     return missing
 
@@ -1263,11 +1379,55 @@ async def details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("Начните новый заказ заново.", reply_markup=main_keyboard())
         return ConversationHandler.END
 
-    try:
-        recognized = await _capture_order_details(update.message, draft)
-    except ValueError as error:
-        await update.message.reply_text(f"Не удалось сохранить данные: {error}")
+    incoming_text = (update.message.text or "").strip()
+    if draft.get("awaiting_text_location"):
+        if update.message.location:
+            draft.pop("awaiting_text_location", None)
+            try:
+                recognized = await _capture_order_details(update.message, draft)
+            except ValueError as error:
+                await update.message.reply_text(f"Не удалось сохранить данные: {error}")
+                return DETAILS
+        else:
+            if incoming_text == TEXT_LOCATION_BUTTON:
+                await update.message.reply_text(
+                    "Напишите адрес клиента текстом. Например: Яшнабадский район, махалля Алимкент, улица Кустанай, дом 15.",
+                    reply_markup=ReplyKeyboardRemove(),
+                )
+                return DETAILS
+            try:
+                address = _text(update.message, maximum=1000)
+            except ValueError as error:
+                await update.message.reply_text(str(error), reply_markup=ReplyKeyboardRemove())
+                return DETAILS
+            draft.update(
+                address_text=address,
+                district=None,
+                mahalla=None,
+                location_url=None,
+                latitude=None,
+                longitude=None,
+            )
+            draft.pop("awaiting_text_location", None)
+            recognized = ["локация текстом"]
+    elif incoming_text == TEXT_LOCATION_BUTTON:
+        if _missing_details(draft) != ["локация"]:
+            await update.message.reply_text(
+                "Сначала отправьте номер клиента и цену. После этого можно будет ввести локацию текстом."
+            )
+            return DETAILS
+        draft["awaiting_text_location"] = True
+        await update.message.reply_text(
+            "Напишите адрес клиента текстом. Например: Яшнабадский район, махалля Алимкент, улица Кустанай, дом 15.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
         return DETAILS
+    else:
+        try:
+            recognized = await _capture_order_details(update.message, draft)
+        except ValueError as error:
+            await update.message.reply_text(f"Не удалось сохранить данные: {error}")
+            return DETAILS
 
     missing = _missing_details(draft)
     if not recognized:
@@ -1276,8 +1436,10 @@ async def details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return DETAILS
     if missing:
+        reply_markup = text_location_keyboard() if missing == ["локация"] else ReplyKeyboardRemove()
         await update.message.reply_text(
-            f"✅ Сохранено: {', '.join(recognized)}. Осталось отправить: {', '.join(missing)}."
+            f"✅ Сохранено: {', '.join(recognized)}. Осталось отправить: {', '.join(missing)}.",
+            reply_markup=reply_markup,
         )
         return DETAILS
 
@@ -2150,6 +2312,7 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             completed_keyboard(order),
         )
         await _notify_manager(context, order.manager_id, result_text)
+        _schedule_courier_map_log(context, order)
 
 
 async def _publish_completed(
@@ -2182,6 +2345,7 @@ async def _publish_completed(
         logger.exception("Could not notify manager %s about order %s", order.manager_id, order.id)
     await _set_location_marker(context, order)
     await update.message.reply_text("✅ Доставка подтверждена.")
+    _schedule_courier_map_log(context, order)
 
 
 async def delivery_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

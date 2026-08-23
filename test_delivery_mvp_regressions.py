@@ -103,6 +103,47 @@ class MultiValueCreationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("latitude", context.user_data["draft"])
         self.assertIn("за пределами Узбекистана", message.reply_text.await_args.args[0])
 
+    async def test_text_location_button_appears_when_only_location_is_missing(self):
+        context = SimpleNamespace(user_data={"draft": {
+            "seller_name": "Ali",
+            "product": "A56",
+            "client_phone": "+998901333999",
+        }})
+        price_message = self.message("375$")
+
+        state = await details(SimpleNamespace(message=price_message), context)
+
+        self.assertEqual(state, DETAILS)
+        keyboard = price_message.reply_text.await_args.kwargs["reply_markup"]
+        self.assertEqual(keyboard.keyboard[0][0].text, "📝 Локация текстом")
+
+    async def test_manager_can_save_location_as_plain_text(self):
+        context = SimpleNamespace(user_data={"draft": {
+            "seller_name": "Ali",
+            "product": "A56",
+            "client_phone": "+998901333999",
+            "amount_usd": 375,
+        }})
+        button_message = self.message("📝 Локация текстом")
+        state = await details(SimpleNamespace(message=button_message), context)
+        self.assertEqual(state, DETAILS)
+        self.assertTrue(context.user_data["draft"]["awaiting_text_location"])
+
+        address_message = self.message(
+            "Яшнабадский район, махалля Алимкент, улица Кустанай, дом 15"
+        )
+        state = await details(SimpleNamespace(message=address_message), context)
+
+        self.assertEqual(state, PAYMENT)
+        draft = context.user_data["draft"]
+        self.assertEqual(
+            draft["address_text"],
+            "Яшнабадский район, махалля Алимкент, улица Кустанай, дом 15",
+        )
+        self.assertIsNone(draft["latitude"])
+        self.assertIsNone(draft["longitude"])
+        self.assertNotIn("awaiting_text_location", draft)
+
 
 class EditSafetyTests(unittest.IsolatedAsyncioTestCase):
     async def test_main_menu_text_never_becomes_edit_value(self):

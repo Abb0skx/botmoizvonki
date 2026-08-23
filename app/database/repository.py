@@ -332,6 +332,28 @@ class OrderRepository:
             ).fetchall()
         return [Order.from_row(row) for row in rows]
 
+    def count_completed_for_courier_since(self, courier_id: int, since: datetime) -> int:
+        """Count completed rows using parsed timestamps instead of string ordering."""
+        if since.tzinfo is None:
+            raise ValueError("since must be timezone-aware")
+        with self.connect() as db:
+            rows = db.execute(
+                """SELECT delivered_at FROM orders
+                   WHERE status='completed' AND courier_id=? AND delivered_at IS NOT NULL""",
+                (courier_id,),
+            ).fetchall()
+        count = 0
+        for row in rows:
+            try:
+                delivered = datetime.fromisoformat(row["delivered_at"])
+            except (TypeError, ValueError):
+                continue
+            if delivered.tzinfo is None:
+                delivered = delivered.replace(tzinfo=timezone.utc)
+            if delivered.astimezone(timezone.utc) >= since.astimezone(timezone.utc):
+                count += 1
+        return count
+
     def list_manager_open(self, manager_id: int) -> list[Order]:
         with self.connect() as db:
             rows = db.execute(
