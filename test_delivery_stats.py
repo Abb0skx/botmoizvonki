@@ -121,6 +121,37 @@ class DeliveryStatsServiceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_report_day("not-a-date", today=self.today)
 
+    def test_report_exposes_text_only_orders_and_optional_map_details(self):
+        mapped = self._order("A59", 41.34, 69.29)
+        self.repo.update(
+            mapped.id,
+            delivery_time="До 16:30",
+            comment="Проверит товар",
+        )
+        text_only = self.repo.create(
+            manager_id=11,
+            manager_name="Abbos",
+            data={
+                "seller_name": "Ali",
+                "client_phone": "+998909998877",
+                "product": "A60",
+                "amount_usd": 140,
+                "address_text": "Юнусабад, 19 квартал",
+                "delivery_time": "Срочно",
+                "comment": "Домофон не работает",
+            },
+        )
+
+        report = build_delivery_stats(self.repo, self.today)
+
+        mapped_stop = next(stop for stop in report["stops"] if stop["order_id"] == mapped.id)
+        self.assertEqual(mapped_stop["delivery_time"], "До 16:30")
+        self.assertEqual(mapped_stop["comment"], "Проверит товар")
+        self.assertFalse(any(stop["order_id"] == text_only.id for stop in report["stops"]))
+        self.assertEqual(len(report["unmapped_orders"]), 1)
+        self.assertEqual(report["unmapped_orders"][0]["id"], text_only.id)
+        self.assertEqual(report["unmapped_orders"][0]["delivery_time"], "Срочно")
+
     def test_yesterday_uses_status_at_end_of_that_day(self):
         yesterday = self.today - timedelta(days=1)
         yesterday_time = datetime(

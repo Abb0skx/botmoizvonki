@@ -232,6 +232,8 @@ def _courier_route(
                     "order_number": order.order_number,
                     "product": order.product,
                     "seller_name": order.seller_name or "—",
+                    "delivery_time": order.delivery_time,
+                    "comment": order.comment,
                     "courier_id": courier_id,
                     "courier_name": courier_name,
                     "color": COURIER_COLORS[courier_id],
@@ -335,6 +337,9 @@ def build_delivery_monitor(repo: OrderRepository) -> dict[str, Any]:
         item["courier_name"],
         item["order_number"],
     ))
+    unmapped_order_ids = {
+        order.id for order in active_orders if not _locations(order)
+    }
     return {
         "generated_at": now.isoformat(timespec="seconds"),
         "generated_time": now.strftime("%H:%M:%S"),
@@ -364,6 +369,9 @@ def build_delivery_monitor(repo: OrderRepository) -> dict[str, Any]:
             for seller in SELLERS
         ],
         "active_orders": active_payloads,
+        "unmapped_orders": [
+            item for item in active_payloads if item["id"] in unmapped_order_ids
+        ],
         "routes": routes,
         "stops": map_stops,
         "disclaimer": (

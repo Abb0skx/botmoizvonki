@@ -274,6 +274,44 @@ class DeliveryMonitorServiceTests(unittest.TestCase):
         self.assertIsNotNone(current_row["picked_up_time"])
         self.assertTrue(any(item["kind"] == "picked_up" for item in report["timeline"]))
 
+    def test_monitor_exposes_text_only_orders_and_optional_map_details(self):
+        mapped = self._assigned("A59", 41.355)
+        self.repo.update(
+            mapped.id,
+            delivery_time="До 17:00",
+            comment="Позвонить заранее",
+        )
+        text_only = self.repo.create(
+            manager_id=11,
+            manager_name="Otabek",
+            data={
+                "seller_name": "Ali",
+                "client_phone": "+998901112233",
+                "product": "A60",
+                "amount_usd": 120,
+                "address_text": "Чиланзар, ориентир Корзинка",
+                "delivery_time": "После 18:00",
+                "comment": "Вход со двора",
+            },
+        )
+        self.repo.transition(
+            text_only.id,
+            {"draft"},
+            status="pending",
+            assigned_courier_id=ABBOS_ID,
+            assigned_courier_name="Abbos",
+        )
+
+        monitor = build_delivery_monitor(self.repo)
+
+        mapped_stop = next(stop for stop in monitor["stops"] if stop["order_id"] == mapped.id)
+        self.assertEqual(mapped_stop["delivery_time"], "До 17:00")
+        self.assertEqual(mapped_stop["comment"], "Позвонить заранее")
+        self.assertFalse(any(stop["order_id"] == text_only.id for stop in monitor["stops"]))
+        self.assertEqual(len(monitor["unmapped_orders"]), 1)
+        self.assertEqual(monitor["unmapped_orders"][0]["id"], text_only.id)
+        self.assertEqual(monitor["unmapped_orders"][0]["comment"], "Вход со двора")
+
 
 class DeliveryMonitorWebTests(unittest.TestCase):
     def setUp(self):
@@ -310,6 +348,8 @@ class DeliveryMonitorWebTests(unittest.TestCase):
         self.assertEqual(page.status_code, 200)
         self.assertIn("Мониторинг доставки", page.text)
         self.assertIn("Расчётная позиция", page.text)
+        self.assertIn("Нет локации", page.text)
+        self.assertIn("movementMarkers", page.text)
         self.assertEqual(page.headers["cache-control"], "no-store")
 
         state = self.client.get("/delivery/monitor/api/state", headers=self.auth())

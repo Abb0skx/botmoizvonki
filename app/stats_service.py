@@ -410,6 +410,8 @@ def build_delivery_stats(
             "status": report_status,
             "phones": phones,
             "address": short_address(order),
+            "delivery_time": order.delivery_time,
+            "comment": order.comment,
             "created_time": created.strftime("%H:%M") if created else None,
             "read_time": read_at.strftime("%H:%M") if read_at else None,
             "picked_up_time": picked_up.strftime("%H:%M") if picked_up else None,
@@ -468,6 +470,8 @@ def build_delivery_stats(
             "address": address,
             "product": order.product,
             "seller_name": order.seller_name or "—",
+            "delivery_time": order.delivery_time,
+            "comment": order.comment,
             "courier_id": row["courier_id"],
             "courier_name": row["courier_name"],
             "color": row["courier_color"],
@@ -568,6 +572,11 @@ def build_delivery_stats(
             timeline.append(item)
     timeline.sort(key=lambda item: (item["timestamp"], item["order_number"]))
 
+    mapped_order_ids = {stop["order_id"] for stop in stops}
+    unmapped_orders = [
+        row for row in rows if row["id"] not in mapped_order_ids
+    ]
+
     courier_summaries = []
     for courier in COURIERS:
         courier_rows = [row for row in rows if row["courier_id"] == courier.user_id]
@@ -622,6 +631,7 @@ def build_delivery_stats(
         },
         "couriers": courier_summaries,
         "orders": rows,
+        "unmapped_orders": unmapped_orders,
         "stops": stops,
         "routes": routes,
         "timeline": timeline,

@@ -52,6 +52,17 @@
     .sequence-marker { width:38px; height:38px; border:3px solid #fff; border-radius:50%; display:grid; place-items:center; color:#fff; font-weight:900; font-size:15px; box-shadow:0 2px 8px #11182766 }
     .warehouse-marker { width:42px; height:42px; border:3px solid #fff; border-radius:13px; display:grid; place-items:center; background:#f59e0b; font-size:22px; box-shadow:0 2px 9px #11182755 }
     .leaflet-div-icon { background:transparent; border:0 }
+    .no-location-control { min-width:210px; max-width:min(330px,calc(100vw - 42px)); background:#fff; border:1px solid #d7dee8; border-radius:12px; box-shadow:0 7px 22px #17203333; overflow:hidden }
+    .no-location-toggle { width:100%; border:0; background:#fff; padding:10px 12px; display:flex; align-items:center; justify-content:space-between; gap:12px; cursor:pointer; font-weight:850; text-align:left }
+    .no-location-toggle span:last-child { color:var(--muted); font-size:12px }
+    .no-location-list { display:none; max-height:270px; overflow:auto; border-top:1px solid var(--line) }
+    .no-location-control.open .no-location-list { display:block }
+    .no-location-item { display:block; width:100%; border:0; border-bottom:1px solid #edf0f4; background:#fff; padding:9px 12px; text-align:left; cursor:pointer }
+    .no-location-item:hover { background:#f7f8fb }
+    .no-location-item strong,.no-location-item small { display:block }
+    .no-location-item small { color:var(--muted); margin-top:2px }
+    .no-location-detail { display:none; margin-top:7px; padding-top:7px; border-top:1px dashed #dfe5ee; color:#39445a; font-size:12px; line-height:1.5 }
+    .no-location-item.expanded .no-location-detail { display:block }
     .side { display:grid; gap:16px }
     .courier-list { display:grid; gap:9px; padding:0 14px 15px }
     .courier { border:1px solid var(--line); border-radius:13px; padding:12px; background:#fff; cursor:pointer; text-align:left }
@@ -161,7 +172,7 @@
     let requestedCourier = params.get("courier_id") || "";
     let requestedMonth = params.get("month") || "";
     let requestedWeek = params.get("week") || "";
-    let map, routeLayer;
+    let map, routeLayer, noLocationControl;
     const $ = id => document.getElementById(id);
     const escapeHtml = value => String(value ?? "").replace(/[&<>'"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[c]));
     const statusLabels = {draft:"Черновик",pending:"Ожидает",remaining:"Ожидает",picked_up:"Товар у курьера",on_way:"Курьер едет",awaiting_photo:"Подтверждается",awaiting_amount:"Ожидается сумма",completed:"Доставлен",cancelled:"Отменён"};
@@ -171,6 +182,9 @@
       map = L.map("map", {zoomControl:true}).setView([41.311,69.279], 12);
       L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {maxZoom:19, attribution:"© OpenStreetMap contributors"}).addTo(map);
       routeLayer = L.layerGroup().addTo(map);
+      noLocationControl = L.control({position:"bottomleft"});
+      noLocationControl.onAdd = () => { const container=L.DomUtil.create("div","no-location-control");container.style.display="none";L.DomEvent.disableClickPropagation(container);L.DomEvent.disableScrollPropagation(container);return container; };
+      noLocationControl.addTo(map);
     }
     function mapUrl(path) {
       const q = new URLSearchParams({day:requestedDay});
@@ -246,12 +260,22 @@
         const text = remaining ? stop.color : "#fff";
         const icon = L.divIcon({className:"", html:`<div class="sequence-marker" style="background:${fill};color:${text};border-color:${stop.color}">${stop.sequence}</div>`, iconSize:[38,38], iconAnchor:[19,19]});
         const link = stop.map_url ? `<br><a class="order-link" href="${escapeHtml(stop.map_url)}" target="_blank" rel="noopener">Открыть локацию</a>` : "";
-        L.marker(point, {icon}).bindPopup(`<b>${stop.sequence}. Заказ №${stop.order_number}</b><br>${escapeHtml(stop.product)}<br>${escapeHtml(stop.address)}<br>Курьер: ${escapeHtml(stop.courier_name)}<br>Этап: ${escapeHtml(statusLabels[stop.state] || stop.state)}${stop.time ? `<br>Время: ${escapeHtml(stop.time)}` : ""}${link}`).addTo(routeLayer);
+        L.marker(point, {icon}).bindPopup(`<b>${stop.sequence}. Заказ №${stop.order_number}</b><br>${escapeHtml(stop.product)}<br>${escapeHtml(stop.address)}<br>Курьер: ${escapeHtml(stop.courier_name)}<br>Этап: ${escapeHtml(statusLabels[stop.state] || stop.state)}${stop.time ? `<br>Время: ${escapeHtml(stop.time)}` : ""}${stop.delivery_time ? `<br>🕒 Доставка: ${escapeHtml(stop.delivery_time)}` : ""}${stop.comment ? `<br>💬 ${escapeHtml(stop.comment)}` : ""}${link}`).addTo(routeLayer);
       });
+      renderUnmapped(data);
       if (bounds.length > 1) map.fitBounds(bounds, {padding:[55,55], maxZoom:14}); else map.setView(warehouse, 12);
       $("mapPhoto").src = mapUrl("map.png") + `&v=${Date.now()}`;
       $("downloadBtn").href = mapUrl("map.png");
       setTimeout(() => map.invalidateSize(), 50);
+    }
+
+    function renderUnmapped(data) {
+      const container=noLocationControl.getContainer(), orders=data.unmapped_orders || [];
+      if (!orders.length) { container.style.display="none"; container.innerHTML=""; return; }
+      container.style.display="block";
+      container.innerHTML=`<button class="no-location-toggle" type="button"><span>📍 Нет локации</span><span>${orders.length} заказ${orders.length===1?"":"а"} ▴</span></button><div class="no-location-list">${orders.map(o=>`<button class="no-location-item" type="button"><strong>№${o.order_number} · ${escapeHtml(o.product)}</strong><small>${escapeHtml(o.courier_name)} · ${escapeHtml(o.address)}</small><span class="no-location-detail">Продавец: ${escapeHtml(o.seller_name)}<br>Телефон: ${escapeHtml(o.phones.join(" / "))}<br>Статус: ${escapeHtml(statusLabels[o.status] || o.status)}${o.delivery_time?`<br>🕒 Доставка: ${escapeHtml(o.delivery_time)}`:""}${o.comment?`<br>💬 ${escapeHtml(o.comment)}`:""}</span></button>`).join("")}</div>`;
+      container.querySelector(".no-location-toggle").onclick=()=>container.classList.toggle("open");
+      container.querySelectorAll(".no-location-item").forEach(item=>item.onclick=()=>item.classList.toggle("expanded"));
     }
 
     function renderTimeline(data) {
