@@ -36,6 +36,35 @@ def create_order(repo: OrderRepository):
 
 
 class DeletedMessageRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_static_location_separators_are_not_reedited_during_sync(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = OrderRepository(Path(directory) / "delivery.db")
+            repo.initialize()
+            order = create_order(repo)
+            order = repo.update(
+                order.id,
+                status="pending",
+                delivery_chat_id=-5125237049,
+                delivery_message_id=55,
+                location_chat_id=-1002,
+                location_message_id=60,
+                location_details_message_id=61,
+                location_footer_message_id=62,
+            )
+            bot = SimpleNamespace(
+                edit_message_reply_markup=AsyncMock(),
+                edit_message_text=AsyncMock(side_effect=RuntimeError("timeout")),
+            )
+            context = SimpleNamespace(
+                bot=bot,
+                application=SimpleNamespace(bot_data={"repo": repo}),
+            )
+
+            self.assertTrue(await _set_location_marker(context, order, 1))
+
+            bot.edit_message_reply_markup.assert_awaited_once()
+            bot.edit_message_text.assert_not_awaited()
+
     async def test_existing_location_moves_buttons_to_pin_and_removes_reply_text(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = OrderRepository(Path(directory) / "delivery.db")

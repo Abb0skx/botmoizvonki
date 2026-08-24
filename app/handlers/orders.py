@@ -534,7 +534,7 @@ async def _set_location_marker(
     order,
     location_number: int | None = None,
 ) -> bool:
-    """Refresh the pin buttons and the two visual separator messages."""
+    """Refresh the functional pin buttons and migrate legacy location replies."""
     numbers = (location_number,) if location_number else (1, 2)
     success = True
     repo: OrderRepository = context.application.bot_data["repo"]
@@ -548,14 +548,12 @@ async def _set_location_marker(
             details_message_id = order.second_location_details_message_id
             footer_message_id = order.second_location_footer_message_id
             details_field = "second_location_details_message_id"
-            footer_field = "second_location_footer_message_id"
         else:
             chat_id = order.location_chat_id
             message_id = order.location_message_id
             details_message_id = order.location_details_message_id
             footer_message_id = order.location_footer_message_id
             details_field = "location_details_message_id"
-            footer_field = "location_footer_message_id"
         if not chat_id or not message_id:
             continue
 
@@ -623,36 +621,12 @@ async def _set_location_marker(
                 success = False
             details_message_id = None
 
-        for separator_id, separator_field in (
-            (details_message_id, details_field),
-            (footer_message_id, footer_field),
-        ):
-            if not separator_id:
-                continue
-            try:
-                await context.bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=separator_id,
-                    text=LOCATION_SEPARATOR,
-                )
-            except Exception as error:
-                if _message_is_not_modified(error):
-                    continue
-                if _message_is_missing(error):
-                    latest = repo.get(order.id)
-                    if latest:
-                        repo.update(
-                            latest.id,
-                            expected_updated_at=latest.updated_at,
-                            **{separator_field: None},
-                        )
-                else:
-                    logger.exception(
-                        "Could not refresh location separator %s for order %s",
-                        separator_field,
-                        order.id,
-                    )
-                success = False
+        # The header and footer are static decoration. Re-editing them during
+        # every status/courier change adds two Telegram API requests per pin
+        # and a timeout used to make the whole order look unsynchronized even
+        # though every functional card and button had already been updated.
+        # They are created together with the pin and removed when the location
+        # is replaced, so there is nothing to refresh here.
     return success
 
 
