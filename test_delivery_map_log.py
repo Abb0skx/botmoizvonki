@@ -303,11 +303,9 @@ class CourierMapLogTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Осталось у курьера: <b>1</b>", caption)
         self.assertIn("Всего активных заказов: <b>2</b>", caption)
         self.assertIn("На карте: <b>1</b>", caption)
-        button = bot.send_photo.await_args.kwargs["reply_markup"].inline_keyboard[0][0]
-        self.assertEqual(button.text, "📅 Доставки за этот день")
-        self.assertRegex(button.callback_data, r"^daily_log:\d{4}-\d{2}-\d{2}$")
+        self.assertNotIn("reply_markup", bot.send_photo.await_args.kwargs)
 
-    async def test_log_channel_button_publishes_requested_day_timeline(self):
+    async def test_old_log_chronology_button_is_disabled_without_new_posts(self):
         order = Order(
             id=21,
             order_number=21,
@@ -350,10 +348,11 @@ class CourierMapLogTests(unittest.IsolatedAsyncioTestCase):
             context,
         )
 
-        query.answer.assert_awaited_once_with("Формирую хронологию…")
-        bot.send_message.assert_awaited_once()
-        self.assertEqual(bot.send_message.await_args.kwargs["chat_id"], -1004459657817)
-        self.assertIn("Хронология доставок за 23.08.2026", bot.send_message.await_args.kwargs["text"])
+        query.answer.assert_awaited_once_with(
+            "Хронология в Log отключена",
+            show_alert=True,
+        )
+        bot.send_message.assert_not_awaited()
 
     async def test_ambiguous_photo_timeout_is_not_retried_as_duplicate(self):
         with tempfile.TemporaryDirectory() as directory:

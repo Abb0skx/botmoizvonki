@@ -207,21 +207,8 @@ def orders_channel_keyboard(order: Order) -> InlineKeyboardMarkup:
             f"🚚 Курьер: {courier_name}",
             callback_data=f"control_courier_menu:{order.id}",
         )])
-    rows.append([InlineKeyboardButton(
-        "📅 Доставки за сегодня",
-        callback_data="daily_log:today",
-    )])
     rows.append([InlineKeyboardButton("🔄 Обновить карточку", callback_data=f"sync:{order.id}")])
     return InlineKeyboardMarkup(rows)
-
-
-def delivery_day_log_keyboard(day: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            "📅 Доставки за этот день",
-            callback_data=f"daily_log:{day}",
-        ),
-    ]])
 
 
 def statistics_keyboard(base_url: str) -> InlineKeyboardMarkup:

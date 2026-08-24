@@ -143,7 +143,7 @@ class OrdersPageKeyboardTests(unittest.TestCase):
 
 
 class OrdersChannelKeyboardTests(unittest.TestCase):
-    def test_journal_card_has_today_delivery_log_button(self):
+    def test_journal_card_has_no_chronology_button(self):
         order = Order(
             id=7,
             order_number=7,
@@ -159,7 +159,7 @@ class OrdersChannelKeyboardTests(unittest.TestCase):
             for button in row
         ]
 
-        self.assertIn("daily_log:today", callbacks)
+        self.assertNotIn("daily_log:today", callbacks)
 
 
 class StatisticsKeyboardTests(unittest.TestCase):

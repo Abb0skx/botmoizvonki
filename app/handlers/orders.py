@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import datetime
 from html import escape
 from math import ceil
 from types import SimpleNamespace
@@ -18,7 +18,7 @@ from telegram.ext import (
 
 from app.bot.keyboards import (
     all_locations_keyboard, completed_keyboard, courier_cancelled_keyboard,
-    courier_keyboard, courier_selection_keyboard, delivery_day_log_keyboard,
+    courier_keyboard, courier_selection_keyboard,
     delivery_pending_keyboard, delivery_time_keyboard, edit_input_keyboard,
     location_channel_keyboard, main_keyboard,
     manager_cancelled_keyboard, manager_sent_keyboard, on_way_keyboard,
@@ -33,7 +33,7 @@ from app.utils import (
     parse_order_details,
 )
 from app.utils.formatters import (
-    STATUS_LABELS, all_locations_card, amount_text, daily_delivery_report,
+    STATUS_LABELS, all_locations_card, amount_text,
     money, orders_channel_card,
 )
 from app.utils.couriers import (
@@ -229,7 +229,6 @@ async def _send_courier_map_log(
                     photo=image,
                     caption=caption,
                     parse_mode=ParseMode.HTML,
-                    reply_markup=delivery_day_log_keyboard(now_tashkent.date().isoformat()),
                 )
             else:
                 suffix = "\n\nНе удалось создать фотографию карты."
@@ -237,7 +236,6 @@ async def _send_courier_map_log(
                     chat_id=channel_id,
                     text=caption + suffix,
                     parse_mode=ParseMode.HTML,
-                    reply_markup=delivery_day_log_keyboard(now_tashkent.date().isoformat()),
                 )
             return
         except asyncio.CancelledError:
@@ -298,55 +296,9 @@ async def daily_delivery_log_action(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    query = update.callback_query
-    settings: Settings = context.application.bot_data["settings"]
-    if not _allowed(
-        query.from_user.id,
-        settings.manager_ids | _allowed_courier_ids(settings),
-    ):
-        await query.answer("Нет доступа", show_alert=True)
-        return
-    if query.message.chat_id != settings.orders_channel_id:
-        await query.answer("Кнопка работает только в канале Log", show_alert=True)
-        return
-
-    raw_day = query.data.partition(":")[2]
-    try:
-        report_day = (
-            datetime.now(ZoneInfo("Asia/Tashkent")).date()
-            if raw_day == "today"
-            else datetime.strptime(raw_day, "%Y-%m-%d").date()
-        )
-    except ValueError:
-        await query.answer("Неверная дата", show_alert=True)
-        return
-
-    await query.answer("Формирую хронологию…")
-    repo: OrderRepository = context.application.bot_data["repo"]
-    tashkent = ZoneInfo("Asia/Tashkent")
-    day_start = datetime(
-        report_day.year,
-        report_day.month,
-        report_day.day,
-        tzinfo=tashkent,
-    )
-    reports = daily_delivery_report(
-        repo.list_all(),
-        report_day,
-        repo.list_events_between(day_start, day_start + timedelta(days=1)),
-    )
-    try:
-        for report in reports:
-            await context.bot.send_message(
-                chat_id=settings.orders_channel_id,
-                text=report,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
-    except Exception:
-        # A timeout can mean that Telegram accepted a report. Blind retries
-        # would create duplicate journal messages.
-        logger.exception("Could not publish daily delivery log for %s", report_day)
+    # Kept only so buttons on already-published old posts stop cleanly instead
+    # of spinning. New Log posts no longer include chronology controls.
+    await update.callback_query.answer("Хронология в Log отключена", show_alert=True)
 
 
 async def _location_values(message) -> dict:
