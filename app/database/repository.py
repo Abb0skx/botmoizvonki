@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS orders (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     delivered_at TEXT,
+    courier_read_at TEXT,
     picked_up_at TEXT,
     time_started TEXT,
     delivery_chat_id INTEGER,
@@ -142,6 +143,7 @@ MIGRATION_COLUMNS = {
     "creation_token": "TEXT",
     "sync_needed": "INTEGER NOT NULL DEFAULT 0",
     "sync_attempted_at": "TEXT",
+    "courier_read_at": "TEXT",
     "picked_up_at": "TEXT",
 }
 
@@ -159,7 +161,7 @@ class OrderRepository:
         "delivery_time", "comment", "status",
         "assigned_courier_id", "assigned_courier_name",
         "courier_id", "courier_name", "delivery_photo", "received_usd",
-        "received_uzs", "delivered_at", "picked_up_at", "time_started", "delivery_chat_id",
+        "received_uzs", "delivered_at", "courier_read_at", "picked_up_at", "time_started", "delivery_chat_id",
         "delivery_message_id", "location_chat_id", "location_message_id",
         "location_details_message_id", "second_location_chat_id",
         "location_footer_message_id", "second_location_message_id",
@@ -521,6 +523,7 @@ class OrderRepository:
         actor_id: int | None = None,
         actor_name: str | None = None,
         actor_role: str | None = None,
+        event_type: str | None = None,
         cleanup_messages: list[tuple[int, int]] | tuple[tuple[int, int], ...] = (),
         **fields: Any,
     ) -> Order | None:
@@ -574,7 +577,10 @@ class OrderRepository:
                 db,
                 order_id=order_id,
                 order_number=row["order_number"],
-                event_type="status_changed" if row["status"] != previous["status"] else "order_updated",
+                event_type=(
+                    event_type
+                    or ("status_changed" if row["status"] != previous["status"] else "order_updated")
+                ),
                 actor_id=event_actor_id,
                 actor_name=event_actor_name,
                 actor_role=event_actor_role,

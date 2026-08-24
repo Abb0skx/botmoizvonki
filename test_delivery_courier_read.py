@@ -1,0 +1,254 @@
+import tempfile
+import unittest
+from datetime import datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
+
+from app.bot.keyboards import courier_keyboard
+from app.database import OrderRepository
+from app.handlers.orders import courier_action
+from app.monitor_service import WAREHOUSE, build_delivery_monitor
+from app.routing_service import enrich_monitor_routes
+from app.stats_service import TASHKENT, build_delivery_stats
+from app.utils.formatters import courier_card, daily_delivery_report, orders_channel_card
+
+
+ABBOS_ID = 202134293
+ABBOS_GROUP_ID = -5216093690
+
+
+def order_data(product: str, latitude: float = 41.311) -> dict:
+    return {
+        "seller_name": "Ali",
+        "client_phone": "+998901333999",
+        "product": product,
+        "amount_usd": 100,
+        "latitude": latitude,
+        "longitude": 69.279,
+        "address_text": f"Адрес {product}, Ташкент",
+    }
+
+
+class CourierReadWorkflowTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.repo = OrderRepository(Path(self.tempdir.name) / "delivery.db")
+        self.repo.initialize()
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+
+    def assigned_order(self):
+        order = self.repo.create(
+            manager_id=11,
+            manager_name="Otabek",
+            data=order_data("A57"),
+        )
+        return self.repo.transition(
+            order.id,
+            {"draft"},
+            status="pending",
+            assigned_courier_id=ABBOS_ID,
+            assigned_courier_name="Abbos",
+            manager_chat_id=11,
+            manager_message_id=55,
+            delivery_chat_id=ABBOS_GROUP_ID,
+            delivery_message_id=77,
+        )
+
+    async def test_courier_confirms_read_once_and_card_visibly_changes(self):
+        order = self.assigned_order()
+        query = SimpleNamespace(
+            data=f"read:{order.id}",
+            from_user=SimpleNamespace(id=ABBOS_ID, full_name="Abbos", username=None),
+            message=SimpleNamespace(chat_id=ABBOS_GROUP_ID, message_id=77),
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        )
+        bot = SimpleNamespace(
+            send_message=AsyncMock(),
+            edit_message_text=AsyncMock(),
+            set_message_reaction=AsyncMock(),
+        )
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={
+                "settings": SimpleNamespace(courier_ids=frozenset({ABBOS_ID})),
+                "repo": self.repo,
+            }),
+            bot=bot,
+        )
+
+        await courier_action(SimpleNamespace(callback_query=query), context)
+
+        read = self.repo.get(order.id)
+        self.assertEqual(read.status, "pending")
+        self.assertIsNotNone(read.courier_read_at)
+        self.assertEqual(read.courier_id, ABBOS_ID)
+        self.assertEqual(read.courier_name, "Abbos")
+        query.answer.assert_awaited_once_with("✅ Прочитано · еду на склад 🏬")
+        bot.set_message_reaction.assert_awaited_once_with(
+            chat_id=ABBOS_GROUP_ID,
+            message_id=77,
+            reaction="👀",
+            is_big=True,
+        )
+        changed_text = query.edit_message_text.await_args.args[0]
+        self.assertIn("ЗАКАЗ ПРОЧИТАН", changed_text)
+        self.assertIn("Курьер едет на склад", changed_text)
+        callbacks = [
+            button.callback_data
+            for row in query.edit_message_text.await_args.kwargs["reply_markup"].inline_keyboard
+            for button in row
+        ]
+        self.assertIn(f"read:{order.id}", callbacks)
+        self.assertTrue(any("выехал на склад" in call.args[1] for call in bot.send_message.await_args_list))
+        events = self.repo.list_events(order.id)
+        read_events = [event for event in events if event.event_type == "courier_read"]
+        self.assertEqual(len(read_events), 1)
+        self.assertEqual(read_events[0].actor_role, "courier")
+
+        query.answer.reset_mock()
+        query.edit_message_text.reset_mock()
+        await courier_action(SimpleNamespace(callback_query=query), context)
+        self.assertIn("Уже прочитано", query.answer.await_args.args[0])
+        query.edit_message_text.assert_not_awaited()
+        self.assertEqual(
+            len([event for event in self.repo.list_events(order.id) if event.event_type == "courier_read"]),
+            1,
+        )
+
+    def test_keyboard_and_cards_show_read_confirmation(self):
+        order = self.assigned_order()
+        unread_button = next(
+            button
+            for row in courier_keyboard(order).inline_keyboard
+            for button in row
+            if button.callback_data == f"read:{order.id}"
+        )
+        self.assertEqual(unread_button.text, "👀 Заказ прочитан")
+
+        order = self.repo.update(
+            order.id,
+            courier_read_at=datetime.now(TASHKENT).isoformat(timespec="seconds"),
+            courier_id=ABBOS_ID,
+            courier_name="Abbos",
+        )
+        read_button = next(
+            button
+            for row in courier_keyboard(order).inline_keyboard
+            for button in row
+            if button.callback_data == f"read:{order.id}"
+        )
+        self.assertEqual(read_button.text, "✅ Прочитано · еду на склад")
+        self.assertIn("🏬 Едет на склад за товаром", courier_card(order))
+        self.assertIn("👀 Заказ прочитал Abbos", orders_channel_card(order))
+
+
+class CourierWarehouseMovementTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.repo = OrderRepository(Path(self.tempdir.name) / "delivery.db")
+        self.repo.initialize()
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+
+    def assigned(self, product: str, latitude: float):
+        order = self.repo.create(
+            manager_id=11,
+            manager_name="Otabek",
+            data=order_data(product, latitude),
+        )
+        return self.repo.transition(
+            order.id,
+            {"draft"},
+            status="pending",
+            assigned_courier_id=ABBOS_ID,
+            assigned_courier_name="Abbos",
+        )
+
+    def test_read_after_delivery_starts_estimated_trip_to_warehouse(self):
+        now = datetime.now(TASHKENT).replace(microsecond=0)
+        completed = self.assigned("A56", 41.320)
+        completed = self.repo.transition(
+            completed.id,
+            {"pending"},
+            status="completed",
+            courier_id=ABBOS_ID,
+            courier_name="Abbos",
+            picked_up_at=(now - timedelta(minutes=70)).isoformat(),
+            time_started=(now - timedelta(minutes=60)).isoformat(),
+            delivered_at=(now - timedelta(minutes=20)).isoformat(),
+        )
+        waiting = self.assigned("A57", 41.350)
+        read_at = now - timedelta(minutes=10)
+        self.repo.transition(
+            waiting.id,
+            {"pending"},
+            status="pending",
+            courier_id=ABBOS_ID,
+            courier_name="Abbos",
+            courier_read_at=read_at.isoformat(),
+            actor_id=ABBOS_ID,
+            actor_name="Abbos",
+            actor_role="courier",
+            event_type="courier_read",
+        )
+
+        monitor = build_delivery_monitor(self.repo)
+        route = next(route for route in monitor["routes"] if route["courier_id"] == ABBOS_ID)
+        courier = next(item for item in monitor["couriers"] if item["id"] == ABBOS_ID)
+        self.assertEqual(route["movement_kind"], "warehouse")
+        self.assertEqual(route["return_path"][0], [completed.latitude, completed.longitude])
+        self.assertEqual(route["return_path"][-1], [WAREHOUSE["latitude"], WAREHOUSE["longitude"]])
+        self.assertEqual(route["movement_started_at"], read_at.isoformat())
+        self.assertTrue(courier["heading_to_warehouse"])
+        self.assertEqual(monitor["summary"]["heading_to_warehouse"], 1)
+
+        report = build_delivery_stats(self.repo, now.date())
+        read_row = next(row for row in report["orders"] if row["id"] == waiting.id)
+        self.assertEqual(read_row["read_time"], read_at.strftime("%H:%M"))
+        self.assertTrue(any(item["kind"] == "read" for item in report["timeline"]))
+        telegram_log = "\n".join(
+            daily_delivery_report(
+                self.repo.list_all(),
+                now.date(),
+                self.repo.list_events_between(
+                    now.replace(hour=0, minute=0, second=0),
+                    now.replace(hour=0, minute=0, second=0) + timedelta(days=1),
+                ),
+            )
+        )
+        self.assertIn("прочитал заказ", telegram_log)
+        self.assertIn("выехал на склад", telegram_log)
+
+    async def test_warehouse_movement_gets_road_eta_and_return_layer(self):
+        started = (datetime.now(TASHKENT) - timedelta(minutes=5)).isoformat()
+        points = [[41.320, 69.279], [WAREHOUSE["latitude"], WAREHOUSE["longitude"]]]
+        routing = Mock()
+        routing.route = AsyncMock(return_value={
+            "provider": "osrm",
+            "geometry": points,
+            "distance_m": 4200,
+            "duration_s": 600,
+        })
+        state = {
+            "summary": {},
+            "couriers": [{"id": ABBOS_ID}],
+            "routes": [{
+                "courier_id": ABBOS_ID,
+                "dark_paths": [],
+                "current_path": [],
+                "return_path": points,
+                "movement_kind": "warehouse",
+                "movement_started_at": started,
+            }],
+        }
+
+        result = await enrich_monitor_routes(state, routing)
+        route = result["routes"][0]
+        self.assertEqual(route["movement"]["kind"], "warehouse")
+        self.assertEqual(route["return_road_path"], points)
+        self.assertEqual(route["movement"]["distance_km"], 4.2)
+        self.assertIsNotNone(route["movement"]["eta_at"])

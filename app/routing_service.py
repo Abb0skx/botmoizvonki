@@ -278,7 +278,9 @@ async def enrich_monitor_routes(
             movement["geometry"] if movement and route.get("movement_kind") == "delivery" else []
         )
         route["return_road_path"] = (
-            movement["geometry"] if movement and route.get("movement_kind") == "return" else []
+            movement["geometry"]
+            if movement and route.get("movement_kind") in {"return", "warehouse"}
+            else []
         )
         route["movement"] = (
             {

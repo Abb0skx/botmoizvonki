@@ -130,6 +130,7 @@ def daily_delivery_report(
     arrived_orders: set[int] = set()
     delivered_orders: set[int] = set()
     event_created_orders: set[int] = set()
+    event_read_orders: set[int] = set()
     event_picked_orders: set[int] = set()
     event_started_orders: set[int] = set()
     event_delivered_orders: set[int] = set()
@@ -158,6 +159,13 @@ def daily_delivery_report(
                 f" · {product} · продавец {seller}"
             )
             priority = 0
+        elif event.event_type == "courier_read":
+            event_read_orders.add(order.id)
+            line = (
+                f"👀 <b>{occurred:%H:%M}</b> · {courier} прочитал заказ"
+                f" №{order.order_number} и выехал на склад"
+            )
+            priority = 1
         elif event.from_status == "completed" and event.to_status in {"pending", "picked_up", "on_way"}:
             line = (
                 f"↩️ <b>{occurred:%H:%M}</b> · {courier} отменил завершение"
@@ -233,6 +241,15 @@ def daily_delivery_report(
                 f"📥 <b>{created:%H:%M}</b> · Пришёл заказ №{order.order_number}"
                 f" · {product} · продавец {seller}",
                 0,
+            ))
+
+        read_at = _tashkent_datetime(order.courier_read_at)
+        if read_at and read_at.date() == report_day and order.id not in event_read_orders:
+            timeline.append((
+                read_at,
+                f"👀 <b>{read_at:%H:%M}</b> · {courier} прочитал заказ"
+                f" №{order.order_number} и выехал на склад",
+                1,
             ))
 
         picked_up = _tashkent_datetime(order.picked_up_at)
@@ -312,6 +329,12 @@ def _compact_order(order: Order, *, status: str | None = None) -> str:
         lines.append(f"🏷 {escape(status)}")
     if order.assigned_courier_name:
         lines.append(f"🚚 Курьер: {escape(order.assigned_courier_name)}")
+    read_at = _local_datetime(order.courier_read_at)
+    if read_at:
+        reader = order.courier_name or order.assigned_courier_name or "Курьер"
+        lines.append(f"👀 Прочитал: {escape(reader)} · {escape(read_at)}")
+        if order.status == "pending":
+            lines.append("🏬 Едет на склад за товаром")
     lines.extend([
         f"📦 {escape(order.product)}",
         amount_text(order),
@@ -374,6 +397,10 @@ def orders_channel_card(order: Order) -> str:
         lines.append(f"🚚 Назначен курьер: <b>{escape(order.assigned_courier_name)}</b>")
     if order.courier_name:
         lines.append(f"👤 Принял заказ: {escape(order.courier_name)}")
+    read_at = _local_datetime(order.courier_read_at)
+    if read_at:
+        reader = order.courier_name or order.assigned_courier_name or "Курьер"
+        lines.append(f"👀 Заказ прочитал {escape(reader)}: {escape(read_at)}")
     picked_up = _local_datetime(order.picked_up_at)
     if picked_up:
         lines.append(f"📦 Курьер забрал товар: {escape(picked_up)}")

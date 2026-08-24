@@ -352,6 +352,14 @@ def _delivery_message(order):
         return courier_card(order, "📸 <b>Курьер подтверждает доставку</b>"), delivery_pending_keyboard(order)
     if order.status == "awaiting_amount":
         return courier_card(order, "💰 <b>Фото получено, ожидается сумма</b>"), delivery_pending_keyboard(order)
+    if order.status == "pending" and order.courier_read_at:
+        return (
+            courier_card(
+                order,
+                "🟡🟡🟡\n👀 <b>ЗАКАЗ ПРОЧИТАН</b>\n🏬 <b>Курьер едет на склад</b>",
+            ),
+            courier_keyboard(order),
+        )
     return courier_card(order), courier_keyboard(order)
 
 
@@ -2004,6 +2012,7 @@ async def manager_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             status="draft",
             courier_id=None,
             courier_name=None,
+            courier_read_at=None,
             time_started=None,
             actor_id=query.from_user.id,
             actor_name=_name(query.from_user),
@@ -2127,6 +2136,7 @@ async def courier_assignment_action(update: Update, context: ContextTypes.DEFAUL
         assigned_courier_name=selected.name,
         courier_id=None,
         courier_name=None,
+        courier_read_at=None,
         picked_up_at=None,
         time_started=None,
         delivery_photo=None,
@@ -2170,6 +2180,7 @@ async def courier_assignment_action(update: Update, context: ContextTypes.DEFAUL
         assigned_courier_name=selected.name,
         courier_id=None,
         courier_name=None,
+        courier_read_at=None,
         picked_up_at=None,
         time_started=None,
         delivery_photo=None,
@@ -2426,6 +2437,61 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "courier_id": query.from_user.id,
         "courier_name": configured_courier.name if configured_courier else _name(query.from_user),
     }
+    if action == "read":
+        if order.status != "pending":
+            await query.answer("Заказ уже перешёл на следующий этап", show_alert=True)
+            return
+        if order.courier_read_at:
+            read_at = datetime.fromisoformat(order.courier_read_at).astimezone(
+                ZoneInfo("Asia/Tashkent")
+            )
+            await query.answer(f"Уже прочитано в {read_at:%H:%M} · вы едете на склад 🏬")
+            return
+        timestamp = datetime.now(ZoneInfo("Asia/Tashkent"))
+        order = repo.transition(
+            order.id,
+            {"pending"},
+            expected_updated_at=order.updated_at,
+            status="pending",
+            courier_read_at=timestamp.isoformat(timespec="seconds"),
+            guard_courier_id=query.from_user.id,
+            require_unassigned_or_same=True,
+            actor_id=query.from_user.id,
+            actor_name=courier["courier_name"],
+            actor_role="courier",
+            event_type="courier_read",
+            **courier,
+        )
+        if not order:
+            await query.answer("Заказ уже изменился. Откройте свежую карточку.", show_alert=True)
+            return
+        await query.answer("✅ Прочитано · еду на склад 🏬")
+        set_reaction = getattr(context.bot, "set_message_reaction", None)
+        if callable(set_reaction):
+            try:
+                # Telegram shows a large native reaction animation when the
+                # group allows this emoji. The edited card below remains the
+                # durable confirmation when reactions are disabled.
+                await set_reaction(
+                    chat_id=query.message.chat_id,
+                    message_id=query.message.message_id,
+                    reaction="👀",
+                    is_big=True,
+                )
+            except Exception:
+                logger.info(
+                    "Could not animate read reaction for order %s; card confirmation remains active",
+                    order.id,
+                )
+        text, keyboard = _delivery_message(order)
+        await _finish_status_change(context, query, order, text, keyboard)
+        await _notify_manager(
+            context,
+            order.manager_id,
+            f"👀 Курьер {escape(order.courier_name or order.assigned_courier_name or '—')} "
+            f"прочитал заказ №{order.order_number} в {timestamp:%H:%M} и выехал на склад.",
+        )
+        return
     if action == "undo_onway":
         target_status = "picked_up" if order.picked_up_at else "pending"
         reset = {
@@ -2777,6 +2843,6 @@ def register_handlers(application: Application) -> None:
         manager_pickup_action,
         pattern=r"^(?:pickup|undo_pickup):\d+$",
     ))
-    application.add_handler(CallbackQueryHandler(courier_action, pattern=r"^(onway|undo_onway|complete|cancel|undo_cancel|undo_complete):\d+$"))
+    application.add_handler(CallbackQueryHandler(courier_action, pattern=r"^(read|onway|undo_onway|complete|cancel|undo_cancel|undo_complete):\d+$"))
     application.add_handler(edit_conversation, group=1)
     application.add_handler(MessageHandler(filters.PHOTO | (filters.TEXT & ~filters.COMMAND), delivery_input), group=2)

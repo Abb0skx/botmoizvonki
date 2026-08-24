@@ -140,6 +140,7 @@ def _status_at_day_end(
 def _activity_event(event: OrderEvent) -> bool:
     return bool(
         event.event_type == "order_created"
+        or event.event_type == "courier_read"
         or event.to_status in {"picked_up", "on_way", "completed", "cancelled"}
         or (
             event.from_status in {"picked_up", "on_way", "completed", "cancelled"}
@@ -186,6 +187,13 @@ def _timeline_item(event: OrderEvent, order: Order) -> dict[str, Any] | None:
                 f"Пришёл заказ №{order.order_number} · {order.product}"
                 f" · продавец {order.seller_name or '—'}"
             ),
+        }
+    if event.event_type == "courier_read":
+        return {
+            **base,
+            "kind": "read",
+            "icon": "👀",
+            "text": f"{courier_name} прочитал заказ №{order.order_number} и выехал на склад",
         }
     if event.from_status == "completed" and event.to_status in {"pending", "picked_up", "on_way"}:
         return {
@@ -250,8 +258,14 @@ def _order_times(
     order: Order,
     events: list[OrderEvent],
     report_day: date,
-) -> tuple[datetime | None, datetime | None, datetime | None, datetime | None]:
+) -> tuple[datetime | None, datetime | None, datetime | None, datetime | None, datetime | None]:
     created = local_datetime(order.created_at)
+    reads = [
+        occurred
+        for event in events
+        if event.event_type == "courier_read"
+        and (occurred := _event_time(event))
+    ]
     pickups = [
         occurred
         for event in events
@@ -267,18 +281,21 @@ def _order_times(
         for event in events
         if event.to_status == "completed" and (occurred := _event_time(event))
     ]
+    read_at = local_datetime(order.courier_read_at) or (reads[-1] if reads else None)
     picked_up = pickups[-1] if pickups else local_datetime(order.picked_up_at)
     started = starts[-1] if starts else local_datetime(order.time_started)
     completed = completions[-1] if completions else local_datetime(order.delivered_at)
     if created and created.date() != report_day:
         created = None
+    if read_at and read_at.date() != report_day:
+        read_at = None
     if picked_up and picked_up.date() != report_day:
         picked_up = None
     if started and started.date() != report_day:
         started = None
     if completed and completed.date() != report_day:
         completed = None
-    return created, picked_up, started, completed
+    return created, read_at, picked_up, started, completed
 
 
 def _duration_minutes(started: datetime | None, completed: datetime | None) -> int | None:
@@ -315,12 +332,13 @@ def build_delivery_stats(
     relevant: list[Order] = []
     for order in all_orders:
         created = local_datetime(order.created_at)
+        read_at = local_datetime(order.courier_read_at)
         picked_up = local_datetime(order.picked_up_at)
         started = local_datetime(order.time_started)
         delivered = local_datetime(order.delivered_at)
         has_day_field = any(
             value and value.date() == report_day
-            for value in (created, picked_up, started, delivered)
+            for value in (created, read_at, picked_up, started, delivered)
         )
         activity_events = activity_events_by_order.get(order.id, [])
         if not has_day_field and not activity_events:
@@ -346,7 +364,7 @@ def build_delivery_stats(
     for order in relevant:
         day_events = all_day_events_by_order.get(order.id, [])
         activity_events = activity_events_by_order.get(order.id, [])
-        created, picked_up, started, completed = _order_times(order, day_events, report_day)
+        created, read_at, picked_up, started, completed = _order_times(order, day_events, report_day)
         created_today = bool(created) or any(
             event.event_type == "order_created" for event in activity_events
         )
@@ -380,7 +398,7 @@ def build_delivery_stats(
         phones = [display_phone(order.client_phone)]
         if order.client_phone_2 and order.client_phone_2 != order.client_phone:
             phones.append(display_phone(order.client_phone_2))
-        sort_time = completed or started or picked_up or created or local_datetime(order.updated_at) or start
+        sort_time = completed or started or picked_up or read_at or created or local_datetime(order.updated_at) or start
         rows.append({
             "id": order.id,
             "order_number": order.order_number,
@@ -393,10 +411,12 @@ def build_delivery_stats(
             "phones": phones,
             "address": short_address(order),
             "created_time": created.strftime("%H:%M") if created else None,
+            "read_time": read_at.strftime("%H:%M") if read_at else None,
             "picked_up_time": picked_up.strftime("%H:%M") if picked_up else None,
             "started_time": started.strftime("%H:%M") if started else None,
             "completed_time": completed.strftime("%H:%M") if completed else None,
             "created_at": created.isoformat() if created else None,
+            "read_at": read_at.isoformat() if read_at else None,
             "picked_up_at": picked_up.isoformat() if picked_up else None,
             "started_at": started.isoformat() if started else None,
             "completed_at": completed.isoformat() if completed else None,

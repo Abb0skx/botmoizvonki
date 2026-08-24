@@ -287,6 +287,13 @@ def location_channel_keyboard(
 
 def courier_keyboard(order: Order) -> InlineKeyboardMarkup:
     rows = _location_rows(order)
+    if order.status == "pending":
+        read_text = (
+            "✅ Прочитано · еду на склад"
+            if order.courier_read_at
+            else "👀 Заказ прочитан"
+        )
+        rows.append([InlineKeyboardButton(read_text, callback_data=f"read:{order.id}")])
     rows += [
         [InlineKeyboardButton("🚗 Еду к заказу", callback_data=f"onway:{order.id}")],
         [InlineKeyboardButton("✅ Доставлено", callback_data=f"complete:{order.id}"),
