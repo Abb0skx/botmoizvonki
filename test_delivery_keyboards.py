@@ -163,13 +163,13 @@ class OrdersChannelKeyboardTests(unittest.TestCase):
 
 
 class StatisticsKeyboardTests(unittest.TestCase):
-    def test_main_menu_and_statistics_links_cover_days_and_couriers(self):
+    def test_main_menu_hides_statistics_while_direct_links_remain_available(self):
         menu_labels = [
             button.text
             for row in main_keyboard().keyboard
             for button in row
         ]
-        self.assertIn("📊 Статистика", menu_labels)
+        self.assertNotIn("📊 Статистика", menu_labels)
 
         keyboard = statistics_keyboard("https://bot.texnikach.uz/delivery/stats/")
         urls = [

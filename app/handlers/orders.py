@@ -125,6 +125,47 @@ async def _notify_manager(context: ContextTypes.DEFAULT_TYPE, manager_id: int, t
         logger.exception("Could not notify manager %s", manager_id)
 
 
+async def _notify_log(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    """Publish a lifecycle notification to the shared delivery Log channel."""
+    settings: Settings = context.application.bot_data["settings"]
+    channel_id = getattr(settings, "orders_channel_id", None)
+    if not channel_id:
+        return
+    send_message = getattr(context.bot, "send_message", None)
+    if not callable(send_message):
+        return
+    try:
+        await send_message(
+            chat_id=channel_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        # A notification is secondary to the durable order/event update. The
+        # canonical Log card is still synchronized by _sync_order.
+        logger.exception("Could not publish delivery notification to Log channel")
+
+
+async def _is_orders_channel_member(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+) -> bool:
+    settings: Settings = context.application.bot_data["settings"]
+    channel_id = getattr(settings, "orders_channel_id", None)
+    if not channel_id:
+        return False
+    try:
+        member = await context.bot.get_chat_member(channel_id, user_id)
+    except Exception:
+        logger.exception("Could not verify Log-channel membership for user %s", user_id)
+        return False
+    status = str(getattr(member, "status", ""))
+    if status in {"creator", "administrator", "member"}:
+        return True
+    return status == "restricted" and bool(getattr(member, "is_member", False))
+
+
 async def _send_courier_map_log(
     application: Application,
     *,
@@ -1312,6 +1353,7 @@ async def _show_orders(
         page,
         total_pages,
         map_url,
+        orders if active_only else None,
     )
     if query:
         try:
@@ -1345,6 +1387,86 @@ async def orders_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     query = update.callback_query
     _, kind, raw_page = query.data.split(":")
     await _show_orders(update, context, active_only=kind == "active", page=int(raw_page))
+
+
+async def open_order_from_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Open an active order as the new canonical manager card for editing."""
+    query = update.callback_query
+    settings: Settings = context.application.bot_data["settings"]
+    if not _allowed(query.from_user.id, settings.manager_ids):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    repo: OrderRepository = context.application.bot_data["repo"]
+    order = repo.get(int(query.data.split(":", 1)[1]))
+    if not order or order.status not in MANAGER_EDITABLE_STATUSES:
+        await query.answer("Этот заказ уже нельзя изменять", show_alert=True)
+        return
+    await query.answer(f"Открываю заказ №{order.order_number}…")
+    try:
+        sent = await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=manager_card(order, sent=order.status != "draft"),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=(
+                review_keyboard(order.id, expanded=True)
+                if order.status == "draft"
+                else manager_sent_keyboard(order, expanded=True)
+            ),
+        )
+    except Exception:
+        logger.exception("Could not open order %s from active list", order.id)
+        await _notify_manager(
+            context,
+            query.from_user.id,
+            f"⚠️ Не удалось открыть заказ №{order.order_number}. Попробуйте ещё раз.",
+        )
+        return
+    sent_chat_id = getattr(sent, "chat_id", None)
+    sent_message_id = getattr(sent, "message_id", None)
+    if not isinstance(sent_chat_id, int) or not isinstance(sent_message_id, int):
+        logger.error("Telegram returned an invalid list-order card reference for order %s", order.id)
+        return
+    old_reference = (order.manager_chat_id, order.manager_message_id)
+    updated = repo.update(
+        order.id,
+        expected_updated_at=order.updated_at,
+        actor_id=query.from_user.id,
+        actor_name=_name(query.from_user),
+        actor_role="manager",
+        manager_chat_id=sent_chat_id,
+        manager_message_id=sent_message_id,
+    )
+    if not updated:
+        repo.enqueue_cleanup_messages(order.id, [(sent_chat_id, sent_message_id)])
+        await _process_cleanup_messages(context, order_id=order.id)
+        await _notify_manager(
+            context,
+            query.from_user.id,
+            "⚠️ Заказ уже изменился. Откройте обновлённый список.",
+        )
+        return
+    old_chat_id, old_message_id = old_reference
+    if old_chat_id and old_message_id and (old_chat_id, old_message_id) != (
+        sent_chat_id,
+        sent_message_id,
+    ):
+        try:
+            await context.bot.edit_message_reply_markup(
+                chat_id=old_chat_id,
+                message_id=old_message_id,
+                reply_markup=None,
+            )
+        except Exception:
+            logger.info("Could not deactivate previous manager card for order %s", order.id)
+    _, success = await _sync_order(context, updated.id)
+    if not success:
+        _schedule_sync_retry(context, updated.id)
+        await _notify_manager(
+            context,
+            query.from_user.id,
+            "⚠️ Карточка открыта, но часть сообщений обновится автоматически позже.",
+        )
 
 
 async def new_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2201,7 +2323,14 @@ async def courier_assignment_action(update: Update, context: ContextTypes.DEFAUL
         return
 
     await _process_cleanup_messages(context, order_id=updated.id)
-    updated, synchronized = await _sync_order(context, updated.id)
+    synced_order, synchronized = await _sync_order(context, updated.id)
+    updated = synced_order or repo.get(updated.id) or updated
+    await _notify_log(
+        context,
+        f"🚚 <b>Заказ №{updated.order_number}</b> назначен курьеру "
+        f"<b>{escape(selected.name)}</b>\n"
+        f"📦 {escape(updated.product)} · 👤 {escape(updated.seller_name or '—')}",
+    )
     if not synchronized:
         _schedule_sync_retry(context, updated.id)
         await _notify_manager(
@@ -2239,9 +2368,6 @@ async def manager_pickup_action(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     action, raw_id = query.data.split(":")
     settings: Settings = context.application.bot_data["settings"]
-    if not _allowed(query.from_user.id, settings.manager_ids):
-        await query.answer("Нет доступа", show_alert=True)
-        return
     repo: OrderRepository = context.application.bot_data["repo"]
     order = repo.get(int(raw_id))
     if not order:
@@ -2260,6 +2386,14 @@ async def manager_pickup_action(update: Update, context: ContextTypes.DEFAULT_TY
         and query.message.message_id == order.orders_channel_message_id
         and query.message.chat_id == getattr(settings, "orders_channel_id", None)
     )
+    manager_allowed = manager_source and _allowed(query.from_user.id, settings.manager_ids)
+    journal_allowed = journal_source and await _is_orders_channel_member(
+        context,
+        query.from_user.id,
+    )
+    if not (manager_allowed or journal_allowed):
+        await query.answer("Нет доступа. Кнопка доступна участникам Log-канала.", show_alert=True)
+        return
     if not (manager_source or journal_source):
         await query.answer(
             "Эта карточка устарела. Откройте актуальную карточку заказа.",
@@ -2282,7 +2416,7 @@ async def manager_pickup_action(update: Update, context: ContextTypes.DEFAULT_TY
             courier_name=order.assigned_courier_name,
             actor_id=query.from_user.id,
             actor_name=_name(query.from_user),
-            actor_role="manager",
+            actor_role="staff" if journal_source else "manager",
         )
         message = f"Товар у курьера {order.assigned_courier_name}"
     else:
@@ -2300,7 +2434,7 @@ async def manager_pickup_action(update: Update, context: ContextTypes.DEFAULT_TY
             time_started=None,
             actor_id=query.from_user.id,
             actor_name=_name(query.from_user),
-            actor_role="manager",
+            actor_role="staff" if journal_source else "manager",
         )
         message = "Отметка «товар забран» снята"
     if not updated:
@@ -2308,6 +2442,21 @@ async def manager_pickup_action(update: Update, context: ContextTypes.DEFAULT_TY
         return
     await query.answer(message)
     _, success = await _sync_order(context, updated.id)
+    actor_name = escape(_name(query.from_user))
+    courier_name = escape(updated.assigned_courier_name or updated.courier_name or "—")
+    if action == "pickup":
+        await _notify_log(
+            context,
+            f"📦 <b>Заказ №{updated.order_number}</b> · товар забран\n"
+            f"🚚 Курьер: <b>{courier_name}</b>\n"
+            f"👤 Отметил: {actor_name}",
+        )
+    else:
+        await _notify_log(
+            context,
+            f"↩️ <b>Заказ №{updated.order_number}</b> · отметка «товар забран» снята\n"
+            f"👤 Отметил: {actor_name}",
+        )
     if not success:
         _schedule_sync_retry(context, updated.id)
         await _notify_manager(
@@ -2380,10 +2529,10 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             courier_card(order, "↩️ <b>Отмена снята, заказ снова активен</b>"),
             courier_keyboard(order),
         )
-        await _notify_manager(
+        await _notify_log(
             context,
-            order.manager_id,
-            f"↩️ Отмена заказа №{order.order_number} снята. Заказ снова активен.",
+            f"↩️ <b>Заказ №{order.order_number}</b> · отмена снята\n"
+            f"🚚 Курьер: {escape(order.assigned_courier_name or order.courier_name or '—')}",
         )
         return
     if action == "undo_complete":
@@ -2422,10 +2571,9 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             courier_card(order, state),
             keyboard,
         )
-        await _notify_manager(
+        await _notify_log(
             context,
-            order.manager_id,
-            f"↩️ Подтверждение доставки заказа №{order.order_number} отменено. Заказ снова активен.",
+            f"↩️ <b>Заказ №{order.order_number}</b> · подтверждение доставки отменено",
         )
         return
     if order.status in {"completed", "cancelled"}:
@@ -2485,11 +2633,10 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 )
         text, keyboard = _delivery_message(order)
         await _finish_status_change(context, query, order, text, keyboard)
-        await _notify_manager(
+        await _notify_log(
             context,
-            order.manager_id,
             f"👀 Курьер {escape(order.courier_name or order.assigned_courier_name or '—')} "
-            f"прочитал заказ №{order.order_number} в {timestamp:%H:%M} и выехал на склад.",
+            f"прочитал <b>заказ №{order.order_number}</b> в {timestamp:%H:%M} и выехал на склад.",
         )
         return
     if action == "undo_onway":
@@ -2517,10 +2664,10 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             courier_card(order, "↩️ <b>Выезд отменён</b>"),
             courier_keyboard(order),
         )
-        await _notify_manager(
+        await _notify_log(
             context,
-            order.manager_id,
-            f"↩️ Курьер отменил выезд к заказу №{order.order_number}.",
+            f"↩️ Курьер {escape(order.assigned_courier_name or order.courier_name or '—')} "
+            f"отменил выезд к <b>заказу №{order.order_number}</b>.",
         )
     elif action == "onway":
         if order.status == "on_way" and order.courier_id == query.from_user.id:
@@ -2552,10 +2699,10 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             courier_card(order, "🚗 <b>Курьер едет</b>"),
             on_way_keyboard(order),
         )
-        await _notify_manager(
+        await _notify_log(
             context,
-            order.manager_id,
-            f"🚗 Курьер едет к заказу №{order.order_number}.",
+            f"🚗 Курьер <b>{escape(order.courier_name or order.assigned_courier_name or '—')}</b> "
+            f"едет к заказу №{order.order_number}\n📍 {escape(order.address_text or order.district or 'Адрес в карточке')}",
         )
     elif action == "cancel":
         order = repo.transition(
@@ -2573,10 +2720,10 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             courier_card(order, "❌ <b>Заказ отменён</b>"),
             courier_cancelled_keyboard(order),
         )
-        await _notify_manager(
+        await _notify_log(
             context,
-            order.manager_id,
-            f"❌ Заказ №{order.order_number} отменён курьером {escape(_name(query.from_user))}.",
+            f"❌ <b>Заказ №{order.order_number}</b> отменён курьером "
+            f"{escape(_name(query.from_user))}.",
         )
     else:
         timestamp = datetime.now().astimezone()
@@ -2602,7 +2749,13 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             result_text,
             completed_keyboard(order),
         )
-        await _notify_manager(context, order.manager_id, result_text)
+        await _notify_log(
+            context,
+            f"✅ Курьер <b>{escape(order.courier_name or _name(query.from_user))}</b> доставил "
+            f"<b>заказ №{order.order_number}</b> в "
+            f"{timestamp.astimezone(ZoneInfo('Asia/Tashkent')):%H:%M}\n"
+            f"📦 {escape(order.product)} · 👤 {escape(order.seller_name or '—')}",
+        )
         await _send_post_delivery_prompt(context, order)
         _schedule_courier_map_log(context, order)
 
@@ -2626,15 +2779,21 @@ async def _publish_completed(
         )
     except Exception:
         logger.exception("Could not update delivery group message for order %s", order.id)
-    try:
-        await context.bot.send_photo(
-            order.manager_id,
-            order.delivery_photo,
-            caption=result_text,
-            parse_mode=ParseMode.HTML,
-        )
-    except Exception:
-        logger.exception("Could not notify manager %s about order %s", order.manager_id, order.id)
+    log_channel_id = getattr(
+        context.application.bot_data["settings"],
+        "orders_channel_id",
+        None,
+    )
+    if log_channel_id:
+        try:
+            await context.bot.send_photo(
+                chat_id=log_channel_id,
+                photo=order.delivery_photo,
+                caption=result_text,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            logger.exception("Could not publish delivery photo for order %s to Log", order.id)
     await _set_location_marker(context, order)
     await update.message.reply_text("✅ Доставка подтверждена.")
     _schedule_courier_map_log(context, order)
@@ -2808,6 +2967,7 @@ def register_handlers(application: Application) -> None:
                 pattern=(
                     r"^(?:(?:edit_(?:menu|close)|send|manager_cancel|manager_restore|sync|pickup|undo_pickup):\d+"
                     r"|courier_(?:menu|close|assign):\d+(?::\d+)?"
+                    r"|list_order:\d+"
                     r"|orders_page:(?:active|all):\d+)$"
                 ),
             ),
@@ -2828,6 +2988,7 @@ def register_handlers(application: Application) -> None:
         pattern=r"^daily_log:(?:today|\d{4}-\d{2}-\d{2})$",
     ))
     application.add_handler(CallbackQueryHandler(orders_page, pattern=r"^orders_page:(?:active|all):\d+$"))
+    application.add_handler(CallbackQueryHandler(open_order_from_list, pattern=r"^list_order:\d+$"))
     application.add_handler(CallbackQueryHandler(
         location_label_action,
         pattern=r"^location_(?:label|order):\d+$",

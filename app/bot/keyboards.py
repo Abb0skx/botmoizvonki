@@ -60,7 +60,7 @@ def main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("➕ Новый заказ"), KeyboardButton("📋 Активные заказы")],
-            [KeyboardButton("📚 Все заказы"), KeyboardButton("📊 Статистика")],
+            [KeyboardButton("📚 Все заказы")],
         ],
         resize_keyboard=True,
     )
@@ -346,6 +346,7 @@ def orders_page_keyboard(
     page: int,
     total_pages: int,
     map_url: str | None = None,
+    orders: list[Order] | None = None,
 ) -> InlineKeyboardMarkup:
     """Navigation for zero-based active/all order-list pages."""
     if kind not in {"active", "all"}:
@@ -356,6 +357,16 @@ def orders_page_keyboard(
         raise ValueError("page is outside total_pages")
 
     rows: list[list[InlineKeyboardButton]] = []
+    if kind == "active":
+        for order in orders or []:
+            product = " ".join(order.product.split()) or "—"
+            label = f"✏️ №{order.order_number} · {product}"
+            if len(label) > 60:
+                label = label[:59].rstrip() + "…"
+            rows.append([InlineKeyboardButton(
+                label,
+                callback_data=f"list_order:{order.id}",
+            )])
     if map_url:
         rows.append([
             InlineKeyboardButton("🗺 Все локации на карте", url=map_url),

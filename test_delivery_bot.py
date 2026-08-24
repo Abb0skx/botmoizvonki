@@ -302,7 +302,11 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
                 message=message,
             )
             bot = SimpleNamespace(edit_message_text=AsyncMock(), send_photo=AsyncMock())
-            settings = SimpleNamespace(delivery_group_id=-100, courier_ids=frozenset({2}))
+            settings = SimpleNamespace(
+                delivery_group_id=-100,
+                courier_ids=frozenset({2}),
+                orders_channel_id=-1004459657817,
+            )
             context = SimpleNamespace(
                 application=SimpleNamespace(bot_data={"settings": settings, "repo": repo}),
                 bot=bot,
@@ -316,6 +320,7 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(completed.delivered_at)
             self.assertEqual((completed.received_usd, completed.received_uzs), (100, 1920000))
             bot.send_photo.assert_awaited_once()
+            self.assertEqual(bot.send_photo.await_args.kwargs["chat_id"], -1004459657817)
             self.assertIn("✅ Оплачено", bot.send_photo.await_args.kwargs["caption"])
             self.assertIn("100$", bot.send_photo.await_args.kwargs["caption"])
             message.reply_text.assert_awaited_once_with("✅ Доставка подтверждена.")
@@ -403,12 +408,8 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
                 query.edit_message_text.await_args.kwargs["reply_markup"].inline_keyboard[-1][0].callback_data,
                 f"undo_complete:{order.id}",
             )
-            self.assertEqual(bot.send_message.await_count, 2)
-            prompt = next(
-                call
-                for call in bot.send_message.await_args_list
-                if call.kwargs.get("chat_id") == -100
-            )
+            self.assertEqual(bot.send_message.await_count, 1)
+            prompt = bot.send_message.await_args
             self.assertEqual(
                 prompt.kwargs["text"],
                 "Courier, отправьте фото и цену товара 📸💰",

@@ -3,11 +3,11 @@ import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
-from app.bot.keyboards import courier_keyboard
+from app.bot.keyboards import courier_keyboard, orders_page_keyboard
 from app.database import OrderRepository
-from app.handlers.orders import courier_action
+from app.handlers.orders import courier_action, manager_pickup_action, open_order_from_list
 from app.monitor_service import WAREHOUSE, build_delivery_monitor
 from app.routing_service import enrich_monitor_routes
 from app.stats_service import TASHKENT, build_delivery_stats
@@ -67,13 +67,19 @@ class CourierReadWorkflowTests(unittest.IsolatedAsyncioTestCase):
             edit_message_text=AsyncMock(),
         )
         bot = SimpleNamespace(
-            send_message=AsyncMock(),
+            send_message=AsyncMock(side_effect=[
+                SimpleNamespace(chat_id=-1004459657817, message_id=88),
+                SimpleNamespace(chat_id=-1004459657817, message_id=89),
+            ]),
             edit_message_text=AsyncMock(),
             set_message_reaction=AsyncMock(),
         )
         context = SimpleNamespace(
             application=SimpleNamespace(bot_data={
-                "settings": SimpleNamespace(courier_ids=frozenset({ABBOS_ID})),
+                "settings": SimpleNamespace(
+                    courier_ids=frozenset({ABBOS_ID}),
+                    orders_channel_id=-1004459657817,
+                ),
                 "repo": self.repo,
             }),
             bot=bot,
@@ -102,7 +108,12 @@ class CourierReadWorkflowTests(unittest.IsolatedAsyncioTestCase):
             for button in row
         ]
         self.assertIn(f"read:{order.id}", callbacks)
-        self.assertTrue(any("выехал на склад" in call.args[1] for call in bot.send_message.await_args_list))
+        self.assertTrue(any(
+            "выехал на склад" in call.kwargs["text"]
+            and call.kwargs["chat_id"] == -1004459657817
+            for call in bot.send_message.await_args_list
+        ))
+        self.assertFalse(any(call.args and call.args[0] == 11 for call in bot.send_message.await_args_list))
         events = self.repo.list_events(order.id)
         read_events = [event for event in events if event.event_type == "courier_read"]
         self.assertEqual(len(read_events), 1)
@@ -143,6 +154,127 @@ class CourierReadWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(read_button.text, "✅ Прочитано · еду на склад")
         self.assertIn("🏬 Едет на склад за товаром", courier_card(order))
         self.assertIn("👀 Заказ прочитал Abbos", orders_channel_card(order))
+
+
+class ManagerListAndLogTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.repo = OrderRepository(Path(self.tempdir.name) / "delivery.db")
+        self.repo.initialize()
+        draft = self.repo.create(
+            manager_id=11,
+            manager_name="Otabek",
+            data=order_data("A57"),
+        )
+        self.order = self.repo.transition(
+            draft.id,
+            {"draft"},
+            status="pending",
+            assigned_courier_id=ABBOS_ID,
+            assigned_courier_name="Abbos",
+            manager_chat_id=11,
+            manager_message_id=55,
+            orders_channel_chat_id=-1004459657817,
+            orders_channel_message_id=66,
+        )
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+
+    def test_active_page_has_edit_button_for_every_order(self):
+        second = self.repo.create(
+            manager_id=12,
+            manager_name="Ali",
+            data=order_data("A58"),
+        )
+        keyboard = orders_page_keyboard(
+            "active",
+            page=0,
+            total_pages=1,
+            orders=[self.order, second],
+        )
+        callbacks = [
+            button.callback_data
+            for row in keyboard.inline_keyboard
+            for button in row
+        ]
+        self.assertIn(f"list_order:{self.order.id}", callbacks)
+        self.assertIn(f"list_order:{second.id}", callbacks)
+
+    async def test_manager_opens_order_from_active_list_as_editable_card(self):
+        sent = SimpleNamespace(chat_id=11, message_id=99)
+        bot = SimpleNamespace(
+            send_message=AsyncMock(return_value=sent),
+            edit_message_reply_markup=AsyncMock(),
+        )
+        query = SimpleNamespace(
+            data=f"list_order:{self.order.id}",
+            from_user=SimpleNamespace(id=11, full_name="Otabek", username=None),
+            message=SimpleNamespace(chat_id=11, message_id=88),
+            answer=AsyncMock(),
+        )
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={
+                "settings": SimpleNamespace(manager_ids=frozenset({11})),
+                "repo": self.repo,
+            }),
+            bot=bot,
+        )
+
+        async def synchronized(_context, order_id):
+            return self.repo.get(order_id), True
+
+        with patch("app.handlers.orders._sync_order", side_effect=synchronized):
+            await open_order_from_list(SimpleNamespace(callback_query=query), context)
+
+        opened = self.repo.get(self.order.id)
+        self.assertEqual((opened.manager_chat_id, opened.manager_message_id), (11, 99))
+        markup = bot.send_message.await_args.kwargs["reply_markup"]
+        callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
+        self.assertIn(f"edit:{self.order.id}:product", callbacks)
+        bot.edit_message_reply_markup.assert_awaited_once_with(
+            chat_id=11,
+            message_id=55,
+            reply_markup=None,
+        )
+
+    async def test_log_channel_member_can_mark_goods_picked_up(self):
+        query = SimpleNamespace(
+            data=f"pickup:{self.order.id}",
+            from_user=SimpleNamespace(id=777, full_name="Сотрудник склада", username=None),
+            message=SimpleNamespace(chat_id=-1004459657817, message_id=66),
+            answer=AsyncMock(),
+        )
+        bot = SimpleNamespace(
+            get_chat_member=AsyncMock(return_value=SimpleNamespace(status="member")),
+            send_message=AsyncMock(),
+        )
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={
+                "settings": SimpleNamespace(
+                    manager_ids=frozenset(),
+                    orders_channel_id=-1004459657817,
+                ),
+                "repo": self.repo,
+            }),
+            bot=bot,
+        )
+
+        async def synchronized(_context, order_id):
+            return self.repo.get(order_id), True
+
+        with patch("app.handlers.orders._sync_order", side_effect=synchronized):
+            await manager_pickup_action(SimpleNamespace(callback_query=query), context)
+
+        picked = self.repo.get(self.order.id)
+        self.assertEqual(picked.status, "picked_up")
+        self.assertEqual(picked.courier_id, ABBOS_ID)
+        bot.get_chat_member.assert_awaited_once_with(-1004459657817, 777)
+        self.assertTrue(any(
+            call.kwargs.get("chat_id") == -1004459657817
+            and "товар забран" in call.kwargs.get("text", "")
+            for call in bot.send_message.await_args_list
+        ))
 
 
 class CourierWarehouseMovementTests(unittest.IsolatedAsyncioTestCase):
