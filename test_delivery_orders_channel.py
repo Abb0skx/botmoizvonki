@@ -248,7 +248,7 @@ class OrdersChannelTests(unittest.IsolatedAsyncioTestCase):
             ):
                 await validate_delivery_configuration(application)
 
-    async def test_preflight_rejects_courier_who_left_location_channel(self):
+    async def test_preflight_warns_when_courier_left_location_channel(self):
         courier_id = 202134293
         courier_group_id = -5216093690
         location_channel_id = -1004398605075
@@ -275,6 +275,13 @@ class OrdersChannelTests(unittest.IsolatedAsyncioTestCase):
                     can_edit_messages=True,
                     can_delete_messages=True,
                 )
+            if (chat_id, user_id) == (ORDERS_CHANNEL_ID, 99):
+                return SimpleNamespace(
+                    status="administrator",
+                    can_post_messages=True,
+                    can_edit_messages=True,
+                    can_delete_messages=True,
+                )
             return SimpleNamespace(status="member")
 
         bot = SimpleNamespace(
@@ -288,11 +295,10 @@ class OrdersChannelTests(unittest.IsolatedAsyncioTestCase):
             "app.handlers.orders._known_delivery_groups",
             return_value=frozenset({courier_group_id}),
         ):
-            with self.assertRaisesRegex(
-                RuntimeError,
-                r"Courier Abbos must be a member of the location channel",
-            ):
+            with self.assertLogs("app.handlers.orders", level="WARNING") as logs:
                 await validate_delivery_configuration(application)
+
+        self.assertTrue(any("Courier Abbos is not a member" in line for line in logs.output))
 
 
 class SettingsValidationTests(unittest.TestCase):

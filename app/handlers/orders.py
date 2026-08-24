@@ -1197,9 +1197,11 @@ async def validate_delivery_configuration(application: Application) -> None:
         ):
             raise RuntimeError(f"The delivery bot cannot send to group {delivery_group_id}")
 
-    # A configured courier who cannot see their own group or the private
-    # location channel will receive unusable cards. Fail at startup with a
-    # precise configuration error instead of losing an order later.
+    # A configured courier who cannot see their own group receives no order at
+    # all, so own-group membership is fatal. The private location channel is
+    # supplementary: direct map/navigation URLs in the courier card still
+    # work, therefore a missing subscription is warned without taking the
+    # whole delivery service offline.
     for courier_id in sorted(_allowed_courier_ids(settings)):
         configured = courier_option(courier_id)
         if not configured:
@@ -1239,8 +1241,11 @@ async def validate_delivery_configuration(application: Application) -> None:
             courier_id,
         )
         if courier_member.status in {"left", "kicked"}:
-            raise RuntimeError(
-                f"Courier {configured.name} must be a member of the location channel"
+            logger.warning(
+                "Courier %s is not a member of the location channel %s; "
+                "direct map links remain available",
+                configured.name,
+                settings.location_channel_id,
             )
 
     orders_channel_id = getattr(settings, "orders_channel_id", None)
