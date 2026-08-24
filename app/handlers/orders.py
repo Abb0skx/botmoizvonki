@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 from telegram import ReplyKeyboardRemove, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, RetryAfter
+from telegram.error import BadRequest
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes,
     ConversationHandler, MessageHandler, filters,
@@ -40,7 +40,6 @@ from app.utils.couriers import (
     courier_group_id, courier_group_ids, courier_ids, courier_option,
 )
 from app.utils.parsers import display_phone
-from app.utils.static_map import render_active_orders_map
 
 logger = logging.getLogger(__name__)
 SELLER, PRODUCT, DETAILS, SECOND_LOCATION, PAYMENT, DELIVERY_TIME, COMMENT, EDIT_VALUE = range(8)
@@ -166,113 +165,27 @@ async def _is_orders_channel_member(
     return status == "restricted" and bool(getattr(member, "is_member", False))
 
 
-async def _send_courier_map_log(
-    application: Application,
-    *,
-    completed_order_id: int,
+def _courier_waiting_pickup_text(
+    repo: OrderRepository,
     courier_id: int,
     courier_name: str,
-) -> None:
-    """Append a delivery summary and current active-order map to the journal."""
-    repo: OrderRepository = application.bot_data["repo"]
-    settings: Settings = application.bot_data["settings"]
-    channel_id = getattr(settings, "orders_channel_id", None)
-    if not channel_id:
-        return
-    completed_order = repo.get(completed_order_id)
-    if not completed_order or completed_order.status != "completed":
-        return
-
-    active_orders = repo.list_active()
-    courier_active = [
+) -> str:
+    """List the assigned products that a courier has not picked up yet."""
+    waiting = [
         order
-        for order in active_orders
-        if order.assigned_courier_id == courier_id or order.courier_id == courier_id
+        for order in repo.list_active()
+        if order.status == "pending" and order.assigned_courier_id == courier_id
     ]
-    now_tashkent = datetime.now(ZoneInfo("Asia/Tashkent"))
-    today_start = now_tashkent.replace(hour=0, minute=0, second=0, microsecond=0)
-    delivered_today = repo.count_completed_for_courier_since(courier_id, today_start)
-    mapped_orders = [
-        order
-        for order in active_orders
-        if (order.latitude is not None and order.longitude is not None)
-        or (order.second_latitude is not None and order.second_longitude is not None)
-    ]
-    caption = (
-        f"🗺 <b>Карта после доставки заказа №{completed_order.order_number}</b>\n"
-        f"👤 Курьер: <b>{escape(courier_name)}</b>\n"
-        f"✅ Доставлено сегодня: <b>{delivered_today}</b>\n"
-        f"🚚 Осталось у курьера: <b>{len(courier_active)}</b>\n"
-        f"📦 Всего активных заказов: <b>{len(active_orders)}</b>\n"
-        f"📍 На карте: <b>{len(mapped_orders)}</b>"
-    )
-
-    image = None
-    try:
-        image = await render_active_orders_map(
-            active_orders,
-            cache_dir=settings.database_path.parent / "map-tiles",
+    lines = [f"⏳ <b>Ждём курьера {escape(courier_name)}</b>"]
+    for index, order in enumerate(waiting, start=1):
+        manager = order.seller_name or order.manager_name or "—"
+        lines.append(
+            f"{index}. Заказ №{order.order_number} · "
+            f"{escape(manager)} · {escape(order.product)}"
         )
-    except Exception:
-        logger.exception("Could not render active-order map after order %s", completed_order_id)
-
-    latest = repo.get(completed_order_id)
-    if not latest or latest.status != "completed":
-        return
-
-    for attempt in range(2):
-        try:
-            if image is not None:
-                image.seek(0)
-                await application.bot.send_photo(
-                    chat_id=channel_id,
-                    photo=image,
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
-                )
-            else:
-                suffix = "\n\nНе удалось создать фотографию карты."
-                await application.bot.send_message(
-                    chat_id=channel_id,
-                    text=caption + suffix,
-                    parse_mode=ParseMode.HTML,
-                )
-            return
-        except asyncio.CancelledError:
-            raise
-        except RetryAfter as error:
-            if attempt == 0:
-                retry_after = error.retry_after
-                delay = (
-                    retry_after.total_seconds()
-                    if hasattr(retry_after, "total_seconds")
-                    else float(retry_after)
-                )
-                await asyncio.sleep(max(1.0, delay))
-                continue
-            logger.exception("Courier map log remained rate-limited after order %s", completed_order_id)
-            return
-        except Exception:
-            # A network timeout can mean Telegram accepted the photo but the
-            # acknowledgement was lost. Do not blindly retry and create a
-            # duplicate journal post.
-            logger.exception("Could not publish courier map log after order %s", completed_order_id)
-            return
-
-
-def _schedule_courier_map_log(context: ContextTypes.DEFAULT_TYPE, order) -> None:
-    create_task = getattr(context.application, "create_task", None)
-    if not callable(create_task) or not order.courier_id:
-        return
-    create_task(
-        _send_courier_map_log(
-            context.application,
-            completed_order_id=order.id,
-            courier_id=order.courier_id,
-            courier_name=order.courier_name or "—",
-        ),
-        name=f"delivery-map-log-{order.id}",
-    )
+    if not waiting:
+        lines.append("Все товары уже забраны.")
+    return "\n".join(lines)
 
 
 async def _send_post_delivery_prompt(
@@ -1459,14 +1372,10 @@ async def product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return PRODUCT
     draft["product"] = value
     await update.message.reply_text(
-        "3/6. Отправьте телефон, цену и локацию. Можно одним сообщением или отдельно, в любом порядке.\n\n"
-        "Пример одного сообщения:\n"
-        "Телефон: 90 133 39 99\n"
-        "Цена: 100$ 1 920 000\n"
-        "Локация: https://yandex.uz/maps/…\n\n"
-        "Можно указать два телефона. Две Telegram Location отправьте подряд, "
-        "либо пришлите две ссылки в одном сообщении — бот сохранит обе без отдельного вопроса. "
-        "Если координат нет, после телефона и цены появится кнопка «📝 Локация текстом»."
+        "3/6. Отправьте:\n"
+        "📍 Локацию\n"
+        "📱 Номер\n"
+        "💰 Общую сумму"
     )
     return DETAILS
 
@@ -2253,9 +2162,7 @@ async def courier_assignment_action(update: Update, context: ContextTypes.DEFAUL
     updated = synced_order or repo.get(updated.id) or updated
     await _notify_log(
         context,
-        f"🚚 <b>Заказ №{updated.order_number}</b> назначен курьеру "
-        f"<b>{escape(selected.name)}</b>\n"
-        f"📦 {escape(updated.product)} · 👤 {escape(updated.seller_name or '—')}",
+        _courier_waiting_pickup_text(repo, selected.user_id, selected.name),
     )
     if not synchronized:
         _schedule_sync_retry(context, updated.id)
@@ -2683,7 +2590,6 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"📦 {escape(order.product)} · 👤 {escape(order.seller_name or '—')}",
         )
         await _send_post_delivery_prompt(context, order)
-        _schedule_courier_map_log(context, order)
 
 
 async def _publish_completed(
@@ -2722,7 +2628,6 @@ async def _publish_completed(
             logger.exception("Could not publish delivery photo for order %s to Log", order.id)
     await _set_location_marker(context, order)
     await update.message.reply_text("✅ Доставка подтверждена.")
-    _schedule_courier_map_log(context, order)
 
 
 async def delivery_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

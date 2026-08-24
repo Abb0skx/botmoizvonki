@@ -1,16 +1,14 @@
-from io import BytesIO
 import tempfile
 import unittest
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
-from zoneinfo import ZoneInfo
 
 from PIL import Image
 
 from app.database import OrderRepository
-from app.handlers.orders import _send_courier_map_log, daily_delivery_log_action
+from app.handlers.orders import daily_delivery_log_action
 from app.models import Order, OrderEvent
 from app.utils.formatters import daily_delivery_report
 from app.utils.static_map import (
@@ -160,151 +158,7 @@ class StaticMapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("11:00</b> · Muzrob Oka приехал и доставил", report)
 
 
-class CourierMapLogTests(unittest.IsolatedAsyncioTestCase):
-    async def test_delivery_log_sends_city_and_warehouse_map_without_active_coordinates(self):
-        with tempfile.TemporaryDirectory() as directory:
-            database_path = Path(directory) / "delivery.db"
-            repo = OrderRepository(database_path)
-            repo.initialize()
-            completed = repo.create(
-                manager_id=11,
-                manager_name="Manager",
-                data={
-                    "seller_name": "Ali",
-                    "client_phone": "+998901333999",
-                    "product": "Delivered",
-                    "amount_usd": 100,
-                },
-            )
-            completed = repo.update(
-                completed.id,
-                status="completed",
-                courier_id=202134293,
-                courier_name="Abbos",
-                delivered_at=datetime.now(ZoneInfo("Asia/Tashkent")).isoformat(),
-            )
-            image = BytesIO(b"city-and-warehouse-map")
-            image.name = "active-deliveries.png"
-            bot = SimpleNamespace(send_photo=AsyncMock(), send_message=AsyncMock())
-            application = SimpleNamespace(
-                bot=bot,
-                bot_data={
-                    "repo": repo,
-                    "settings": SimpleNamespace(
-                        orders_channel_id=-1004459657817,
-                        database_path=database_path,
-                    ),
-                },
-            )
-
-            renderer = AsyncMock(return_value=image)
-            with patch("app.handlers.orders.render_active_orders_map", renderer):
-                await _send_courier_map_log(
-                    application,
-                    completed_order_id=completed.id,
-                    courier_id=202134293,
-                    courier_name="Abbos",
-                )
-
-        renderer.assert_awaited_once_with(
-            [],
-            cache_dir=database_path.parent / "map-tiles",
-        )
-        bot.send_photo.assert_awaited_once()
-        bot.send_message.assert_not_awaited()
-        self.assertIn("На карте: <b>0</b>", bot.send_photo.await_args.kwargs["caption"])
-
-    async def test_delivery_log_contains_daily_and_active_counts_with_map(self):
-        with tempfile.TemporaryDirectory() as directory:
-            database_path = Path(directory) / "delivery.db"
-            repo = OrderRepository(database_path)
-            repo.initialize()
-            completed = repo.create(
-                manager_id=11,
-                manager_name="Manager",
-                data={
-                    "seller_name": "Ali",
-                    "client_phone": "+998901333999",
-                    "product": "Delivered",
-                    "amount_usd": 100,
-                },
-            )
-            completed = repo.update(
-                completed.id,
-                status="completed",
-                courier_id=1799690992,
-                courier_name="Muzrob Oka",
-                delivered_at=datetime.now(ZoneInfo("Asia/Tashkent")).isoformat(),
-            )
-            first_active = repo.create(
-                manager_id=11,
-                manager_name="Manager",
-                data={
-                    "seller_name": "Ali",
-                    "client_phone": "+998901333999",
-                    "product": "A57",
-                    "amount_usd": 375,
-                    "latitude": 41.338586,
-                    "longitude": 69.272757,
-                },
-            )
-            repo.update(
-                first_active.id,
-                status="pending",
-                assigned_courier_id=1799690992,
-                assigned_courier_name="Muzrob Oka",
-            )
-            second_active = repo.create(
-                manager_id=11,
-                manager_name="Manager",
-                data={
-                    "seller_name": "Abbos",
-                    "client_phone": "+998998904713",
-                    "product": "Text address",
-                    "amount_usd": 200,
-                    "address_text": "Рынок Малика",
-                },
-            )
-            repo.update(
-                second_active.id,
-                status="pending",
-                assigned_courier_id=202134293,
-                assigned_courier_name="Abbos",
-            )
-            image = BytesIO(b"fake-png")
-            image.name = "active-deliveries.png"
-            bot = SimpleNamespace(send_photo=AsyncMock(), send_message=AsyncMock())
-            application = SimpleNamespace(
-                bot=bot,
-                bot_data={
-                    "repo": repo,
-                    "settings": SimpleNamespace(
-                        orders_channel_id=-1004459657817,
-                        database_path=database_path,
-                    ),
-                },
-            )
-
-            with patch(
-                "app.handlers.orders.render_active_orders_map",
-                AsyncMock(return_value=image),
-            ):
-                await _send_courier_map_log(
-                    application,
-                    completed_order_id=completed.id,
-                    courier_id=1799690992,
-                    courier_name="Muzrob Oka",
-                )
-
-        bot.send_photo.assert_awaited_once()
-        bot.send_message.assert_not_awaited()
-        caption = bot.send_photo.await_args.kwargs["caption"]
-        self.assertIn("Доставлено сегодня: <b>1</b>", caption)
-        self.assertIn("Осталось у курьера: <b>1</b>", caption)
-        self.assertIn("Всего активных заказов: <b>2</b>", caption)
-        self.assertIn("На карте: <b>1</b>", caption)
-        self.assertNotIn("reply_markup", bot.send_photo.await_args.kwargs)
-
+class LogChannelTests(unittest.IsolatedAsyncioTestCase):
     async def test_old_log_chronology_button_is_disabled_without_new_posts(self):
         order = Order(
             id=21,
@@ -353,71 +207,3 @@ class CourierMapLogTests(unittest.IsolatedAsyncioTestCase):
             show_alert=True,
         )
         bot.send_message.assert_not_awaited()
-
-    async def test_ambiguous_photo_timeout_is_not_retried_as_duplicate(self):
-        with tempfile.TemporaryDirectory() as directory:
-            database_path = Path(directory) / "delivery.db"
-            repo = OrderRepository(database_path)
-            repo.initialize()
-            completed = repo.create(
-                manager_id=11,
-                manager_name="Manager",
-                data={
-                    "seller_name": "Ali",
-                    "client_phone": "+998901333999",
-                    "product": "Delivered",
-                    "amount_usd": 100,
-                },
-            )
-            completed = repo.update(
-                completed.id,
-                status="completed",
-                courier_id=1799690992,
-                courier_name="Muzrob Oka",
-                delivered_at=datetime.now(ZoneInfo("Asia/Tashkent")).isoformat(),
-            )
-            active = repo.create(
-                manager_id=11,
-                manager_name="Manager",
-                data={
-                    "seller_name": "Ali",
-                    "client_phone": "+998901333999",
-                    "product": "Active",
-                    "amount_usd": 120,
-                    "latitude": 41.338586,
-                    "longitude": 69.272757,
-                },
-            )
-            repo.update(active.id, status="pending")
-            image = BytesIO(b"fake-png")
-            image.name = "active-deliveries.png"
-            bot = SimpleNamespace(
-                send_photo=AsyncMock(side_effect=RuntimeError("ambiguous timeout")),
-                send_message=AsyncMock(),
-            )
-            application = SimpleNamespace(
-                bot=bot,
-                bot_data={
-                    "repo": repo,
-                    "settings": SimpleNamespace(
-                        orders_channel_id=-1004459657817,
-                        database_path=database_path,
-                    ),
-                },
-            )
-
-            with (
-                patch(
-                    "app.handlers.orders.render_active_orders_map",
-                    AsyncMock(return_value=image),
-                ),
-                self.assertLogs("app.handlers.orders", level="ERROR"),
-            ):
-                await _send_courier_map_log(
-                    application,
-                    completed_order_id=completed.id,
-                    courier_id=1799690992,
-                    courier_name="Muzrob Oka",
-                )
-
-        bot.send_photo.assert_awaited_once()

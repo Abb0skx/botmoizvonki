@@ -203,7 +203,10 @@ class CallbackAcknowledgementTests(unittest.IsolatedAsyncioTestCase):
         async def synchronized(_context, order_id):
             return self.repo.get(order_id), True
 
-        with patch("app.handlers.orders._sync_order", side_effect=synchronized):
+        with (
+            patch("app.handlers.orders._sync_order", side_effect=synchronized),
+            patch("app.handlers.orders._notify_log", new=AsyncMock()) as notify_log,
+        ):
             await courier_assignment_action(SimpleNamespace(callback_query=query), context)
 
         assigned = self.repo.get(order.id)
@@ -214,6 +217,11 @@ class CallbackAcknowledgementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(assigned.delivery_chat_id, -5111626405)
         self.assertEqual(bot.send_message.await_args.args[0], -5111626405)
         self.assertIn("🚚 Курьер: Olmas", bot.send_message.await_args.args[1])
+        notify_log.assert_awaited_once_with(
+            context,
+            "⏳ <b>Ждём курьера Olmas</b>\n"
+            f"1. Заказ №{order.order_number} · Ali · Model 1",
+        )
 
     async def test_reassignment_publishes_new_card_then_deletes_old_card(self):
         order = self.repo.create(manager_id=11, manager_name="Manager", data=_order_data())

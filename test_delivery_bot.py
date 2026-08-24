@@ -13,8 +13,9 @@ from app.bot.keyboards import (
 from app.database import OrderRepository
 from app.database.repository import MIGRATION_COLUMNS, SCHEMA
 from app.handlers.orders import (
-    DETAILS, PAYMENT, SECOND_LOCATION, _publish_location, courier_action,
-    delivery_input, details, location_label_action, save_edit, second_location,
+    DETAILS, PAYMENT, SECOND_LOCATION, _courier_waiting_pickup_text,
+    _publish_location, courier_action, delivery_input, details,
+    location_label_action, product, save_edit, second_location,
 )
 from app.utils.formatters import (
     all_locations_card, completed_card, courier_card, manager_card, short_address,
@@ -148,6 +149,79 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
     def update(text: str) -> SimpleNamespace:
         message = SimpleNamespace(text=text, location=None, reply_text=AsyncMock())
         return SimpleNamespace(message=message)
+
+    async def test_product_step_uses_short_details_prompt(self):
+        update = self.update("A57 Pro")
+
+        state = await product(update, self.context())
+
+        self.assertEqual(state, DETAILS)
+        self.assertEqual(
+            update.message.reply_text.await_args.args[0],
+            "3/6. Отправьте:\n📍 Локацию\n📱 Номер\n💰 Общую сумму",
+        )
+
+    async def test_waiting_pickup_log_lists_only_pending_products_for_courier(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = OrderRepository(Path(directory) / "delivery.db")
+            repo.initialize()
+            first = repo.create(
+                manager_id=1,
+                manager_name="Manager",
+                data={
+                    "seller_name": "Ali",
+                    "client_phone": "+998901333999",
+                    "product": "A57 Pro",
+                    "amount_usd": 100,
+                },
+            )
+            repo.update(
+                first.id,
+                status="pending",
+                assigned_courier_id=1799690992,
+                assigned_courier_name="Muzrob Oka",
+            )
+            second = repo.create(
+                manager_id=1,
+                manager_name="Manager",
+                data={
+                    "seller_name": "Abbos",
+                    "client_phone": "+998901333999",
+                    "product": "A56",
+                    "amount_usd": 200,
+                },
+            )
+            repo.update(
+                second.id,
+                status="pending",
+                assigned_courier_id=1799690992,
+                assigned_courier_name="Muzrob Oka",
+            )
+            picked_up = repo.create(
+                manager_id=1,
+                manager_name="Manager",
+                data={
+                    "seller_name": "Olmas",
+                    "client_phone": "+998901333999",
+                    "product": "Не показывать",
+                    "amount_usd": 300,
+                },
+            )
+            repo.update(
+                picked_up.id,
+                status="picked_up",
+                assigned_courier_id=1799690992,
+                assigned_courier_name="Muzrob Oka",
+            )
+
+            text = _courier_waiting_pickup_text(repo, 1799690992, "Muzrob Oka")
+
+        self.assertEqual(
+            text,
+            "⏳ <b>Ждём курьера Muzrob Oka</b>\n"
+            "1. Заказ №1 · Ali · A57 Pro\n"
+            "2. Заказ №2 · Abbos · A56",
+        )
 
     async def test_combined_details_complete_collection(self):
         update = self.update(
