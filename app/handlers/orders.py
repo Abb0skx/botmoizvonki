@@ -1234,6 +1234,10 @@ async def validate_delivery_configuration(application: Application) -> None:
         False,
     ):
         raise RuntimeError("The delivery bot must be allowed to delete obsolete location posts")
+    warned_location_members: set[int] = application.bot_data.setdefault(
+        "warned_missing_location_members",
+        set(),
+    )
     for courier_id in sorted(_allowed_courier_ids(settings)):
         configured = courier_option(courier_id)
         courier_member = await application.bot.get_chat_member(
@@ -1241,12 +1245,17 @@ async def validate_delivery_configuration(application: Application) -> None:
             courier_id,
         )
         if courier_member.status in {"left", "kicked"}:
-            logger.warning(
-                "Courier %s is not a member of the location channel %s; "
-                "direct map links remain available",
-                configured.name,
-                settings.location_channel_id,
-            )
+            if courier_id not in warned_location_members:
+                logger.warning(
+                    "Courier %s is not a member of the location channel %s; "
+                    "direct map links remain available",
+                    configured.name,
+                    settings.location_channel_id,
+                )
+                warned_location_members.add(courier_id)
+        else:
+            # If membership is restored, warn again on a future regression.
+            warned_location_members.discard(courier_id)
 
     orders_channel_id = getattr(settings, "orders_channel_id", None)
     if orders_channel_id:

@@ -297,8 +297,10 @@ class OrdersChannelTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.assertLogs("app.handlers.orders", level="WARNING") as logs:
                 await validate_delivery_configuration(application)
+                await validate_delivery_configuration(application)
 
-        self.assertTrue(any("Courier Abbos is not a member" in line for line in logs.output))
+        matching = [line for line in logs.output if "Courier Abbos is not a member" in line]
+        self.assertEqual(len(matching), 1)
 
 
 class SettingsValidationTests(unittest.TestCase):
