@@ -79,7 +79,11 @@ class OrderListUxTests(unittest.IsolatedAsyncioTestCase):
             if button.callback_data
         ]
         self.assertTrue(callback_data)
-        self.assertTrue(all(value.startswith("orders_page:") for value in callback_data))
+        self.assertEqual(
+            [value for value in callback_data if value.startswith("list_order:")],
+            [f"list_order:{order.id}" for order in self.repo.list_all_page(limit=10, offset=0)],
+        )
+        self.assertTrue(any(value.startswith("orders_page:") for value in callback_data))
 
     async def test_page_button_answers_first_and_edits_same_message(self):
         events: list[str] = []
@@ -151,7 +155,10 @@ class CallbackAcknowledgementTests(unittest.IsolatedAsyncioTestCase):
         update = SimpleNamespace(callback_query=query)
         context = SimpleNamespace(
             application=SimpleNamespace(bot_data={
-                "settings": SimpleNamespace(manager_ids=frozenset({11})),
+                "settings": SimpleNamespace(
+                    manager_ids=frozenset({11}),
+                    courier_ids=frozenset({7636344727, 202134293, 1799690992}),
+                ),
                 "repo": self.repo,
             }),
             bot=SimpleNamespace(),
@@ -179,6 +186,7 @@ class CallbackAcknowledgementTests(unittest.IsolatedAsyncioTestCase):
             from_user=SimpleNamespace(id=11, full_name="Manager", username=None),
             message=SimpleNamespace(chat_id=11, message_id=90),
             answer=AsyncMock(),
+            edit_message_reply_markup=AsyncMock(),
         )
         bot = SimpleNamespace(
             send_message=AsyncMock(return_value=SimpleNamespace(
@@ -192,7 +200,7 @@ class CallbackAcknowledgementTests(unittest.IsolatedAsyncioTestCase):
             application=SimpleNamespace(bot_data={
                 "settings": SimpleNamespace(
                     manager_ids=frozenset({11}),
-                    courier_ids=frozenset(),
+                    courier_ids=frozenset({7636344727}),
                     delivery_group_id=-100,
                     location_channel_id=-1002,
                 ),
@@ -243,6 +251,7 @@ class CallbackAcknowledgementTests(unittest.IsolatedAsyncioTestCase):
             from_user=SimpleNamespace(id=11, full_name="Manager", username=None),
             message=SimpleNamespace(chat_id=11, message_id=90),
             answer=AsyncMock(),
+            edit_message_reply_markup=AsyncMock(),
         )
         bot = SimpleNamespace(
             send_message=AsyncMock(return_value=SimpleNamespace(
@@ -256,7 +265,7 @@ class CallbackAcknowledgementTests(unittest.IsolatedAsyncioTestCase):
             application=SimpleNamespace(bot_data={
                 "settings": SimpleNamespace(
                     manager_ids=frozenset({11}),
-                    courier_ids=frozenset(),
+                    courier_ids=frozenset({7636344727, 202134293}),
                     delivery_group_id=-100,
                     location_channel_id=-1002,
                 ),
@@ -268,6 +277,25 @@ class CallbackAcknowledgementTests(unittest.IsolatedAsyncioTestCase):
             return self.repo.get(order_id), True
 
         with patch("app.handlers.orders._sync_order", side_effect=synchronized):
+            # A trip in progress cannot be reset by a single accidental click.
+            await courier_assignment_action(SimpleNamespace(callback_query=query), context)
+
+            unchanged = self.repo.get(order.id)
+            self.assertEqual(unchanged.status, "on_way")
+            self.assertEqual(unchanged.assigned_courier_id, 7636344727)
+            bot.send_message.assert_not_awaited()
+            confirmation = query.edit_message_reply_markup.await_args.kwargs["reply_markup"]
+            callbacks = [
+                button.callback_data
+                for row in confirmation.inline_keyboard
+                for button in row
+            ]
+            self.assertIn(
+                f"courier_force_assign:{order.id}:202134293",
+                callbacks,
+            )
+
+            query.data = f"courier_force_assign:{order.id}:202134293"
             await courier_assignment_action(SimpleNamespace(callback_query=query), context)
 
         assigned = self.repo.get(order.id)
@@ -278,6 +306,11 @@ class CallbackAcknowledgementTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(assigned.time_started)
         self.assertEqual(assigned.delivery_chat_id, -5216093690)
         bot.delete_message.assert_awaited_once_with(chat_id=-5111626405, message_id=50)
+        self.assertTrue(any(
+            call.kwargs.get("chat_id") == -5111626405
+            and "переназначен" in call.kwargs.get("text", "")
+            for call in bot.send_message.await_args_list
+        ))
 
     async def test_failed_reassignment_keeps_old_courier_and_card(self):
         order = self.repo.create(manager_id=11, manager_name="Manager", data=_order_data())
@@ -304,7 +337,12 @@ class CallbackAcknowledgementTests(unittest.IsolatedAsyncioTestCase):
         context = SimpleNamespace(
             bot=bot,
             application=SimpleNamespace(bot_data={
-                "settings": SimpleNamespace(manager_ids=frozenset({11})),
+                "settings": SimpleNamespace(
+                    manager_ids=frozenset({11}),
+                    courier_ids=frozenset({7636344727, 202134293}),
+                    delivery_group_id=-100,
+                    location_channel_id=-1002,
+                ),
                 "repo": self.repo,
             }),
         )
@@ -352,7 +390,16 @@ class CallbackAcknowledgementTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_courier_status_answers_before_message_refresh(self):
         order = self.repo.create(manager_id=11, manager_name="Manager", data=_order_data())
-        self.repo.update(order.id, status="pending")
+        self.repo.update(
+            order.id,
+            status="on_way",
+            assigned_courier_id=22,
+            assigned_courier_name="Courier",
+            courier_id=22,
+            courier_name="Courier",
+            picked_up_at="2026-08-24T10:00:00+05:00",
+            time_started="2026-08-24T10:05:00+05:00",
+        )
         events: list[str] = []
 
         async def answer(*_args, **_kwargs):
@@ -501,7 +548,7 @@ class CallbackAcknowledgementTests(unittest.IsolatedAsyncioTestCase):
             reply_text=AsyncMock(),
         )
         update = SimpleNamespace(
-            effective_chat=SimpleNamespace(id=11),
+            effective_chat=SimpleNamespace(id=11, type="private"),
             effective_user=SimpleNamespace(id=11, full_name="Manager", username=None),
             message=message,
         )
@@ -515,7 +562,10 @@ class CallbackAcknowledgementTests(unittest.IsolatedAsyncioTestCase):
                     "updated_at": order.updated_at,
                 }
             },
-            application=SimpleNamespace(bot_data={"repo": self.repo}),
+            application=SimpleNamespace(bot_data={
+                "repo": self.repo,
+                "settings": SimpleNamespace(manager_ids=frozenset({11})),
+            }),
             bot=SimpleNamespace(edit_message_text=AsyncMock(side_effect=RuntimeError("timeout"))),
         )
 

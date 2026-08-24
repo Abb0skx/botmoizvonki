@@ -12,12 +12,14 @@ RUN apt-get update \
 COPY requirements-delivery.txt .
 RUN pip install --no-cache-dir -r requirements-delivery.txt
 
-COPY . .
+# Keep the delivery image isolated from unrelated project data and credentials,
+# even if its Dockerfile-specific ignore file is accidentally changed later.
+COPY app ./app
 
 RUN addgroup --system delivery \
     && adduser --system --ingroup delivery delivery \
-    && mkdir -p /app/data \
-    && chown -R delivery:delivery /app/data
+    && mkdir -p /app/data /app/cache \
+    && chown -R delivery:delivery /app/data /app/cache
 
 USER delivery
 

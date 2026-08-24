@@ -16,6 +16,12 @@ _PHONE_RE = re.compile(
 _AMOUNT_PATTERN = r"(?:\d{1,3}(?:[ \t.,]\d{3})+|\d+)"
 _USD_MARKER = r"(?:\$|usd\b|доллар(?:а|ов)?\b|дол(?:л)?\.?(?!\w))"
 _UZS_MARKER = r"(?:uzs\b|с[уў]м(?:а|ов)?\b|so['ʻ’`]?m\b)"
+_EXPLICIT_UZS_RE = re.compile(
+    rf"(?<!\w)(?:{_AMOUNT_PATTERN})[ \t]*{_UZS_MARKER}"
+    rf"|(?<!\w){_UZS_MARKER}[ \t:]*(?:{_AMOUNT_PATTERN})(?!\w)",
+    re.I,
+)
+MAX_STORED_AMOUNT = (1 << 63) - 1
 
 
 def normalize_phone(value: str) -> str:
@@ -80,6 +86,10 @@ def parse_amount(value: str) -> tuple[int | None, int | None]:
         raise ValueError("Сумма в долларах должна быть больше нуля")
     if uzs is not None and uzs <= 0:
         raise ValueError("Сумма в сумах должна быть больше нуля")
+    if usd is not None and usd > MAX_STORED_AMOUNT:
+        raise ValueError("Сумма в долларах слишком большая")
+    if uzs is not None and uzs > MAX_STORED_AMOUNT:
+        raise ValueError("Сумма в сумах слишком большая")
     return usd, uzs
 
 
@@ -109,16 +119,31 @@ def parse_order_details(value: str) -> dict[str, str | int | None | list[str]]:
         for start, end in reversed(url_spans):
             remaining = remaining[:start] + " " + remaining[end:]
 
+    # An explicitly marked amount always wins over the visually ambiguous
+    # nine-digit Uzbek phone form. Keep character offsets intact so phone spans
+    # can still be removed from ``remaining`` below.
+    phone_source = list(remaining)
+    for amount_match in _EXPLICIT_UZS_RE.finditer(remaining):
+        for index in range(amount_match.start(), amount_match.end()):
+            if phone_source[index] not in "\r\n":
+                phone_source[index] = " "
+    phone_search = "".join(phone_source)
+
     phone_spans: set[tuple[int, int]] = set()
+    labelled_phone_spans: set[tuple[int, int]] = set()
     phones: list[str] = []
 
-    def remember_phone(match: re.Match, offset: int = 0) -> None:
+    def phone_span(match: re.Match, offset: int = 0) -> tuple[int, int]:
         # ``_PHONE_RE`` permits whitespace between digits and can therefore
         # include a trailing newline. Do not let that make the labelled and
         # global scans look like two overlapping phone occurrences.
         raw_phone = match.group(0)
         trimmed_phone = raw_phone.rstrip()
-        span = (offset + match.start(), offset + match.start() + len(trimmed_phone))
+        return (offset + match.start(), offset + match.start() + len(trimmed_phone))
+
+    def remember_phone(match: re.Match, offset: int = 0) -> None:
+        trimmed_phone = match.group(0).rstrip()
+        span = phone_span(match, offset)
         phone_spans.add(span)
         try:
             phone = normalize_phone(trimmed_phone)
@@ -129,12 +154,42 @@ def parse_order_details(value: str) -> dict[str, str | int | None | list[str]]:
 
     # Preserve the old preference for explicitly labelled phone lines while
     # allowing more than one phone on the same or on separate lines.
-    for labelled in _PHONE_LABEL_RE.finditer(remaining):
+    for labelled in _PHONE_LABEL_RE.finditer(phone_search):
         for phone_match in _PHONE_RE.finditer(labelled.group(1)):
             remember_phone(phone_match, labelled.start(1))
-    for phone_match in _PHONE_RE.finditer(remaining):
-        if phone_match.span() not in phone_spans:
+            labelled_phone_spans.add(phone_span(phone_match, labelled.start(1)))
+    phones = phones[:2]
+
+    # A full 998 number is unambiguously a phone. Bare nine-digit values are
+    # ambiguous because they may also be an unmarked UZS amount. The order
+    # supports at most two phones: when a labelled/full phone already exists,
+    # keep the last remaining bare value for the amount; with three bare
+    # values, keep the first two as phones and the last one as the amount.
+    # Explicit ``Телефон:`` / currency markers always take precedence.
+    definite_phone_ends = [end for _start, end in labelled_phone_spans]
+    deferred_bare_phones: list[re.Match] = []
+    for phone_match in _PHONE_RE.finditer(phone_search):
+        span = phone_span(phone_match)
+        digits = re.sub(r"\D", "", phone_match.group(0))
+        has_country_code = len(digits) == 12 and digits.startswith("998")
+        if span in phone_spans:
+            if has_country_code and span[1] not in definite_phone_ends:
+                definite_phone_ends.append(span[1])
+            continue
+        if not has_country_code:
+            deferred_bare_phones.append(phone_match)
+            continue
+        if len(phones) < 2:
             remember_phone(phone_match)
+            definite_phone_ends.append(span[1])
+
+    phone_slots = max(0, 2 - len(phones))
+    if definite_phone_ends:
+        bare_phone_count = min(phone_slots, max(0, len(deferred_bare_phones) - 1))
+    else:
+        bare_phone_count = min(phone_slots, 2, len(deferred_bare_phones))
+    for phone_match in deferred_bare_phones[:bare_phone_count]:
+        remember_phone(phone_match)
 
     if phones:
         result["client_phone"] = phones[0]

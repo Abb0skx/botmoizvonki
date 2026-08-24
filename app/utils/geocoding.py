@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 import time
 from typing import Any
 from urllib.parse import urljoin, urlsplit
@@ -26,6 +27,57 @@ ALLOWED_MAP_HOSTS = {
     "maps.yandex.uz",
 }
 
+# Canonical names keep monthly district statistics stable even when Telegram,
+# Nominatim or a manager uses Russian/Uzbek spelling variants.
+_TASHKENT_DISTRICTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Алмазарский район", ("алмазар", "олмазар", "almazar", "olmazor")),
+    ("Бектемирский район", ("бектемир", "bektemir")),
+    ("Мирабадский район", ("мирабад", "миробод", "mirabad", "mirobod")),
+    ("Мирзо-Улугбекский район", ("мирзо улугбек", "мирзо-улугбек", "mirzo ulugbek", "mirzo-ulugbek")),
+    ("Сергелийский район", ("сергели", "sergeli")),
+    ("Учтепинский район", ("учтеп", "uchtepa")),
+    ("Чиланзарский район", ("чиланзар", "чилонзор", "chilanzar", "chilonzor")),
+    ("Шайхантахурский район", ("шайхантахур", "шайхонтохур", "shaykhantakhur", "shayxontohur")),
+    ("Юнусабадский район", ("юнусабад", "юнусобод", "yunusabad", "yunusobod")),
+    ("Яккасарайский район", ("яккасарай", "яккасарой", "yakkasaray", "yakkasaroy")),
+    ("Янгихаётский район", ("янгихаёт", "янгихаят", "yangihayot")),
+    ("Яшнабадский район", ("яшнабад", "яшнобод", "yashnabad", "yashnobod")),
+)
+_MAHALLA_RE = re.compile(
+    r"(?:махалл(?:а|я|аси)?|мфй|mahalla(?:si)?|mahalla)\s*[:\-]?\s*"
+    r"([^,;\n]{2,100})",
+    re.IGNORECASE,
+)
+
+
+def _recognized_district(value: str | None) -> str | None:
+    if not value:
+        return None
+    normalized = re.sub(r"[’'ʻ`]+", "", value.casefold().replace("ё", "е"))
+    normalized = re.sub(r"[\s_\-]+", " ", normalized).strip()
+    for canonical, aliases in _TASHKENT_DISTRICTS:
+        if any(alias.replace("-", " ") in normalized for alias in aliases):
+            return canonical
+    return None
+
+
+def normalize_district(value: str | None) -> str | None:
+    if not value:
+        return None
+    return _recognized_district(value) or value.strip()[:200] or None
+
+
+def extract_text_address(value: str) -> dict[str, str | None]:
+    """Extract stable district/mahalla fields from a manager-entered address."""
+    address_text = value.strip()[:1000]
+    mahalla_match = _MAHALLA_RE.search(address_text)
+    mahalla = mahalla_match.group(1).strip(" .:-")[:200] if mahalla_match else None
+    return {
+        "address_text": address_text or None,
+        "district": _recognized_district(address_text),
+        "mahalla": mahalla or None,
+    }
+
 
 def _allowed_map_url(url: str) -> bool:
     host = (urlsplit(url).hostname or "").lower()
@@ -48,7 +100,7 @@ def extract_address(payload: dict[str, Any]) -> dict[str, str | None]:
     )
     return {
         "address_text": (payload.get("display_name") or "")[:1000] or None,
-        "district": str(district)[:200] if district else None,
+        "district": normalize_district(str(district)) if district else None,
         "mahalla": str(mahalla)[:200] if mahalla else None,
     }
 

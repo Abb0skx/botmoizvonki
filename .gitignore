@@ -1,5 +1,6 @@
 .env
 .env.*
+!.env.delivery.example
 !.env.example
 data/.env
 __pycache__/

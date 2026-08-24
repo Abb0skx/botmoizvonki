@@ -15,6 +15,7 @@ from app.stats_service import TASHKENT
 
 
 ABBOS_ID = 202134293
+MUZROB_ID = 1799690992
 
 
 def _road_result(points, *, distance=4_200, duration=600):
@@ -147,8 +148,12 @@ class DeliveryAnalyticsTests(unittest.TestCase):
         today = datetime.now(TASHKENT).date()
         month_start = today.replace(day=1)
         previous_month_end = month_start - timedelta(days=1)
+        previous_month_start = previous_month_end.replace(day=1)
         current_day = min(today.day, 15)
         selected_day = month_start.replace(day=current_day)
+        previous_selected_day = previous_month_start + timedelta(
+            days=min(current_day - 1, previous_month_end.day - 1)
+        )
         self._create(
             datetime.combine(selected_day, datetime.min.time(), TASHKENT) + timedelta(hours=12),
             "Юнусабадский район",
@@ -160,7 +165,7 @@ class DeliveryAnalyticsTests(unittest.TestCase):
             "A56",
         )
         self._create(
-            datetime.combine(previous_month_end, datetime.min.time(), TASHKENT) + timedelta(hours=12),
+            datetime.combine(previous_selected_day, datetime.min.time(), TASHKENT) + timedelta(hours=12),
             "Чиланзарский район",
             "A55",
         )
@@ -189,6 +194,143 @@ class DeliveryAnalyticsTests(unittest.TestCase):
 
         self.assertEqual(near["expected"], far["expected"])
         self.assertGreater(near["expected"], 0)
+
+    def test_empty_history_has_low_forecast_confidence(self):
+        today = date(2026, 8, 24)
+
+        forecast = _forecast(
+            today + timedelta(days=1),
+            Counter(),
+            None,
+            as_of=today - timedelta(days=1),
+        )
+
+        self.assertEqual(forecast["sample"], 0)
+        self.assertEqual(forecast["confidence"], "низкая")
+        self.assertEqual(forecast["expected"], 0)
+
+    def test_current_incomplete_day_does_not_change_future_forecast(self):
+        today = datetime.now(TASHKENT).date()
+        for offset in (7, 14, 21, 28):
+            day = today - timedelta(days=offset)
+            self._create(
+                datetime.combine(day, datetime.min.time(), TASHKENT) + timedelta(hours=12),
+                "Чиланзарский район",
+                f"Past-{offset}",
+            )
+        before = build_delivery_analytics(self.repo)["next_7_days"]
+        for index in range(12):
+            self._create(
+                datetime.combine(today, datetime.min.time(), TASHKENT) + timedelta(hours=10),
+                "Чиланзарский район",
+                f"Today-{index}",
+            )
+
+        after = build_delivery_analytics(self.repo)["next_7_days"]
+
+        self.assertEqual(before, after)
+
+    def test_current_month_change_uses_equal_number_of_days(self):
+        fake_today = date(2026, 3, 31)
+        for day_number in range(1, 32):
+            self._create(
+                datetime(2026, 3, day_number, 12, tzinfo=TASHKENT),
+                "Юнусабадский район",
+                f"March-{day_number}",
+            )
+        for day_number in range(1, 29):
+            self._create(
+                datetime(2026, 2, day_number, 12, tzinfo=TASHKENT),
+                "Юнусабадский район",
+                f"February-{day_number}",
+            )
+
+        with patch("app.analytics_service.datetime") as mocked_datetime:
+            mocked_datetime.now.return_value = datetime(
+                2026,
+                3,
+                31,
+                18,
+                tzinfo=TASHKENT,
+            )
+            result = build_delivery_analytics(self.repo, month="2026-03")
+
+        self.assertEqual(result["month"]["orders"], 31)
+        self.assertEqual(result["month"]["previous_orders"], 28)
+        self.assertEqual(result["month"]["change"], 0)
+        self.assertEqual(result["month"]["districts"][0]["change"], 0)
+
+    def test_analytics_can_be_filtered_by_courier(self):
+        today = datetime.now(TASHKENT).date()
+        first = self._create(
+            datetime.combine(today, datetime.min.time(), TASHKENT) + timedelta(hours=11),
+            "Юнусабадский район",
+            "Abbos-order",
+        )
+        second = self._create(
+            datetime.combine(today, datetime.min.time(), TASHKENT) + timedelta(hours=12),
+            "Чиланзарский район",
+            "Muzrob-order",
+        )
+        self.repo.transition(
+            first.id,
+            {"draft"},
+            status="pending",
+            assigned_courier_id=ABBOS_ID,
+            assigned_courier_name="Abbos",
+        )
+        self.repo.transition(
+            second.id,
+            {"draft"},
+            status="pending",
+            assigned_courier_id=MUZROB_ID,
+            assigned_courier_name="Muzrob Oka",
+        )
+
+        result = build_delivery_analytics(self.repo, courier_id=ABBOS_ID)
+
+        self.assertEqual(result["selected_courier_id"], ABBOS_ID)
+        self.assertEqual(result["month"]["orders"], 1)
+        self.assertEqual(result["month"]["districts"][0]["name"], "Юнусабадский район")
+
+    def test_completed_order_does_not_move_to_new_courier_analytics(self):
+        today = datetime.now(TASHKENT).date()
+        created_at = datetime.combine(today, datetime.min.time(), TASHKENT) + timedelta(hours=10)
+        order = self._create(created_at, "Яшнабадский район", "Historical")
+        order = self.repo.transition(
+            order.id,
+            {"draft"},
+            status="pending",
+            assigned_courier_id=ABBOS_ID,
+            assigned_courier_name="Abbos",
+        )
+        order = self.repo.transition(
+            order.id,
+            {"pending"},
+            status="completed",
+            courier_id=ABBOS_ID,
+            courier_name="Abbos",
+            delivered_at=(created_at + timedelta(hours=1)).isoformat(),
+            actor_id=ABBOS_ID,
+            actor_name="Abbos",
+            actor_role="courier",
+        )
+        self.repo.transition(
+            order.id,
+            {"completed"},
+            status="pending",
+            assigned_courier_id=MUZROB_ID,
+            assigned_courier_name="Muzrob Oka",
+            courier_id=None,
+            courier_name=None,
+            delivered_at=None,
+        )
+
+        abbos = build_delivery_analytics(self.repo, courier_id=ABBOS_ID)
+        muzrob = build_delivery_analytics(self.repo, courier_id=MUZROB_ID)
+
+        self.assertEqual(abbos["month"]["orders"], 1)
+        self.assertEqual(muzrob["month"]["orders"], 0)
 
     def test_month_and_week_validation(self):
         today = date(2026, 8, 24)
@@ -238,6 +380,12 @@ class DeliveryAnalyticsWebTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["month"]["value"], "2026-08")
         self.assertEqual(response.json()["week"]["value"], "2026-W35")
+
+        unknown = self.client.get(
+            "/delivery/stats/api/analytics?courier_id=999",
+            headers=self.auth(),
+        )
+        self.assertEqual(unknown.status_code, 422)
 
 
 if __name__ == "__main__":

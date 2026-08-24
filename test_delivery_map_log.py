@@ -157,6 +157,35 @@ class StaticMapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("10:10</b> · Muzrob Oka отменил выезд", report)
         self.assertIn("11:00</b> · Muzrob Oka приехал и доставил", report)
 
+    def test_daily_report_ignores_same_status_edits(self):
+        order = Order(
+            id=21,
+            order_number=21,
+            manager_id=11,
+            manager_name="Abbos",
+            seller_name="Ali",
+            client_phone="+998901333999",
+            product="Nokia A17",
+            status="completed",
+        )
+        event = OrderEvent(
+            id=1,
+            order_id=21,
+            order_number=21,
+            event_type="order_updated",
+            from_status="completed",
+            to_status="completed",
+            changed_fields=("comment",),
+            created_at="2026-08-23T06:00:00+00:00",
+        )
+
+        report = "\n".join(
+            daily_delivery_report([order], date(2026, 8, 23), [event])
+        )
+
+        self.assertNotIn("доставил заказ", report)
+        self.assertIn("За этот день действий пока нет", report)
+
 
 class LogChannelTests(unittest.IsolatedAsyncioTestCase):
     async def test_old_log_chronology_button_is_disabled_without_new_posts(self):

@@ -494,12 +494,13 @@ async def render_delivery_sequence_map(
             for field, color in (
                 ("current_road_path", route_color),
                 ("return_road_path", "#f59e0b"),
+                ("planned_road_path", "#94a3b8"),
             ):
                 path = route.get(field) or []
                 points = [pixel(latitude, longitude) for latitude, longitude in path]
                 if len(points) >= 2:
                     draw.line(points, fill=(255, 255, 255, 240), width=15, joint="curve")
-                    draw.line(points, fill=color, width=8, joint="curve")
+                    draw.line(points, fill=color, width=6 if field == "planned_road_path" else 8, joint="curve")
     else:
         grouped: dict[int | None, list[DeliverySequenceStop]] = {}
         for stop in stops:
@@ -569,9 +570,14 @@ async def render_delivery_sequence_map(
         radius = 28
         completed = stop.state == "completed"
         remaining = stop.state in {"picked_up", "remaining"}
-        marker_fill = _darken_hex(stop.color) if completed else ("white" if remaining else stop.color)
-        text_fill = stop.color if remaining else "white"
-        outline = stop.color if remaining else "white"
+        cancelled = stop.state == "cancelled"
+        marker_fill = (
+            "#e2e8f0"
+            if cancelled
+            else (_darken_hex(stop.color) if completed else ("white" if remaining else stop.color))
+        )
+        text_fill = "#64748b" if cancelled else (stop.color if remaining else "white")
+        outline = "#64748b" if cancelled else (stop.color if remaining else "white")
         draw.ellipse(
             (x - radius - 6, y - radius - 6, x + radius + 6, y + radius + 6),
             fill=(255, 255, 255, 235),
@@ -584,7 +590,7 @@ async def render_delivery_sequence_map(
             outline=outline,
             width=4,
         )
-        label = str(stop.sequence)
+        label = "×" if cancelled else str(stop.sequence)
         bounds = draw.textbbox((0, 0), label, font=number_font)
         draw.text(
             (x - (bounds[2] - bounds[0]) / 2, y - (bounds[3] - bounds[1]) / 2 - 2),

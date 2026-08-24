@@ -1,11 +1,12 @@
 import asyncio
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call, patch
 
-from telegram.error import BadRequest
+from telegram.error import BadRequest, RetryAfter
 
 from app.database import OrderRepository
 from app.handlers.orders import (
@@ -36,6 +37,26 @@ def create_order(repo: OrderRepository):
 
 
 class DeletedMessageRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_delivery_refresh_propagates_retry_after(self):
+        order = Order(
+            id=1,
+            order_number=1,
+            manager_id=1,
+            manager_name="Manager",
+            client_phone="+998901333999",
+            product="A56",
+            status="pending",
+            delivery_chat_id=-1001,
+            delivery_message_id=55,
+        )
+        context = SimpleNamespace(
+            bot=SimpleNamespace(edit_message_text=AsyncMock(side_effect=RetryAfter(7))),
+            application=SimpleNamespace(bot_data={}),
+        )
+
+        with self.assertRaises(RetryAfter):
+            await _refresh_delivery_message(context, order)
+
     async def test_static_location_separators_are_not_reedited_during_sync(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = OrderRepository(Path(directory) / "delivery.db")
@@ -236,7 +257,14 @@ class DeletedMessageRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
             recovered = repo.get(order.id)
             self.assertIsNone(recovered.location_message_id)
-            queued = repo.list_cleanup_messages(order_id=order.id)
+            with repo.connect() as db:
+                queued = [
+                    dict(row)
+                    for row in db.execute(
+                        "SELECT * FROM telegram_cleanup_queue WHERE order_id=? ORDER BY id",
+                        (order.id,),
+                    ).fetchall()
+                ]
             self.assertEqual(
                 {(item["chat_id"], item["message_id"]) for item in queued},
                 {(-1002, 60), (-1002, 61)},
@@ -263,9 +291,57 @@ class DeletedMessageRecoveryTests(unittest.IsolatedAsyncioTestCase):
             )
 
             self.assertFalse(await _process_cleanup_messages(context))
-            self.assertEqual(repo.list_cleanup_messages()[0]["attempts"], 1)
-            self.assertTrue(await _process_cleanup_messages(context))
+            with repo.connect() as db:
+                delayed = db.execute(
+                    "SELECT * FROM telegram_cleanup_queue WHERE order_id=?", (order.id,)
+                ).fetchone()
+            self.assertEqual(delayed["attempts"], 1)
+            self.assertIsNotNone(delayed["next_attempt_at"])
+            future = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat(
+                timespec="microseconds"
+            )
+            with patch("app.database.repository.now", return_value=future):
+                self.assertTrue(await _process_cleanup_messages(context))
             self.assertEqual(repo.list_cleanup_messages(), [])
+
+    async def test_permanent_cleanup_failure_moves_item_to_dead_letter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = OrderRepository(Path(directory) / "delivery.db")
+            repo.initialize()
+            order = create_order(repo)
+            repo.enqueue_cleanup_messages(order.id, [(-1002, 72)])
+            context = SimpleNamespace(
+                bot=SimpleNamespace(
+                    delete_message=AsyncMock(
+                        side_effect=BadRequest("Message can't be deleted")
+                    )
+                ),
+                application=SimpleNamespace(bot_data={"repo": repo}),
+            )
+
+            self.assertFalse(await _process_cleanup_messages(context))
+            self.assertEqual(repo.list_cleanup_messages(order_id=order.id), [])
+            dead_letters = repo.list_terminal_cleanup_messages(order_id=order.id)
+            self.assertEqual(len(dead_letters), 1)
+            self.assertEqual(dead_letters[0]["attempts"], 1)
+
+    async def test_cleanup_rate_limit_is_propagated_without_marking_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = OrderRepository(Path(directory) / "delivery.db")
+            repo.initialize()
+            order = create_order(repo)
+            repo.enqueue_cleanup_messages(order.id, [(-1002, 72)])
+            context = SimpleNamespace(
+                bot=SimpleNamespace(delete_message=AsyncMock(side_effect=RetryAfter(7))),
+                application=SimpleNamespace(bot_data={"repo": repo}),
+            )
+
+            with self.assertRaises(RetryAfter):
+                await _process_cleanup_messages(context)
+
+            queued = repo.list_cleanup_messages(order_id=order.id)
+            self.assertEqual(len(queued), 1)
+            self.assertEqual(queued[0]["attempts"], 0)
 
 
 class ConcurrentPublicationTests(unittest.IsolatedAsyncioTestCase):

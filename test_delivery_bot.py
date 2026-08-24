@@ -22,7 +22,7 @@ from app.utils.formatters import (
     telegram_location_url, telegram_message_url, yandex_map_url,
     yandex_route_url,
 )
-from app.utils.geocoding import extract_address, resolve_map_url
+from app.utils.geocoding import extract_address, extract_text_address, resolve_map_url
 from app.utils.parsers import normalize_phone, parse_amount, parse_location_url, parse_order_details
 from app.utils.payments import PAID_AT_ASSEMBLY, normalize_payment
 from app.utils.sellers import normalize_seller
@@ -121,6 +121,15 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(result["district"], "Чиланзарский район")
         self.assertEqual(result["mahalla"], "Махалля Бунёдкор")
 
+    def test_text_address_extracts_canonical_district_and_mahalla(self):
+        result = extract_text_address(
+            "Yashnobod tumani, mahalla Alimkent, Кустанай улица"
+        )
+
+        self.assertEqual(result["district"], "Яшнабадский район")
+        self.assertEqual(result["mahalla"], "Alimkent")
+        self.assertIsNone(extract_text_address("Ориентир возле школы")["district"])
+
     def test_private_channel_message_link(self):
         self.assertEqual(
             telegram_message_url(-1004398605075, 125),
@@ -143,12 +152,22 @@ class MapUrlTests(unittest.IsolatedAsyncioTestCase):
 class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def context() -> SimpleNamespace:
-        return SimpleNamespace(user_data={"draft": {"seller_name": "Ali", "product": "A7 Pro"}})
+        return SimpleNamespace(
+            user_data={"draft": {"seller_name": "Ali", "product": "A7 Pro"}},
+            application=SimpleNamespace(bot_data={
+                "settings": SimpleNamespace(manager_ids=frozenset({1})),
+            }),
+        )
 
     @staticmethod
     def update(text: str) -> SimpleNamespace:
         message = SimpleNamespace(text=text, location=None, reply_text=AsyncMock())
-        return SimpleNamespace(message=message)
+        return SimpleNamespace(
+            message=message,
+            effective_message=message,
+            effective_chat=SimpleNamespace(id=1, type="private"),
+            effective_user=SimpleNamespace(id=1, full_name="Manager", username=None),
+        )
 
     async def test_product_step_uses_short_details_prompt(self):
         update = self.update("A57 Pro")
@@ -317,7 +336,8 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
                 reply_text=AsyncMock(),
             )
             update = SimpleNamespace(
-                effective_chat=SimpleNamespace(id=1),
+                effective_chat=SimpleNamespace(id=1, type="private"),
+                effective_user=SimpleNamespace(id=1, full_name="Manager", username=None),
                 message=message,
             )
             bot = SimpleNamespace(edit_message_text=AsyncMock())
@@ -330,7 +350,10 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
                         "chat_id": 1,
                     }
                 },
-                application=SimpleNamespace(bot_data={"repo": repo}),
+                application=SimpleNamespace(bot_data={
+                    "repo": repo,
+                    "settings": SimpleNamespace(manager_ids=frozenset({1})),
+                }),
                 bot=bot,
             )
 
@@ -340,6 +363,27 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((updated.amount_usd, updated.amount_uzs), (120, 1536000))
             self.assertNotIn("edit", context.user_data)
             self.assertIn("Новая цена сохранена", message.reply_text.await_args.args[0])
+
+    async def test_delivery_input_ignores_anonymous_channel_post(self):
+        message = SimpleNamespace(
+            photo=[],
+            text="служебная запись канала",
+            caption=None,
+            reply_text=AsyncMock(),
+        )
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=-1004459657817),
+            effective_user=None,
+            message=message,
+        )
+        settings = SimpleNamespace(courier_ids=frozenset({2}))
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={"settings": settings}),
+        )
+
+        await delivery_input(update, context)
+
+        message.reply_text.assert_not_awaited()
 
     async def test_delivery_completes_from_photo_with_price_caption(self):
         with tempfile.TemporaryDirectory() as tempdir:
@@ -452,7 +496,13 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
             )
             repo.update(
                 order.id,
-                status="pending",
+                status="on_way",
+                assigned_courier_id=2,
+                assigned_courier_name="Courier",
+                courier_id=2,
+                courier_name="Courier",
+                picked_up_at="2026-08-24T10:00:00+05:00",
+                time_started="2026-08-24T10:05:00+05:00",
                 delivery_chat_id=-100,
                 delivery_message_id=50,
             )

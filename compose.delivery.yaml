@@ -7,10 +7,24 @@ services:
     restart: unless-stopped
     stop_grace_period: 1m
     init: true
+    cpus: 1.0
+    mem_limit: 512m
+    pids_limit: 256
     env_file:
       - .env.delivery
+    environment:
+      # The bot only needs the stats URL, never the Basic Auth secret.
+      DELIVERY_STATS_PASSWORD: ""
+      REVIEWS_ADMIN_PASSWORD: ""
     volumes:
       - delivery-data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     healthcheck:
       test: ["CMD", "python", "-c", "import os,sqlite3,time; from pathlib import Path; from urllib.parse import quote; p=Path(os.getenv('DELIVERY_DB_PATH','/app/data/delivery.db')).resolve(); assert p.is_file(); db=sqlite3.connect('file:'+quote(str(p))+'?mode=ro',uri=True); assert db.execute(\"SELECT 1 FROM sqlite_master WHERE type='table' AND name='orders'\").fetchone(); assert db.execute('PRAGMA quick_check').fetchone()[0]=='ok'; h=p.with_name('delivery-heartbeat'); assert h.is_file() and time.time()-h.stat().st_mtime<180"]
       interval: 1m
@@ -31,9 +45,19 @@ services:
     restart: unless-stopped
     stop_grace_period: 30s
     init: true
+    cpus: 1.5
+    mem_limit: 768m
+    pids_limit: 256
     command: ["uvicorn", "app.stats:app", "--host", "0.0.0.0", "--port", "8080", "--proxy-headers", "--forwarded-allow-ips=*"]
     env_file:
       - .env.delivery
+    depends_on:
+      delivery-bot:
+        condition: service_healthy
+    environment:
+      # Do not expose the Telegram bot credential to the public web process.
+      DELIVERY_BOT_TOKEN: ""
+      DELIVERY_CACHE_PATH: /app/cache
     ports:
       - "127.0.0.1:8011:8080"
     networks:
@@ -43,6 +67,14 @@ services:
       - "traefik.enable=true"
       - "traefik.docker.network=coolify"
       - "traefik.http.middlewares.delivery-stats-https.redirectscheme.scheme=https"
+      - "traefik.http.middlewares.delivery-stats-security.headers.stsSeconds=31536000"
+      - "traefik.http.middlewares.delivery-stats-security.headers.stsIncludeSubdomains=true"
+      - "traefik.http.middlewares.delivery-stats-security.headers.stsPreload=true"
+      - "traefik.http.middlewares.delivery-stats-security.headers.contentTypeNosniff=true"
+      - "traefik.http.middlewares.delivery-stats-security.headers.frameDeny=true"
+      - "traefik.http.middlewares.delivery-stats-rate.ratelimit.average=30"
+      - "traefik.http.middlewares.delivery-stats-rate.ratelimit.burst=60"
+      - "traefik.http.middlewares.delivery-stats-rate.ratelimit.period=1m"
       - "traefik.http.routers.delivery-stats-http.entrypoints=http"
       - "traefik.http.routers.delivery-stats-http.rule=Host(`bot.texnikach.uz`) && (PathPrefix(`/delivery/stats`) || PathPrefix(`/delivery/monitor`))"
       - "traefik.http.routers.delivery-stats-http.priority=100"
@@ -52,10 +84,22 @@ services:
       - "traefik.http.routers.delivery-stats.priority=100"
       - "traefik.http.routers.delivery-stats.tls=true"
       - "traefik.http.routers.delivery-stats.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.delivery-stats.middlewares=delivery-stats-security,delivery-stats-rate"
       - "traefik.http.routers.delivery-stats.service=delivery-stats"
       - "traefik.http.services.delivery-stats.loadbalancer.server.port=8080"
     volumes:
+      # SQLite WAL readers may need to create/refresh delivery.db-shm.  The
+      # repository itself opens delivery.db with mode=ro, so application data
+      # remains SQL read-only while the sidecar files stay usable.
       - delivery-data:/app/data
+      - delivery-stats-cache:/app/cache
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; assert urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=5).status == 200"]
       interval: 30s
@@ -71,6 +115,8 @@ services:
 volumes:
   delivery-data:
     name: texnikach-delivery-data
+  delivery-stats-cache:
+    name: texnikach-delivery-stats-cache
 
 networks:
   coolify:

@@ -47,6 +47,63 @@ class DeliveryParserRegressionTests(unittest.TestCase):
         self.assertEqual(parse_amount("9000"), (9000, None))
         self.assertEqual(parse_amount("9001"), (None, 9001))
 
+    def test_full_phone_then_unmarked_nine_digit_uzs_is_not_a_second_phone(self):
+        parsed = parse_order_details("+998901333999\n900000000")
+
+        self.assertEqual(parsed["client_phones"], ["+998901333999"])
+        self.assertEqual(parsed["amount_usd"], None)
+        self.assertEqual(parsed["amount_uzs"], 900_000_000)
+
+    def test_two_bare_local_phones_then_unmarked_uzs_keeps_all_fields(self):
+        parsed = parse_order_details(
+            "901333999\n"
+            "912223344\n"
+            "900000000"
+        )
+
+        self.assertEqual(
+            parsed["client_phones"],
+            ["+998901333999", "+998912223344"],
+        )
+        self.assertEqual(parsed["amount_uzs"], 900_000_000)
+
+    def test_full_and_local_phone_before_unmarked_uzs_keeps_second_phone(self):
+        parsed = parse_order_details(
+            "+998901333999\n"
+            "912223344\n"
+            "900000000"
+        )
+
+        self.assertEqual(
+            parsed["client_phones"],
+            ["+998901333999", "+998912223344"],
+        )
+        self.assertEqual(parsed["amount_uzs"], 900_000_000)
+
+    def test_labelled_local_phones_still_win_over_amount_heuristic(self):
+        parsed = parse_order_details(
+            "Телефон: 90 133 39 99\n"
+            "Телефон: 91 222 33 44\n"
+            "900000000"
+        )
+
+        self.assertEqual(
+            parsed["client_phones"],
+            ["+998901333999", "+998912223344"],
+        )
+        self.assertEqual(parsed["amount_uzs"], 900_000_000)
+
+    def test_explicit_uzs_amount_is_protected_before_phone_extraction(self):
+        parsed = parse_order_details("90 133 39 99\n900 000 000 сум")
+
+        self.assertEqual(parsed["client_phones"], ["+998901333999"])
+        self.assertEqual(parsed["amount_uzs"], 900_000_000)
+
+    def test_amounts_outside_sqlite_integer_range_are_rejected(self):
+        self.assertEqual(parse_amount("9223372036854775807 сум"), (None, 9223372036854775807))
+        with self.assertRaisesRegex(ValueError, "слишком большая"):
+            parse_amount("9223372036854775808 сум")
+
 
 if __name__ == "__main__":
     unittest.main()

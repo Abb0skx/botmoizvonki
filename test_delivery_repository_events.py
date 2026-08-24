@@ -205,6 +205,32 @@ class DeliveryRepositoryEventTests(unittest.TestCase):
             )
         )
 
+    def test_publication_references_do_not_invalidate_a_manager_edit(self) -> None:
+        order = self.create_order()
+        version = order.updated_at
+        event_count = len(self.repo.list_events(order.id))
+
+        published = self.repo.update(
+            order.id,
+            expected_updated_at=version,
+            manager_chat_id=101,
+            manager_message_id=501,
+        )
+
+        self.assertIsNotNone(published)
+        self.assertEqual(published.updated_at, version)
+        self.assertEqual(len(self.repo.list_events(order.id)), event_count)
+
+        edited = self.repo.update(
+            order.id,
+            expected_updated_at=version,
+            product="A7 Pro 256GB",
+        )
+        self.assertIsNotNone(edited)
+        self.assertNotEqual(edited.updated_at, version)
+        self.assertEqual(edited.product, "A7 Pro 256GB")
+        self.assertEqual(len(self.repo.list_events(order.id)), event_count + 1)
+
     def test_location_cleanup_outbox_is_committed_with_transition(self) -> None:
         order = self.create_order()
         updated = self.repo.transition(
@@ -221,11 +247,16 @@ class DeliveryRepositoryEventTests(unittest.TestCase):
             [(-100123, 80), (-100123, 81)],
         )
         self.assertTrue(self.repo.mark_cleanup_failed(queued[0]["id"], "timeout"))
-        retried = self.repo.list_cleanup_messages(order_id=order.id)
-        self.assertEqual(retried[-1]["message_id"], 80)
-        self.assertEqual(retried[-1]["attempts"], 1)
-        self.assertTrue(self.repo.mark_cleanup_done(retried[0]["id"]))
-        self.assertEqual(len(self.repo.list_cleanup_messages(order_id=order.id)), 1)
+        due = self.repo.list_cleanup_messages(order_id=order.id)
+        self.assertEqual([item["message_id"] for item in due], [81])
+        self.assertTrue(self.repo.mark_cleanup_done(due[0]["id"]))
+        self.assertEqual(self.repo.list_cleanup_messages(order_id=order.id), [])
+        with self.repo.connect() as db:
+            delayed = db.execute(
+                "SELECT * FROM telegram_cleanup_queue WHERE id=?", (queued[0]["id"],)
+            ).fetchone()
+        self.assertEqual(delayed["attempts"], 1)
+        self.assertIsNotNone(delayed["next_attempt_at"])
 
     def test_create_update_and_transition_append_events(self) -> None:
         order = self.create_order()

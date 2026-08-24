@@ -1,11 +1,51 @@
 import json
+import math
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 from typing import Any
 
 from app.models import Order, OrderEvent
+
+SCHEMA_VERSION = 1
+SQLITE_INT_MAX = 2**63 - 1
+KNOWN_STATUSES = frozenset({
+    "draft",
+    "pending",
+    "picked_up",
+    "on_way",
+    "awaiting_photo",
+    "awaiting_amount",
+    "completed",
+    "cancelled",
+})
+KNOWN_PAYMENT_STATUSES = frozenset({"collect_on_delivery", "paid_at_assembly"})
+MONEY_FIELDS = frozenset({"amount_usd", "amount_uzs", "received_usd", "received_uzs"})
+COORDINATE_PAIRS = (
+    ("latitude", "longitude"),
+    ("second_latitude", "second_longitude"),
+)
+PUBLICATION_FIELDS = frozenset({
+    "delivery_chat_id",
+    "delivery_message_id",
+    "location_chat_id",
+    "location_message_id",
+    "location_details_message_id",
+    "location_footer_message_id",
+    "second_location_chat_id",
+    "second_location_message_id",
+    "second_location_details_message_id",
+    "second_location_footer_message_id",
+    "manager_chat_id",
+    "manager_message_id",
+    "orders_channel_chat_id",
+    "orders_channel_message_id",
+    "sync_needed",
+})
+CLEANUP_MAX_ATTEMPTS = 8
+CLEANUP_RETRY_BASE_SECONDS = 30
+CLEANUP_RETRY_MAX_SECONDS = 60 * 60
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS orders (
@@ -106,6 +146,8 @@ CREATE TABLE IF NOT EXISTS telegram_cleanup_queue (
     message_id INTEGER NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
+    next_attempt_at TEXT,
+    terminal INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     UNIQUE(chat_id, message_id)
 );
@@ -147,9 +189,28 @@ MIGRATION_COLUMNS = {
     "picked_up_at": "TEXT",
 }
 
+CLEANUP_MIGRATION_COLUMNS = {
+    "next_attempt_at": "TEXT",
+    "terminal": "INTEGER NOT NULL DEFAULT 0",
+}
+
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def _retry_at(attempts: int) -> str:
+    """Return the bounded exponential retry timestamp for one failed cleanup."""
+    timestamp = datetime.fromisoformat(now())
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    delay = min(
+        CLEANUP_RETRY_BASE_SECONDS * (2 ** max(0, attempts - 1)),
+        CLEANUP_RETRY_MAX_SECONDS,
+    )
+    return (timestamp.astimezone(timezone.utc) + timedelta(seconds=delay)).isoformat(
+        timespec="microseconds"
+    )
 
 
 class OrderRepository:
@@ -170,15 +231,42 @@ class OrderRepository:
         "orders_channel_message_id", "sync_needed",
     }
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, read_only: bool = False):
         self.path = path
+        self.read_only = read_only
         self._lock = Lock()
 
     def connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=10)
+        if self.read_only:
+            connection = sqlite3.connect(
+                self.path.resolve().as_uri() + "?mode=ro",
+                uri=True,
+                timeout=10,
+            )
+        else:
+            connection = sqlite3.connect(self.path, timeout=10)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout=10000")
         return connection
+
+    @staticmethod
+    def _add_column_if_missing(
+        db: sqlite3.Connection,
+        table: str,
+        column: str,
+        definition: str,
+    ) -> None:
+        """Add a migration column safely when two app instances start together."""
+        existing = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+        if column in existing:
+            return
+        try:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        except sqlite3.OperationalError:
+            # A concurrent initializer may have added it after our first PRAGMA.
+            current = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+            if column not in current:
+                raise
 
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -187,7 +275,18 @@ class OrderRepository:
             existing = {row[1] for row in db.execute("PRAGMA table_info(orders)")}
             for column, definition in MIGRATION_COLUMNS.items():
                 if column not in existing:
-                    db.execute(f"ALTER TABLE orders ADD COLUMN {column} {definition}")
+                    self._add_column_if_missing(db, "orders", column, definition)
+            cleanup_existing = {
+                row[1] for row in db.execute("PRAGMA table_info(telegram_cleanup_queue)")
+            }
+            for column, definition in CLEANUP_MIGRATION_COLUMNS.items():
+                if column not in cleanup_existing:
+                    self._add_column_if_missing(
+                        db,
+                        "telegram_cleanup_queue",
+                        column,
+                        definition,
+                    )
             db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_orders_sync_retry "
                 "ON orders(sync_needed, sync_attempted_at, updated_at, id)"
@@ -196,12 +295,96 @@ class OrderRepository:
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_creation_token "
                 "ON orders(creation_token) WHERE creation_token IS NOT NULL"
             )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_orders_created_at "
+                "ON orders(created_at, id)"
+            )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_orders_delivered_at "
+                "ON orders(delivered_at, id) WHERE delivered_at IS NOT NULL"
+            )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_orders_effective_courier_status "
+                "ON orders(status, COALESCE(courier_id, assigned_courier_id), time_started, id)"
+            )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_order_events_order_created "
+                "ON order_events(order_id, created_at, id)"
+            )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cleanup_queue_due "
+                "ON telegram_cleanup_queue(terminal, next_attempt_at, attempts, id)"
+            )
             db.execute("PRAGMA journal_mode=WAL")
             db.execute(
                 """UPDATE counters
                    SET value=MAX(value, (SELECT COALESCE(MAX(order_number), 0) FROM orders))
                    WHERE name='order_number'"""
             )
+            current_version = int(db.execute("PRAGMA user_version").fetchone()[0])
+            if current_version < SCHEMA_VERSION:
+                db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+    @staticmethod
+    def _validate_money(field: str, value: Any) -> None:
+        if value is None:
+            return
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{field} must be an integer or null")
+        if value < 0:
+            raise ValueError(f"{field} cannot be negative")
+        if value > SQLITE_INT_MAX:
+            raise ValueError(f"{field} exceeds the SQLite integer range")
+
+    @classmethod
+    def _validate_domain_fields(
+        cls,
+        fields: dict[str, Any],
+        *,
+        current: sqlite3.Row | dict[str, Any] | None = None,
+    ) -> None:
+        """Validate writes without rejecting untouched values in legacy rows."""
+        if "status" in fields and fields["status"] not in KNOWN_STATUSES:
+            raise ValueError(f"Unknown order status: {fields['status']!r}")
+        if (
+            "payment_status" in fields
+            and fields["payment_status"] not in KNOWN_PAYMENT_STATUSES
+        ):
+            raise ValueError(f"Unknown payment status: {fields['payment_status']!r}")
+        for field in MONEY_FIELDS & fields.keys():
+            cls._validate_money(field, fields[field])
+
+        def resulting_value(field: str) -> Any:
+            if field in fields:
+                return fields[field]
+            if current is None:
+                return None
+            return current[field]
+
+        for latitude_field, longitude_field in COORDINATE_PAIRS:
+            if latitude_field not in fields and longitude_field not in fields:
+                continue
+            latitude = resulting_value(latitude_field)
+            longitude = resulting_value(longitude_field)
+            if (latitude is None) != (longitude is None):
+                raise ValueError(
+                    f"{latitude_field} and {longitude_field} must be set or cleared together"
+                )
+            if latitude is None:
+                continue
+            for field, value, minimum, maximum in (
+                (latitude_field, latitude, -90.0, 90.0),
+                (longitude_field, longitude, -180.0, 180.0),
+            ):
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                    or not minimum <= float(value) <= maximum
+                ):
+                    raise ValueError(
+                        f"{field} must be a finite coordinate between {minimum:g} and {maximum:g}"
+                    )
 
     @staticmethod
     def _insert_event(
@@ -264,6 +447,10 @@ class OrderRepository:
                 ).fetchone()
                 if existing:
                     return Order.from_row(existing)
+            creation_fields = dict(data)
+            creation_fields.setdefault("status", "draft")
+            creation_fields.setdefault("payment_status", "collect_on_delivery")
+            self._validate_domain_fields(creation_fields)
             db.execute("UPDATE counters SET value=value+1 WHERE name='order_number'")
             number = db.execute("SELECT value FROM counters WHERE name='order_number'").fetchone()[0]
             cursor = db.execute(
@@ -473,22 +660,25 @@ class OrderRepository:
         if invalid:
             raise ValueError(f"Unsupported fields: {invalid}")
         changed_fields = set(fields)
+        publication_only = bool(changed_fields) and changed_fields <= PUBLICATION_FIELDS
         if "sync_needed" not in fields:
             fields["sync_needed"] = 1
         if fields.get("sync_needed"):
             fields["sync_attempted_at"] = None
-        fields["updated_at"] = now()
+        if not publication_only:
+            fields["updated_at"] = now()
         assignments = ", ".join(f"{key}=?" for key in fields)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             previous = db.execute(
-                "SELECT order_number, status, updated_at FROM orders WHERE id=?",
+                "SELECT * FROM orders WHERE id=?",
                 (order_id,),
             ).fetchone()
             if not previous:
                 return None
             if expected_updated_at is not None and previous["updated_at"] != expected_updated_at:
                 return None
+            self._validate_domain_fields(fields, current=previous)
             where = "id=?"
             params: list[Any] = [*fields.values(), order_id]
             if expected_updated_at is not None:
@@ -498,18 +688,23 @@ class OrderRepository:
             if cursor.rowcount != 1:
                 return None
             row = db.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
-            self._insert_event(
-                db,
-                order_id=order_id,
-                order_number=row["order_number"],
-                event_type="status_changed" if row["status"] != previous["status"] else "order_updated",
-                actor_id=actor_id,
-                actor_name=actor_name,
-                actor_role=actor_role,
-                from_status=previous["status"],
-                to_status=row["status"],
-                changed_fields=changed_fields,
-            )
+            if not publication_only:
+                self._insert_event(
+                    db,
+                    order_id=order_id,
+                    order_number=row["order_number"],
+                    event_type=(
+                        "status_changed"
+                        if row["status"] != previous["status"]
+                        else "order_updated"
+                    ),
+                    actor_id=actor_id,
+                    actor_name=actor_name,
+                    actor_role=actor_role,
+                    from_status=previous["status"],
+                    to_status=row["status"],
+                    changed_fields=changed_fields,
+                )
         return Order.from_row(row)
 
     def transition(
@@ -519,6 +714,7 @@ class OrderRepository:
         *,
         guard_courier_id: int | None = None,
         require_unassigned_or_same: bool = False,
+        require_no_other_on_way_for_courier: bool = False,
         expected_updated_at: str | None = None,
         actor_id: int | None = None,
         actor_name: str | None = None,
@@ -533,6 +729,10 @@ class OrderRepository:
             raise ValueError(f"Unsupported fields: {invalid}")
         if not from_statuses:
             raise ValueError("from_statuses cannot be empty")
+        if (
+            require_unassigned_or_same or require_no_other_on_way_for_courier
+        ) and guard_courier_id is None:
+            raise ValueError("guard_courier_id is required")
         cleanups = [
             (int(chat_id), int(message_id))
             for chat_id, message_id in cleanup_messages
@@ -549,9 +749,26 @@ class OrderRepository:
         where = f"id=? AND status IN ({placeholders})"
         params: list[Any] = [*fields.values(), order_id, *sorted(from_statuses)]
         if require_unassigned_or_same:
-            if guard_courier_id is None:
-                raise ValueError("guard_courier_id is required")
-            where += " AND (courier_id IS NULL OR courier_id=?)"
+            # Authorization belongs in the same transaction as the status
+            # update. A manager can reassign a pending order between a
+            # courier's button click and this UPDATE; guarding only
+            # ``courier_id`` would then let the old courier mutate the newly
+            # assigned courier's order while courier_id is still NULL.
+            where += (
+                " AND (assigned_courier_id IS NULL OR assigned_courier_id=?)"
+                " AND (courier_id IS NULL OR courier_id=?)"
+            )
+            params.extend((guard_courier_id, guard_courier_id))
+        if require_no_other_on_way_for_courier:
+            where += (
+                " AND NOT EXISTS ("
+                "SELECT 1 FROM orders AS active_on_way "
+                "WHERE active_on_way.id != orders.id "
+                "AND active_on_way.status='on_way' "
+                "AND COALESCE(active_on_way.courier_id, "
+                "active_on_way.assigned_courier_id)=?"
+                ")"
+            )
             params.append(guard_courier_id)
         if expected_updated_at is not None:
             where += " AND updated_at=?"
@@ -559,11 +776,40 @@ class OrderRepository:
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             previous = db.execute(
-                "SELECT order_number, status, courier_id, courier_name, updated_at FROM orders WHERE id=?",
+                "SELECT * FROM orders WHERE id=?",
                 (order_id,),
             ).fetchone()
-            if previous and expected_updated_at is not None and previous["updated_at"] != expected_updated_at:
+            if not previous:
                 return None
+            if expected_updated_at is not None and previous["updated_at"] != expected_updated_at:
+                return None
+            self._validate_domain_fields(fields, current=previous)
+            if require_unassigned_or_same:
+                for courier_field in ("assigned_courier_id", "courier_id"):
+                    # Validate only values this call is trying to write. An
+                    # already-reassigned row is a normal stale-button race;
+                    # the atomic WHERE guard below must return ``None`` rather
+                    # than turn it into an application error.
+                    if (
+                        courier_field in fields
+                        and fields[courier_field] not in {None, guard_courier_id}
+                    ):
+                        raise ValueError(
+                            f"{courier_field} must match guard_courier_id"
+                        )
+            if require_no_other_on_way_for_courier:
+                resulting_status = fields.get("status", previous["status"])
+                if resulting_status != "on_way":
+                    raise ValueError(
+                        "require_no_other_on_way_for_courier requires status='on_way'"
+                    )
+                # Starting a trip must explicitly claim the order for the
+                # guarded courier; merely inheriting assigned_courier_id is
+                # not enough for an authorization-sensitive transition.
+                if fields.get("courier_id") != guard_courier_id:
+                    raise ValueError(
+                        "guard_courier_id must match the order's effective courier"
+                    )
             cursor = db.execute(f"UPDATE orders SET {assignments} WHERE {where}", params)
             if cursor.rowcount != 1:
                 return None
@@ -666,24 +912,66 @@ class OrderRepository:
             )
         return cursor.rowcount == 1
 
+    def operational_counts(self) -> dict[str, int]:
+        """Return small queue-health counters without loading queue rows."""
+        with self.connect() as db:
+            row = db.execute(
+                """SELECT
+                       (SELECT COUNT(*) FROM orders WHERE sync_needed=1) AS sync_pending,
+                       (SELECT COUNT(*) FROM telegram_cleanup_queue WHERE terminal=0)
+                           AS cleanup_pending,
+                       (SELECT COUNT(*) FROM telegram_cleanup_queue WHERE terminal=1)
+                           AS cleanup_terminal"""
+            ).fetchone()
+        return {
+            "sync_pending": int(row["sync_pending"]),
+            "cleanup_pending": int(row["cleanup_pending"]),
+            "cleanup_terminal": int(row["cleanup_terminal"]),
+        }
+
     def list_cleanup_messages(
         self,
         *,
         limit: int = 100,
         order_id: int | None = None,
     ) -> list[dict[str, Any]]:
+        """Return only non-terminal cleanup work whose retry time has arrived."""
         limit, _ = self._page_bounds(limit, 0)
-        where = ""
-        params: list[Any] = []
+        clauses = ["terminal=0", "(next_attempt_at IS NULL OR next_attempt_at<=?)"]
+        params: list[Any] = [now()]
         if order_id is not None:
-            where = "WHERE order_id=?"
+            clauses.append("order_id=?")
             params.append(order_id)
         params.append(limit)
         with self.connect() as db:
             rows = db.execute(
                 f"""SELECT * FROM telegram_cleanup_queue
-                    {where}
-                    ORDER BY attempts, id
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY COALESCE(next_attempt_at, ''), attempts, id
+                    LIMIT ?""",
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_terminal_cleanup_messages(
+        self,
+        *,
+        limit: int = 100,
+        order_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return dead-letter cleanup work for diagnostics or manual requeue."""
+        limit, _ = self._page_bounds(limit, 0)
+        clauses = ["terminal=1"]
+        params: list[Any] = []
+        if order_id is not None:
+            clauses.append("order_id=?")
+            params.append(order_id)
+        params.append(limit)
+        with self.connect() as db:
+            rows = db.execute(
+                f"""SELECT * FROM telegram_cleanup_queue
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY attempts DESC, id
                     LIMIT ?""",
                 params,
             ).fetchall()
@@ -724,13 +1012,47 @@ class OrderRepository:
             )
         return cursor.rowcount == 1
 
-    def mark_cleanup_failed(self, cleanup_id: int, error: str) -> bool:
+    def mark_cleanup_failed(
+        self,
+        cleanup_id: int,
+        error: str,
+        *,
+        permanent: bool = False,
+    ) -> bool:
+        """Back off transient cleanup failures and dead-letter permanent ones."""
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT attempts, terminal FROM telegram_cleanup_queue WHERE id=?",
+                (cleanup_id,),
+            ).fetchone()
+            if not row or row["terminal"]:
+                return False
+            attempts = int(row["attempts"]) + 1
+            terminal = int(permanent or attempts >= CLEANUP_MAX_ATTEMPTS)
+            next_attempt_at = None if terminal else _retry_at(attempts)
+            cursor = db.execute(
+                """UPDATE telegram_cleanup_queue
+                   SET attempts=?, last_error=?, next_attempt_at=?, terminal=?
+                   WHERE id=? AND terminal=0""",
+                (
+                    attempts,
+                    str(error)[:500],
+                    next_attempt_at,
+                    terminal,
+                    cleanup_id,
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def requeue_cleanup_message(self, cleanup_id: int) -> bool:
+        """Explicitly return a dead-letter cleanup item to the runnable queue."""
         with self.connect() as db:
             cursor = db.execute(
                 """UPDATE telegram_cleanup_queue
-                   SET attempts=attempts+1, last_error=?
-                   WHERE id=?""",
-                (error[:500], cleanup_id),
+                   SET attempts=0, last_error=NULL, next_attempt_at=NULL, terminal=0
+                   WHERE id=? AND terminal=1""",
+                (cleanup_id,),
             )
         return cursor.rowcount == 1
 
@@ -772,6 +1094,14 @@ class OrderRepository:
             rows = db.execute(
                 "SELECT * FROM order_events WHERE order_id=? ORDER BY id",
                 (order_id,),
+            ).fetchall()
+        return [OrderEvent.from_row(row) for row in rows]
+
+    def list_all_events(self) -> list[OrderEvent]:
+        """Return the append-only audit stream without per-order N+1 reads."""
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM order_events ORDER BY created_at, id"
             ).fetchall()
         return [OrderEvent.from_row(row) for row in rows]
 

@@ -10,26 +10,28 @@ from zoneinfo import ZoneInfo
 
 from telegram import ReplyKeyboardRemove, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Forbidden, RetryAfter
 from telegram.ext import (
-    Application, CallbackQueryHandler, CommandHandler, ContextTypes,
-    ConversationHandler, MessageHandler, filters,
+    Application, ApplicationHandlerStop, CallbackQueryHandler, CommandHandler, ContextTypes,
+    ConversationHandler, MessageHandler, TypeHandler, filters,
 )
 
 from app.bot.keyboards import (
     all_locations_keyboard, completed_keyboard, courier_cancelled_keyboard,
-    courier_keyboard, courier_selection_keyboard,
+    courier_keyboard, courier_reassignment_confirmation_keyboard,
+    courier_selection_keyboard,
     delivery_pending_keyboard, delivery_time_keyboard, edit_input_keyboard,
-    location_channel_keyboard, log_location_keyboard, main_keyboard,
+    location_channel_keyboard, log_location_keyboard, log_order_keyboard, log_read_keyboard,
+    main_keyboard,
     manager_cancelled_keyboard, manager_sent_keyboard, on_way_keyboard,
     orders_channel_keyboard, orders_page_keyboard, payment_keyboard, review_keyboard, seller_keyboard,
-    skip_keyboard, statistics_keyboard, text_location_keyboard,
+    readonly_order_keyboard, skip_keyboard, statistics_keyboard, text_location_keyboard,
 )
 from app.config import Settings
 from app.database import OrderRepository
 from app.monitor_service import build_delivery_monitor
 from app.utils import (
-    completed_card, courier_card, enrich_location, manager_card,
+    completed_card, courier_card, enrich_location, extract_text_address, manager_card,
     normalize_payment, normalize_seller, parse_amount,
     parse_order_details,
 )
@@ -38,7 +40,7 @@ from app.utils.formatters import (
     money, orders_channel_card, short_address,
 )
 from app.utils.couriers import (
-    courier_group_id, courier_group_ids, courier_ids, courier_option,
+    courier_group_id, courier_option,
 )
 from app.utils.parsers import display_phone
 
@@ -50,6 +52,8 @@ LOCATION_SEPARATOR = "\n".join(["📍" * 11] * 3)
 ORDER_PAGE_SIZE = 10
 EDIT_CANCEL_TEXT = "❌ Отменить изменение"
 TEXT_LOCATION_BUTTON = "📝 Локация текстом"
+DELETE_SECOND_LOCATION_TEXT = "🗑 Удалить доп. локацию"
+TELEGRAM_SAFE_TEXT_LIMIT = 3800
 MAIN_MENU_TEXTS = {
     "➕ Новый заказ",
     "📋 Активные заказы",
@@ -84,6 +88,22 @@ def _message_is_missing(error: Exception) -> bool:
             "message can't be edited",
         )
     )
+
+
+def _cleanup_error_is_permanent(error: Exception) -> bool:
+    if isinstance(error, Forbidden):
+        return True
+    if not isinstance(error, BadRequest):
+        return False
+    value = str(error).casefold()
+    return any(marker in value for marker in (
+        "message can't be deleted",
+        "message cannot be deleted",
+        "not enough rights",
+        "need administrator rights",
+        "chat not found",
+        "bot was kicked",
+    ))
 
 
 def _order_sync_lock(application: Application, order_id: int) -> asyncio.Lock:
@@ -125,6 +145,54 @@ async def _notify_manager(context: ContextTypes.DEFAULT_TYPE, manager_id: int, t
         logger.exception("Could not notify manager %s", manager_id)
 
 
+async def _access_guard(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Silently discard updates outside the configured users and work chats."""
+    settings: Settings = context.application.bot_data["settings"]
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat and chat.type == "private":
+        if user and user.id in (settings.manager_ids | _allowed_courier_ids(settings)):
+            return
+        raise ApplicationHandlerStop
+    # Channel posts and anonymous service updates have no accountable actor.
+    # They must never enter manager conversations or command handlers.
+    if user is None:
+        raise ApplicationHandlerStop
+    allowed_chats = _known_delivery_groups(settings) | frozenset({
+        settings.location_channel_id,
+        settings.orders_channel_id,
+    })
+    if chat and chat.id in allowed_chats:
+        return
+    raise ApplicationHandlerStop
+
+
+async def _require_manager_flow(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> bool:
+    """Revalidate persisted manager conversations before every state write."""
+    settings: Settings = context.application.bot_data["settings"]
+    chat = getattr(update, "effective_chat", None)
+    user = getattr(update, "effective_user", None)
+    if getattr(chat, "type", None) == "private" and user and user.id in settings.manager_ids:
+        return True
+    user_data = getattr(context, "user_data", None)
+    if isinstance(user_data, dict):
+        user_data.pop("draft", None)
+        user_data.pop("edit", None)
+    message = getattr(update, "effective_message", None) or getattr(update, "message", None)
+    if message and getattr(chat, "type", None) == "private":
+        await message.reply_text(
+            "Доступ менеджера отозван. Незавершённое действие закрыто.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    return False
+
+
 async def _notify_log(
     context: ContextTypes.DEFAULT_TYPE,
     text: str,
@@ -155,6 +223,80 @@ async def _notify_log(
         # A notification is secondary to the durable order/event update. The
         # canonical Log card is still synchronized by _sync_order.
         logger.exception("Could not publish delivery notification to Log channel")
+
+
+_EDIT_FIELD_LABELS = {
+    "seller": "владелец заказа",
+    "payment_status": "оплата",
+    "product": "товар",
+    "phone": "телефон клиента",
+    "location": "основная локация",
+    "second_location": "дополнительная локация",
+    "amount": "сумма",
+    "delivery_time": "время доставки",
+    "comment": "комментарий",
+}
+
+
+def _edited_value_text(order, field: str) -> str:
+    if field == "seller":
+        return order.seller_name or "—"
+    if field == "payment_status":
+        return "оплачено" if order.payment_status == "paid_at_assembly" else "оплата при доставке"
+    if field == "product":
+        return order.product
+    if field == "phone":
+        phones = [display_phone(order.client_phone)]
+        if order.client_phone_2 and order.client_phone_2 != order.client_phone:
+            phones.append(display_phone(order.client_phone_2))
+        return " · ".join(phones)
+    if field == "amount":
+        return money(order.amount_usd, order.amount_uzs)
+    if field == "location":
+        return short_address(order)
+    if field == "second_location":
+        return (
+            short_address(order, 2)
+            if order.second_address_text or order.second_location_url
+            else "удалена"
+        )
+    if field == "delivery_time":
+        return order.delivery_time or "не указано"
+    if field == "comment":
+        return order.comment or "удалён"
+    return "обновлено"
+
+
+async def _notify_active_order_edit(
+    context: ContextTypes.DEFAULT_TYPE,
+    order,
+    field: str,
+    actor_name: str,
+) -> None:
+    """Push edits after the courier acknowledged the order."""
+    label = _EDIT_FIELD_LABELS.get(field, "данные заказа")
+    value = escape(_edited_value_text(order, field)).replace("\n", " · ")
+    text = (
+        f"⚠️ <b>Заказ №{order.order_number} изменён менеджером</b>\n"
+        f"✏️ {escape(label).capitalize()}: <b>{value}</b>\n"
+        f"👤 {escape(actor_name)}\n"
+        "Проверьте обновлённую карточку перед доставкой."
+    )
+    if order.delivery_chat_id:
+        try:
+            await context.bot.send_message(
+                chat_id=order.delivery_chat_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=log_order_keyboard(order),
+            )
+        except Exception:
+            logger.exception(
+                "Could not notify courier group about edited order %s",
+                order.id,
+            )
+    await _notify_log(context, text, reply_markup=log_order_keyboard(order))
 
 
 async def _estimated_delivery_time(
@@ -248,14 +390,21 @@ def _courier_waiting_pickup_text(
         if order.status == "pending" and order.assigned_courier_id == courier_id
     ]
     lines = [f"⏳ <b>Ждём курьера {escape(courier_name)}</b>"]
+    omitted = 0
     for index, order in enumerate(waiting, start=1):
         manager = order.seller_name or order.manager_name or "—"
-        lines.append(
+        line = (
             f"{index}. Заказ №{order.order_number} · "
-            f"{escape(manager)} · {escape(order.product)}"
+            f"{escape(manager[:80])} · {escape(order.product[:200])}"
         )
+        if len("\n".join([*lines, line])) > TELEGRAM_SAFE_TEXT_LIMIT - 80:
+            omitted = len(waiting) - index + 1
+            break
+        lines.append(line)
     if not waiting:
         lines.append("Все товары уже забраны.")
+    elif omitted:
+        lines.append(f"…и ещё {omitted} заказов. Полный список — в мониторинге.")
     return "\n".join(lines)
 
 
@@ -354,6 +503,8 @@ async def _refresh_delivery_message(context: ContextTypes.DEFAULT_TYPE, order) -
             reply_markup=keyboard,
         )
         return True
+    except RetryAfter:
+        raise
     except Exception as error:
         if _message_is_not_modified(error):
             return True
@@ -403,6 +554,8 @@ async def _refresh_manager_message(context: ContextTypes.DEFAULT_TYPE, order) ->
                 disable_web_page_preview=True,
                 reply_markup=_manager_order_keyboard(order),
             )
+        except RetryAfter:
+            raise
         except Exception:
             logger.exception("Could not recreate manager message for order %s", order.id)
             return False
@@ -432,6 +585,8 @@ async def _refresh_manager_message(context: ContextTypes.DEFAULT_TYPE, order) ->
             reply_markup=_manager_order_keyboard(order),
         )
         return True
+    except RetryAfter:
+        raise
     except Exception as error:
         if _message_is_not_modified(error):
             return True
@@ -467,6 +622,8 @@ async def _refresh_orders_channel_message(context: ContextTypes.DEFAULT_TYPE, or
                 disable_web_page_preview=True,
                 reply_markup=keyboard,
             )
+        except RetryAfter:
+            raise
         except Exception:
             logger.exception("Could not publish orders-channel card for order %s", order.id)
             return False
@@ -496,6 +653,8 @@ async def _refresh_orders_channel_message(context: ContextTypes.DEFAULT_TYPE, or
             reply_markup=keyboard,
         )
         return True
+    except RetryAfter:
+        raise
     except Exception as error:
         if _message_is_not_modified(error):
             return True
@@ -550,6 +709,8 @@ async def _set_location_marker(
                     location_number=number,
                 ),
             )
+        except RetryAfter:
+            raise
         except Exception as error:
             if not _message_is_not_modified(error):
                 if _message_is_missing(error):
@@ -724,12 +885,18 @@ async def _process_cleanup_messages(
                 chat_id=item["chat_id"],
                 message_id=item["message_id"],
             )
+        except RetryAfter:
+            raise
         except Exception as error:
             if _message_is_missing(error):
                 repo.mark_cleanup_done(item["id"])
             else:
                 success = False
-                repo.mark_cleanup_failed(item["id"], str(error))
+                repo.mark_cleanup_failed(
+                    item["id"],
+                    str(error),
+                    permanent=_cleanup_error_is_permanent(error),
+                )
                 logger.warning(
                     "Could not clean superseded Telegram message %s/%s: %s",
                     item["chat_id"],
@@ -754,6 +921,9 @@ def _order_should_be_in_delivery_group(order) -> bool:
 
 def _target_delivery_group(settings: Settings, order) -> int:
     """Resolve the assigned courier group while preserving legacy orders."""
+    # A known assignment must never jump to the fallback group merely because
+    # an environment file was temporarily incomplete. Settings.load rejects
+    # that configuration, while this remains a defence for legacy/test rows.
     assigned_group = courier_group_id(order.assigned_courier_id)
     if assigned_group is not None:
         return assigned_group
@@ -761,11 +931,17 @@ def _target_delivery_group(settings: Settings, order) -> int:
 
 
 def _allowed_courier_ids(settings: Settings) -> frozenset[int]:
-    return settings.courier_ids | courier_ids()
+    return frozenset(getattr(settings, "courier_ids", ()))
 
 
 def _known_delivery_groups(settings: Settings) -> frozenset[int]:
-    return courier_group_ids() | frozenset({settings.delivery_group_id})
+    configured_ids = frozenset(getattr(settings, "courier_ids", ()))
+    configured_groups = {
+        group_id
+        for courier_id in configured_ids
+        if (group_id := courier_group_id(courier_id)) is not None
+    }
+    return frozenset(configured_groups) | frozenset({settings.delivery_group_id})
 
 
 async def _sync_order(context: ContextTypes.DEFAULT_TYPE, order_id: int) -> tuple[object | None, bool]:
@@ -869,6 +1045,8 @@ async def _sync_order_locked(context: ContextTypes.DEFAULT_TYPE, order_id: int) 
                 repo.enqueue_cleanup_messages(order_id, [(sent.chat_id, sent.message_id)])
                 await _process_cleanup_messages(context, order_id=order_id)
                 success = False
+        except RetryAfter:
+            raise
         except Exception:
             success = False
             logger.exception("Could not publish delivery message for order %s", order_id)
@@ -889,6 +1067,8 @@ async def _sync_order_locked(context: ContextTypes.DEFAULT_TYPE, order_id: int) 
                     continue
                 try:
                     order = await _publish_location(context, repo, order, location_number)
+                except RetryAfter:
+                    raise
                 except Exception:
                     success = False
                     logger.exception("Could not publish location %s for order %s", location_number, order_id)
@@ -970,6 +1150,8 @@ async def _finish_status_change_locked(
             disable_web_page_preview=True,
             reply_markup=keyboard,
         )
+    except RetryAfter:
+        raise
     except Exception as error:
         if not _message_is_not_modified(error):
             success = False
@@ -1014,6 +1196,22 @@ async def validate_delivery_configuration(application: Application) -> None:
             False,
         ):
             raise RuntimeError(f"The delivery bot cannot send to group {delivery_group_id}")
+
+    # A configured courier who cannot see their own group or the private
+    # location channel will receive unusable cards. Fail at startup with a
+    # precise configuration error instead of losing an order later.
+    for courier_id in sorted(_allowed_courier_ids(settings)):
+        configured = courier_option(courier_id)
+        if not configured:
+            raise RuntimeError(f"Courier {courier_id} has no configured name/group")
+        courier_member = await application.bot.get_chat_member(
+            configured.group_id,
+            courier_id,
+        )
+        if courier_member.status in {"left", "kicked"}:
+            raise RuntimeError(
+                f"Courier {configured.name} must be a member of group {configured.group_id}"
+            )
     location_chat = await application.bot.get_chat(settings.location_channel_id)
     if location_chat.type not in {"channel", "supergroup"}:
         raise RuntimeError("DELIVERY_LOCATION_CHANNEL_ID must point to a channel or supergroup")
@@ -1034,6 +1232,16 @@ async def validate_delivery_configuration(application: Application) -> None:
         False,
     ):
         raise RuntimeError("The delivery bot must be allowed to delete obsolete location posts")
+    for courier_id in sorted(_allowed_courier_ids(settings)):
+        configured = courier_option(courier_id)
+        courier_member = await application.bot.get_chat_member(
+            settings.location_channel_id,
+            courier_id,
+        )
+        if courier_member.status in {"left", "kicked"}:
+            raise RuntimeError(
+                f"Courier {configured.name} must be a member of the location channel"
+            )
 
     orders_channel_id = getattr(settings, "orders_channel_id", None)
     if orders_channel_id:
@@ -1080,6 +1288,8 @@ async def reconcile_orders_on_start(application: Application) -> None:
     for order_id in sorted(candidates):
         try:
             await _sync_order(context, order_id)
+        except RetryAfter:
+            raise
         except Exception:
             logger.exception("Startup reconciliation failed for order %s", order_id)
     await _process_cleanup_messages(context)
@@ -1124,6 +1334,8 @@ async def _end_creation_with_order_list(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> int:
     """Discard a draft when the manager intentionally opens another screen."""
+    if not await _require_manager_flow(update, context):
+        return ConversationHandler.END
     draft = context.user_data.get("draft") or {}
     repo: OrderRepository = context.application.bot_data["repo"]
     committed = repo.get_by_creation_token(draft.get("creation_token"))
@@ -1145,6 +1357,8 @@ async def _end_creation_with_map(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> int:
+    if not await _require_manager_flow(update, context):
+        return ConversationHandler.END
     draft = context.user_data.get("draft") or {}
     repo: OrderRepository = context.application.bot_data["repo"]
     committed = repo.get_by_creation_token(draft.get("creation_token"))
@@ -1161,6 +1375,8 @@ async def _end_creation_with_statistics(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> int:
+    if not await _require_manager_flow(update, context):
+        return ConversationHandler.END
     draft = context.user_data.get("draft") or {}
     repo: OrderRepository = context.application.bot_data["repo"]
     committed = repo.get_by_creation_token(draft.get("creation_token"))
@@ -1193,6 +1409,13 @@ async def show_statistics(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         parse_mode=ParseMode.HTML,
         reply_markup=statistics_keyboard(settings.stats_url),
     )
+
+
+def _monitor_url(settings: Settings) -> str | None:
+    stats_url = (getattr(settings, "stats_url", "") or "").strip().rstrip("/")
+    if not stats_url:
+        return None
+    return stats_url.rsplit("/", 1)[0] + "/monitor"
 
 
 async def _show_orders(
@@ -1239,7 +1462,8 @@ async def _show_orders(
     map_url = None
     heading = f"{title}: {total}\nСтраница {page + 1} из {total_pages}"
     if active_only:
-        _map_text, map_url = all_locations_card(repo.list_open())
+        _map_text, fallback_map_url = all_locations_card(repo.list_open())
+        map_url = _monitor_url(settings) or fallback_map_url
         if map_url:
             heading += "\n🗺 Все локации — по кнопке ниже"
     entries: list[str] = []
@@ -1263,7 +1487,7 @@ async def _show_orders(
         page,
         total_pages,
         map_url,
-        orders if active_only else None,
+        orders,
     )
     if query:
         try:
@@ -1308,8 +1532,26 @@ async def open_order_from_list(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     repo: OrderRepository = context.application.bot_data["repo"]
     order = repo.get(int(query.data.split(":", 1)[1]))
-    if not order or order.status not in MANAGER_EDITABLE_STATUSES:
-        await query.answer("Этот заказ уже нельзя изменять", show_alert=True)
+    if not order:
+        await query.answer("Заказ не найден", show_alert=True)
+        return
+    if order.status not in MANAGER_EDITABLE_STATUSES:
+        await query.answer(f"Заказ №{order.order_number}")
+        try:
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=orders_channel_card(order),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=readonly_order_keyboard(order),
+            )
+        except Exception:
+            logger.exception("Could not open archived order %s from order list", order.id)
+            await _notify_manager(
+                context,
+                query.from_user.id,
+                f"⚠️ Не удалось открыть заказ №{order.order_number}. Попробуйте ещё раз.",
+            )
         return
     await query.answer(f"Открываю заказ №{order.order_number}…")
     try:
@@ -1380,9 +1622,7 @@ async def open_order_from_list(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def new_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    settings: Settings = context.application.bot_data["settings"]
-    if update.effective_chat.type != "private" or not _allowed(update.effective_user.id, settings.manager_ids):
-        await update.message.reply_text("Создание заказа доступно менеджерам в личном чате с ботом.")
+    if not await _require_manager_flow(update, context):
         return ConversationHandler.END
     context.user_data.pop("edit", None)
     previous_draft = context.user_data.get("draft") or {}
@@ -1417,6 +1657,8 @@ async def new_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def seller(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await _require_manager_flow(update, context):
+        return ConversationHandler.END
     draft = context.user_data.get("draft")
     if draft is None:
         await update.message.reply_text("Начните новый заказ заново.", reply_markup=main_keyboard())
@@ -1432,6 +1674,8 @@ async def seller(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await _require_manager_flow(update, context):
+        return ConversationHandler.END
     draft = context.user_data.get("draft")
     if draft is None:
         await update.message.reply_text("Начните новый заказ заново.", reply_markup=main_keyboard())
@@ -1487,15 +1731,22 @@ def _same_location(draft: dict, values: dict, prefix: str = "") -> bool:
 
 
 def _merge_location(draft: dict, values: dict) -> int:
-    if draft.get("latitude") is None or draft.get("longitude") is None:
+    primary_occupied = bool(draft.get("address_text")) or (
+        draft.get("latitude") is not None and draft.get("longitude") is not None
+    )
+    if not primary_occupied:
         draft.update(values)
         return 1
-    if _same_location(draft, values):
+    if draft.get("latitude") is not None and _same_location(draft, values):
         return 1
-    if draft.get("second_latitude") is None or draft.get("second_longitude") is None:
+    second_occupied = bool(draft.get("second_address_text")) or (
+        draft.get("second_latitude") is not None
+        and draft.get("second_longitude") is not None
+    )
+    if not second_occupied:
         draft.update(_as_second_location(values))
         return 2
-    if _same_location(draft, values, "second_"):
+    if draft.get("second_latitude") is not None and _same_location(draft, values, "second_"):
         return 2
     raise ValueError("У заказа уже сохранены две локации")
 
@@ -1526,6 +1777,8 @@ async def _capture_order_details(message, draft: dict) -> list[str]:
 
 
 async def details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await _require_manager_flow(update, context):
+        return ConversationHandler.END
     draft = context.user_data.get("draft")
     if draft is None:
         await update.message.reply_text("Начните новый заказ заново.", reply_markup=main_keyboard())
@@ -1553,9 +1806,7 @@ async def details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 await update.message.reply_text(str(error), reply_markup=ReplyKeyboardRemove())
                 return DETAILS
             draft.update(
-                address_text=address,
-                district=None,
-                mahalla=None,
+                **extract_text_address(address),
                 location_url=None,
                 latitude=None,
                 longitude=None,
@@ -1605,6 +1856,8 @@ def _as_second_location(values: dict) -> dict:
 
 async def second_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Compatibility path for conversations started by the previous release."""
+    if not await _require_manager_flow(update, context):
+        return ConversationHandler.END
     draft = context.user_data.get("draft")
     if draft is None:
         await update.message.reply_text("Начните новый заказ заново.", reply_markup=main_keyboard())
@@ -1632,6 +1885,8 @@ async def second_location(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await _require_manager_flow(update, context):
+        return ConversationHandler.END
     draft = context.user_data.get("draft")
     if draft is None:
         await update.message.reply_text("Начните новый заказ заново.", reply_markup=main_keyboard())
@@ -1663,6 +1918,8 @@ async def payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def delivery_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await _require_manager_flow(update, context):
+        return ConversationHandler.END
     draft = context.user_data.get("draft")
     if draft is None:
         await update.message.reply_text("Начните новый заказ заново.", reply_markup=main_keyboard())
@@ -1678,6 +1935,8 @@ async def delivery_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 
 async def comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await _require_manager_flow(update, context):
+        return ConversationHandler.END
     draft = context.user_data.get("draft")
     if draft is None:
         await update.message.reply_text(
@@ -1834,12 +2093,16 @@ async def toggle_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def cancel_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await _require_manager_flow(update, context):
+        return ConversationHandler.END
     context.user_data.pop("edit", None)
     await update.message.reply_text("Изменение отменено.", reply_markup=main_keyboard())
     return ConversationHandler.END
 
 
 async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await _require_manager_flow(update, context):
+        return ConversationHandler.END
     edit = context.user_data.get("edit")
     if not edit or update.effective_chat.id != edit["chat_id"]:
         return ConversationHandler.END
@@ -1861,9 +2124,43 @@ async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             values["client_phone_2"] = phones[1] if len(phones) > 1 else None
         elif field == "amount": values["amount_usd"], values["amount_uzs"] = parse_amount(update.message.text or "")
         elif field in {"location", "second_location"}:
-            values.update(await _location_values(update.message))
-            if field == "second_location":
-                values = _as_second_location(values)
+            prefix = "second_" if field == "second_location" else ""
+            if incoming_text == DELETE_SECOND_LOCATION_TEXT:
+                if field != "second_location":
+                    raise ValueError("Основную локацию нельзя удалить")
+                values = {
+                    "second_location_url": None,
+                    "second_latitude": None,
+                    "second_longitude": None,
+                    "second_address_text": None,
+                    "second_district": None,
+                    "second_mahalla": None,
+                }
+                edit.pop("awaiting_text_location", None)
+            elif incoming_text == TEXT_LOCATION_BUTTON and not update.message.location:
+                edit["awaiting_text_location"] = True
+                await update.message.reply_text(
+                    "Напишите адрес текстом.",
+                    reply_markup=edit_input_keyboard(field),
+                )
+                return EDIT_VALUE
+            elif edit.get("awaiting_text_location") and not update.message.location:
+                address = _text(update.message, maximum=1000)
+                values = {
+                    f"{prefix}location_url": None,
+                    f"{prefix}latitude": None,
+                    f"{prefix}longitude": None,
+                }
+                values.update({
+                    f"{prefix}{key}": value
+                    for key, value in extract_text_address(address).items()
+                })
+                edit.pop("awaiting_text_location", None)
+            else:
+                edit.pop("awaiting_text_location", None)
+                values.update(await _location_values(update.message))
+                if field == "second_location":
+                    values = _as_second_location(values)
         else:
             limits = {"product": 200, "delivery_time": 100, "comment": 1000}
             values[field] = _text(update.message, maximum=limits[field], required=field == "product")
@@ -1877,25 +2174,18 @@ async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("Этот заказ уже нельзя изменить.", reply_markup=main_keyboard())
         return ConversationHandler.END
 
+    if all(getattr(previous, key) == value for key, value in values.items()):
+        context.user_data.pop("edit", None)
+        await update.message.reply_text("ℹ️ Данные не изменились.", reply_markup=main_keyboard())
+        return ConversationHandler.END
+
     sent = previous.status != "draft"
     location_number = 2 if field == "second_location" else 1
     publication_fields: dict = {}
-    if sent and field in {"location", "second_location"}:
-        candidate = replace(previous, **values)
-        try:
-            publication_fields = await _send_location_messages(context, candidate, location_number)
-        except Exception:
-            logger.exception("Could not publish replacement location for order %s", previous.id)
-            await update.message.reply_text(
-                "⚠️ Новая локация не сохранена: Telegram-канал недоступен. Старая точка осталась рабочей. Попробуйте ещё раз.",
-                reply_markup=edit_input_keyboard(field),
-            )
-            return EDIT_VALUE
-        values.update(publication_fields)
-
     actor = getattr(update, "effective_user", None)
     cleanup_messages: list[tuple[int, int]] = []
-    if publication_fields:
+    if field in {"location", "second_location"}:
+        prefix = "second_" if location_number == 2 else ""
         old_chat_id = (
             previous.second_location_chat_id
             if location_number == 2
@@ -1922,6 +2212,34 @@ async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 for message_id in (old_details_id, old_pin_id, old_footer_id)
                 if message_id
             ]
+        has_coordinates = (
+            values.get(f"{prefix}latitude") is not None
+            and values.get(f"{prefix}longitude") is not None
+        )
+        if sent and has_coordinates:
+            candidate = replace(previous, **values)
+            try:
+                publication_fields = await _send_location_messages(
+                    context,
+                    candidate,
+                    location_number,
+                )
+            except Exception:
+                logger.exception("Could not publish replacement location for order %s", previous.id)
+                await update.message.reply_text(
+                    "⚠️ Новая локация не сохранена: Telegram-канал недоступен. "
+                    "Старая точка осталась рабочей. Попробуйте ещё раз.",
+                    reply_markup=edit_input_keyboard(field),
+                )
+                return EDIT_VALUE
+            values.update(publication_fields)
+        else:
+            values.update({
+                f"{prefix}location_chat_id": None,
+                f"{prefix}location_message_id": None,
+                f"{prefix}location_details_message_id": None,
+                f"{prefix}location_footer_message_id": None,
+            })
     order = repo.transition(
         edit["order_id"],
         MANAGER_EDITABLE_STATUSES,
@@ -1970,7 +2288,7 @@ async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             reply_markup=main_keyboard(),
         )
         return ConversationHandler.END
-    if publication_fields:
+    if cleanup_messages:
         await _process_cleanup_messages(context, order_id=order.id)
 
     keyboard = manager_sent_keyboard(order) if sent else review_keyboard(order.id)
@@ -1990,6 +2308,7 @@ async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             logger.exception("Could not refresh manager message for order %s", order.id)
     if sent or _orders_channel_id(context):
         order, refreshed = await _sync_order(context, order.id)
+        order = order or repo.get(edit["order_id"])
         if not refreshed:
             _schedule_sync_retry(context, order.id)
     else:
@@ -1999,6 +2318,17 @@ async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             repo.mark_synced(refreshed_order.id, expected_updated_at=refreshed_order.updated_at)
         elif not manager_refreshed:
             _schedule_sync_retry(context, order.id)
+    if (
+        sent
+        and (previous.courier_read_at or previous.status in {"picked_up", "on_way"})
+        and field in _EDIT_FIELD_LABELS
+    ):
+        await _notify_active_order_edit(
+            context,
+            order,
+            field,
+            _name(actor) if actor else previous.manager_name,
+        )
     context.user_data.pop("edit", None)
     if not manager_refreshed:
         result = "⚠️ Данные сохранены в базе, но карточку менеджера обновить не удалось."
@@ -2088,8 +2418,37 @@ async def manager_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         else:
             repo.mark_synced(cancelled.id, expected_updated_at=cancelled.updated_at)
         return
-    await query.edit_message_reply_markup(reply_markup=courier_selection_keyboard(order))
+    await query.edit_message_reply_markup(
+        reply_markup=courier_selection_keyboard(
+            order,
+            allowed_courier_ids=_allowed_courier_ids(settings),
+        )
+    )
     await query.answer("Выберите курьера")
+
+
+def _courier_assignment_source_is_current(
+    order,
+    query,
+    settings: Settings,
+    *,
+    orders_channel_source: bool,
+) -> bool:
+    if orders_channel_source:
+        return bool(
+            order.orders_channel_chat_id
+            and order.orders_channel_message_id
+            and query.message.chat_id == order.orders_channel_chat_id
+            and query.message.message_id == order.orders_channel_message_id
+            and query.message.chat_id == getattr(settings, "orders_channel_id", None)
+        )
+    return bool(
+        not order.manager_message_id
+        or (
+            query.message.chat_id == order.manager_chat_id
+            and query.message.message_id == order.manager_message_id
+        )
+    )
 
 
 async def courier_assignment_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2107,22 +2466,12 @@ async def courier_assignment_action(update: Update, context: ContextTypes.DEFAUL
     if not order:
         await query.answer("Заказ не найден", show_alert=True)
         return
-    if orders_channel_source:
-        source_is_current = bool(
-            order.orders_channel_chat_id
-            and order.orders_channel_message_id
-            and query.message.chat_id == order.orders_channel_chat_id
-            and query.message.message_id == order.orders_channel_message_id
-            and query.message.chat_id == getattr(settings, "orders_channel_id", None)
-        )
-    else:
-        source_is_current = bool(
-            not order.manager_message_id
-            or (
-                query.message.chat_id == order.manager_chat_id
-                and query.message.message_id == order.manager_message_id
-            )
-        )
+    source_is_current = _courier_assignment_source_is_current(
+        order,
+        query,
+        settings,
+        orders_channel_source=orders_channel_source,
+    )
     if not source_is_current:
         await query.answer("Эта карточка устарела. Откройте актуальную карточку заказа.", show_alert=True)
         return
@@ -2132,7 +2481,11 @@ async def courier_assignment_action(update: Update, context: ContextTypes.DEFAUL
     if action == "courier_menu":
         source = "orders_channel" if orders_channel_source else "manager"
         await query.edit_message_reply_markup(
-            reply_markup=courier_selection_keyboard(order, source=source)
+            reply_markup=courier_selection_keyboard(
+                order,
+                source=source,
+                allowed_courier_ids=_allowed_courier_ids(settings),
+            )
         )
         await query.answer("Выберите курьера")
         return
@@ -2146,7 +2499,7 @@ async def courier_assignment_action(update: Update, context: ContextTypes.DEFAUL
         return
 
     selected = courier_option(int(parts[2])) if len(parts) == 3 else None
-    if not selected:
+    if not selected or selected.user_id not in _allowed_courier_ids(settings):
         await query.answer("Курьер не найден", show_alert=True)
         return
     if order.status != "draft" and order.assigned_courier_id == selected.user_id:
@@ -2155,79 +2508,150 @@ async def courier_assignment_action(update: Update, context: ContextTypes.DEFAUL
         await query.answer(f"Курьер {selected.name} уже выбран")
         return
 
-    # Publish first. Only after Telegram confirms the new card do we switch
-    # SQLite and enqueue the previous group's card for deletion atomically.
-    candidate = replace(
-        order,
-        status="pending",
-        assigned_courier_id=selected.user_id,
-        assigned_courier_name=selected.name,
-        courier_id=None,
-        courier_name=None,
-        courier_read_at=None,
-        picked_up_at=None,
-        time_started=None,
-        delivery_photo=None,
-        received_usd=None,
-        received_uzs=None,
-        delivered_at=None,
-    )
-    text, keyboard = _delivery_message(candidate)
-    await query.answer(f"Отправляю заказ курьеру {selected.name}…")
-    try:
-        sent = await context.bot.send_message(
-            selected.group_id,
-            text,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-            reply_markup=keyboard,
+    force_assignment = action == "courier_force_assign"
+    if (order.courier_read_at or order.status in {"picked_up", "on_way"}) and not force_assignment:
+        source = "orders_channel" if orders_channel_source else "manager"
+        await query.edit_message_reply_markup(
+            reply_markup=courier_reassignment_confirmation_keyboard(
+                order,
+                selected.user_id,
+                selected.name,
+                source=source,
+            )
         )
-    except Exception:
-        logger.exception("Could not assign order %s to courier %s", order.id, selected.name)
-        await _notify_manager(
-            context,
-            query.from_user.id,
-            f"⚠️ Не удалось отправить заказ №{order.order_number} курьеру {selected.name}. "
-            "Старый курьер не изменён.",
+        if order.status == "on_way":
+            consequence = "Будет отменён текущий выезд"
+        elif order.status == "picked_up":
+            consequence = "Будет снята отметка о получении товара"
+        else:
+            consequence = "Будет отменена поездка курьера на склад"
+        await query.answer(
+            f"{consequence}. Нажмите подтверждение ещё раз.",
+            show_alert=True,
         )
         return
 
-    cleanup_messages = []
-    if order.delivery_chat_id and order.delivery_message_id:
-        cleanup_messages.append((order.delivery_chat_id, order.delivery_message_id))
-    updated = repo.transition(
-        order.id,
-        {"draft", "pending", "picked_up", "on_way"},
-        expected_updated_at=order.updated_at,
-        actor_id=query.from_user.id,
-        actor_name=_name(query.from_user),
-        actor_role="manager",
-        cleanup_messages=cleanup_messages,
-        status="pending",
-        assigned_courier_id=selected.user_id,
-        assigned_courier_name=selected.name,
-        courier_id=None,
-        courier_name=None,
-        courier_read_at=None,
-        picked_up_at=None,
-        time_started=None,
-        delivery_photo=None,
-        received_usd=None,
-        received_uzs=None,
-        delivered_at=None,
-        delivery_chat_id=sent.chat_id,
-        delivery_message_id=sent.message_id,
-    )
+    # Serialize publication with background reconciliation for this order.
+    # Telegram has no idempotency key for sendMessage, but this closes the
+    # avoidable race where reconciliation and reassignment could both publish.
+    async with _order_sync_lock(context.application, order.id):
+        current = repo.get(order.id)
+        if (
+            not current
+            or current.updated_at != order.updated_at
+            or current.status not in {"draft", "pending", "picked_up", "on_way"}
+            or not _courier_assignment_source_is_current(
+                current,
+                query,
+                settings,
+                orders_channel_source=orders_channel_source,
+            )
+        ):
+            await query.answer(
+                "Заказ уже изменился. Откройте актуальную карточку.",
+                show_alert=True,
+            )
+            return
+        order = current
+
+        # Publish first. Only after Telegram confirms the new card do we switch
+        # SQLite and enqueue the previous group's card for deletion atomically.
+        candidate = replace(
+            order,
+            status="pending",
+            assigned_courier_id=selected.user_id,
+            assigned_courier_name=selected.name,
+            courier_id=None,
+            courier_name=None,
+            courier_read_at=None,
+            picked_up_at=None,
+            time_started=None,
+            delivery_photo=None,
+            received_usd=None,
+            received_uzs=None,
+            delivered_at=None,
+        )
+        text, keyboard = _delivery_message(candidate)
+        await query.answer(f"Отправляю заказ курьеру {selected.name}…")
+        try:
+            sent = await context.bot.send_message(
+                selected.group_id,
+                text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=keyboard,
+            )
+        except Exception:
+            logger.exception("Could not assign order %s to courier %s", order.id, selected.name)
+            await _notify_manager(
+                context,
+                query.from_user.id,
+                f"⚠️ Не удалось отправить заказ №{order.order_number} курьеру {selected.name}. "
+                "Старый курьер не изменён.",
+            )
+            return
+
+        cleanup_messages = []
+        if order.delivery_chat_id and order.delivery_message_id:
+            cleanup_messages.append((order.delivery_chat_id, order.delivery_message_id))
+        updated = repo.transition(
+            order.id,
+            {"draft", "pending", "picked_up", "on_way"},
+            expected_updated_at=order.updated_at,
+            actor_id=query.from_user.id,
+            actor_name=_name(query.from_user),
+            actor_role="manager",
+            cleanup_messages=cleanup_messages,
+            status="pending",
+            assigned_courier_id=selected.user_id,
+            assigned_courier_name=selected.name,
+            courier_id=None,
+            courier_name=None,
+            courier_read_at=None,
+            picked_up_at=None,
+            time_started=None,
+            delivery_photo=None,
+            received_usd=None,
+            received_uzs=None,
+            delivered_at=None,
+            delivery_chat_id=sent.chat_id,
+            delivery_message_id=sent.message_id,
+        )
+        if not updated:
+            repo.enqueue_cleanup_messages(order.id, [(sent.chat_id, sent.message_id)])
+            await _notify_manager(
+                context,
+                query.from_user.id,
+                "⚠️ Заказ уже изменился. Новая карточка курьера будет удалена; "
+                "откройте актуальный заказ.",
+            )
+            # Cleanup runs after releasing the order lock, because Telegram
+            # deletion may be rate-limited and needs no business-state lock.
     if not updated:
-        repo.enqueue_cleanup_messages(order.id, [(sent.chat_id, sent.message_id)])
         await _process_cleanup_messages(context, order_id=order.id)
-        await _notify_manager(
-            context,
-            query.from_user.id,
-            "⚠️ Заказ уже изменился. Новая карточка курьера удалена; откройте актуальный заказ.",
-        )
         return
 
+    if order.delivery_chat_id and order.delivery_chat_id != sent.chat_id:
+        try:
+            await context.bot.send_message(
+                chat_id=order.delivery_chat_id,
+                text=(
+                    f"⛔ <b>Заказ №{order.order_number} переназначен</b>\n"
+                    f"Не выполняйте этот заказ. Новый курьер: <b>{escape(selected.name)}</b>."
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            logger.exception(
+                "Could not warn previous courier group about reassigned order %s",
+                order.id,
+            )
+            await _notify_manager(
+                context,
+                query.from_user.id,
+                f"⚠️ Заказ №{order.order_number} переназначен на {escape(selected.name)}, "
+                "но старую группу предупредить не удалось. Свяжитесь со старым курьером вручную.",
+            )
     await _process_cleanup_messages(context, order_id=updated.id)
     synced_order, synchronized = await _sync_order(context, updated.id)
     updated = synced_order or repo.get(updated.id) or updated
@@ -2270,7 +2694,13 @@ async def manager_sync_action(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def manager_pickup_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    action, raw_id = query.data.split(":")
+    parts = query.data.split(":")
+    raw_action, raw_id = parts[:2]
+    notification_courier_id = int(parts[2]) if len(parts) == 3 else None
+    action = {
+        "pickup_log": "pickup",
+        "undo_pickup_log": "undo_pickup",
+    }.get(raw_action, raw_action)
     settings: Settings = context.application.bot_data["settings"]
     repo: OrderRepository = context.application.bot_data["repo"]
     order = repo.get(int(raw_id))
@@ -2296,15 +2726,20 @@ async def manager_pickup_action(update: Update, context: ContextTypes.DEFAULT_TY
         and query.message.message_id == order.orders_channel_message_id
         and query.message.chat_id == getattr(settings, "orders_channel_id", None)
     )
+    notification_source = bool(
+        raw_action in {"pickup_log", "undo_pickup_log"}
+        and notification_courier_id == order.assigned_courier_id
+        and query.message.chat_id == getattr(settings, "orders_channel_id", None)
+    )
     manager_allowed = manager_source and _allowed(query.from_user.id, settings.manager_ids)
-    journal_allowed = journal_source and await _is_orders_channel_member(
+    journal_allowed = (journal_source or notification_source) and await _is_orders_channel_member(
         context,
         query.from_user.id,
     )
     if not (manager_allowed or journal_allowed):
         await query.answer("Нет доступа. Кнопка доступна участникам Log-канала.", show_alert=True)
         return
-    if not (manager_source or journal_source):
+    if not (manager_source or journal_source or notification_source):
         await query.answer(
             "Эта карточка устарела. Откройте актуальную карточку заказа.",
             show_alert=True,
@@ -2335,7 +2770,7 @@ async def manager_pickup_action(update: Update, context: ContextTypes.DEFAULT_TY
             courier_name=order.assigned_courier_name,
             actor_id=query.from_user.id,
             actor_name=_name(query.from_user),
-            actor_role="staff" if journal_source else "manager",
+            actor_role="staff" if (journal_source or notification_source) else "manager",
         )
         message = f"Товар у курьера {order.assigned_courier_name}"
     else:
@@ -2353,7 +2788,7 @@ async def manager_pickup_action(update: Update, context: ContextTypes.DEFAULT_TY
             time_started=None,
             actor_id=query.from_user.id,
             actor_name=_name(query.from_user),
-            actor_role="staff" if journal_source else "manager",
+            actor_role="staff" if (journal_source or notification_source) else "manager",
         )
         message = "Отметка «товар забран» снята"
     if not updated:
@@ -2361,6 +2796,17 @@ async def manager_pickup_action(update: Update, context: ContextTypes.DEFAULT_TY
         return
     await query.answer(message)
     _, success = await _sync_order(context, updated.id)
+    if notification_source:
+        edit_markup = getattr(query, "edit_message_reply_markup", None)
+        if callable(edit_markup):
+            try:
+                await edit_markup(reply_markup=log_read_keyboard(updated))
+            except Exception as error:
+                if not (_message_is_not_modified(error) or _message_is_missing(error)):
+                    logger.exception(
+                        "Could not retire Log pickup button for order %s",
+                        updated.id,
+                    )
     actor_name = escape(_name(query.from_user))
     courier_name = escape(updated.assigned_courier_name or updated.courier_name or "—")
     if action == "pickup":
@@ -2369,12 +2815,14 @@ async def manager_pickup_action(update: Update, context: ContextTypes.DEFAULT_TY
             f"📦 <b>Заказ №{updated.order_number}</b> · товар забран\n"
             f"🚚 Курьер: <b>{courier_name}</b>\n"
             f"👤 Отметил: {actor_name}",
+            reply_markup=log_order_keyboard(updated),
         )
     else:
         await _notify_log(
             context,
             f"↩️ <b>Заказ №{updated.order_number}</b> · отметка «товар забран» снята\n"
             f"👤 Отметил: {actor_name}",
+            reply_markup=log_order_keyboard(updated),
         )
     if not success:
         _schedule_sync_retry(context, updated.id)
@@ -2452,6 +2900,7 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             context,
             f"↩️ <b>Заказ №{order.order_number}</b> · отмена снята\n"
             f"🚚 Курьер: {escape(order.assigned_courier_name or order.courier_name or '—')}",
+            reply_markup=log_order_keyboard(order),
         )
         return
     if action == "undo_complete":
@@ -2493,6 +2942,7 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _notify_log(
             context,
             f"↩️ <b>Заказ №{order.order_number}</b> · подтверждение доставки отменено",
+            reply_markup=log_order_keyboard(order),
         )
         return
     if order.status in {"completed", "cancelled"}:
@@ -2554,8 +3004,9 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _finish_status_change(context, query, order, text, keyboard)
         await _notify_log(
             context,
-            f"👀 Курьер {escape(order.courier_name or order.assigned_courier_name or '—')} "
-            f"прочитал <b>заказ №{order.order_number}</b> в {timestamp:%H:%M} и выехал на склад.",
+            f"👀 <b>Заказ №{order.order_number} прочитан {timestamp:%H:%M}</b>\n"
+            f"🏬 {escape(order.courier_name or order.assigned_courier_name or '—')} едет на склад.",
+            reply_markup=log_read_keyboard(order),
         )
         return
     if action == "undo_onway":
@@ -2587,6 +3038,7 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             context,
             f"↩️ Курьер {escape(order.assigned_courier_name or order.courier_name or '—')} "
             f"отменил выезд к <b>заказу №{order.order_number}</b>.",
+            reply_markup=log_order_keyboard(order),
         )
     elif action == "onway":
         if order.status == "on_way" and order.courier_id == query.from_user.id:
@@ -2603,13 +3055,20 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
         timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
         order = repo.transition(
-            order.id, {"pending", "picked_up"}, status="on_way",
-            picked_up_at=order.picked_up_at or timestamp,
+            order.id, {"picked_up"}, status="on_way",
             time_started=timestamp,
-            guard_courier_id=query.from_user.id, require_unassigned_or_same=True, **courier,
+            guard_courier_id=query.from_user.id,
+            require_unassigned_or_same=True,
+            require_no_other_on_way_for_courier=True,
+            **courier,
         )
         if not order:
-            await query.answer("Заказ уже взял другой курьер", show_alert=True); return
+            await query.answer(
+                "Сначала сотрудник склада должен отметить, что товар забран, "
+                "или завершите текущую доставку.",
+                show_alert=True,
+            )
+            return
         await query.answer("Статус обновлён")
         await _finish_status_change(
             context,
@@ -2639,19 +3098,19 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             context,
             f"❌ <b>Заказ №{order.order_number}</b> отменён курьером "
             f"{escape(_name(query.from_user))}.",
+            reply_markup=log_order_keyboard(order),
         )
-    else:
+    elif action == "complete":
         timestamp = datetime.now().astimezone()
         order = repo.transition(
             order.id,
-            {"pending", "picked_up", "on_way"},
+            {"on_way"},
             status="completed",
-            picked_up_at=order.picked_up_at or timestamp.isoformat(timespec="seconds"),
             delivered_at=timestamp.isoformat(timespec="seconds"),
             guard_courier_id=query.from_user.id, require_unassigned_or_same=True, **courier,
         )
         if not order:
-            await query.answer("Заказ уже обрабатывает другой курьер", show_alert=True); return
+            await query.answer("Сначала нажмите «🚗 Еду к заказу»", show_alert=True); return
         result_text = completed_card(
             order,
             timestamp.astimezone(ZoneInfo("Asia/Tashkent")).strftime("%H:%M"),
@@ -2670,8 +3129,11 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"<b>заказ №{order.order_number}</b> в "
             f"{timestamp.astimezone(ZoneInfo('Asia/Tashkent')):%H:%M}\n"
             f"📦 {escape(order.product)} · 👤 {escape(order.seller_name or '—')}",
+            reply_markup=log_order_keyboard(order),
         )
         await _send_post_delivery_prompt(context, order)
+    else:
+        await query.answer("Неизвестное действие", show_alert=True)
 
 
 async def _publish_completed(
@@ -2714,28 +3176,35 @@ async def _publish_completed(
 
 async def delivery_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings: Settings = context.application.bot_data["settings"]
-    if update.effective_user.id not in _allowed_courier_ids(settings):
+    user = update.effective_user
+    chat = update.effective_chat
+    message = getattr(update, "effective_message", None) or getattr(update, "message", None)
+    # Channel posts and anonymous/admin messages may not have an effective
+    # user.  They are valid Telegram updates, but never delivery evidence.
+    if not user or not chat or not message:
+        return
+    if user.id not in _allowed_courier_ids(settings):
         return
     repo: OrderRepository = context.application.bot_data["repo"]
-    order = repo.get_active_delivery(update.effective_user.id)
+    order = repo.get_active_delivery(user.id)
     if not order:
         return
-    if update.effective_chat.id != order.delivery_chat_id:
+    if chat.id != order.delivery_chat_id:
         return
     if order.status == "awaiting_photo":
-        if not update.message.photo:
-            await update.message.reply_text(
+        if not message.photo:
+            await message.reply_text(
                 "Отправьте фото и укажите цену в подписи к фото. Пример: 100$ 1 920 000"
             ); return
         try:
-            usd, uzs = parse_amount(update.message.caption or "")
+            usd, uzs = parse_amount(message.caption or "")
         except ValueError:
-            await update.message.reply_text(
+            await message.reply_text(
                 "Цена не распознана. Отправьте фото заново и напишите цену в подписи. "
                 "Пример: 100$ 1 920 000"
             )
             return
-        photo_id = update.message.photo[-1].file_id
+        photo_id = message.photo[-1].file_id
         timestamp = datetime.now().astimezone()
         updated = repo.transition(
             order.id,
@@ -2747,22 +3216,24 @@ async def delivery_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             delivered_at=timestamp.isoformat(timespec="seconds"),
         )
         if not updated:
-            await update.message.reply_text("Статус заказа уже изменился."); return
+            await message.reply_text("Статус заказа уже изменился."); return
         await _publish_completed(update, context, updated, timestamp)
         return
-    if update.message.photo:
-        await update.message.reply_text("Фото уже получено. Теперь введите сумму текстом."); return
-    try: usd, uzs = parse_amount(update.message.text or "")
+    if message.photo:
+        await message.reply_text("Фото уже получено. Теперь введите сумму текстом."); return
+    try: usd, uzs = parse_amount(message.text or "")
     except ValueError as error:
-        await update.message.reply_text(str(error)); return
+        await message.reply_text(str(error)); return
     timestamp = datetime.now().astimezone()
     order = repo.transition(order.id, {"awaiting_amount"}, status="completed", received_usd=usd, received_uzs=uzs, delivered_at=timestamp.isoformat(timespec="seconds"))
     if not order:
-        await update.message.reply_text("Заказ уже обработан."); return
+        await message.reply_text("Заказ уже обработан."); return
     await _publish_completed(update, context, order, timestamp)
 
 
 async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await _require_manager_flow(update, context):
+        return ConversationHandler.END
     draft = context.user_data.get("draft") or {}
     repo: OrderRepository | None = context.application.bot_data.get("repo")
     committed = repo.get_by_creation_token(draft.get("creation_token")) if repo else None
@@ -2812,14 +3283,16 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def show_all_locations(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings: Settings = context.application.bot_data["settings"]
-    user_id = update.effective_user.id
-    if update.effective_chat.type != "private" or user_id not in settings.manager_ids:
+    user = getattr(update, "effective_user", None)
+    chat = getattr(update, "effective_chat", None)
+    if not user or getattr(chat, "type", None) != "private" or user.id not in settings.manager_ids:
         if update.effective_message:
             await update.effective_message.reply_text("Все активные заказы доступны менеджерам в личном чате с ботом.")
         return
     context.user_data.pop("edit", None)
     repo: OrderRepository = context.application.bot_data["repo"]
-    text, map_url = all_locations_card(repo.list_open())
+    text, fallback_map_url = all_locations_card(repo.list_open())
+    map_url = _monitor_url(settings) or fallback_map_url
     await update.effective_message.reply_text(
         text,
         parse_mode=ParseMode.HTML,
@@ -2834,6 +3307,10 @@ async def location_label_action(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 def register_handlers(application: Application) -> None:
+    application.add_handler(
+        TypeHandler(Update, _access_guard),
+        group=-1,
+    )
     creation_menu = MessageHandler(
         filters.Regex(
             r"^(?:📋 (?:Мои|Активные|Все) заказы|📦 Все активные заказы|📚 Все заказы)$"
@@ -2879,7 +3356,7 @@ def register_handlers(application: Application) -> None:
                 _end_edit_on_global_command,
                 pattern=(
                     r"^(?:(?:edit_(?:menu|close)|send|manager_cancel|manager_restore|sync|pickup|undo_pickup):\d+"
-                    r"|courier_(?:menu|close|assign):\d+(?::\d+)?"
+                    r"|courier_(?:menu|close|assign|force_assign):\d+(?::\d+)?"
                     r"|list_order:\d+"
                     r"|orders_page:(?:active|all):\d+)$"
                 ),
@@ -2890,12 +3367,12 @@ def register_handlers(application: Application) -> None:
         persistent=True,
     )
     application.add_handler(conversation)
-    application.add_handler(CommandHandler("map", show_all_locations))
+    application.add_handler(CommandHandler("map", show_all_locations, filters=filters.ChatType.PRIVATE))
     application.add_handler(MessageHandler(filters.Regex(r"^(?:📋 (?:Мои|Активные) заказы|📦 Все активные заказы)$") & filters.ChatType.PRIVATE, active_orders))
     application.add_handler(MessageHandler(filters.Regex(r"^(?:📋|📚) Все заказы$") & filters.ChatType.PRIVATE, my_orders))
     application.add_handler(MessageHandler(filters.Regex(r"^📊 Статистика$") & filters.ChatType.PRIVATE, show_statistics))
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("cancel", cancel_conversation))
+    application.add_handler(CommandHandler("start", start, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("cancel", cancel_conversation, filters=filters.ChatType.PRIVATE))
     application.add_handler(CallbackQueryHandler(
         daily_delivery_log_action,
         pattern=r"^daily_log:(?:today|\d{4}-\d{2}-\d{2})$",
@@ -2910,12 +3387,12 @@ def register_handlers(application: Application) -> None:
     application.add_handler(CallbackQueryHandler(manager_action, pattern=r"^(send|manager_cancel|manager_restore):\d+$"))
     application.add_handler(CallbackQueryHandler(
         courier_assignment_action,
-        pattern=r"^(?:control_)?courier_(?:menu|close|assign):\d+(?::\d+)?$",
+        pattern=r"^(?:control_)?courier_(?:menu|close|assign|force_assign):\d+(?::\d+)?$",
     ))
     application.add_handler(CallbackQueryHandler(manager_sync_action, pattern=r"^sync:\d+$"))
     application.add_handler(CallbackQueryHandler(
         manager_pickup_action,
-        pattern=r"^(?:pickup|undo_pickup):\d+$",
+        pattern=r"^(?:(?:pickup|undo_pickup):\d+|(?:pickup_log|undo_pickup_log):\d+:\d+)$",
     ))
     application.add_handler(CallbackQueryHandler(courier_action, pattern=r"^(read|onway|undo_onway|complete|cancel|undo_cancel|undo_complete):\d+$"))
     application.add_handler(edit_conversation, group=1)

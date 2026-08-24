@@ -7,7 +7,11 @@ from app.bot.keyboards import (
     DELIVERY_TIME_SLOTS,
     delivery_time_keyboard,
     edit_input_keyboard,
+    courier_keyboard,
+    courier_selection_keyboard,
+    log_order_keyboard,
     main_keyboard,
+    on_way_keyboard,
     orders_channel_keyboard,
     orders_page_keyboard,
     statistics_keyboard,
@@ -58,6 +62,76 @@ class EditInputKeyboardTests(unittest.TestCase):
         self.assertEqual(labels[3:3 + len(DELIVERY_TIME_SLOTS)], list(DELIVERY_TIME_SLOTS))
         self.assertEqual(labels[-2:], ["Пропустить", "❌ Отменить изменение"])
 
+    def test_location_edit_supports_text_and_removing_only_second_location(self):
+        self.assertEqual(
+            self._labels(edit_input_keyboard("location")),
+            ["📝 Локация текстом", "❌ Отменить изменение"],
+        )
+        self.assertEqual(
+            self._labels(edit_input_keyboard("second_location")),
+            [
+                "📝 Локация текстом",
+                "🗑 Удалить доп. локацию",
+                "❌ Отменить изменение",
+            ],
+        )
+
+
+class CourierWorkflowKeyboardTests(unittest.TestCase):
+    @staticmethod
+    def _callbacks(keyboard) -> list[str]:
+        return [
+            button.callback_data
+            for row in keyboard.inline_keyboard
+            for button in row
+            if button.callback_data
+        ]
+
+    def test_pending_and_picked_up_cards_only_expose_valid_next_actions(self):
+        pending = Order(
+            id=7, order_number=7, manager_id=1, manager_name="Manager",
+            client_phone="+998901333999", product="A57", status="pending",
+        )
+        picked = Order(
+            id=8, order_number=8, manager_id=1, manager_name="Manager",
+            client_phone="+998901333999", product="A58", status="picked_up",
+        )
+
+        self.assertEqual(self._callbacks(courier_keyboard(pending)), ["read:7", "cancel:7"])
+        self.assertEqual(self._callbacks(courier_keyboard(picked)), ["onway:8", "cancel:8"])
+        self.assertEqual(
+            self._callbacks(on_way_keyboard(picked)),
+            ["undo_onway:8", "complete:8", "cancel:8"],
+        )
+
+    def test_courier_selection_is_filtered_by_environment_allowlist(self):
+        order = Order(
+            id=7, order_number=7, manager_id=1, manager_name="Manager",
+            client_phone="+998901333999", product="A57",
+        )
+
+        callbacks = self._callbacks(courier_selection_keyboard(
+            order,
+            allowed_courier_ids=frozenset({202134293}),
+        ))
+
+        self.assertEqual(callbacks, ["courier_assign:7:202134293", "courier_close:7"])
+
+    def test_log_navigation_uses_canonical_order_and_stable_map_links(self):
+        order = Order(
+            id=7, order_number=7, manager_id=1, manager_name="Manager",
+            client_phone="+998901333999", product="A57",
+            latitude=41.338586, longitude=69.272757,
+            location_chat_id=-1004398605075, location_message_id=20,
+            orders_channel_chat_id=-1004459657817, orders_channel_message_id=30,
+        )
+
+        keyboard = log_order_keyboard(order)
+        buttons = {button.text: button.url for row in keyboard.inline_keyboard for button in row}
+        self.assertEqual(buttons["📋 Открыть заказ"], "https://t.me/c/4459657817/30")
+        self.assertTrue(buttons["📍 Локация"].startswith("https://yandex.uz/maps/?"))
+        self.assertNotIn("t.me/c/4398605075", buttons["📍 Локация"])
+
 
 class DeliveryTimeCreationFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_payment_step_opens_delivery_time_presets(self):
@@ -65,8 +139,17 @@ class DeliveryTimeCreationFlowTests(unittest.IsolatedAsyncioTestCase):
             text=next(iter(PAYMENT_LABELS.values())),
             reply_text=AsyncMock(),
         )
-        update = SimpleNamespace(message=message)
-        context = SimpleNamespace(user_data={"draft": {}})
+        update = SimpleNamespace(
+            message=message,
+            effective_chat=SimpleNamespace(type="private"),
+            effective_user=SimpleNamespace(id=1),
+        )
+        context = SimpleNamespace(
+            user_data={"draft": {}},
+            application=SimpleNamespace(bot_data={
+                "settings": SimpleNamespace(manager_ids=frozenset({1})),
+            }),
+        )
 
         state = await payment(update, context)
 
@@ -81,8 +164,17 @@ class DeliveryTimeCreationFlowTests(unittest.IsolatedAsyncioTestCase):
         for value in ("2–3 часа", "После 18:15"):
             with self.subTest(value=value):
                 message = SimpleNamespace(text=value, reply_text=AsyncMock())
-                update = SimpleNamespace(message=message)
-                context = SimpleNamespace(user_data={"draft": {}})
+                update = SimpleNamespace(
+                    message=message,
+                    effective_chat=SimpleNamespace(type="private"),
+                    effective_user=SimpleNamespace(id=1),
+                )
+                context = SimpleNamespace(
+                    user_data={"draft": {}},
+                    application=SimpleNamespace(bot_data={
+                        "settings": SimpleNamespace(manager_ids=frozenset({1})),
+                    }),
+                )
 
                 state = await delivery_time(update, context)
 

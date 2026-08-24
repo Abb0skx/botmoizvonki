@@ -115,9 +115,20 @@ class CourierReadWorkflowTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertIn(f"read:{order.id}", callbacks)
         self.assertTrue(any(
-            "выехал на склад" in call.kwargs["text"]
+            "Заказ №1 прочитан" in call.kwargs["text"]
+            and "едет на склад" in call.kwargs["text"]
             and call.kwargs["chat_id"] == -1004459657817
             for call in bot.send_message.await_args_list
+        ))
+        log_markup = next(
+            call.kwargs["reply_markup"]
+            for call in bot.send_message.await_args_list
+            if "Заказ №1 прочитан" in call.kwargs.get("text", "")
+        )
+        self.assertTrue(any(
+            button.callback_data == f"pickup_log:{order.id}:{ABBOS_ID}"
+            for row in log_markup.inline_keyboard
+            for button in row
         ))
         self.assertFalse(any(call.args and call.args[0] == 11 for call in bot.send_message.await_args_list))
         events = self.repo.list_events(order.id)
@@ -314,6 +325,93 @@ class ManagerListAndLogTests(unittest.IsolatedAsyncioTestCase):
         )
         bot.get_chat_member.assert_not_awaited()
 
+    async def test_log_pickup_button_roundtrip_restores_pending_action(self):
+        query = SimpleNamespace(
+            data=f"pickup_log:{self.order.id}:{ABBOS_ID}",
+            from_user=SimpleNamespace(
+                id=777,
+                full_name="Сотрудник склада",
+                username=None,
+            ),
+            message=SimpleNamespace(chat_id=-1004459657817, message_id=91),
+            answer=AsyncMock(),
+            edit_message_reply_markup=AsyncMock(),
+        )
+        bot = SimpleNamespace(
+            get_chat_member=AsyncMock(return_value=SimpleNamespace(status="member")),
+            send_message=AsyncMock(),
+        )
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={
+                "settings": SimpleNamespace(
+                    manager_ids=frozenset(),
+                    orders_channel_id=-1004459657817,
+                ),
+                "repo": self.repo,
+            }),
+            bot=bot,
+        )
+
+        async def synchronized(_context, order_id):
+            return self.repo.get(order_id), True
+
+        with patch("app.handlers.orders._sync_order", side_effect=synchronized):
+            await manager_pickup_action(SimpleNamespace(callback_query=query), context)
+            picked = self.repo.get(self.order.id)
+            self.assertEqual(picked.status, "picked_up")
+            self.assertIsNotNone(picked.picked_up_at)
+            pickup_markup = query.edit_message_reply_markup.await_args.kwargs["reply_markup"]
+            self.assertTrue(any(
+                button.callback_data == f"undo_pickup_log:{self.order.id}:{ABBOS_ID}"
+                for row in pickup_markup.inline_keyboard
+                for button in row
+            ))
+
+            query.data = f"undo_pickup_log:{self.order.id}:{ABBOS_ID}"
+            await manager_pickup_action(SimpleNamespace(callback_query=query), context)
+
+        restored = self.repo.get(self.order.id)
+        self.assertEqual(restored.status, "pending")
+        self.assertIsNone(restored.picked_up_at)
+        self.assertIsNone(restored.courier_id)
+        restored_markup = query.edit_message_reply_markup.await_args.kwargs["reply_markup"]
+        self.assertTrue(any(
+            button.callback_data == f"pickup_log:{self.order.id}:{ABBOS_ID}"
+            for row in restored_markup.inline_keyboard
+            for button in row
+        ))
+
+    async def test_assigned_courier_is_denied_on_log_pickup_button(self):
+        query = SimpleNamespace(
+            data=f"pickup_log:{self.order.id}:{ABBOS_ID}",
+            from_user=SimpleNamespace(id=ABBOS_ID, full_name="Abbos", username=None),
+            message=SimpleNamespace(chat_id=-1004459657817, message_id=91),
+            answer=AsyncMock(),
+            edit_message_reply_markup=AsyncMock(),
+        )
+        bot = SimpleNamespace(get_chat_member=AsyncMock(), send_message=AsyncMock())
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={
+                "settings": SimpleNamespace(
+                    manager_ids=frozenset(),
+                    orders_channel_id=-1004459657817,
+                ),
+                "repo": self.repo,
+            }),
+            bot=bot,
+        )
+
+        await manager_pickup_action(SimpleNamespace(callback_query=query), context)
+
+        self.assertEqual(self.repo.get(self.order.id).status, "pending")
+        query.answer.assert_awaited_once_with(
+            "Эту отметку ставит сотрудник склада, не курьер.",
+            show_alert=True,
+        )
+        query.edit_message_reply_markup.assert_not_awaited()
+        bot.get_chat_member.assert_not_awaited()
+        bot.send_message.assert_not_awaited()
+
     async def test_on_way_log_contains_eta_customer_and_location_button(self):
         started = datetime.now(TASHKENT).replace(second=0, microsecond=0)
         order = self.repo.transition(
@@ -347,9 +445,17 @@ class ManagerListAndLogTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(f"Примерно к <b>{expected_arrival}</b> доставит", sent["text"])
         self.assertIn("📱 +998 90 133 39 99", sent["text"])
         self.assertIn("📍 Адрес A57", sent["text"])
-        button = sent["reply_markup"].inline_keyboard[0][0]
-        self.assertEqual(button.text, "📍 Показать локацию")
-        self.assertEqual(button.url, "https://t.me/c/4398605075/501")
+        buttons = {
+            button.text: button.url
+            for row in sent["reply_markup"].inline_keyboard
+            for button in row
+        }
+        self.assertEqual(
+            buttons["📋 Открыть заказ"],
+            "https://t.me/c/4459657817/66",
+        )
+        self.assertTrue(buttons["📍 Локация"].startswith("https://yandex.uz/maps/?"))
+        self.assertNotIn("t.me/c/4398605075", buttons["📍 Локация"])
         routing.route.assert_awaited_once()
 
 

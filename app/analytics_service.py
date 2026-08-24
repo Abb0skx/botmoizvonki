@@ -3,12 +3,13 @@ from __future__ import annotations
 import calendar
 import math
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
 from typing import Any
 
 from app.database import OrderRepository
-from app.stats_service import TASHKENT, local_datetime
+from app.utils.geocoding import extract_text_address, normalize_district
+from app.stats_service import TASHKENT, _courier_id, _status_changed, local_datetime
 
 
 MONTH_RE = re.compile(r"^(\d{4})-(\d{2})$")
@@ -89,12 +90,12 @@ def _forecast(
     same_weekday = [
         daily_counts[day]
         for day in same_weekday_dates
-        if history_start is None or day >= history_start
+        if history_start is not None and day >= history_start
     ]
     recent_days = [
         daily_counts[as_of - timedelta(days=offset)]
         for offset in range(28)
-        if history_start is None or as_of - timedelta(days=offset) >= history_start
+        if history_start is not None and as_of - timedelta(days=offset) >= history_start
     ]
     baseline = (
         sum(same_weekday) / len(same_weekday)
@@ -124,25 +125,61 @@ def build_delivery_analytics(
     *,
     month: str | None = None,
     week: str | None = None,
+    courier_id: int | None = None,
 ) -> dict[str, Any]:
     today = datetime.now(TASHKENT).date()
     month_start = parse_month(month, today=today)
     week_start = parse_week(week, today=today)
     orders = repo.list_all()
+    events_by_order = defaultdict(list)
+    if courier_id is not None:
+        for event in repo.list_all_events():
+            events_by_order[event.order_id].append(event)
+
+    def analytics_courier(order) -> int | None:
+        events = [
+            event
+            for event in events_by_order.get(order.id, [])
+            if event.actor_role == "courier" and event.actor_id is not None
+        ]
+        completed = [
+            event
+            for event in events
+            if _status_changed(event) and event.to_status == "completed"
+        ]
+        if completed:
+            # The first actual fulfilment is immutable attribution for the
+            # order's creation-period analytics, even if it is later reopened.
+            return completed[0].actor_id
+        lifecycle = [
+            event
+            for event in events
+            if event.event_type == "courier_read"
+            or (
+                _status_changed(event)
+                and event.to_status in {"picked_up", "on_way", "cancelled"}
+            )
+        ]
+        return lifecycle[-1].actor_id if lifecycle else _courier_id(order)
+
     created_orders = [
         (order, created.date())
         for order in orders
         if (created := local_datetime(order.created_at))
+        and (courier_id is None or analytics_courier(order) == courier_id)
     ]
     daily_counts: Counter[date] = Counter(day for _, day in created_orders)
     history_start = min(daily_counts, default=None)
+    # Today is still incomplete and must not be treated as a full low-volume
+    # day in trend calculations.
+    forecast_as_of = today - timedelta(days=1)
 
     month_days = calendar.monthrange(month_start.year, month_start.month)[1]
     month_dates = [month_start + timedelta(days=index) for index in range(month_days)]
     month_series = []
     for day in month_dates:
         forecast = (
-            _forecast(day, daily_counts, history_start, as_of=today)
+            _forecast(day, daily_counts, history_start, as_of=forecast_as_of)
             if day > today
             else None
         )
@@ -158,28 +195,59 @@ def build_delivery_analytics(
     previous_month = _month_shift(month_start, -1)
     next_month = _month_shift(month_start, 1)
     previous_month_days = calendar.monthrange(previous_month.year, previous_month.month)[1]
+    is_current_month = (
+        month_start.year == today.year and month_start.month == today.month
+    )
+    if is_current_month:
+        comparison_days = min(today.day, previous_month_days)
+        comparison_label = f"с первыми {comparison_days} дн. прошлого месяца"
+    else:
+        comparison_days = previous_month_days
+        comparison_label = "с прошлым месяцем"
     current_total = sum(daily_counts[day] for day in month_dates)
+    current_comparison_total = (
+        sum(
+            daily_counts[month_start + timedelta(days=index)]
+            for index in range(comparison_days)
+        )
+        if is_current_month
+        else current_total
+    )
     previous_total = sum(
         daily_counts[previous_month + timedelta(days=index)]
-        for index in range(previous_month_days)
+        for index in range(comparison_days)
     )
 
+    def district_name(order) -> str:
+        stored = normalize_district(order.district)
+        inferred = extract_text_address(order.address_text or "").get("district")
+        return stored or inferred or "Район не определён"
+
     districts = Counter(
-        (order.district or "Район не определён").strip()
+        district_name(order)
         for order, day in created_orders
         if month_start <= day < next_month
     )
     previous_districts = Counter(
-        (order.district or "Район не определён").strip()
+        district_name(order)
         for order, day in created_orders
-        if previous_month <= day < month_start
+        if previous_month <= day < previous_month + timedelta(days=comparison_days)
+    )
+    comparison_districts = (
+        Counter(
+            district_name(order)
+            for order, day in created_orders
+            if month_start <= day < month_start + timedelta(days=comparison_days)
+        )
+        if is_current_month
+        else districts
     )
     district_rows = [
         {
             "name": name,
             "orders": count,
             "previous": previous_districts.get(name, 0),
-            "change": count - previous_districts.get(name, 0),
+            "change": comparison_districts.get(name, 0) - previous_districts.get(name, 0),
             "share": round(count / current_total * 100, 1) if current_total else 0,
         }
         for name, count in districts.most_common()
@@ -189,7 +257,7 @@ def build_delivery_analytics(
     week_series = []
     for day in week_dates:
         forecast = (
-            _forecast(day, daily_counts, history_start, as_of=today)
+            _forecast(day, daily_counts, history_start, as_of=forecast_as_of)
             if day > today
             else None
         )
@@ -222,7 +290,7 @@ def build_delivery_analytics(
     next_forecast = []
     for offset in range(1, 8):
         day = today + timedelta(days=offset)
-        forecast = _forecast(day, daily_counts, history_start, as_of=today)
+        forecast = _forecast(day, daily_counts, history_start, as_of=forecast_as_of)
         next_forecast.append({
             "date": day.isoformat(),
             "label": f"{WEEKDAY_NAMES[day.weekday()]} · {day:%d.%m}",
@@ -237,6 +305,7 @@ def build_delivery_analytics(
     )
     return {
         "generated_at": datetime.now(TASHKENT).isoformat(timespec="seconds"),
+        "selected_courier_id": courier_id,
         "month": {
             "value": month_start.strftime("%Y-%m"),
             "label": f"{MONTH_NAMES[month_start.month]} {month_start.year}",
@@ -244,7 +313,8 @@ def build_delivery_analytics(
             "next_value": next_month.strftime("%Y-%m"),
             "orders": current_total,
             "previous_orders": previous_total,
-            "change": current_total - previous_total,
+            "change": current_comparison_total - previous_total,
+            "comparison_label": comparison_label,
             "series": month_series,
             "districts": district_rows,
         },
@@ -262,6 +332,7 @@ def build_delivery_analytics(
         "next_7_days": next_forecast,
         "forecast_note": (
             "Прогноз экспериментальный: среднее по таким же дням недели за последние "
-            "8 недель с поправкой на динамику последних 28 дней. Это вероятность, а не гарантия."
+            "8 недель с поправкой на динамику последних 28 завершённых дней. "
+            "Текущий незавершённый день не занижает прогноз. Это вероятность, а не гарантия."
         ),
     }

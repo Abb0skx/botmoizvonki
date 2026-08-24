@@ -257,7 +257,8 @@ class DeliveryMonitorServiceTests(unittest.TestCase):
         route = next(item for item in monitor["routes"] if item["courier_id"] == ABBOS_ID)
 
         self.assertEqual(monitor["summary"]["active"], 2)
-        self.assertEqual(monitor["summary"]["waiting_pickup"], 1)
+        self.assertEqual(monitor["summary"]["new_orders"], 1)
+        self.assertEqual(monitor["summary"]["waiting_pickup"], 0)
         self.assertEqual(monitor["summary"]["on_way"], 1)
         self.assertEqual(monitor["manager_counts"], [{"name": "Otabek", "orders": 3}])
         self.assertEqual(route["current_target"]["order_number"], current.order_number)
@@ -280,6 +281,7 @@ class DeliveryMonitorServiceTests(unittest.TestCase):
             mapped.id,
             delivery_time="До 17:00",
             comment="Позвонить заранее",
+            second_address_text="Вторая точка текстом",
         )
         text_only = self.repo.create(
             manager_id=11,
@@ -308,9 +310,57 @@ class DeliveryMonitorServiceTests(unittest.TestCase):
         self.assertEqual(mapped_stop["delivery_time"], "До 17:00")
         self.assertEqual(mapped_stop["comment"], "Позвонить заранее")
         self.assertFalse(any(stop["order_id"] == text_only.id for stop in monitor["stops"]))
-        self.assertEqual(len(monitor["unmapped_orders"]), 1)
-        self.assertEqual(monitor["unmapped_orders"][0]["id"], text_only.id)
-        self.assertEqual(monitor["unmapped_orders"][0]["comment"], "Вход со двора")
+        self.assertEqual(len(monitor["unmapped_orders"]), 2)
+        mapped_text = next(
+            item for item in monitor["unmapped_orders"] if item["id"] == mapped.id
+        )
+        self.assertEqual(mapped_text["location_number"], 2)
+        text_only_item = next(
+            item for item in monitor["unmapped_orders"] if item["id"] == text_only.id
+        )
+        self.assertEqual(text_only_item["comment"], "Вход со двора")
+        self.assertEqual(monitor["summary"]["unmapped"], 2)
+
+    def test_undo_completion_is_not_duplicated_on_monitor_map(self):
+        order = self._assigned("A61", 41.365)
+        order = self.repo.transition(
+            order.id,
+            {"pending"},
+            status="on_way",
+            time_started=datetime.now(TASHKENT).isoformat(),
+            courier_id=ABBOS_ID,
+            courier_name="Abbos",
+            actor_id=ABBOS_ID,
+            actor_name="Abbos",
+            actor_role="courier",
+        )
+        order = self.repo.transition(
+            order.id,
+            {"on_way"},
+            status="completed",
+            delivered_at=datetime.now(TASHKENT).isoformat(),
+            actor_id=ABBOS_ID,
+            actor_name="Abbos",
+            actor_role="courier",
+        )
+        self.repo.transition(
+            order.id,
+            {"completed"},
+            status="on_way",
+            delivered_at=None,
+            actor_id=ABBOS_ID,
+            actor_name="Abbos",
+            actor_role="courier",
+        )
+
+        monitor = build_delivery_monitor(self.repo)
+        order_stops = [
+            stop for stop in monitor["stops"] if stop["order_id"] == order.id
+        ]
+
+        self.assertEqual(monitor["summary"]["completed_today"], 0)
+        self.assertEqual(len(order_stops), 1)
+        self.assertEqual(order_stops[0]["state"], "on_way")
 
 
 class DeliveryMonitorWebTests(unittest.TestCase):
@@ -348,8 +398,9 @@ class DeliveryMonitorWebTests(unittest.TestCase):
         self.assertEqual(page.status_code, 200)
         self.assertIn("Мониторинг доставки", page.text)
         self.assertIn("Расчётная позиция", page.text)
-        self.assertIn("Нет локации", page.text)
+        self.assertIn("Нет координат", page.text)
         self.assertIn("movementMarkers", page.text)
+        self.assertIn("AbortController", page.text)
         self.assertEqual(page.headers["cache-control"], "no-store")
 
         state = self.client.get("/delivery/monitor/api/state", headers=self.auth())

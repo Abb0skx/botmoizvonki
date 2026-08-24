@@ -1,9 +1,11 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from app.config import Settings
 from app.database import OrderRepository
 from app.handlers.orders import (
     _sync_order,
@@ -11,6 +13,7 @@ from app.handlers.orders import (
     reconcile_orders_on_start,
     validate_delivery_configuration,
 )
+from app.utils.couriers import courier_ids as known_courier_ids
 from app.utils.formatters import orders_channel_card
 
 
@@ -41,7 +44,7 @@ class OrdersChannelTests(unittest.IsolatedAsyncioTestCase):
         self.repo.initialize()
         self.settings = SimpleNamespace(
             manager_ids=frozenset({11}),
-            courier_ids=frozenset(),
+            courier_ids=frozenset({7636344727, 202134293, 1799690992}),
             delivery_group_id=-5125237049,
             location_channel_id=-1004398605075,
             orders_channel_id=ORDERS_CHANNEL_ID,
@@ -179,6 +182,18 @@ class OrdersChannelTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(f"control_courier_assign:{order.id}:1799690992", callbacks)
 
     async def test_preflight_requires_orders_channel_admin_rights(self):
+        async def member(chat_id, user_id):
+            if chat_id == ORDERS_CHANNEL_ID and user_id == 99:
+                return SimpleNamespace(status="member")
+            if chat_id == self.settings.location_channel_id and user_id == 99:
+                return SimpleNamespace(
+                    status="administrator",
+                    can_post_messages=True,
+                    can_edit_messages=True,
+                    can_delete_messages=True,
+                )
+            return SimpleNamespace(status="member")
+
         bot = SimpleNamespace(
             id=99,
             get_chat=AsyncMock(side_effect=[
@@ -186,16 +201,7 @@ class OrdersChannelTests(unittest.IsolatedAsyncioTestCase):
                 SimpleNamespace(type="channel"),
                 SimpleNamespace(type="channel"),
             ]),
-            get_chat_member=AsyncMock(side_effect=[
-                SimpleNamespace(status="member"),
-                SimpleNamespace(
-                    status="administrator",
-                    can_post_messages=True,
-                    can_edit_messages=True,
-                    can_delete_messages=True,
-                ),
-                SimpleNamespace(status="member"),
-            ]),
+            get_chat_member=AsyncMock(side_effect=member),
         )
         application = SimpleNamespace(
             bot=bot,
@@ -208,6 +214,127 @@ class OrdersChannelTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "administrator in the orders channel"):
                 await validate_delivery_configuration(application)
+
+    async def test_preflight_rejects_courier_who_left_own_group(self):
+        courier_id = 202134293
+        courier_group_id = -5216093690
+        settings = SimpleNamespace(
+            manager_ids=frozenset({11}),
+            courier_ids=frozenset({courier_id}),
+            delivery_group_id=courier_group_id,
+            location_channel_id=-1004398605075,
+            orders_channel_id=ORDERS_CHANNEL_ID,
+        )
+
+        async def member(chat_id, user_id):
+            if (chat_id, user_id) == (courier_group_id, courier_id):
+                return SimpleNamespace(status="left")
+            return SimpleNamespace(status="member")
+
+        bot = SimpleNamespace(
+            id=99,
+            get_chat=AsyncMock(return_value=SimpleNamespace(type="group")),
+            get_chat_member=AsyncMock(side_effect=member),
+        )
+        application = SimpleNamespace(bot=bot, bot_data={"settings": settings})
+
+        with patch(
+            "app.handlers.orders._known_delivery_groups",
+            return_value=frozenset({courier_group_id}),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"Courier Abbos must be a member of group -5216093690",
+            ):
+                await validate_delivery_configuration(application)
+
+    async def test_preflight_rejects_courier_who_left_location_channel(self):
+        courier_id = 202134293
+        courier_group_id = -5216093690
+        location_channel_id = -1004398605075
+        settings = SimpleNamespace(
+            manager_ids=frozenset({11}),
+            courier_ids=frozenset({courier_id}),
+            delivery_group_id=courier_group_id,
+            location_channel_id=location_channel_id,
+            orders_channel_id=ORDERS_CHANNEL_ID,
+        )
+
+        async def chat(chat_id):
+            return SimpleNamespace(
+                type="group" if chat_id == courier_group_id else "channel",
+            )
+
+        async def member(chat_id, user_id):
+            if (chat_id, user_id) == (location_channel_id, courier_id):
+                return SimpleNamespace(status="left")
+            if (chat_id, user_id) == (location_channel_id, 99):
+                return SimpleNamespace(
+                    status="administrator",
+                    can_post_messages=True,
+                    can_edit_messages=True,
+                    can_delete_messages=True,
+                )
+            return SimpleNamespace(status="member")
+
+        bot = SimpleNamespace(
+            id=99,
+            get_chat=AsyncMock(side_effect=chat),
+            get_chat_member=AsyncMock(side_effect=member),
+        )
+        application = SimpleNamespace(bot=bot, bot_data={"settings": settings})
+
+        with patch(
+            "app.handlers.orders._known_delivery_groups",
+            return_value=frozenset({courier_group_id}),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"Courier Abbos must be a member of the location channel",
+            ):
+                await validate_delivery_configuration(application)
+
+
+class SettingsValidationTests(unittest.TestCase):
+    def test_load_rejects_unknown_courier_id(self):
+        unknown_id = 999999999
+        configured_couriers = known_courier_ids() | frozenset({unknown_id})
+        environment = {
+            "DELIVERY_BOT_TOKEN": "test-token",
+            "DELIVERY_GROUP_ID": "-5216093690",
+            "DELIVERY_LOCATION_CHANNEL_ID": "-1004398605075",
+            "DELIVERY_ORDERS_CHANNEL_ID": str(ORDERS_CHANNEL_ID),
+            "DELIVERY_MANAGER_IDS": "11",
+            "DELIVERY_COURIER_IDS": ",".join(
+                str(value) for value in sorted(configured_couriers)
+            ),
+        }
+
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch("app.config.load_dotenv"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"couriers without a configured name/group: 999999999",
+            ):
+                Settings.load()
+
+    def test_load_rejects_missing_configured_courier(self):
+        environment = {
+            "DELIVERY_BOT_TOKEN": "test-token",
+            "DELIVERY_GROUP_ID": "-5125237049",
+            "DELIVERY_LOCATION_CHANNEL_ID": "-1004398605075",
+            "DELIVERY_ORDERS_CHANNEL_ID": "-1004459657817",
+            "DELIVERY_MANAGER_IDS": "11",
+            "DELIVERY_COURIER_IDS": "202134293,1799690992",
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"missing configured couriers: 7636344727",
+            ):
+                Settings.load()
 
 
 class OrdersChannelFormatterTests(unittest.TestCase):

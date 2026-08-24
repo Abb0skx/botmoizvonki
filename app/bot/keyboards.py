@@ -6,6 +6,7 @@ from app.models import Order
 from app.utils.formatters import (
     delivery_order_message_url,
     short_address,
+    telegram_message_url,
     telegram_location_url,
 )
 from app.utils.parsers import display_phone
@@ -103,6 +104,10 @@ def edit_input_keyboard(field: str | None = None) -> ReplyKeyboardMarkup:
         rows.extend([[KeyboardButton(label)] for label in PAYMENT_LABELS.values()])
     elif field == "delivery_time":
         rows.extend(_delivery_time_rows(include_skip=True))
+    elif field in {"location", "second_location"}:
+        rows.append([KeyboardButton("📝 Локация текстом")])
+        if field == "second_location":
+            rows.append([KeyboardButton("🗑 Удалить доп. локацию")])
     rows.append([KeyboardButton("❌ Отменить изменение")])
     return ReplyKeyboardMarkup(
         rows,
@@ -156,12 +161,22 @@ def manager_sent_keyboard(order: Order, *, expanded: bool = False) -> InlineKeyb
     )
 
 
-def courier_selection_keyboard(order: Order, *, source: str = "manager") -> InlineKeyboardMarkup:
+def courier_selection_keyboard(
+    order: Order,
+    *,
+    source: str = "manager",
+    allowed_courier_ids: frozenset[int] | None = None,
+) -> InlineKeyboardMarkup:
     if source not in {"manager", "orders_channel"}:
         raise ValueError("unsupported courier selection source")
     prefix = "control_courier" if source == "orders_channel" else "courier"
     rows = []
-    for courier in COURIERS:
+    available = (
+        COURIERS
+        if allowed_courier_ids is None
+        else tuple(courier for courier in COURIERS if courier.user_id in allowed_courier_ids)
+    )
+    for courier in available:
         selected = "✅ " if order.assigned_courier_id == courier.user_id else "🚚 "
         rows.append([InlineKeyboardButton(
             selected + courier.name,
@@ -169,6 +184,29 @@ def courier_selection_keyboard(order: Order, *, source: str = "manager") -> Inli
         )])
     rows.append([InlineKeyboardButton("↩️ Назад", callback_data=f"{prefix}_close:{order.id}")])
     return InlineKeyboardMarkup(rows)
+
+
+def courier_reassignment_confirmation_keyboard(
+    order: Order,
+    courier_id: int,
+    courier_name: str,
+    *,
+    source: str = "manager",
+) -> InlineKeyboardMarkup:
+    """Require a second deliberate click when custody or a trip already began."""
+    if source not in {"manager", "orders_channel"}:
+        raise ValueError("unsupported courier selection source")
+    prefix = "control_courier" if source == "orders_channel" else "courier"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"⚠️ Да, назначить {courier_name}",
+            callback_data=f"{prefix}_force_assign:{order.id}:{courier_id}",
+        )],
+        [InlineKeyboardButton(
+            "↩️ Не менять курьера",
+            callback_data=f"{prefix}_close:{order.id}",
+        )],
+    ])
 
 
 def _location_rows(order: Order) -> list[list[InlineKeyboardButton]]:
@@ -201,16 +239,71 @@ def _pickup_rows(order: Order) -> list[list[InlineKeyboardButton]]:
     return []
 
 
-def log_location_keyboard(order: Order) -> InlineKeyboardMarkup | None:
-    """Open the native location post from a compact Log notification."""
-    buttons: list[InlineKeyboardButton] = []
-    first_url = telegram_location_url(order) or order.location_url
-    second_url = telegram_location_url(order, 2) or order.second_location_url
+def _stable_map_url(order: Order, location_number: int) -> str | None:
+    if location_number == 2:
+        latitude, longitude = order.second_latitude, order.second_longitude
+        fallback = order.second_location_url
+    else:
+        latitude, longitude = order.latitude, order.longitude
+        fallback = order.location_url
+    if latitude is None or longitude is None:
+        return fallback
+    query = urlencode({
+        "ll": f"{longitude:.6f},{latitude:.6f}",
+        "z": "17",
+        "pt": f"{longitude:.6f},{latitude:.6f},pm2rdm",
+    })
+    return f"https://yandex.uz/maps/?{query}"
+
+
+def log_order_keyboard(order: Order) -> InlineKeyboardMarkup | None:
+    """Stable navigation shared by lifecycle notifications in Log."""
+    rows: list[list[InlineKeyboardButton]] = []
+    order_url = telegram_message_url(
+        order.orders_channel_chat_id,
+        order.orders_channel_message_id,
+    )
+    if order_url:
+        rows.append([InlineKeyboardButton("📋 Открыть заказ", url=order_url)])
+    locations: list[InlineKeyboardButton] = []
+    first_url = _stable_map_url(order, 1)
+    second_url = _stable_map_url(order, 2)
     if first_url:
-        buttons.append(InlineKeyboardButton("📍 Показать локацию", url=first_url))
+        locations.append(InlineKeyboardButton("📍 Локация", url=first_url))
     if second_url:
-        buttons.append(InlineKeyboardButton("📍 Доп. локация", url=second_url))
-    return InlineKeyboardMarkup([buttons]) if buttons else None
+        locations.append(InlineKeyboardButton("📍 Доп. локация", url=second_url))
+    if locations:
+        rows.append(locations)
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+def log_read_keyboard(order: Order) -> InlineKeyboardMarkup | None:
+    """Log read notification with a warehouse hand-over action.
+
+    The callback carries the currently assigned courier ID, so an old
+    notification cannot mark an order picked up after reassignment.
+    """
+    rows: list[list[InlineKeyboardButton]] = []
+    if order.courier_read_at and order.assigned_courier_id and order.status in {"pending", "picked_up"}:
+        courier_name = order.assigned_courier_name or order.courier_name or "Курьер"
+        undo = order.status == "picked_up"
+        rows.append([InlineKeyboardButton(
+            f"↩️ Отменить: {courier_name} забрал товар"
+            if undo else f"📦 {courier_name} забрал товар",
+            callback_data=(
+                f"{'undo_pickup_log' if undo else 'pickup_log'}:"
+                f"{order.id}:{order.assigned_courier_id}"
+            ),
+        )])
+    navigation = log_order_keyboard(order)
+    if navigation:
+        rows.extend(navigation.inline_keyboard)
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+def log_location_keyboard(order: Order) -> InlineKeyboardMarkup | None:
+    """Backward-compatible alias for the common Log navigation."""
+    return log_order_keyboard(order)
 
 
 def orders_channel_keyboard(order: Order) -> InlineKeyboardMarkup:
@@ -298,11 +391,12 @@ def courier_keyboard(order: Order) -> InlineKeyboardMarkup:
             else "👀 Заказ прочитан"
         )
         rows.append([InlineKeyboardButton(read_text, callback_data=f"read:{order.id}")])
-    rows += [
-        [InlineKeyboardButton("🚗 Еду к заказу", callback_data=f"onway:{order.id}")],
-        [InlineKeyboardButton("✅ Доставлено", callback_data=f"complete:{order.id}"),
-         InlineKeyboardButton("❌ Отменён", callback_data=f"cancel:{order.id}")],
-    ]
+        rows.append([InlineKeyboardButton("❌ Отменён", callback_data=f"cancel:{order.id}")])
+    elif order.status == "picked_up":
+        rows += [
+            [InlineKeyboardButton("🚗 Еду к заказу", callback_data=f"onway:{order.id}")],
+            [InlineKeyboardButton("❌ Отменён", callback_data=f"cancel:{order.id}")],
+        ]
     return InlineKeyboardMarkup(rows)
 
 
@@ -329,6 +423,12 @@ def completed_keyboard(order: Order) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(_location_rows(order) + [[
         InlineKeyboardButton("↩️ Назад", callback_data=f"undo_complete:{order.id}"),
     ]])
+
+
+def readonly_order_keyboard(order: Order) -> InlineKeyboardMarkup | None:
+    """Location links for an archived order without mutable actions."""
+    rows = _location_rows(order)
+    return InlineKeyboardMarkup(rows) if rows else None
 
 
 def courier_cancelled_keyboard(order: Order) -> InlineKeyboardMarkup:
@@ -361,16 +461,16 @@ def orders_page_keyboard(
         raise ValueError("page is outside total_pages")
 
     rows: list[list[InlineKeyboardButton]] = []
-    if kind == "active":
-        for order in orders or []:
-            product = " ".join(order.product.split()) or "—"
-            label = f"✏️ №{order.order_number} · {product}"
-            if len(label) > 60:
-                label = label[:59].rstrip() + "…"
-            rows.append([InlineKeyboardButton(
-                label,
-                callback_data=f"list_order:{order.id}",
-            )])
+    for order in orders or []:
+        product = " ".join(order.product.split()) or "—"
+        icon = "✏️" if kind == "active" else "👁"
+        label = f"{icon} №{order.order_number} · {product}"
+        if len(label) > 60:
+            label = label[:59].rstrip() + "…"
+        rows.append([InlineKeyboardButton(
+            label,
+            callback_data=f"list_order:{order.id}",
+        )])
     if map_url:
         rows.append([
             InlineKeyboardButton("🗺 Все локации на карте", url=map_url),

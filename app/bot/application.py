@@ -105,9 +105,28 @@ class AtomicPicklePersistence(PicklePersistence):
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Unhandled Telegram update error", exc_info=context.error)
-    if isinstance(update, Update) and update.effective_message:
-        try: await update.effective_message.reply_text("Произошла ошибка. Попробуйте ещё раз или используйте /cancel.")
-        except Exception: logger.exception("Could not notify user")
+    if not isinstance(update, Update):
+        return
+    if update.callback_query:
+        try:
+            await update.callback_query.answer(
+                "Произошла ошибка. Попробуйте ещё раз.",
+                show_alert=True,
+            )
+        except Exception:
+            logger.exception("Could not show callback error to user")
+        return
+    if (
+        update.effective_message
+        and update.effective_chat
+        and update.effective_chat.type == "private"
+    ):
+        try:
+            await update.effective_message.reply_text(
+                "Произошла ошибка. Попробуйте ещё раз или используйте /cancel."
+            )
+        except Exception:
+            logger.exception("Could not notify user")
 
 
 def _touch_health_signal(application: Application) -> None:
@@ -122,6 +141,20 @@ def _touch_health_signal(application: Application) -> None:
         logger.exception("Could not update delivery bot health signal")
 
 
+async def _sleep_with_health_signal(
+    application: Application,
+    delay_seconds: float,
+) -> None:
+    """Honor Telegram flood waits without making the container look dead."""
+    remaining = max(1.0, float(delay_seconds))
+    while remaining > 0:
+        _touch_health_signal(application)
+        chunk = min(60.0, remaining)
+        await asyncio.sleep(chunk)
+        remaining -= chunk
+    _touch_health_signal(application)
+
+
 async def reconcile_pending_orders(application: Application) -> None:
     """Retry every order that SQLite still marks as not synchronized."""
     repo: OrderRepository = application.bot_data["repo"]
@@ -134,7 +167,7 @@ async def reconcile_pending_orders(application: Application) -> None:
                     order.id,
                     expected_updated_at=getattr(order, "updated_at", None),
                 )
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, RetryAfter):
             raise
         except Exception:
             # One broken Telegram message/order must not starve later orders.
@@ -145,7 +178,7 @@ async def reconcile_pending_orders(application: Application) -> None:
             logger.exception("Background reconciliation failed for order %s", order.id)
     try:
         await _process_cleanup_messages(context, limit=SYNC_RECONCILIATION_BATCH_SIZE)
-    except asyncio.CancelledError:
+    except (asyncio.CancelledError, RetryAfter):
         raise
     except Exception:
         logger.exception("Background cleanup reconciliation failed")
@@ -179,7 +212,7 @@ async def _delivery_sync_worker(application: Application) -> None:
                         "Telegram rate-limited delivery reconciliation for %.1f seconds",
                         delay,
                     )
-                    await asyncio.sleep(max(1.0, delay))
+                    await _sleep_with_health_signal(application, delay)
                     continue
                 except BadRequest:
                     # ``BadRequest`` inherits from ``NetworkError`` in PTB,
@@ -206,7 +239,29 @@ async def _delivery_sync_worker(application: Application) -> None:
                 application.bot_data["delivery_preflight_validated"] = True
                 cycles_since_full = 0
             else:
-                await reconcile_pending_orders(application)
+                try:
+                    await reconcile_pending_orders(application)
+                except RetryAfter as error:
+                    retry_after = error.retry_after
+                    delay = (
+                        retry_after.total_seconds()
+                        if hasattr(retry_after, "total_seconds")
+                        else float(retry_after)
+                    )
+                    logger.warning(
+                        "Telegram rate-limited incremental delivery reconciliation "
+                        "for %.1f seconds",
+                        delay,
+                    )
+                    await _sleep_with_health_signal(application, delay)
+                    continue
+                except NetworkError as error:
+                    logger.warning(
+                        "Telegram is temporarily unavailable during incremental "
+                        "delivery reconciliation: %s",
+                        error,
+                    )
+                    continue
                 cycles_since_full += 1
     finally:
         _touch_health_signal(application)

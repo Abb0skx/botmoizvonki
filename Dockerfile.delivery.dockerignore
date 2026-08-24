@@ -2,3 +2,5 @@
 !app/
 !app/**
 !requirements-delivery.txt
+app/**/__pycache__/
+app/**/*.pyc

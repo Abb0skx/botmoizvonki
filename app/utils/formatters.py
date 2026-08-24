@@ -166,6 +166,10 @@ def daily_delivery_report(
                 f" №{order.order_number} и выехал на склад"
             )
             priority = 1
+        elif event.from_status == event.to_status:
+            # Regular edits are recorded in the append-only audit log, but
+            # must never look like another pickup/departure/delivery.
+            continue
         elif event.from_status == "completed" and event.to_status in {"pending", "picked_up", "on_way"}:
             line = (
                 f"↩️ <b>{occurred:%H:%M}</b> · {courier} отменил завершение"
@@ -304,7 +308,10 @@ def daily_delivery_report(
 
 def locations_text(order: Order) -> str:
     lines = [f"📍 {escape(short_address(order))}"]
-    if order.second_latitude is not None and order.second_longitude is not None:
+    if (
+        order.second_address_text
+        or (order.second_latitude is not None and order.second_longitude is not None)
+    ):
         lines.append(f"📍 {escape(short_address(order, 2))}")
     return "\n".join(lines)
 
@@ -391,13 +398,10 @@ def orders_channel_card(order: Order) -> str:
         "",
         f"📦 Товар: <b>{escape(order.product)}</b>",
         f"💰 Сумма: {money(order.amount_usd, order.amount_uzs)}",
-        (
-            "✅ Оплата: <b>оплачено при сборе товара</b>"
-            if order.payment_status == PAID_AT_ASSEMBLY
-            else "💵 Оплата: при доставке"
-        ),
-        phones_text(order),
     ]
+    if order.payment_status == PAID_AT_ASSEMBLY:
+        lines.append("✅ <b>Оплачено при сборе товара</b>")
+    lines.append(phones_text(order))
     if order.delivery_time:
         lines.append(f"🕒 Время доставки: {escape(order.delivery_time)}")
     if order.comment:
@@ -424,7 +428,10 @@ def orders_channel_card(order: Order) -> str:
         lines.append(f"💵 Получено: {money(order.received_usd, order.received_uzs)}")
 
     lines.extend(["", f"📍 Основная: {escape(short_address(order))}"])
-    if order.second_latitude is not None and order.second_longitude is not None:
+    if (
+        order.second_address_text
+        or (order.second_latitude is not None and order.second_longitude is not None)
+    ):
         lines.append(f"📍 Дополнительная: {escape(short_address(order, 2))}")
 
     created = _local_datetime(order.created_at)

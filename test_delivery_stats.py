@@ -12,7 +12,7 @@ from PIL import Image
 
 from app.database import OrderRepository
 from app.handlers.orders import show_statistics
-from app.stats_service import TASHKENT, build_delivery_stats, parse_report_day
+from app.stats_service import TASHKENT, _money_text, build_delivery_stats, parse_report_day
 from app.utils.static_map import (
     DeliverySequenceStop,
     MAP_HEIGHT,
@@ -121,12 +121,69 @@ class DeliveryStatsServiceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_report_day("not-a-date", today=self.today)
 
+    def test_reassigned_active_order_belongs_only_to_current_courier(self):
+        order = self._order("A58", 41.32, 69.28)
+        order = self.repo.transition(
+            order.id,
+            {"draft"},
+            status="pending",
+            assigned_courier_id=ABBOS_ID,
+            assigned_courier_name="Abbos",
+        )
+        order = self.repo.transition(
+            order.id,
+            {"pending"},
+            status="pending",
+            courier_read_at=datetime.now(TASHKENT).isoformat(),
+            courier_id=ABBOS_ID,
+            courier_name="Abbos",
+            actor_id=ABBOS_ID,
+            actor_name="Abbos",
+            actor_role="courier",
+            event_type="courier_read",
+        )
+        self.repo.transition(
+            order.id,
+            {"pending"},
+            status="pending",
+            assigned_courier_id=MUZROB_ID,
+            assigned_courier_name="Muzrob Oka",
+            courier_id=None,
+            courier_name=None,
+            courier_read_at=None,
+            actor_id=11,
+            actor_name="Manager",
+            actor_role="manager",
+        )
+
+        all_report = build_delivery_stats(self.repo, self.today)
+        old_courier = build_delivery_stats(
+            self.repo,
+            self.today,
+            courier_id=ABBOS_ID,
+        )
+        new_courier = build_delivery_stats(
+            self.repo,
+            self.today,
+            courier_id=MUZROB_ID,
+        )
+
+        self.assertEqual(all_report["orders"][0]["courier_id"], MUZROB_ID)
+        self.assertEqual(old_courier["summary"]["orders"], 0)
+        self.assertEqual(new_courier["summary"]["orders"], 1)
+        self.assertEqual(new_courier["summary"]["active"], 1)
+        self.assertTrue(all(
+            item["courier_id"] == MUZROB_ID
+            for item in new_courier["timeline"]
+        ))
+
     def test_report_exposes_text_only_orders_and_optional_map_details(self):
         mapped = self._order("A59", 41.34, 69.29)
         self.repo.update(
             mapped.id,
             delivery_time="До 16:30",
             comment="Проверит товар",
+            second_address_text="Вторая точка только текстом",
         )
         text_only = self.repo.create(
             manager_id=11,
@@ -148,9 +205,16 @@ class DeliveryStatsServiceTests(unittest.TestCase):
         self.assertEqual(mapped_stop["delivery_time"], "До 16:30")
         self.assertEqual(mapped_stop["comment"], "Проверит товар")
         self.assertFalse(any(stop["order_id"] == text_only.id for stop in report["stops"]))
-        self.assertEqual(len(report["unmapped_orders"]), 1)
-        self.assertEqual(report["unmapped_orders"][0]["id"], text_only.id)
-        self.assertEqual(report["unmapped_orders"][0]["delivery_time"], "Срочно")
+        self.assertEqual(len(report["unmapped_orders"]), 2)
+        second_text = next(
+            item for item in report["unmapped_orders"] if item["id"] == mapped.id
+        )
+        self.assertEqual(second_text["location_number"], 2)
+        text_only_row = next(
+            item for item in report["unmapped_orders"] if item["id"] == text_only.id
+        )
+        self.assertEqual(text_only_row["delivery_time"], "Срочно")
+        self.assertEqual(report["summary"]["unmapped"], 2)
 
     def test_yesterday_uses_status_at_end_of_that_day(self):
         yesterday = self.today - timedelta(days=1)
@@ -198,6 +262,382 @@ class DeliveryStatsServiceTests(unittest.TestCase):
         self.assertEqual(report["summary"]["completed"], 0)
         self.assertEqual(report["summary"]["active"], 1)
         self.assertEqual(report["orders"][0]["status"], "pending")
+
+    def test_same_status_edit_does_not_create_false_completion_activity(self):
+        yesterday = self.today - timedelta(days=1)
+        event_time = datetime(
+            yesterday.year, yesterday.month, yesterday.day, 14, tzinfo=TASHKENT
+        ).astimezone(timezone.utc).isoformat(timespec="microseconds")
+        with patch("app.database.repository.now", return_value=event_time):
+            order = self._order("A61", 41.32, 69.28)
+            order = self.repo.transition(order.id, {"draft"}, status="pending")
+            order = self.repo.transition(
+                order.id,
+                {"pending"},
+                status="on_way",
+                time_started=datetime(
+                    yesterday.year, yesterday.month, yesterday.day, 13, 30,
+                    tzinfo=TASHKENT,
+                ).isoformat(),
+            )
+            order = self.repo.transition(
+                order.id,
+                {"on_way"},
+                status="completed",
+                delivered_at=datetime(
+                    yesterday.year, yesterday.month, yesterday.day, 14,
+                    tzinfo=TASHKENT,
+                ).isoformat(),
+            )
+
+        self.repo.update(order.id, comment="Только исправили комментарий")
+        report = build_delivery_stats(self.repo, self.today)
+
+        self.assertEqual(report["summary"]["orders"], 0)
+        self.assertEqual(report["summary"]["completed"], 0)
+        self.assertEqual(report["timeline"], [])
+
+    def test_undo_completion_and_cancel_are_net_final_states(self):
+        order = self._order("A62", 41.33, 69.29)
+        order = self.repo.transition(
+            order.id,
+            {"draft"},
+            status="pending",
+            assigned_courier_id=ABBOS_ID,
+            assigned_courier_name="Abbos",
+            courier_id=ABBOS_ID,
+            courier_name="Abbos",
+        )
+        order = self.repo.transition(
+            order.id,
+            {"pending"},
+            status="on_way",
+            time_started=datetime.now(TASHKENT).isoformat(),
+            actor_id=ABBOS_ID,
+            actor_name="Abbos",
+            actor_role="courier",
+        )
+        order = self.repo.transition(
+            order.id,
+            {"on_way"},
+            status="completed",
+            received_usd=100,
+            delivered_at=datetime.now(TASHKENT).isoformat(),
+            actor_id=ABBOS_ID,
+            actor_name="Abbos",
+            actor_role="courier",
+        )
+        self.repo.transition(
+            order.id,
+            {"completed"},
+            status="on_way",
+            delivered_at=None,
+            received_usd=None,
+            actor_id=ABBOS_ID,
+            actor_name="Abbos",
+            actor_role="courier",
+        )
+
+        cancelled = self._order("A63", 41.34, 69.30)
+        cancelled = self.repo.transition(cancelled.id, {"draft"}, status="pending")
+        cancelled = self.repo.transition(cancelled.id, {"pending"}, status="cancelled")
+        self.repo.transition(cancelled.id, {"cancelled"}, status="pending")
+
+        report = build_delivery_stats(self.repo, self.today)
+        reopened = next(row for row in report["orders"] if row["id"] == order.id)
+
+        self.assertEqual(report["summary"]["completed"], 0)
+        self.assertEqual(report["summary"]["cancelled"], 0)
+        self.assertEqual(report["summary"]["received_usd"], 0)
+        self.assertEqual(reopened["status"], "on_way")
+        self.assertIsNone(reopened["completed_time"])
+        self.assertEqual(
+            [stop["state"] for stop in report["stops"] if stop["order_id"] == order.id],
+            ["on_way"],
+        )
+
+    def test_cancelled_stop_is_not_a_remaining_route_stop(self):
+        order = self._order("Cancelled", 41.34, 69.30)
+        order = self.repo.transition(
+            order.id,
+            {"draft"},
+            status="pending",
+            assigned_courier_id=ABBOS_ID,
+            assigned_courier_name="Abbos",
+        )
+        self.repo.transition(
+            order.id,
+            {"pending"},
+            status="cancelled",
+            courier_id=ABBOS_ID,
+            courier_name="Abbos",
+            actor_id=ABBOS_ID,
+            actor_name="Abbos",
+            actor_role="courier",
+        )
+
+        report = build_delivery_stats(self.repo, self.today)
+        stop = next(item for item in report["stops"] if item["order_id"] == order.id)
+        route = next(item for item in report["routes"] if item["courier_id"] == ABBOS_ID)
+
+        self.assertEqual(stop["state"], "cancelled")
+        self.assertNotIn(stop["sequence"], route["remaining_sequences"])
+
+    def test_assignment_read_and_warehouse_response_metrics(self):
+        start = datetime.combine(self.today, datetime.min.time(), TASHKENT) + timedelta(hours=10)
+        def utc_text(value):
+            return value.astimezone(timezone.utc).isoformat(timespec="microseconds")
+
+        with patch("app.database.repository.now", return_value=utc_text(start)):
+            order = self._order("SLA", 41.33, 69.29)
+        with patch("app.database.repository.now", return_value=utc_text(start + timedelta(minutes=5))):
+            order = self.repo.transition(
+                order.id,
+                {"draft"},
+                status="pending",
+                assigned_courier_id=ABBOS_ID,
+                assigned_courier_name="Abbos",
+                actor_id=11,
+                actor_name="Manager",
+                actor_role="manager",
+            )
+        with patch("app.database.repository.now", return_value=utc_text(start + timedelta(minutes=10))):
+            order = self.repo.transition(
+                order.id,
+                {"pending"},
+                status="pending",
+                courier_read_at=(start + timedelta(minutes=10)).isoformat(),
+                courier_id=ABBOS_ID,
+                courier_name="Abbos",
+                actor_id=ABBOS_ID,
+                actor_name="Abbos",
+                actor_role="courier",
+                event_type="courier_read",
+            )
+        with patch("app.database.repository.now", return_value=utc_text(start + timedelta(minutes=30))):
+            self.repo.transition(
+                order.id,
+                {"pending"},
+                status="picked_up",
+                picked_up_at=(start + timedelta(minutes=30)).isoformat(),
+                actor_id=11,
+                actor_name="Warehouse",
+                actor_role="staff",
+            )
+
+        report = build_delivery_stats(self.repo, self.today)
+        row = next(item for item in report["orders"] if item["id"] == order.id)
+
+        self.assertEqual(row["response_minutes"], 5)
+        self.assertEqual(row["warehouse_minutes"], 20)
+        self.assertEqual(report["summary"]["average_response_minutes"], 5)
+        self.assertEqual(report["summary"]["average_warehouse_minutes"], 20)
+
+    def test_past_delivery_keeps_historical_courier_after_reassignment(self):
+        day = self.today - timedelta(days=1)
+        start = datetime.combine(day, datetime.min.time(), TASHKENT) + timedelta(hours=10)
+        def utc_text(value):
+            return value.astimezone(timezone.utc).isoformat(timespec="microseconds")
+
+        with patch("app.database.repository.now", return_value=utc_text(start)):
+            order = self._order("History", 41.35, 69.31)
+            order = self.repo.transition(
+                order.id,
+                {"draft"},
+                status="pending",
+                assigned_courier_id=ABBOS_ID,
+                assigned_courier_name="Abbos",
+            )
+        with patch("app.database.repository.now", return_value=utc_text(start + timedelta(hours=1))):
+            order = self.repo.transition(
+                order.id,
+                {"pending"},
+                status="completed",
+                courier_id=ABBOS_ID,
+                courier_name="Abbos",
+                delivered_at=(start + timedelta(hours=1)).isoformat(),
+                actor_id=ABBOS_ID,
+                actor_name="Abbos",
+                actor_role="courier",
+            )
+        self.repo.transition(
+            order.id,
+            {"completed"},
+            status="pending",
+            assigned_courier_id=MUZROB_ID,
+            assigned_courier_name="Muzrob Oka",
+            courier_id=None,
+            courier_name=None,
+            delivered_at=None,
+        )
+
+        abbos = build_delivery_stats(self.repo, day, courier_id=ABBOS_ID)
+        muzrob = build_delivery_stats(self.repo, day, courier_id=MUZROB_ID)
+
+        self.assertEqual(abbos["summary"]["completed"], 1)
+        self.assertEqual(abbos["orders"][0]["courier_id"], ABBOS_ID)
+        self.assertEqual(muzrob["summary"]["orders"], 0)
+
+    def test_stats_plan_keeps_carried_goods_at_last_customer(self):
+        now = datetime.now(TASHKENT).replace(microsecond=0)
+        delivered = self._order("First", 41.31, 69.27)
+        delivered = self.repo.transition(
+            delivered.id,
+            {"draft"},
+            status="pending",
+            assigned_courier_id=ABBOS_ID,
+            assigned_courier_name="Abbos",
+            courier_id=ABBOS_ID,
+            courier_name="Abbos",
+        )
+        delivered = self.repo.transition(
+            delivered.id,
+            {"pending"},
+            status="picked_up",
+            picked_up_at=(now - timedelta(minutes=50)).isoformat(),
+        )
+        carried = self._order("Second", 41.36, 69.31)
+        carried = self.repo.transition(
+            carried.id,
+            {"draft"},
+            status="pending",
+            assigned_courier_id=ABBOS_ID,
+            assigned_courier_name="Abbos",
+            courier_id=ABBOS_ID,
+            courier_name="Abbos",
+        )
+        self.repo.transition(
+            carried.id,
+            {"pending"},
+            status="picked_up",
+            picked_up_at=(now - timedelta(minutes=50)).isoformat(),
+        )
+        self.repo.transition(
+            delivered.id,
+            {"picked_up"},
+            status="completed",
+            delivered_at=(now - timedelta(minutes=10)).isoformat(),
+            actor_id=ABBOS_ID,
+            actor_name="Abbos",
+            actor_role="courier",
+        )
+
+        report = build_delivery_stats(self.repo, self.today)
+        route = next(item for item in report["routes"] if item["courier_id"] == ABBOS_ID)
+
+        self.assertEqual(route["return_path"], [])
+        self.assertEqual(route["planned_path"][0], [41.31, 69.27])
+        self.assertIn([41.36, 69.31], route["planned_path"])
+
+    def test_stats_plan_tolerates_legacy_missing_pickup_timestamp(self):
+        for index, picked_up_at in enumerate((None, datetime.now(TASHKENT).isoformat())):
+            order = self._order(f"Legacy-{index}", 41.34 + index / 100, 69.28)
+            self.repo.transition(
+                order.id,
+                {"draft"},
+                status="picked_up",
+                assigned_courier_id=ABBOS_ID,
+                assigned_courier_name="Abbos",
+                courier_id=ABBOS_ID,
+                courier_name="Abbos",
+                picked_up_at=picked_up_at,
+            )
+
+        report = build_delivery_stats(self.repo, self.today)
+        route = next(item for item in report["routes"] if item["courier_id"] == ABBOS_ID)
+
+        self.assertEqual(len(route["planned_order_ids"]), 2)
+
+    def test_cross_midnight_delivery_keeps_duration(self):
+        start = datetime(
+            self.today.year, self.today.month, self.today.day, tzinfo=TASHKENT
+        ) - timedelta(minutes=10)
+        completed = start + timedelta(minutes=20)
+        with patch(
+            "app.database.repository.now",
+            return_value=start.astimezone(timezone.utc).isoformat(timespec="microseconds"),
+        ):
+            order = self._order("A64", 41.35, 69.31)
+            order = self.repo.transition(order.id, {"draft"}, status="pending")
+            order = self.repo.transition(
+                order.id,
+                {"pending"},
+                status="on_way",
+                time_started=start.isoformat(),
+            )
+        with patch(
+            "app.database.repository.now",
+            return_value=completed.astimezone(timezone.utc).isoformat(timespec="microseconds"),
+        ):
+            self.repo.transition(
+                order.id,
+                {"on_way"},
+                status="completed",
+                delivered_at=completed.isoformat(),
+            )
+
+        report = build_delivery_stats(self.repo, self.today)
+
+        self.assertEqual(report["orders"][0]["duration_minutes"], 20)
+        self.assertEqual(report["summary"]["average_minutes"], 20)
+
+    def test_day_read_event_wins_over_later_mutable_read_field(self):
+        yesterday = self.today - timedelta(days=1)
+        read_at = datetime(
+            yesterday.year, yesterday.month, yesterday.day, 16, 5, tzinfo=TASHKENT
+        )
+        with patch(
+            "app.database.repository.now",
+            return_value=read_at.astimezone(timezone.utc).isoformat(timespec="microseconds"),
+        ):
+            order = self._order("A65", 41.36, 69.32)
+            order = self.repo.transition(
+                order.id,
+                {"draft"},
+                status="pending",
+                assigned_courier_id=ABBOS_ID,
+                assigned_courier_name="Abbos",
+            )
+            self.repo.transition(
+                order.id,
+                {"pending"},
+                status="pending",
+                courier_read_at=read_at.isoformat(),
+                courier_id=ABBOS_ID,
+                courier_name="Abbos",
+                actor_id=ABBOS_ID,
+                actor_name="Abbos",
+                actor_role="courier",
+                event_type="courier_read",
+            )
+        self.repo.update(
+            order.id,
+            courier_read_at=datetime.now(TASHKENT).isoformat(),
+        )
+
+        report = build_delivery_stats(self.repo, yesterday)
+
+        self.assertEqual(report["orders"][0]["read_time"], "16:05")
+        self.assertEqual(report["orders"][0]["courier_id"], ABBOS_ID)
+
+    def test_money_summary_is_explicit_and_never_assumes_received(self):
+        order = self._order("A66", 41.37, 69.33)
+        order = self.repo.transition(order.id, {"draft"}, status="pending")
+        self.repo.transition(
+            order.id,
+            {"pending"},
+            status="completed",
+            delivered_at=datetime.now(TASHKENT).isoformat(),
+        )
+
+        report = build_delivery_stats(self.repo, self.today)
+
+        self.assertEqual(_money_text(100, 0).count("100$"), 1)
+        self.assertEqual(report["summary"]["created_value_usd"], 100)
+        self.assertEqual(report["summary"]["delivered_value_usd"], 100)
+        self.assertEqual(report["summary"]["received_usd"], 0)
+        self.assertEqual(report["summary"]["missing_received_confirmation"], 1)
+        self.assertEqual(report["breakdowns"]["managers"][0]["name"], "Abbos")
 
 
 class DeliverySequenceMapTests(unittest.IsolatedAsyncioTestCase):
@@ -298,8 +738,14 @@ class DeliveryStatsWebTests(unittest.TestCase):
         page = self.client.get("/delivery/stats", headers=self._auth())
         self.assertEqual(page.status_code, 200)
         self.assertIn("Статистика доставки", page.text)
+        self.assertIn("Разбивка за день", page.text)
+        self.assertIn("loadMapPhoto", page.text)
         self.assertEqual(page.headers["cache-control"], "no-store")
         self.assertEqual(page.headers["x-frame-options"], "DENY")
+
+        health = self.client.get("/healthz")
+        self.assertEqual(health.status_code, 200)
+        self.assertEqual(health.json()["database"], "ok")
 
         report = self.client.get(
             "/delivery/stats/api/report?day=today",
@@ -307,6 +753,8 @@ class DeliveryStatsWebTests(unittest.TestCase):
         )
         self.assertEqual(report.status_code, 200)
         self.assertEqual(report.json()["summary"]["orders"], 1)
+        self.assertIn("breakdowns", report.json())
+        self.assertIn("created_value_text", report.json()["summary"])
 
     def test_map_endpoint_returns_png(self):
         image = BytesIO(b"png-data")

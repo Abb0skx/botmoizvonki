@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import math
 import os
 import sqlite3
@@ -24,6 +25,9 @@ ROUTING_USER_AGENT = "TEXNIKACH-Delivery/1.0 (texnikach@gmail.com)"
 CACHE_TTL_SECONDS = 30 * 24 * 60 * 60
 FAILURE_COOLDOWN_SECONDS = 60
 MIN_REQUEST_INTERVAL_SECONDS = 1.05
+MAX_ROUTING_POINTS = 20
+ROUTE_SPECIFIC_HTTP_ERRORS = frozenset({400, 404, 422})
+logger = logging.getLogger(__name__)
 
 
 def _haversine_m(start: list[float], finish: list[float]) -> float:
@@ -89,6 +93,8 @@ class RoutingService:
         self._request_lock = threading.Lock()
         self._last_request_at = 0.0
         self._failed_until = 0.0
+        self._failed_keys: dict[str, float] = {}
+        self._cache_enabled = True
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
@@ -99,15 +105,40 @@ class RoutingService:
 
     def _initialize(self) -> None:
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as db:
-            db.execute("PRAGMA journal_mode=WAL")
-            db.execute(
-                """CREATE TABLE IF NOT EXISTS road_routes (
-                       cache_key TEXT PRIMARY KEY,
-                       payload TEXT NOT NULL,
-                       created_at REAL NOT NULL
-                   )"""
-            )
+        for attempt in range(7):
+            try:
+                with self._connect() as db:
+                    db.execute("PRAGMA journal_mode=WAL")
+                    db.execute(
+                        """CREATE TABLE IF NOT EXISTS road_routes (
+                               cache_key TEXT PRIMARY KEY,
+                               payload TEXT NOT NULL,
+                               created_at REAL NOT NULL
+                           )"""
+                    )
+                    db.execute(
+                        "DELETE FROM road_routes WHERE created_at < ?",
+                        (time.time() - CACHE_TTL_SECONDS,),
+                    )
+                return
+            except sqlite3.OperationalError as error:
+                if "locked" not in str(error).casefold() or attempt == 6:
+                    logger.warning(
+                        "Routing cache unavailable; continuing without persistent cache: %s",
+                        type(error).__name__,
+                    )
+                    self._cache_enabled = False
+                    return
+                time.sleep(0.05 * (2**attempt))
+            except sqlite3.DatabaseError as error:
+                # Road geometry is derived data. A corrupt cache must never
+                # prevent Telegram order processing from starting.
+                logger.warning(
+                    "Routing cache is unreadable; continuing without it: %s",
+                    type(error).__name__,
+                )
+                self._cache_enabled = False
+                return
 
     def _key(self, points: list[list[float]]) -> str:
         raw = json.dumps(
@@ -118,11 +149,17 @@ class RoutingService:
         return hashlib.sha256(raw.encode()).hexdigest()
 
     def _cached(self, key: str) -> dict[str, Any] | None:
-        with self._connect() as db:
-            row = db.execute(
-                "SELECT payload,created_at FROM road_routes WHERE cache_key=?",
-                (key,),
-            ).fetchone()
+        if not self._cache_enabled:
+            return None
+        try:
+            with self._connect() as db:
+                row = db.execute(
+                    "SELECT payload,created_at FROM road_routes WHERE cache_key=?",
+                    (key,),
+                ).fetchone()
+        except sqlite3.DatabaseError:
+            logger.warning("Routing cache read failed; using a fresh route")
+            return None
         if not row or time.time() - row["created_at"] > CACHE_TTL_SECONDS:
             return None
         try:
@@ -131,15 +168,20 @@ class RoutingService:
             return None
 
     def _store(self, key: str, payload: dict[str, Any]) -> None:
-        with self._connect() as db:
-            db.execute(
-                """INSERT INTO road_routes(cache_key,payload,created_at)
-                   VALUES(?,?,?)
-                   ON CONFLICT(cache_key) DO UPDATE SET
-                     payload=excluded.payload,
-                     created_at=excluded.created_at""",
-                (key, json.dumps(payload, separators=(",", ":")), time.time()),
-            )
+        if not self._cache_enabled:
+            return
+        try:
+            with self._connect() as db:
+                db.execute(
+                    """INSERT INTO road_routes(cache_key,payload,created_at)
+                       VALUES(?,?,?)
+                       ON CONFLICT(cache_key) DO UPDATE SET
+                         payload=excluded.payload,
+                         created_at=excluded.created_at""",
+                    (key, json.dumps(payload, separators=(",", ":")), time.time()),
+                )
+        except sqlite3.DatabaseError:
+            logger.warning("Routing cache write failed; route remains available in memory")
 
     @staticmethod
     def _leg_geometry(leg: dict[str, Any], start: list[float], finish: list[float]) -> list[list[float]]:
@@ -207,6 +249,40 @@ class RoutingService:
         cached = self._cached(key)
         if cached:
             return cached
+        if len(normalized) > MAX_ROUTING_POINTS:
+            chunks = [
+                normalized[index:index + MAX_ROUTING_POINTS]
+                for index in range(0, len(normalized) - 1, MAX_ROUTING_POINTS - 1)
+            ]
+            results = [self._route_sync(chunk) for chunk in chunks if len(chunk) >= 2]
+            geometry: list[list[float]] = []
+            legs: list[dict[str, Any]] = []
+            for result in results:
+                part = result.get("geometry") or []
+                if geometry and part and geometry[-1] == part[0]:
+                    geometry.extend(part[1:])
+                else:
+                    geometry.extend(part)
+                legs.extend(result.get("legs") or [])
+            merged = {
+                "provider": (
+                    "osrm" if results and all(item.get("provider") == "osrm" for item in results)
+                    else "mixed"
+                ),
+                "approximate": True,
+                "geometry": geometry,
+                "legs": legs,
+                "distance_m": round(sum(item.get("distance_m", 0) for item in results)),
+                "duration_s": round(sum(item.get("duration_s", 0) for item in results)),
+            }
+            # Never retain a transient chunk fallback for the normal 30-day
+            # road-route TTL.
+            if results and all(item.get("provider") == "osrm" for item in results):
+                self._store(key, merged)
+            return merged
+        failed_key_until = self._failed_keys.get(key, 0.0)
+        if time.monotonic() < failed_key_until:
+            return _fallback(normalized)
         if time.monotonic() < self._failed_until:
             return _fallback(normalized)
         with self._request_lock:
@@ -218,7 +294,21 @@ class RoutingService:
                 time.sleep(wait)
             try:
                 result = self._fetch(normalized)
-            except (HTTPError, URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError):
+            except HTTPError as error:
+                if error.code in ROUTE_SPECIFIC_HTTP_ERRORS:
+                    self._failed_keys[key] = time.monotonic() + CACHE_TTL_SECONDS
+                else:
+                    # Rate limits, request timeouts and authentication/service
+                    # failures affect the router globally. A 429 must never
+                    # poison this particular route for the 30-day cache TTL.
+                    self._failed_until = time.monotonic() + FAILURE_COOLDOWN_SECONDS
+                return _fallback(normalized)
+            except (ValueError, json.JSONDecodeError):
+                # A bad or unroutable coordinate must not disable road routes
+                # for every other courier.
+                self._failed_keys[key] = time.monotonic() + FAILURE_COOLDOWN_SECONDS
+                return _fallback(normalized)
+            except (URLError, TimeoutError, OSError):
                 self._failed_until = time.monotonic() + FAILURE_COOLDOWN_SECONDS
                 return _fallback(normalized)
             finally:
@@ -250,6 +340,7 @@ async def enrich_monitor_routes(
     routing: RoutingService,
 ) -> dict[str, Any]:
     total_driven = 0.0
+    total_planned_remaining = 0.0
     for route in state["routes"]:
         dark_results = []
         for path in route.get("dark_paths") or []:
@@ -274,6 +365,8 @@ async def enrich_monitor_routes(
             else 0.0
         )
         movement_distance = (movement["distance_m"] * movement_progress) if movement else 0
+        planned_path = route.get("planned_path") or []
+        planned = await routing.route(planned_path) if len(planned_path) >= 2 else None
         route["current_road_path"] = (
             movement["geometry"] if movement and route.get("movement_kind") == "delivery" else []
         )
@@ -281,6 +374,16 @@ async def enrich_monitor_routes(
             movement["geometry"]
             if movement and route.get("movement_kind") in {"return", "warehouse"}
             else []
+        )
+        route["planned_road_path"] = planned["geometry"] if planned else []
+        route["planned_route"] = (
+            {
+                "distance_km": round(planned["distance_m"] / 1_000, 1),
+                "duration_minutes": max(1, round(planned["duration_s"] / 60)),
+                "provider": planned["provider"],
+            }
+            if planned
+            else None
         )
         route["movement"] = (
             {
@@ -301,11 +404,16 @@ async def enrich_monitor_routes(
             (completed_distance + movement_distance) / 1_000,
             1,
         )
+        movement_remaining = (
+            max(0.0, movement["distance_m"] - movement_distance) if movement else 0.0
+        )
+        planned_distance = planned["distance_m"] if planned else 0.0
         route["planned_remaining_km"] = round(
-            ((movement["distance_m"] - movement_distance) if movement else 0) / 1_000,
+            (movement_remaining + planned_distance) / 1_000,
             1,
         )
         total_driven += completed_distance + movement_distance
+        total_planned_remaining += movement_remaining + planned_distance
 
     route_by_courier = {route["courier_id"]: route for route in state["routes"]}
     for courier in state["couriers"]:
@@ -314,6 +422,10 @@ async def enrich_monitor_routes(
         courier["planned_remaining_km"] = route["planned_remaining_km"]
         courier["movement"] = route["movement"]
     state["summary"]["distance_today_km"] = round(total_driven / 1_000, 1)
+    state["summary"]["planned_remaining_km"] = round(
+        total_planned_remaining / 1_000,
+        1,
+    )
     state["routing_attribution"] = "Маршруты: OSRM / © OpenStreetMap contributors"
     return state
 
@@ -339,9 +451,29 @@ async def enrich_stats_routes(
             if len(route.get("return_path") or []) >= 2
             else None
         )
+        planned = (
+            await routing.route(route["planned_path"])
+            if len(route.get("planned_path") or []) >= 2
+            else None
+        )
         completed_distance = sum(item["distance_m"] for item in completed_results)
         current_distance = current["distance_m"] if current else 0
         return_distance = returning["distance_m"] if returning else 0
+        current_progress = (
+            _progress(route.get("current_started_at"), current["duration_s"])
+            if current
+            else 0.0
+        )
+        return_progress = (
+            _progress(route.get("return_started_at"), returning["duration_s"])
+            if returning
+            else 0.0
+        )
+        current_driven = current_distance * current_progress
+        return_driven = return_distance * return_progress
+        current_remaining = max(0.0, current_distance - current_driven)
+        return_remaining = max(0.0, return_distance - return_driven)
+        planned_distance = planned["distance_m"] if planned else 0
         route["completed_road_paths"] = [item["geometry"] for item in completed_results]
         route["completed_road_segments"] = [
             {
@@ -353,19 +485,38 @@ async def enrich_stats_routes(
         ]
         route["current_road_path"] = current["geometry"] if current else []
         route["return_road_path"] = returning["geometry"] if returning else []
-        route["distance_km"] = round((completed_distance + return_distance) / 1_000, 1)
-        route["planned_distance_km"] = round(current_distance / 1_000, 1)
+        route["planned_road_path"] = planned["geometry"] if planned else []
+        route["planned_route"] = (
+            {
+                "distance_km": round(planned["distance_m"] / 1_000, 1),
+                "duration_minutes": max(1, round(planned["duration_s"] / 60)),
+                "provider": planned["provider"],
+            }
+            if planned
+            else None
+        )
+        route["distance_km"] = round(
+            (completed_distance + current_driven + return_driven) / 1_000,
+            1,
+        )
+        route["planned_distance_km"] = round(
+            (current_remaining + return_remaining + planned_distance) / 1_000,
+            1,
+        )
         route["completed_minutes"] = round(
             sum(item["duration_s"] for item in completed_results) / 60
         )
-        route["return_minutes"] = (
-            max(1, round(returning["duration_s"] / 60)) if returning else 0
-        )
+        route["current_driven_minutes"] = round(
+            (current["duration_s"] * current_progress) / 60
+        ) if current else 0
+        route["return_minutes"] = round(
+            (returning["duration_s"] * return_progress) / 60
+        ) if returning else 0
         route["estimated_minutes"] = (
             max(1, round(current["duration_s"] / 60)) if current else None
         )
-        total_distance += completed_distance + return_distance
-        total_planned += current_distance
+        total_distance += completed_distance + current_driven + return_driven
+        total_planned += current_remaining + return_remaining + planned_distance
 
     route_by_courier = {route["courier_id"]: route for route in report["routes"]}
     for courier in report["couriers"]:
@@ -373,7 +524,9 @@ async def enrich_stats_routes(
         courier["distance_km"] = route.get("distance_km", 0)
         courier["planned_distance_km"] = route.get("planned_distance_km", 0)
         courier["route_minutes"] = (
-            route.get("completed_minutes", 0) + route.get("return_minutes", 0)
+            route.get("completed_minutes", 0)
+            + route.get("current_driven_minutes", 0)
+            + route.get("return_minutes", 0)
         )
     report["summary"]["distance_km"] = round(total_distance / 1_000, 1)
     report["summary"]["planned_distance_km"] = round(total_planned / 1_000, 1)

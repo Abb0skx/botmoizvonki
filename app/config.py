@@ -4,6 +4,8 @@ import os
 
 from dotenv import load_dotenv
 
+from app.utils.couriers import courier_ids as known_courier_ids
+
 
 def _ids(value: str) -> frozenset[int]:
     try:
@@ -54,6 +56,19 @@ class Settings:
             raise RuntimeError("DELIVERY_MANAGER_IDS must contain at least one Telegram user ID")
         if not courier_ids:
             raise RuntimeError("DELIVERY_COURIER_IDS must contain at least one Telegram user ID")
+        unknown_courier_ids = courier_ids - known_courier_ids()
+        if unknown_courier_ids:
+            unknown = ", ".join(str(value) for value in sorted(unknown_courier_ids))
+            raise RuntimeError(
+                "DELIVERY_COURIER_IDS contains couriers without a configured "
+                f"name/group: {unknown}"
+            )
+        missing_courier_ids = known_courier_ids() - courier_ids
+        if missing_courier_ids:
+            missing = ", ".join(str(value) for value in sorted(missing_courier_ids))
+            raise RuntimeError(
+                "DELIVERY_COURIER_IDS is missing configured couriers: " + missing
+            )
         return cls(
             bot_token=token,
             delivery_group_id=parsed_group_id,

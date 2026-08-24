@@ -1,9 +1,12 @@
 import base64
+import logging
 import os
 import secrets
+import sqlite3
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
 from app.analytics_service import build_delivery_analytics
@@ -16,6 +19,7 @@ from app.utils.static_map import DeliverySequenceStop, render_delivery_sequence_
 
 
 DATABASE_PATH = Path(os.getenv("DELIVERY_DB_PATH", "/app/data/delivery.db"))
+DELIVERY_CACHE_PATH = os.getenv("DELIVERY_CACHE_PATH", "").strip()
 STATS_USERNAME = (
     os.getenv("DELIVERY_STATS_USERNAME")
     or os.getenv("REVIEWS_ADMIN_USERNAME")
@@ -31,6 +35,7 @@ STATS_TEMPLATE_PATH = TEMPLATE_DIR / "delivery_stats.html"
 MONITOR_TEMPLATE_PATH = TEMPLATE_DIR / "delivery_monitor.html"
 _ROUTING_SERVICE: RoutingService | None = None
 _ROUTING_CACHE_PATH: Path | None = None
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="TEXNIKACH Delivery Statistics",
@@ -73,12 +78,16 @@ def require_stats_auth(request: Request) -> str:
 def _repository() -> OrderRepository:
     if not DATABASE_PATH.is_file():
         raise HTTPException(status_code=503, detail="delivery_database_not_found")
-    return OrderRepository(DATABASE_PATH)
+    return OrderRepository(DATABASE_PATH, read_only=True)
+
+
+def _cache_directory() -> Path:
+    return Path(DELIVERY_CACHE_PATH) if DELIVERY_CACHE_PATH else DATABASE_PATH.parent
 
 
 def _routing_service() -> RoutingService:
     global _ROUTING_SERVICE, _ROUTING_CACHE_PATH
-    cache_path = DATABASE_PATH.parent / "routing-cache.db"
+    cache_path = _cache_directory() / "routing-cache.db"
     if _ROUTING_SERVICE is None or _ROUTING_CACHE_PATH != cache_path:
         _ROUTING_SERVICE = RoutingService(cache_path)
         _ROUTING_CACHE_PATH = cache_path
@@ -126,7 +135,45 @@ def health():
         return JSONResponse({"ok": False, "reason": "password"}, status_code=503)
     if not DATABASE_PATH.is_file():
         return JSONResponse({"ok": False, "reason": "database"}, status_code=503)
-    return {"ok": True}
+    try:
+        with sqlite3.connect(
+            DATABASE_PATH.resolve().as_uri() + "?mode=ro",
+            uri=True,
+            timeout=5,
+        ) as database:
+            database.execute("PRAGMA busy_timeout=5000")
+            quick_check = database.execute("PRAGMA quick_check").fetchone()
+            tables = {
+                row[0]
+                for row in database.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            cleanup_columns = {
+                row[1]
+                for row in database.execute(
+                    "PRAGMA table_info(telegram_cleanup_queue)"
+                ).fetchall()
+            }
+        if not quick_check or quick_check[0] != "ok":
+            return JSONResponse(
+                {"ok": False, "reason": "database_integrity"},
+                status_code=503,
+            )
+        if not {"orders", "order_events", "telegram_cleanup_queue"}.issubset(tables):
+            return JSONResponse(
+                {"ok": False, "reason": "database_schema"},
+                status_code=503,
+            )
+        if not {"terminal", "next_attempt_at"}.issubset(cleanup_columns):
+            return JSONResponse(
+                {"ok": False, "reason": "database_migration"},
+                status_code=503,
+            )
+    except sqlite3.Error:
+        logger.exception("Delivery statistics health check could not read SQLite")
+        return JSONResponse({"ok": False, "reason": "database_read"}, status_code=503)
+    return {"ok": True, "database": "ok"}
 
 
 @app.get("/robots.txt", response_class=PlainTextResponse)
@@ -148,7 +195,8 @@ def monitor_page(_username: str = Depends(require_stats_auth)):
 
 @app.get("/delivery/monitor/api/state")
 async def monitor_state(_username: str = Depends(require_stats_auth)):
-    state = build_delivery_monitor(_repository())
+    repository = _repository()
+    state = await run_in_threadpool(build_delivery_monitor, repository)
     return await enrich_monitor_routes(state, _routing_service())
 
 
@@ -158,7 +206,7 @@ async def statistics_report(
     courier_id: int | None = Query(None),
     _username: str = Depends(require_stats_auth),
 ):
-    report = _report(day, courier_id)
+    report = await run_in_threadpool(_report, day, courier_id)
     return await enrich_stats_routes(report, _routing_service())
 
 
@@ -166,13 +214,17 @@ async def statistics_report(
 def statistics_analytics(
     month: str | None = Query(None, max_length=7),
     week: str | None = Query(None, max_length=8),
+    courier_id: int | None = Query(None),
     _username: str = Depends(require_stats_auth),
 ):
+    if courier_id is not None and courier_id not in COURIERS_BY_ID:
+        raise HTTPException(status_code=422, detail="unknown_courier")
     try:
         return build_delivery_analytics(
             _repository(),
             month=month,
             week=week,
+            courier_id=courier_id,
         )
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
@@ -184,10 +236,8 @@ async def statistics_map(
     courier_id: int | None = Query(None),
     _username: str = Depends(require_stats_auth),
 ):
-    report = await enrich_stats_routes(
-        _report(day, courier_id),
-        _routing_service(),
-    )
+    report = await run_in_threadpool(_report, day, courier_id)
+    report = await enrich_stats_routes(report, _routing_service())
     stops = [
         DeliverySequenceStop(
             sequence=stop["sequence"],
@@ -205,10 +255,15 @@ async def statistics_map(
         image = await render_delivery_sequence_map(
             stops,
             report_day_label=report["day_label"],
-            cache_dir=DATABASE_PATH.parent / "map-tiles",
+            cache_dir=_cache_directory() / "map-tiles",
             road_routes=report["routes"],
         )
     except Exception as error:
+        logger.exception(
+            "Could not render delivery statistics map for day=%s courier_id=%s",
+            day,
+            courier_id,
+        )
         raise HTTPException(status_code=503, detail="map_temporarily_unavailable") from error
     filename = f"texnikach-delivery-{report['day']}.png"
     return StreamingResponse(

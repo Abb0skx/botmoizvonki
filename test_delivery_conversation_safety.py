@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from telegram.ext import CallbackQueryHandler, CommandHandler, ConversationHandler
+from telegram.ext import CallbackQueryHandler, CommandHandler, ConversationHandler, filters
 
 from app.database import OrderRepository
 from app.handlers.orders import (
@@ -14,6 +14,8 @@ from app.handlers.orders import (
     comment,
     new_order,
     register_handlers,
+    save_edit,
+    show_all_locations,
     start,
 )
 
@@ -64,8 +66,19 @@ class FinalCreationStepSafetyTests(unittest.IsolatedAsyncioTestCase):
 
     def make_context(self):
         return SimpleNamespace(
-            application=SimpleNamespace(bot_data={"repo": self.repo}),
+            application=SimpleNamespace(bot_data={
+                "repo": self.repo,
+                "settings": SimpleNamespace(manager_ids=frozenset({self.user.id})),
+            }),
             user_data={"draft": complete_draft()},
+        )
+
+    def private_update(self, message):
+        return SimpleNamespace(
+            message=message,
+            effective_message=message,
+            effective_chat=SimpleNamespace(type="private"),
+            effective_user=self.user,
         )
 
     async def test_retry_after_card_send_failure_does_not_duplicate_order(self):
@@ -74,7 +87,7 @@ class FinalCreationStepSafetyTests(unittest.IsolatedAsyncioTestCase):
             text="Пропустить",
             reply_text=AsyncMock(side_effect=[RuntimeError("Telegram timeout"), card_message, None]),
         )
-        update = SimpleNamespace(message=message, effective_user=self.user)
+        update = self.private_update(message)
         context = self.make_context()
 
         with self.assertRaisesRegex(RuntimeError, "Telegram timeout"):
@@ -91,7 +104,9 @@ class FinalCreationStepSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("draft", context.user_data)
         order = self.repo.list_all()[0]
         self.assertEqual(order.manager_message_id, 501)
-        self.assertEqual(len(self.repo.list_events(order.id)), 2)
+        # Telegram publication references are technical metadata, not a
+        # manager-visible business edit in the append-only order history.
+        self.assertEqual(len(self.repo.list_events(order.id)), 1)
 
     async def test_retry_after_confirmation_failure_does_not_resend_card(self):
         card_message = SimpleNamespace(chat_id=101, message_id=502)
@@ -99,7 +114,7 @@ class FinalCreationStepSafetyTests(unittest.IsolatedAsyncioTestCase):
             text="Пропустить",
             reply_text=AsyncMock(side_effect=[card_message, RuntimeError("confirmation timeout"), None]),
         )
-        update = SimpleNamespace(message=message, effective_user=self.user)
+        update = self.private_update(message)
         context = self.make_context()
 
         with self.assertRaisesRegex(RuntimeError, "confirmation timeout"):
@@ -115,9 +130,12 @@ class FinalCreationStepSafetyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_persisted_draft_ends_safely(self):
         message = SimpleNamespace(text="Пропустить", reply_text=AsyncMock())
-        update = SimpleNamespace(message=message, effective_user=self.user)
+        update = self.private_update(message)
         context = SimpleNamespace(
-            application=SimpleNamespace(bot_data={"repo": self.repo}),
+            application=SimpleNamespace(bot_data={
+                "repo": self.repo,
+                "settings": SimpleNamespace(manager_ids=frozenset({self.user.id})),
+            }),
             user_data={},
         )
 
@@ -127,21 +145,68 @@ class FinalCreationStepSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.repo.count_all(), 0)
         self.assertIn("Черновик заказа не найден", message.reply_text.await_args.args[0])
 
+    async def test_revoked_manager_cannot_finish_persisted_creation_as_courier(self):
+        message = SimpleNamespace(text="Пропустить", reply_text=AsyncMock())
+        update = self.private_update(message)
+        context = self.make_context()
+        context.user_data["edit"] = {"order_id": 99}
+        context.application.bot_data["settings"] = SimpleNamespace(
+            manager_ids=frozenset(),
+            courier_ids=frozenset({self.user.id}),
+        )
+
+        state = await comment(update, context)
+
+        self.assertEqual(state, ConversationHandler.END)
+        self.assertEqual(self.repo.count_all(), 0)
+        self.assertNotIn("draft", context.user_data)
+        self.assertNotIn("edit", context.user_data)
+        self.assertIn("Доступ менеджера отозван", message.reply_text.await_args.args[0])
+
+    async def test_revoked_manager_cannot_finish_persisted_edit_as_courier(self):
+        order = self.repo.create(
+            manager_id=self.user.id,
+            manager_name=self.user.full_name,
+            data=complete_draft(),
+        )
+        message = SimpleNamespace(
+            text="Подменённая модель",
+            location=None,
+            reply_text=AsyncMock(),
+        )
+        update = self.private_update(message)
+        context = self.make_context()
+        context.user_data = {
+            "edit": {
+                "order_id": order.id,
+                "field": "product",
+                "chat_id": self.user.id,
+                "updated_at": order.updated_at,
+            }
+        }
+        context.application.bot_data["settings"] = SimpleNamespace(
+            manager_ids=frozenset(),
+            courier_ids=frozenset({self.user.id}),
+        )
+
+        state = await save_edit(update, context)
+
+        self.assertEqual(state, ConversationHandler.END)
+        self.assertEqual(self.repo.get(order.id).product, "A56")
+        self.assertNotIn("edit", context.user_data)
+
     async def test_cancel_after_card_send_failure_cancels_committed_draft(self):
         message = SimpleNamespace(
             text="Пропустить",
             reply_text=AsyncMock(side_effect=RuntimeError("Telegram timeout")),
         )
-        update = SimpleNamespace(
-            message=message,
-            effective_user=self.user,
-        )
+        update = self.private_update(message)
         context = self.make_context()
         with self.assertRaisesRegex(RuntimeError, "Telegram timeout"):
             await comment(update, context)
 
         cancel_message = SimpleNamespace(reply_text=AsyncMock())
-        cancel_update = SimpleNamespace(message=cancel_message, effective_user=self.user)
+        cancel_update = self.private_update(cancel_message)
         state = await cancel_conversation(cancel_update, context)
 
         self.assertEqual(state, ConversationHandler.END)
@@ -158,7 +223,7 @@ class FinalCreationStepSafetyTests(unittest.IsolatedAsyncioTestCase):
         )
         context = self.make_context()
         cancel_message = SimpleNamespace(reply_text=AsyncMock())
-        cancel_update = SimpleNamespace(message=cancel_message, effective_user=self.user)
+        cancel_update = self.private_update(cancel_message)
 
         with patch.object(
             self.repo,
@@ -182,7 +247,7 @@ class FinalCreationStepSafetyTests(unittest.IsolatedAsyncioTestCase):
             text="Пропустить",
             reply_text=AsyncMock(side_effect=RuntimeError("Telegram timeout")),
         )
-        failed_update = SimpleNamespace(message=failed_message, effective_user=self.user)
+        failed_update = self.private_update(failed_message)
         context = self.make_context()
         with self.assertRaisesRegex(RuntimeError, "Telegram timeout"):
             await comment(failed_update, context)
@@ -298,6 +363,30 @@ class StartConversationResetTests(unittest.IsolatedAsyncioTestCase):
             if isinstance(handler, CommandHandler) and handler.callback is start
         )
         self.assertLess(creation_index, global_start_index)
+
+    def test_global_manager_commands_are_private_chat_only(self):
+        class CapturingApplication:
+            def __init__(self):
+                self.handlers = []
+
+            def add_handler(self, handler, group=0):
+                self.handlers.append((group, handler))
+
+        application = CapturingApplication()
+        register_handlers(application)
+        callbacks = {start, cancel_conversation, show_all_locations}
+        global_commands = [
+            handler
+            for group, handler in application.handlers
+            if group == 0
+            and isinstance(handler, CommandHandler)
+            and handler.callback in callbacks
+        ]
+
+        self.assertEqual(len(global_commands), 3)
+        self.assertTrue(
+            all(handler.filters is filters.ChatType.PRIVATE for handler in global_commands)
+        )
 
     async def test_inline_manager_action_ends_persisted_edit_conversation(self):
         class CapturingApplication:
