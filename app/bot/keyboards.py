@@ -14,6 +14,48 @@ from app.utils.payments import PAYMENT_LABELS
 from app.utils.sellers import SELLERS
 
 
+DELIVERY_TIME_QUICK_CHOICES = (
+    "Срочно 🚨🚨🚨",
+    "2 часа",
+    "2–3 часа",
+)
+DELIVERY_TIME_SLOTS = (
+    "11:00", "11:30", "12:00", "12:30",
+    "13:00", "13:30", "14:00", "14:30",
+    "15:00", "15:30", "16:00", "16:30",
+    "17:00", "17:30", "18:00", "18:30",
+    "19:00", "19:30", "20:00", "20:30",
+    "21:00", "21:30", "22:00",
+)
+
+
+def _delivery_time_rows(*, include_skip: bool) -> list[list[KeyboardButton]]:
+    rows = [
+        [KeyboardButton(DELIVERY_TIME_QUICK_CHOICES[0])],
+        [
+            KeyboardButton(DELIVERY_TIME_QUICK_CHOICES[1]),
+            KeyboardButton(DELIVERY_TIME_QUICK_CHOICES[2]),
+        ],
+    ]
+    rows.extend([
+        [KeyboardButton(value) for value in DELIVERY_TIME_SLOTS[index:index + 4]]
+        for index in range(0, len(DELIVERY_TIME_SLOTS), 4)
+    ])
+    if include_skip:
+        rows.append([KeyboardButton("Пропустить")])
+    return rows
+
+
+def delivery_time_keyboard() -> ReplyKeyboardMarkup:
+    """Quick delivery-time presets while keeping free text available."""
+    return ReplyKeyboardMarkup(
+        _delivery_time_rows(include_skip=True),
+        resize_keyboard=True,
+        one_time_keyboard=True,
+        input_field_placeholder="Или напишите время текстом",
+    )
+
+
 def main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
@@ -59,8 +101,16 @@ def edit_input_keyboard(field: str | None = None) -> ReplyKeyboardMarkup:
         ])
     elif field in {"payment", "payment_status"}:
         rows.extend([[KeyboardButton(label)] for label in PAYMENT_LABELS.values()])
+    elif field == "delivery_time":
+        rows.extend(_delivery_time_rows(include_skip=True))
     rows.append([KeyboardButton("❌ Отменить изменение")])
-    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+    return ReplyKeyboardMarkup(
+        rows,
+        resize_keyboard=True,
+        input_field_placeholder=(
+            "Или напишите время текстом" if field == "delivery_time" else None
+        ),
+    )
 
 
 def review_keyboard(order_id: int, *, expanded: bool = False) -> InlineKeyboardMarkup:

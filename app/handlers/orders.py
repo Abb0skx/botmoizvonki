@@ -19,7 +19,7 @@ from telegram.ext import (
 from app.bot.keyboards import (
     all_locations_keyboard, completed_keyboard, courier_cancelled_keyboard,
     courier_keyboard, courier_selection_keyboard, delivery_day_log_keyboard,
-    delivery_pending_keyboard, edit_input_keyboard,
+    delivery_pending_keyboard, delivery_time_keyboard, edit_input_keyboard,
     location_channel_keyboard, main_keyboard,
     manager_cancelled_keyboard, manager_sent_keyboard, on_way_keyboard,
     orders_channel_keyboard, orders_page_keyboard, payment_keyboard, review_keyboard, seller_keyboard,
@@ -1620,8 +1620,8 @@ async def payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return PAYMENT
     draft["payment_status"] = value
     await update.message.reply_text(
-        "5/6. Укажите время доставки (например, До 17:00) или пропустите:",
-        reply_markup=skip_keyboard(),
+        "5/6. Выберите время доставки или напишите свой вариант текстом:",
+        reply_markup=delivery_time_keyboard(),
     )
     return DELIVERY_TIME
 
@@ -1634,7 +1634,7 @@ async def delivery_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     try:
         value = _text(update.message, maximum=100, required=False)
     except ValueError as error:
-        await update.message.reply_text(str(error))
+        await update.message.reply_text(str(error), reply_markup=delivery_time_keyboard())
         return DELIVERY_TIME
     draft["delivery_time"] = value
     await update.message.reply_text("6/6. Добавьте комментарий или пропустите:", reply_markup=skip_keyboard())

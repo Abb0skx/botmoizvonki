@@ -1,6 +1,11 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from app.bot.keyboards import (
+    DELIVERY_TIME_QUICK_CHOICES,
+    DELIVERY_TIME_SLOTS,
+    delivery_time_keyboard,
     edit_input_keyboard,
     main_keyboard,
     orders_channel_keyboard,
@@ -8,6 +13,7 @@ from app.bot.keyboards import (
     statistics_keyboard,
 )
 from app.models import Order
+from app.handlers.orders import COMMENT, DELIVERY_TIME, delivery_time, payment
 from app.utils.payments import PAYMENT_LABELS
 from app.utils.sellers import SELLERS
 
@@ -33,6 +39,55 @@ class EditInputKeyboardTests(unittest.TestCase):
 
         self.assertEqual(self._labels(edit_input_keyboard("payment")), expected)
         self.assertEqual(self._labels(edit_input_keyboard("payment_status")), expected)
+
+    def test_delivery_time_keyboard_has_presets_slots_skip_and_free_text_hint(self):
+        keyboard = delivery_time_keyboard()
+        labels = self._labels(keyboard)
+
+        self.assertEqual(labels[:3], list(DELIVERY_TIME_QUICK_CHOICES))
+        self.assertEqual(labels[3:-1], list(DELIVERY_TIME_SLOTS))
+        self.assertEqual(labels[-1], "Пропустить")
+        self.assertEqual(keyboard.input_field_placeholder, "Или напишите время текстом")
+        self.assertTrue(keyboard.one_time_keyboard)
+
+    def test_delivery_time_edit_keeps_presets_skip_and_cancel(self):
+        keyboard = edit_input_keyboard("delivery_time")
+        labels = self._labels(keyboard)
+
+        self.assertEqual(labels[:3], list(DELIVERY_TIME_QUICK_CHOICES))
+        self.assertEqual(labels[3:3 + len(DELIVERY_TIME_SLOTS)], list(DELIVERY_TIME_SLOTS))
+        self.assertEqual(labels[-2:], ["Пропустить", "❌ Отменить изменение"])
+
+
+class DeliveryTimeCreationFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_payment_step_opens_delivery_time_presets(self):
+        message = SimpleNamespace(
+            text=next(iter(PAYMENT_LABELS.values())),
+            reply_text=AsyncMock(),
+        )
+        update = SimpleNamespace(message=message)
+        context = SimpleNamespace(user_data={"draft": {}})
+
+        state = await payment(update, context)
+
+        self.assertEqual(state, DELIVERY_TIME)
+        markup = message.reply_text.await_args.kwargs["reply_markup"]
+        labels = [button.text for row in markup.keyboard for button in row]
+        self.assertIn("Срочно 🚨🚨🚨", labels)
+        self.assertIn("22:00", labels)
+        self.assertIn("Пропустить", labels)
+
+    async def test_time_step_accepts_both_preset_and_free_text(self):
+        for value in ("2–3 часа", "После 18:15"):
+            with self.subTest(value=value):
+                message = SimpleNamespace(text=value, reply_text=AsyncMock())
+                update = SimpleNamespace(message=message)
+                context = SimpleNamespace(user_data={"draft": {}})
+
+                state = await delivery_time(update, context)
+
+                self.assertEqual(state, COMMENT)
+                self.assertEqual(context.user_data["draft"]["delivery_time"], value)
 
 
 class OrdersPageKeyboardTests(unittest.TestCase):
