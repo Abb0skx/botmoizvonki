@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from html import escape
 from math import ceil
 from types import SimpleNamespace
@@ -20,13 +20,14 @@ from app.bot.keyboards import (
     all_locations_keyboard, completed_keyboard, courier_cancelled_keyboard,
     courier_keyboard, courier_selection_keyboard,
     delivery_pending_keyboard, delivery_time_keyboard, edit_input_keyboard,
-    location_channel_keyboard, main_keyboard,
+    location_channel_keyboard, log_location_keyboard, main_keyboard,
     manager_cancelled_keyboard, manager_sent_keyboard, on_way_keyboard,
     orders_channel_keyboard, orders_page_keyboard, payment_keyboard, review_keyboard, seller_keyboard,
     skip_keyboard, statistics_keyboard, text_location_keyboard,
 )
 from app.config import Settings
 from app.database import OrderRepository
+from app.monitor_service import build_delivery_monitor
 from app.utils import (
     completed_card, courier_card, enrich_location, manager_card,
     normalize_payment, normalize_seller, parse_amount,
@@ -34,7 +35,7 @@ from app.utils import (
 )
 from app.utils.formatters import (
     STATUS_LABELS, all_locations_card, amount_text,
-    money, orders_channel_card,
+    money, orders_channel_card, short_address,
 )
 from app.utils.couriers import (
     courier_group_id, courier_group_ids, courier_ids, courier_option,
@@ -124,7 +125,12 @@ async def _notify_manager(context: ContextTypes.DEFAULT_TYPE, manager_id: int, t
         logger.exception("Could not notify manager %s", manager_id)
 
 
-async def _notify_log(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+async def _notify_log(
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    *,
+    reply_markup=None,
+) -> None:
     """Publish a lifecycle notification to the shared delivery Log channel."""
     settings: Settings = context.application.bot_data["settings"]
     channel_id = getattr(settings, "orders_channel_id", None)
@@ -134,16 +140,81 @@ async def _notify_log(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     if not callable(send_message):
         return
     try:
+        kwargs = {
+            "chat_id": channel_id,
+            "text": text,
+            "parse_mode": ParseMode.HTML,
+            "disable_web_page_preview": True,
+        }
+        if reply_markup is not None:
+            kwargs["reply_markup"] = reply_markup
         await send_message(
-            chat_id=channel_id,
-            text=text,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
+            **kwargs,
         )
     except Exception:
         # A notification is secondary to the durable order/event update. The
         # canonical Log card is still synchronized by _sync_order.
         logger.exception("Could not publish delivery notification to Log channel")
+
+
+async def _estimated_delivery_time(
+    context: ContextTypes.DEFAULT_TYPE,
+    order,
+) -> str | None:
+    """Estimate arrival using the same road route as the manager monitor."""
+    routing = context.application.bot_data.get("routing_service")
+    if routing is None or not order.time_started:
+        return None
+    try:
+        monitor = build_delivery_monitor(context.application.bot_data["repo"])
+        courier_id = order.courier_id or order.assigned_courier_id
+        route = next(
+            item
+            for item in monitor["routes"]
+            if item["courier_id"] == courier_id
+        )
+        points = route.get("current_path") or []
+        if len(points) < 2:
+            return None
+        road_route = await routing.route(points)
+        duration_seconds = max(60, int(road_route.get("duration_s") or 0))
+        started = datetime.fromisoformat(order.time_started)
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=ZoneInfo("Asia/Tashkent"))
+        arrival = started + timedelta(seconds=duration_seconds)
+        return arrival.astimezone(ZoneInfo("Asia/Tashkent")).strftime("%H:%M")
+    except Exception:
+        logger.exception("Could not estimate arrival time for order %s", order.id)
+        return None
+
+
+async def _notify_on_way_log(
+    context: ContextTypes.DEFAULT_TYPE,
+    order,
+) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    if not getattr(settings, "orders_channel_id", None):
+        return
+    arrival_time = await _estimated_delivery_time(context, order)
+    eta = (
+        f"⏱ Примерно к <b>{arrival_time}</b> доставит"
+        if arrival_time
+        else "⏱ Примерное время доставки уточняется"
+    )
+    phones = [display_phone(order.client_phone)]
+    if order.client_phone_2 and order.client_phone_2 != order.client_phone:
+        phones.append(display_phone(order.client_phone_2))
+    phone_text = "\n".join(f"📱 {phone}" for phone in phones)
+    await _notify_log(
+        context,
+        f"🚗 <b>{escape(order.courier_name or order.assigned_courier_name or '—')}</b> "
+        f"едет к заказу №{order.order_number}\n"
+        f"📦 Модель: <b>{escape(order.product)}</b>\n"
+        f"{eta}\n"
+        f"{phone_text}\n"
+        f"📍 {escape(short_address(order))}",
+        reply_markup=log_location_keyboard(order),
+    )
 
 
 async def _is_orders_channel_member(
@@ -262,7 +333,7 @@ def _delivery_message(order):
         return (
             courier_card(
                 order,
-                "🟡🟡🟡\n👀 <b>ЗАКАЗ ПРОЧИТАН</b>\n🏬 <b>Курьер едет на склад</b>",
+                "🟡🟡🟡\n🏬 <b>Курьер едет на склад</b>",
             ),
             courier_keyboard(order),
         )
@@ -2206,6 +2277,12 @@ async def manager_pickup_action(update: Update, context: ContextTypes.DEFAULT_TY
     if not order:
         await query.answer("Заказ не найден", show_alert=True)
         return
+    if order.assigned_courier_id == query.from_user.id:
+        await query.answer(
+            "Эту отметку ставит сотрудник склада, не курьер.",
+            show_alert=True,
+        )
+        return
     manager_source = bool(
         order.manager_chat_id
         and order.manager_message_id
@@ -2235,8 +2312,17 @@ async def manager_pickup_action(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if action == "pickup":
-        if order.status != "pending" or not order.assigned_courier_id:
-            await query.answer("Заказ уже изменился или курьер не выбран", show_alert=True)
+        if (
+            order.status != "pending"
+            or not order.assigned_courier_id
+            or not order.courier_read_at
+        ):
+            message = (
+                "Сначала курьер должен прочитать заказ"
+                if order.status == "pending" and not order.courier_read_at
+                else "Заказ уже изменился или курьер не выбран"
+            )
+            await query.answer(message, show_alert=True)
             return
         timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
         updated = repo.transition(
@@ -2532,11 +2618,7 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             courier_card(order, "🚗 <b>Курьер едет</b>"),
             on_way_keyboard(order),
         )
-        await _notify_log(
-            context,
-            f"🚗 Курьер <b>{escape(order.courier_name or order.assigned_courier_name or '—')}</b> "
-            f"едет к заказу №{order.order_number}\n📍 {escape(order.address_text or order.district or 'Адрес в карточке')}",
-        )
+        await _notify_on_way_log(context, order)
     elif action == "cancel":
         order = repo.transition(
             order.id, {"pending", "picked_up", "on_way", "awaiting_photo", "awaiting_amount"},

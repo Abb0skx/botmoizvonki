@@ -173,8 +173,8 @@ def courier_selection_keyboard(order: Order, *, source: str = "manager") -> Inli
 
 def _location_rows(order: Order) -> list[list[InlineKeyboardButton]]:
     row: list[InlineKeyboardButton] = []
-    first_url = telegram_location_url(order)
-    second_url = telegram_location_url(order, 2)
+    first_url = telegram_location_url(order) or order.location_url
+    second_url = telegram_location_url(order, 2) or order.second_location_url
     if first_url:
         row.append(InlineKeyboardButton("📍 Локация", url=first_url))
     if second_url:
@@ -183,17 +183,34 @@ def _location_rows(order: Order) -> list[list[InlineKeyboardButton]]:
 
 
 def _pickup_rows(order: Order) -> list[list[InlineKeyboardButton]]:
-    if order.status == "pending" and order.assigned_courier_id:
+    courier_name = order.assigned_courier_name or order.courier_name or "Курьер"
+    if (
+        order.status == "pending"
+        and order.assigned_courier_id
+        and order.courier_read_at
+    ):
         return [[InlineKeyboardButton(
-            "📦 Курьер забрал товар",
+            f"📦 {courier_name} забрал товар",
             callback_data=f"pickup:{order.id}",
         )]]
     if order.status == "picked_up":
         return [[InlineKeyboardButton(
-            "↩️ Отменить «товар забран»",
+            f"↩️ Отменить: {courier_name} забрал товар",
             callback_data=f"undo_pickup:{order.id}",
         )]]
     return []
+
+
+def log_location_keyboard(order: Order) -> InlineKeyboardMarkup | None:
+    """Open the native location post from a compact Log notification."""
+    buttons: list[InlineKeyboardButton] = []
+    first_url = telegram_location_url(order) or order.location_url
+    second_url = telegram_location_url(order, 2) or order.second_location_url
+    if first_url:
+        buttons.append(InlineKeyboardButton("📍 Показать локацию", url=first_url))
+    if second_url:
+        buttons.append(InlineKeyboardButton("📍 Доп. локация", url=second_url))
+    return InlineKeyboardMarkup([buttons]) if buttons else None
 
 
 def orders_channel_keyboard(order: Order) -> InlineKeyboardMarkup:

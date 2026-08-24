@@ -51,6 +51,9 @@ class PickupWorkflowTests(unittest.IsolatedAsyncioTestCase):
             status="pending",
             assigned_courier_id=ABBOS_ID,
             assigned_courier_name="Abbos",
+            courier_id=ABBOS_ID,
+            courier_name="Abbos",
+            courier_read_at=datetime.now(TASHKENT).isoformat(timespec="seconds"),
             manager_chat_id=11,
             manager_message_id=90 + order.id,
             delivery_chat_id=-5216093690,
@@ -140,6 +143,14 @@ class PickupWorkflowTests(unittest.IsolatedAsyncioTestCase):
             if button.callback_data
         ]
         self.assertEqual(callbacks.count(f"pickup:{pending.id}"), 2)
+        labels = [
+            button.text
+            for keyboard in (manager_sent_keyboard(pending), orders_channel_keyboard(pending))
+            for row in keyboard.inline_keyboard
+            for button in row
+            if button.callback_data == f"pickup:{pending.id}"
+        ]
+        self.assertEqual(labels, ["📦 Abbos забрал товар", "📦 Abbos забрал товар"])
 
         picked = self.repo.transition(
             pending.id,
@@ -154,6 +165,13 @@ class PickupWorkflowTests(unittest.IsolatedAsyncioTestCase):
             if button.callback_data
         ]
         self.assertIn(f"undo_pickup:{picked.id}", callbacks)
+        undo_button = next(
+            button
+            for row in manager_sent_keyboard(picked).inline_keyboard
+            for button in row
+            if button.callback_data == f"undo_pickup:{picked.id}"
+        )
+        self.assertEqual(undo_button.text, "↩️ Отменить: Abbos забрал товар")
 
 
 class DeliveryMonitorServiceTests(unittest.TestCase):

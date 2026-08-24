@@ -329,10 +329,9 @@ def _compact_order(order: Order, *, status: str | None = None) -> str:
         lines.append(f"🏷 {escape(status)}")
     if order.assigned_courier_name:
         lines.append(f"🚚 Курьер: {escape(order.assigned_courier_name)}")
-    read_at = _local_datetime(order.courier_read_at)
+    read_at = _local_time(order.courier_read_at)
     if read_at:
-        reader = order.courier_name or order.assigned_courier_name or "Курьер"
-        lines.append(f"👀 Прочитал: {escape(reader)} · {escape(read_at)}")
+        lines.append(f"👀 Заказ прочитан {escape(read_at)}")
         if order.status == "pending":
             lines.append("🏬 Едет на склад за товаром")
     lines.extend([
@@ -362,6 +361,18 @@ def _local_datetime(value: str | None) -> str | None:
     if parsed.tzinfo is not None:
         parsed = parsed.astimezone(ZoneInfo("Asia/Tashkent"))
     return parsed.strftime("%d.%m.%Y %H:%M")
+
+
+def _local_time(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return value[-5:] if len(value) >= 5 else value
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(ZoneInfo("Asia/Tashkent"))
+    return parsed.strftime("%H:%M")
 
 
 def orders_channel_card(order: Order) -> str:
@@ -397,10 +408,9 @@ def orders_channel_card(order: Order) -> str:
         lines.append(f"🚚 Назначен курьер: <b>{escape(order.assigned_courier_name)}</b>")
     if order.courier_name:
         lines.append(f"👤 Принял заказ: {escape(order.courier_name)}")
-    read_at = _local_datetime(order.courier_read_at)
+    read_at = _local_time(order.courier_read_at)
     if read_at:
-        reader = order.courier_name or order.assigned_courier_name or "Курьер"
-        lines.append(f"👀 Заказ прочитал {escape(reader)}: {escape(read_at)}")
+        lines.append(f"👀 Заказ прочитан {escape(read_at)}")
     picked_up = _local_datetime(order.picked_up_at)
     if picked_up:
         lines.append(f"📦 Курьер забрал товар: {escape(picked_up)}")

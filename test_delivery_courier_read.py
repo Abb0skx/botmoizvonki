@@ -7,7 +7,12 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from app.bot.keyboards import courier_keyboard, orders_page_keyboard
 from app.database import OrderRepository
-from app.handlers.orders import courier_action, manager_pickup_action, open_order_from_list
+from app.handlers.orders import (
+    _notify_on_way_log,
+    courier_action,
+    manager_pickup_action,
+    open_order_from_list,
+)
 from app.monitor_service import WAREHOUSE, build_delivery_monitor
 from app.routing_service import enrich_monitor_routes
 from app.stats_service import TASHKENT, build_delivery_stats
@@ -100,7 +105,8 @@ class CourierReadWorkflowTests(unittest.IsolatedAsyncioTestCase):
             is_big=True,
         )
         changed_text = query.edit_message_text.await_args.args[0]
-        self.assertIn("ЗАКАЗ ПРОЧИТАН", changed_text)
+        read_time = datetime.fromisoformat(read.courier_read_at).astimezone(TASHKENT).strftime("%H:%M")
+        self.assertIn(f"Заказ прочитан {read_time}", changed_text)
         self.assertIn("Курьер едет на склад", changed_text)
         callbacks = [
             button.callback_data
@@ -153,7 +159,8 @@ class CourierReadWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(read_button.text, "✅ Прочитано · еду на склад")
         self.assertIn("🏬 Едет на склад за товаром", courier_card(order))
-        self.assertIn("👀 Заказ прочитал Abbos", orders_channel_card(order))
+        read_time = datetime.fromisoformat(order.courier_read_at).astimezone(TASHKENT).strftime("%H:%M")
+        self.assertIn(f"👀 Заказ прочитан {read_time}", orders_channel_card(order))
 
 
 class ManagerListAndLogTests(unittest.IsolatedAsyncioTestCase):
@@ -172,6 +179,9 @@ class ManagerListAndLogTests(unittest.IsolatedAsyncioTestCase):
             status="pending",
             assigned_courier_id=ABBOS_ID,
             assigned_courier_name="Abbos",
+            courier_id=ABBOS_ID,
+            courier_name="Abbos",
+            courier_read_at=datetime.now(TASHKENT).isoformat(timespec="seconds"),
             manager_chat_id=11,
             manager_message_id=55,
             orders_channel_chat_id=-1004459657817,
@@ -275,6 +285,72 @@ class ManagerListAndLogTests(unittest.IsolatedAsyncioTestCase):
             and "товар забран" in call.kwargs.get("text", "")
             for call in bot.send_message.await_args_list
         ))
+
+    async def test_assigned_courier_cannot_mark_own_goods_as_picked_up(self):
+        query = SimpleNamespace(
+            data=f"pickup:{self.order.id}",
+            from_user=SimpleNamespace(id=ABBOS_ID, full_name="Abbos", username=None),
+            message=SimpleNamespace(chat_id=-1004459657817, message_id=66),
+            answer=AsyncMock(),
+        )
+        bot = SimpleNamespace(get_chat_member=AsyncMock(), send_message=AsyncMock())
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={
+                "settings": SimpleNamespace(
+                    manager_ids=frozenset(),
+                    orders_channel_id=-1004459657817,
+                ),
+                "repo": self.repo,
+            }),
+            bot=bot,
+        )
+
+        await manager_pickup_action(SimpleNamespace(callback_query=query), context)
+
+        self.assertEqual(self.repo.get(self.order.id).status, "pending")
+        query.answer.assert_awaited_once_with(
+            "Эту отметку ставит сотрудник склада, не курьер.",
+            show_alert=True,
+        )
+        bot.get_chat_member.assert_not_awaited()
+
+    async def test_on_way_log_contains_eta_customer_and_location_button(self):
+        started = datetime.now(TASHKENT).replace(second=0, microsecond=0)
+        order = self.repo.transition(
+            self.order.id,
+            {"pending"},
+            status="on_way",
+            picked_up_at=started.isoformat(),
+            time_started=started.isoformat(),
+            location_chat_id=-1004398605075,
+            location_message_id=501,
+        )
+        routing = SimpleNamespace(
+            route=AsyncMock(return_value={"duration_s": 30 * 60}),
+        )
+        bot = SimpleNamespace(send_message=AsyncMock())
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={
+                "settings": SimpleNamespace(orders_channel_id=-1004459657817),
+                "repo": self.repo,
+                "routing_service": routing,
+            }),
+            bot=bot,
+        )
+
+        await _notify_on_way_log(context, order)
+
+        expected_arrival = (started + timedelta(minutes=30)).strftime("%H:%M")
+        sent = bot.send_message.await_args.kwargs
+        self.assertIn("🚗 <b>Abbos</b> едет к заказу №1", sent["text"])
+        self.assertIn("📦 Модель: <b>A57</b>", sent["text"])
+        self.assertIn(f"Примерно к <b>{expected_arrival}</b> доставит", sent["text"])
+        self.assertIn("📱 +998 90 133 39 99", sent["text"])
+        self.assertIn("📍 Адрес A57", sent["text"])
+        button = sent["reply_markup"].inline_keyboard[0][0]
+        self.assertEqual(button.text, "📍 Показать локацию")
+        self.assertEqual(button.url, "https://t.me/c/4398605075/501")
+        routing.route.assert_awaited_once()
 
 
 class CourierWarehouseMovementTests(unittest.IsolatedAsyncioTestCase):

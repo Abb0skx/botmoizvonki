@@ -26,6 +26,7 @@ from app.handlers.orders import (
     reconcile_orders_on_start,
     validate_delivery_configuration,
 )
+from app.routing_service import RoutingService
 
 logger = logging.getLogger(__name__)
 CONVERSATION_PERSISTENCE_NAME = "delivery_order_creation"
@@ -272,6 +273,9 @@ async def shutdown_delivery_runtime(application: Application) -> None:
 def build_application(settings: Settings) -> Application:
     repo = OrderRepository(settings.database_path)
     repo.initialize()
+    routing_service = RoutingService(
+        settings.database_path.with_name("routing-cache.db")
+    )
     persistence = AtomicPicklePersistence(
         filepath=settings.database_path.with_name("delivery-state.pickle"),
         store_data=PersistenceInput(
@@ -290,7 +294,11 @@ def build_application(settings: Settings) -> Application:
         .post_shutdown(shutdown_delivery_runtime)
         .build()
     )
-    application.bot_data.update(settings=settings, repo=repo)
+    application.bot_data.update(
+        settings=settings,
+        repo=repo,
+        routing_service=routing_service,
+    )
     register_handlers(application)
     application.add_error_handler(error_handler)
     return application
