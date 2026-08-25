@@ -286,29 +286,15 @@ async def _notify_active_order_edit(
     field: str,
     actor_name: str,
 ) -> None:
-    """Push edits after the courier acknowledged the order."""
+    """Record an active-order edit in Log without pinging the courier group."""
     label = _EDIT_FIELD_LABELS.get(field, "данные заказа")
     value = escape(_edited_value_text(order, field)).replace("\n", " · ")
     text = (
         f"⚠️ <b>Заказ №{order.order_number} изменён менеджером</b>\n"
         f"✏️ {escape(label).capitalize()}: <b>{value}</b>\n"
         f"👤 {escape(actor_name)}\n"
-        "Проверьте обновлённую карточку перед доставкой."
+        "Актуальные данные — в карточке заказа."
     )
-    if order.delivery_chat_id:
-        try:
-            await context.bot.send_message(
-                chat_id=order.delivery_chat_id,
-                text=text,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-                reply_markup=log_order_keyboard(order),
-            )
-        except Exception:
-            logger.exception(
-                "Could not notify courier group about edited order %s",
-                order.id,
-            )
     await _notify_log(context, text, reply_markup=log_order_keyboard(order))
 
 
@@ -2091,7 +2077,15 @@ async def begin_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "delivery_time": "Введите новое время (или Пропустить):",
         "comment": "Введите новый комментарий (или Пропустить):",
     }
-    await query.message.reply_text(prompts[field], reply_markup=edit_input_keyboard(field))
+    prompt = prompts[field]
+    if order.status == "on_way":
+        courier_name = order.courier_name or order.assigned_courier_name or "Курьер"
+        prompt = (
+            f"⚠️ Курьер {courier_name} уже едет к заказу №{order.order_number}.\n"
+            "Убедитесь, что он знает об изменении.\n\n"
+            f"{prompt}"
+        )
+    await query.message.reply_text(prompt, reply_markup=edit_input_keyboard(field))
     return EDIT_VALUE
 
 

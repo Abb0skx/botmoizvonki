@@ -9,9 +9,11 @@ from telegram.ext import ConversationHandler
 from app.database import OrderRepository
 from app.handlers.orders import (
     DETAILS,
+    EDIT_VALUE,
     PAYMENT,
     _merge_location,
     _send_location_messages,
+    begin_edit,
     details,
     payment,
     save_edit,
@@ -280,7 +282,7 @@ class ActiveEditNotificationTests(unittest.IsolatedAsyncioTestCase):
             manager_message_id=55,
         )
 
-    async def test_edit_after_courier_read_warns_courier_group_and_log(self):
+    async def test_edit_after_courier_read_notifies_log_only(self):
         order = self.pending_order(read=True)
         context, update = self.context_and_update(order, "A57 Pro")
 
@@ -297,14 +299,11 @@ class ActiveEditNotificationTests(unittest.IsolatedAsyncioTestCase):
             for call in context.bot.send_message.await_args_list
             if "изменён менеджером" in call.kwargs.get("text", "")
         ]
-        self.assertEqual(len(warnings), 2)
-        self.assertEqual(
-            {call["chat_id"] for call in warnings},
-            {-5216093690, -1004459657817},
-        )
+        self.assertEqual(len(warnings), 1)
+        self.assertEqual(warnings[0]["chat_id"], -1004459657817)
         self.assertTrue(all("A57 Pro" in call["text"] for call in warnings))
 
-    async def test_edit_of_published_pending_warns_without_read_receipt(self):
+    async def test_edit_of_published_pending_notifies_log_without_read_receipt(self):
         order = self.pending_order(read=False)
         context, update = self.context_and_update(order, "A57 Pro")
 
@@ -320,11 +319,73 @@ class ActiveEditNotificationTests(unittest.IsolatedAsyncioTestCase):
             for call in context.bot.send_message.await_args_list
             if "изменён менеджером" in call.kwargs.get("text", "")
         ]
-        self.assertEqual(len(warnings), 2)
-        self.assertEqual(
-            {call["chat_id"] for call in warnings},
-            {-5216093690, -1004459657817},
+        self.assertEqual(len(warnings), 1)
+        self.assertEqual(warnings[0]["chat_id"], -1004459657817)
+
+    async def test_begin_edit_warns_manager_when_courier_is_already_on_way(self):
+        order = self.pending_order(read=False)
+        order = self.repo.update(
+            order.id,
+            status="on_way",
+            courier_id=202134293,
+            courier_name="Abbos",
+            time_started="2026-08-25T15:00:00+05:00",
         )
+        reply_text = AsyncMock()
+        query = SimpleNamespace(
+            data=f"edit:{order.id}:location",
+            from_user=SimpleNamespace(id=11),
+            message=SimpleNamespace(
+                chat_id=11,
+                message_id=55,
+                reply_text=reply_text,
+            ),
+            answer=AsyncMock(),
+        )
+        context = SimpleNamespace(
+            user_data={},
+            application=SimpleNamespace(bot_data={
+                "repo": self.repo,
+                "settings": SimpleNamespace(manager_ids=frozenset({11})),
+            }),
+        )
+
+        state = await begin_edit(SimpleNamespace(callback_query=query), context)
+
+        self.assertEqual(state, EDIT_VALUE)
+        reply_text.assert_awaited_once()
+        prompt = reply_text.await_args.args[0]
+        self.assertIn("Курьер Abbos уже едет к заказу", prompt)
+        self.assertIn(f"№{order.order_number}", prompt)
+        self.assertIn("Отправьте новую основную локацию", prompt)
+
+    async def test_begin_edit_does_not_warn_before_courier_starts_trip(self):
+        order = self.pending_order(read=False)
+        reply_text = AsyncMock()
+        query = SimpleNamespace(
+            data=f"edit:{order.id}:location",
+            from_user=SimpleNamespace(id=11),
+            message=SimpleNamespace(
+                chat_id=11,
+                message_id=55,
+                reply_text=reply_text,
+            ),
+            answer=AsyncMock(),
+        )
+        context = SimpleNamespace(
+            user_data={},
+            application=SimpleNamespace(bot_data={
+                "repo": self.repo,
+                "settings": SimpleNamespace(manager_ids=frozenset({11})),
+            }),
+        )
+
+        state = await begin_edit(SimpleNamespace(callback_query=query), context)
+
+        self.assertEqual(state, EDIT_VALUE)
+        prompt = reply_text.await_args.args[0]
+        self.assertNotIn("уже едет", prompt)
+        self.assertEqual(prompt, "Отправьте новую основную локацию или ссылку:")
 
     async def test_edit_of_unpublished_pending_does_not_send_warning(self):
         order = self.pending_order(read=False, published=False)
