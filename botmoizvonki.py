@@ -1,18 +1,35 @@
+import asyncio
 import hashlib
+import ipaddress
 import json
 import os
+import re
 import secrets
+import socket
 import sqlite3
 import subprocess
 import tempfile
+import threading
+import time
+import uuid
 
 from datetime import datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 
 from dotenv import load_dotenv
+
+# Load the project environment before importing routers. Some routers construct
+# immutable settings objects at import time.
+BASE_DIR = Path(__file__).resolve().parent
+ENV_FILE = BASE_DIR / "data" / ".env"
+# Coolify/container environment variables are authoritative.  The optional
+# local file may only fill values that are not already present; it must never
+# replace production secrets injected by the platform.
+load_dotenv(dotenv_path=ENV_FILE, override=False)
 
 from fastapi import (
     FastAPI,
@@ -24,6 +41,10 @@ from fastapi.responses import HTMLResponse
 
 from instagram_bot import router as instagram_router
 from reviews.router import router as reviews_router
+from telegram_business.router import router as telegram_business_router
+from telegram_business.router import get_service as get_telegram_business_service
+from telegram_business.router import settings as telegram_business_settings
+from telegram_business.scheduler import DurableScheduler
 
 
 # =========================================================
@@ -40,6 +61,47 @@ app.include_router(
     reviews_router
 )
 
+app.include_router(
+    telegram_business_router
+)
+
+_telegram_business_scheduler = None
+_transcription_worker = None
+
+
+@app.on_event("startup")
+async def start_telegram_business():
+    global _telegram_business_scheduler
+    global _transcription_worker
+
+    if telegram_business_settings.enabled:
+        service = get_telegram_business_service()
+        _telegram_business_scheduler = DurableScheduler(service)
+        await _telegram_business_scheduler.start()
+
+    if TRANSCRIPTION_ENABLED:
+        transcription_config_error = (
+            get_transcription_config_error()
+        )
+
+        if transcription_config_error:
+            print(
+                "TRANSCRIPTION CONFIG BLOCKED:",
+                transcription_config_error,
+            )
+        else:
+            _transcription_worker = TranscriptionWorker()
+            await _transcription_worker.start()
+
+
+@app.on_event("shutdown")
+async def stop_telegram_business():
+    if _telegram_business_scheduler:
+        await _telegram_business_scheduler.stop()
+
+    if _transcription_worker:
+        await _transcription_worker.stop()
+
 
 # =========================================================
 # CONFIG
@@ -47,21 +109,6 @@ app.include_router(
 
 UZ_TZ = timezone(
     timedelta(hours=5)
-)
-
-BASE_DIR = Path(
-    __file__
-).resolve().parent
-
-ENV_FILE = (
-    BASE_DIR
-    / "data"
-    / ".env"
-)
-
-load_dotenv(
-    dotenv_path=ENV_FILE,
-    override=True,
 )
 
 TELEGRAM_BOT_TOKEN = os.getenv(
@@ -76,6 +123,11 @@ TELEGRAM_WEBHOOK_SECRET = os.getenv(
     "TELEGRAM_WEBHOOK_SECRET",
     "",
 )
+
+MOIZVONKI_WEBHOOK_SECRET = os.getenv(
+    "MOIZVONKI_WEBHOOK_SECRET",
+    "",
+).strip()
 
 MOIZVONKI_API_URL = os.getenv(
     "MOIZVONKI_API_URL",
@@ -100,6 +152,42 @@ PUBLIC_BASE_URL = os.getenv(
 SMS_COOLDOWN_DAYS = 30
 
 RESULT_COOLDOWN_HOURS = 30
+
+AUTO_SMS_ENABLED = (
+    os.getenv(
+        "AUTO_SMS_ENABLED",
+        "true",
+    ).strip().casefold()
+    in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+)
+
+RATING_SMS_ENABLED = (
+    os.getenv(
+        "RATING_SMS_ENABLED",
+        "true",
+    ).strip().casefold()
+    in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+)
+
+MISSED_CALL_WORK_START = os.getenv(
+    "MISSED_CALL_WORK_START",
+    "10:00",
+).strip()
+
+MISSED_CALL_WORK_END = os.getenv(
+    "MISSED_CALL_WORK_END",
+    "20:00",
+).strip()
 
 SMS_TEXT = """TEXNIKACH
 
@@ -128,6 +216,283 @@ RATING_SMS_TEXT = """TEXNIKACH
 Qo‘ng‘iroqni 1 dan 5 gacha baholang.
 {rating_url}
 1 — плохо/yomon, 5 — отлично/a’lo"""
+
+AFTER_HOURS_MISSED_SMS_TEXT = """TEXNIKACH
+Мы закрыты. {day_ru} работаем с {work_start}.
+Доставка по городу бесплатная. Также можно забрать в магазине.
+
+Hozir yopiqmiz. {day_uz} {work_start} dan ishlaymiz.
+Shahar bo‘ylab yetkazib berish bepul. Shuningdek, do‘kondan olib ketish mumkin.
+
+Все цены в Telegram / Telegramdagi barcha narxlar:
+https://texnikach.uz/go"""
+
+
+def parse_work_clock(
+    value: str,
+    default: str,
+) -> tuple[int, str]:
+
+    match = re.fullmatch(
+        r"(\d{1,2}):(\d{2})",
+        str(
+            value
+            or ""
+        ).strip(),
+    )
+
+    if match:
+        hours = int(
+            match.group(1)
+        )
+        minutes = int(
+            match.group(2)
+        )
+
+        if (
+            0 <= hours <= 23
+            and 0 <= minutes <= 59
+        ):
+            return (
+                hours * 60 + minutes,
+                f"{hours:02d}:{minutes:02d}",
+            )
+
+    print(
+        "WORK CLOCK INVALID; USING DEFAULT:",
+        value,
+    )
+
+    default_hours, default_minutes = (
+        int(part)
+        for part in default.split(
+            ":",
+            1,
+        )
+    )
+
+    return (
+        default_hours * 60
+        + default_minutes,
+        default,
+    )
+
+
+(
+    MISSED_CALL_WORK_START_MINUTES,
+    MISSED_CALL_WORK_START_LABEL,
+) = parse_work_clock(
+    MISSED_CALL_WORK_START,
+    "10:00",
+)
+
+(
+    MISSED_CALL_WORK_END_MINUTES,
+    MISSED_CALL_WORK_END_LABEL,
+) = parse_work_clock(
+    MISSED_CALL_WORK_END,
+    "20:00",
+)
+
+if (
+    MISSED_CALL_WORK_START_MINUTES
+    >= MISSED_CALL_WORK_END_MINUTES
+):
+    print(
+        "MISSED CALL WORK WINDOW INVALID; "
+        "USING 10:00-20:00"
+    )
+    MISSED_CALL_WORK_START_MINUTES = 10 * 60
+    MISSED_CALL_WORK_START_LABEL = "10:00"
+    MISSED_CALL_WORK_END_MINUTES = 20 * 60
+    MISSED_CALL_WORK_END_LABEL = "20:00"
+
+
+def env_int(
+    name: str,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+
+    raw_value = os.getenv(
+        name
+    )
+
+    if raw_value is None:
+        return default
+
+    try:
+        value = int(
+            raw_value
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
+        print(
+            "CONFIG VALUE INVALID; USING DEFAULT:",
+            name,
+        )
+        return default
+
+    if not minimum <= value <= maximum:
+        print(
+            "CONFIG VALUE OUT OF RANGE; USING DEFAULT:",
+            name,
+        )
+        return default
+
+    return value
+
+
+def env_float(
+    name: str,
+    default: float,
+    minimum: float,
+    maximum: float,
+) -> float:
+
+    raw_value = os.getenv(
+        name
+    )
+
+    if raw_value is None:
+        return default
+
+    try:
+        value = float(
+            raw_value
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
+        print(
+            "CONFIG VALUE INVALID; USING DEFAULT:",
+            name,
+        )
+        return default
+
+    if not minimum <= value <= maximum:
+        print(
+            "CONFIG VALUE OUT OF RANGE; USING DEFAULT:",
+            name,
+        )
+        return default
+
+    return value
+
+TRANSCRIPTION_ENABLED = (
+    os.getenv(
+        "TRANSCRIPTION_ENABLED",
+        "false",
+    ).strip().casefold()
+    in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+)
+
+TRANSCRIPTION_API_URL = os.getenv(
+    "TRANSCRIPTION_API_URL",
+    "https://api.openai.com/v1/audio/transcriptions",
+).strip()
+
+TRANSCRIPTION_API_KEY = (
+    os.getenv(
+        "TRANSCRIPTION_API_KEY",
+        "",
+    ).strip()
+    or os.getenv(
+        "OPENAI_API_KEY",
+        "",
+    ).strip()
+)
+
+TRANSCRIPTION_MODEL = os.getenv(
+    "TRANSCRIPTION_MODEL",
+    "gpt-4o-mini-transcribe",
+).strip()
+
+TRANSCRIPTION_TIMEOUT_SECONDS = env_int(
+    "TRANSCRIPTION_TIMEOUT_SECONDS",
+    180,
+    10,
+    3600,
+)
+
+TRANSCRIPTION_MAX_BYTES = env_int(
+    "TRANSCRIPTION_MAX_BYTES",
+    25 * 1024 * 1024,
+    64 * 1024,
+    100 * 1024 * 1024,
+)
+
+TRANSCRIPTION_MAX_DURATION_SECONDS = env_int(
+    "TRANSCRIPTION_MAX_DURATION_SECONDS",
+    1800,
+    1,
+    4 * 60 * 60,
+)
+
+TRANSCRIPTION_MAX_ATTEMPTS = env_int(
+    "TRANSCRIPTION_MAX_ATTEMPTS",
+    4,
+    1,
+    20,
+)
+
+TRANSCRIPTION_LEASE_SECONDS = env_int(
+    "TRANSCRIPTION_LEASE_SECONDS",
+    600,
+    60,
+    24 * 60 * 60,
+)
+
+TRANSCRIPTION_POLL_SECONDS = env_float(
+    "TRANSCRIPTION_POLL_SECONDS",
+    5.0,
+    0.25,
+    300.0,
+)
+
+TRANSCRIPTION_ALLOWED_HOSTS = tuple(
+    host.strip().casefold()
+    for host in os.getenv(
+        "TRANSCRIPTION_ALLOWED_HOSTS",
+        ".moizvonki.ru",
+    ).split(",")
+    if host.strip()
+)
+
+
+def get_transcription_config_error() -> str | None:
+
+    if not TRANSCRIPTION_API_KEY:
+        return "TRANSCRIPTION_API_KEY не указан"
+
+    if not TRANSCRIPTION_MODEL:
+        return "TRANSCRIPTION_MODEL не указан"
+
+    parsed = urlparse(
+        TRANSCRIPTION_API_URL
+    )
+
+    if (
+        parsed.scheme.casefold() != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+    ):
+        return "TRANSCRIPTION_API_URL должен быть безопасным HTTPS URL"
+
+    if not TRANSCRIPTION_ALLOWED_HOSTS:
+        return "TRANSCRIPTION_ALLOWED_HOSTS пуст"
+
+    return None
 
 DB_PATH = Path(
     os.getenv(
@@ -186,6 +551,242 @@ MANAGERS = {
     "ali": "Ali",
     "abbos": "Abbos",
 }
+
+
+# =========================================================
+# DEVICES, SIMS AND LEAD SOURCES
+# =========================================================
+
+LEAD_SOURCES = {
+    "olx": "OLX",
+    "instagram": "Instagram",
+    "telegram_channel": "Telegram Kanal",
+    "old_client": "Старый клиент",
+}
+
+CALL_SOURCE_PROFILES = {
+    "texnikach@gmail.com": {
+        "device_name": "texnikach@gmail.com",
+        "default_manager_code": "abbos",
+        # Android reports slots from zero in the webhooks received
+        # for this account: 0 = SIM 1, 1 = SIM 2.
+        "slot_numbers": {
+            0: "+998998446162",
+            1: "+998901313999",
+        },
+        "sim_labels": {
+            "998998446162": "SIM 1",
+            "998901313999": "SIM 2",
+        },
+        "source_by_number": {
+            "998998446162": "olx",
+        },
+    },
+    "texnikacholx@gmail.com": {
+        "device_name": "Techno",
+        "default_manager_code": None,
+        "slot_numbers": {},
+        "sim_labels": {},
+        "default_source_code": "olx",
+    },
+}
+
+
+def normalize_user_login(
+    value: str | None,
+) -> str:
+
+    return str(
+        value
+        or ""
+    ).strip().casefold()
+
+
+def get_call_source_profile(
+    user_login: str | None,
+):
+
+    return CALL_SOURCE_PROFILES.get(
+        normalize_user_login(
+            user_login
+        )
+    )
+
+
+def normalize_display_phone(
+    value: str | None,
+) -> str:
+
+    phone = normalize_phone(
+        value
+    )
+
+    return (
+        "+" + phone
+        if phone
+        else ""
+    )
+
+
+def resolve_call_device(
+    user_login: str | None,
+    provider_src_number: str | None,
+    src_slot,
+):
+
+    profile = get_call_source_profile(
+        user_login
+    )
+
+    provider_number = normalize_display_phone(
+        provider_src_number
+    )
+
+    slot = None
+
+    try:
+        if src_slot is not None:
+            slot = int(
+                src_slot
+            )
+    except (
+        TypeError,
+        ValueError,
+    ):
+        slot = None
+
+    resolved_number = provider_number
+    mapping_conflict = False
+    device_name = (
+        profile.get(
+            "device_name"
+        )
+        if profile
+        else (
+            normalize_user_login(
+                user_login
+            )
+            or "Неизвестно"
+        )
+    )
+
+    if profile and slot is not None:
+        configured_number = (
+            profile.get(
+                "slot_numbers",
+                {},
+            ).get(
+                slot
+            )
+        )
+
+        if configured_number:
+            provider_key = normalize_phone(
+                provider_number
+            )
+
+            configured_key = normalize_phone(
+                configured_number
+            )
+
+            known_numbers = set(
+                profile.get(
+                    "sim_labels",
+                    {},
+                )
+            )
+
+            mapping_conflict = bool(
+                provider_key
+                and configured_key
+                and provider_key in known_numbers
+                and configured_key in known_numbers
+                and provider_key != configured_key
+            )
+
+            resolved_number = (
+                normalize_display_phone(
+                    configured_number
+                )
+            )
+
+    number_key = normalize_phone(
+        resolved_number
+    )
+
+    sim_label = None
+
+    if profile:
+        sim_label = (
+            profile.get(
+                "sim_labels",
+                {},
+            ).get(
+                number_key
+            )
+        )
+
+    if not sim_label and slot is not None:
+        sim_label = (
+            f"SIM {slot + 1}"
+        )
+
+    if not sim_label:
+        sim_label = "SIM"
+
+    source_code = None
+    source_method = None
+    source_confidence = None
+
+    if profile:
+        source_code = (
+            profile.get(
+                "source_by_number",
+                {},
+            ).get(
+                number_key
+            )
+        )
+
+        if source_code:
+            source_method = "sim"
+            source_confidence = 0.90
+        else:
+            source_code = profile.get(
+                "default_source_code"
+            )
+
+            if source_code:
+                source_method = "account"
+                source_confidence = 0.85
+
+    return {
+        "device_name": device_name,
+        "provider_src_number": provider_number,
+        "src_number": resolved_number,
+        "src_slot": slot,
+        "sim_label": sim_label,
+        "mapping_conflict": mapping_conflict,
+        "default_manager_code": (
+            profile.get(
+                "default_manager_code"
+            )
+            if profile
+            else None
+        ),
+        "lead_source_code": source_code,
+        "lead_source_method": source_method,
+        "lead_source_confidence": source_confidence,
+    }
+
+
+def get_lead_source_name(
+    source_code: str | None,
+) -> str | None:
+
+    return LEAD_SOURCES.get(
+        source_code
+    )
 
 
 # =========================================================
@@ -337,6 +938,193 @@ def get_internal_contact_name(
     )
 
 
+def recompute_client_window_sources(
+    conn,
+    client_key: str | None = None,
+):
+
+    parameters = []
+    client_filter = ""
+
+    if client_key:
+        client_filter = (
+            "WHERE window.client_key = ?"
+        )
+        parameters.append(
+            client_key
+        )
+
+    windows = conn.execute(
+        f"""
+        SELECT window.id
+        FROM client_windows AS window
+        {client_filter}
+        """,
+        parameters,
+    ).fetchall()
+
+    for window in windows:
+
+        source = conn.execute(
+            """
+            SELECT
+                call.id,
+                CASE
+                    WHEN call.lead_source_manual_code
+                        IS NOT NULL
+                        AND call.lead_source_manual_code != ''
+                    THEN call.lead_source_manual_code
+                    ELSE call.lead_source_auto_code
+                END AS source_code,
+                CASE
+                    WHEN call.lead_source_manual_code
+                        IS NOT NULL
+                        AND call.lead_source_manual_code != ''
+                    THEN 'manual'
+                    ELSE call.lead_source_auto_method
+                END AS source_origin,
+                CASE
+                    WHEN call.lead_source_manual_code
+                        IS NOT NULL
+                        AND call.lead_source_manual_code != ''
+                    THEN 1.0
+                    ELSE call.lead_source_auto_confidence
+                END AS source_confidence,
+                CASE
+                    WHEN call.lead_source_manual_code
+                        IS NOT NULL
+                        AND call.lead_source_manual_code != ''
+                    THEN
+                        'Ручной выбор'
+                        || CASE
+                            WHEN NULLIF(
+                                call.lead_source_marked_username,
+                                ''
+                            ) IS NOT NULL
+                            THEN
+                                ': '
+                                || call.lead_source_marked_username
+                            ELSE ''
+                        END
+                    ELSE call.lead_source_auto_evidence
+                END AS source_evidence,
+                COALESCE(
+                    call.lead_source_revision,
+                    0
+                ) AS source_revision,
+                call.start_time
+
+            FROM reporting_calls AS call
+
+            WHERE
+                call.client_window_id = ?
+                AND (
+                    NULLIF(
+                        call.lead_source_manual_code,
+                        ''
+                    ) IS NOT NULL
+                    OR NULLIF(
+                        call.lead_source_auto_code,
+                        ''
+                    ) IS NOT NULL
+                )
+
+            ORDER BY
+                CASE
+                    WHEN NULLIF(
+                        call.lead_source_manual_code,
+                        ''
+                    ) IS NOT NULL
+                    THEN 3
+                    WHEN call.lead_source_auto_method =
+                        'transcript'
+                    THEN 2
+                    ELSE 1
+                END DESC,
+                CASE
+                    WHEN NULLIF(
+                        call.lead_source_manual_code,
+                        ''
+                    ) IS NOT NULL
+                    THEN COALESCE(
+                        call.lead_source_revision,
+                        0
+                    )
+                    ELSE COALESCE(
+                        call.lead_source_auto_confidence,
+                        0
+                    )
+                END DESC,
+                CASE
+                    WHEN NULLIF(
+                        call.lead_source_manual_code,
+                        ''
+                    ) IS NULL
+                    THEN COALESCE(
+                        call.start_time,
+                        0
+                    )
+                END ASC,
+                call.id ASC
+
+            LIMIT 1
+            """,
+            (
+                window["id"],
+            ),
+        ).fetchone()
+
+        conn.execute(
+            """
+            UPDATE client_windows
+
+            SET
+                lead_source_code = ?,
+                lead_source_origin = ?,
+                lead_source_call_id = ?,
+                lead_source_confidence = ?,
+                lead_source_evidence = ?,
+                lead_source_revision = ?,
+                updated_at = CURRENT_TIMESTAMP
+
+            WHERE id = ?
+            """,
+            (
+                (
+                    source["source_code"]
+                    if source
+                    else None
+                ),
+                (
+                    source["source_origin"]
+                    if source
+                    else None
+                ),
+                (
+                    source["id"]
+                    if source
+                    else None
+                ),
+                (
+                    source["source_confidence"]
+                    if source
+                    else None
+                ),
+                (
+                    source["source_evidence"]
+                    if source
+                    else None
+                ),
+                (
+                    source["source_revision"]
+                    if source
+                    else None
+                ),
+                window["id"],
+            ),
+        )
+
+
 def init_db():
 
     with connect_db() as conn:
@@ -380,6 +1168,8 @@ def init_db():
                 user_id INTEGER,
                 user_login TEXT,
 
+                device_name TEXT,
+                provider_src_number TEXT,
                 src_number TEXT,
                 src_id INTEGER,
                 src_slot INTEGER,
@@ -419,6 +1209,17 @@ def init_db():
                 manager_marked_at INTEGER,
                 manager_marked_by INTEGER,
                 manager_marked_username TEXT,
+
+                lead_source_auto_code TEXT,
+                lead_source_auto_method TEXT,
+                lead_source_auto_confidence REAL,
+                lead_source_auto_evidence TEXT,
+
+                lead_source_manual_code TEXT,
+                lead_source_revision INTEGER,
+                lead_source_marked_at INTEGER,
+                lead_source_marked_by INTEGER,
+                lead_source_marked_username TEXT,
 
                 sale_status TEXT,
 
@@ -486,6 +1287,72 @@ def init_db():
                 """
                 ALTER TABLE calls
                 ADD COLUMN duration_source TEXT
+                """,
+
+            "device_name":
+                """
+                ALTER TABLE calls
+                ADD COLUMN device_name TEXT
+                """,
+
+            "provider_src_number":
+                """
+                ALTER TABLE calls
+                ADD COLUMN provider_src_number TEXT
+                """,
+
+            "lead_source_auto_code":
+                """
+                ALTER TABLE calls
+                ADD COLUMN lead_source_auto_code TEXT
+                """,
+
+            "lead_source_auto_method":
+                """
+                ALTER TABLE calls
+                ADD COLUMN lead_source_auto_method TEXT
+                """,
+
+            "lead_source_auto_confidence":
+                """
+                ALTER TABLE calls
+                ADD COLUMN lead_source_auto_confidence REAL
+                """,
+
+            "lead_source_auto_evidence":
+                """
+                ALTER TABLE calls
+                ADD COLUMN lead_source_auto_evidence TEXT
+                """,
+
+            "lead_source_manual_code":
+                """
+                ALTER TABLE calls
+                ADD COLUMN lead_source_manual_code TEXT
+                """,
+
+            "lead_source_revision":
+                """
+                ALTER TABLE calls
+                ADD COLUMN lead_source_revision INTEGER
+                """,
+
+            "lead_source_marked_at":
+                """
+                ALTER TABLE calls
+                ADD COLUMN lead_source_marked_at INTEGER
+                """,
+
+            "lead_source_marked_by":
+                """
+                ALTER TABLE calls
+                ADD COLUMN lead_source_marked_by INTEGER
+                """,
+
+            "lead_source_marked_username":
+                """
+                ALTER TABLE calls
+                ADD COLUMN lead_source_marked_username TEXT
                 """,
 
             "telegram_sent":
@@ -644,6 +1511,10 @@ def init_db():
 
                 sender_user_login TEXT,
 
+                message_kind TEXT
+                    NOT NULL
+                    DEFAULT 'promo',
+
                 status TEXT
                     NOT NULL,
 
@@ -680,6 +1551,18 @@ def init_db():
                 """
                 ALTER TABLE sms_history
                 ADD COLUMN sender_user_login TEXT
+                """
+            )
+
+        if (
+            "message_kind"
+            not in sms_history_columns
+        ):
+            conn.execute(
+                """
+                ALTER TABLE sms_history
+                ADD COLUMN message_kind TEXT
+                NOT NULL DEFAULT 'promo'
                 """
             )
 
@@ -932,6 +1815,13 @@ def init_db():
                 latest_call_id INTEGER
                     NOT NULL,
 
+                lead_source_code TEXT,
+                lead_source_origin TEXT,
+                lead_source_call_id INTEGER,
+                lead_source_confidence REAL,
+                lead_source_evidence TEXT,
+                lead_source_revision INTEGER,
+
                 created_at TIMESTAMP
                     DEFAULT CURRENT_TIMESTAMP,
 
@@ -951,6 +1841,56 @@ def init_db():
             )
             """
         )
+
+        client_window_columns = {
+            row["name"]
+            for row in conn.execute(
+                """
+                PRAGMA table_info(client_windows)
+                """
+            ).fetchall()
+        }
+
+        client_window_migrations = {
+            "lead_source_code":
+                """
+                ALTER TABLE client_windows
+                ADD COLUMN lead_source_code TEXT
+                """,
+            "lead_source_origin":
+                """
+                ALTER TABLE client_windows
+                ADD COLUMN lead_source_origin TEXT
+                """,
+            "lead_source_call_id":
+                """
+                ALTER TABLE client_windows
+                ADD COLUMN lead_source_call_id INTEGER
+                """,
+            "lead_source_confidence":
+                """
+                ALTER TABLE client_windows
+                ADD COLUMN lead_source_confidence REAL
+                """,
+            "lead_source_evidence":
+                """
+                ALTER TABLE client_windows
+                ADD COLUMN lead_source_evidence TEXT
+                """,
+            "lead_source_revision":
+                """
+                ALTER TABLE client_windows
+                ADD COLUMN lead_source_revision INTEGER
+                """,
+        }
+
+        for column, sql in (
+            client_window_migrations.items()
+        ):
+            if column not in client_window_columns:
+                conn.execute(
+                    sql
+                )
 
         conn.execute(
             """
@@ -1050,6 +1990,49 @@ def init_db():
                 ADD COLUMN result_category TEXT
                 """
             )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS call_transcriptions (
+
+                call_id INTEGER
+                    PRIMARY KEY,
+
+                status TEXT
+                    NOT NULL,
+
+                attempts INTEGER
+                    NOT NULL
+                    DEFAULT 0,
+
+                next_attempt_at INTEGER,
+                lease_token TEXT,
+                lease_until INTEGER,
+
+                provider TEXT,
+                model TEXT,
+                language TEXT,
+                transcript_text TEXT,
+                audio_sha256 TEXT,
+
+                error TEXT,
+
+                lead_source_code TEXT,
+                lead_source_confidence REAL,
+                lead_source_evidence TEXT,
+                lead_source_candidates_json TEXT,
+                classifier_version TEXT,
+
+                queued_at INTEGER NOT NULL,
+                started_at INTEGER,
+                completed_at INTEGER,
+                updated_at INTEGER NOT NULL,
+
+                FOREIGN KEY(call_id)
+                    REFERENCES calls(id)
+            )
+            """
+        )
 
         # `sale_marked_at` has only one-second precision.  Give
         # legacy result clicks a stable monotonic order so a rebuild
@@ -1187,6 +2170,212 @@ def init_db():
                         row["id"],
                     ),
                 )
+
+        # -------------------------------------------------
+        # NORMALIZE KNOWN DEVICES / SIMS AND SAFE DEFAULTS
+        # -------------------------------------------------
+
+        profile_rows = conn.execute(
+            """
+            SELECT
+                id,
+                user_login,
+                provider_src_number,
+                src_number,
+                src_slot,
+                is_internal_contact,
+                talk_manager_code,
+                lead_source_auto_code,
+                lead_source_auto_method
+
+            FROM calls
+            """
+        ).fetchall()
+
+        for row in profile_rows:
+
+            provider_src_number = (
+                row["provider_src_number"]
+                or row["src_number"]
+            )
+
+            device = resolve_call_device(
+                row["user_login"],
+                provider_src_number,
+                row["src_slot"],
+            )
+
+            conn.execute(
+                """
+                UPDATE calls
+
+                SET
+                    provider_src_number = ?,
+                    src_number = ?,
+                    device_name = ?
+
+                WHERE id = ?
+                """,
+                (
+                    provider_src_number,
+                    (
+                        device["src_number"]
+                        or row["src_number"]
+                    ),
+                    device["device_name"],
+                    row["id"],
+                ),
+            )
+
+            default_manager_code = device[
+                "default_manager_code"
+            ]
+
+            if (
+                default_manager_code
+                and not row["is_internal_contact"]
+                and not row["talk_manager_code"]
+            ):
+
+                manager_name = MANAGERS.get(
+                    default_manager_code
+                )
+
+                if manager_name:
+                    conn.execute(
+                        """
+                        UPDATE calls
+
+                        SET
+                            talk_manager_code = ?,
+                            talk_manager_name = ?,
+                            manager_marked_at = COALESCE(
+                                manager_marked_at,
+                                start_time
+                            ),
+                            manager_marked_username =
+                                COALESCE(
+                                    manager_marked_username,
+                                    ?
+                                )
+
+                        WHERE
+                            id = ?
+                            AND COALESCE(
+                                talk_manager_code,
+                                ''
+                            ) = ''
+                        """,
+                        (
+                            default_manager_code,
+                            manager_name,
+                            (
+                                "Авто: "
+                                + normalize_user_login(
+                                    row["user_login"]
+                                )
+                            ),
+                            row["id"],
+                        ),
+                    )
+
+            default_source_code = device[
+                "lead_source_code"
+            ]
+
+            static_source_method = (
+                row["lead_source_auto_method"]
+                in {
+                    "sim",
+                    "account",
+                }
+            )
+
+            if (
+                not row["is_internal_contact"]
+                and (
+                    default_source_code
+                    or static_source_method
+                )
+                and (
+                    static_source_method
+                    or (
+                        not row["lead_source_auto_code"]
+                        and not row[
+                            "lead_source_auto_method"
+                        ]
+                    )
+                )
+            ):
+                conn.execute(
+                    """
+                    UPDATE calls
+
+                    SET
+                        lead_source_auto_code = ?,
+                        lead_source_auto_method = ?,
+                        lead_source_auto_confidence = ?,
+                        lead_source_auto_evidence = ?
+
+                    WHERE id = ?
+                    """,
+                    (
+                        default_source_code,
+                        device[
+                            "lead_source_method"
+                        ],
+                        device[
+                            "lead_source_confidence"
+                        ],
+                        (
+                            "Авто по SIM/аккаунту: "
+                            + normalize_user_login(
+                                row["user_login"]
+                            )
+                            if default_source_code
+                            else None
+                        ),
+                        row["id"],
+                    ),
+                )
+
+        conn.execute(
+            """
+            UPDATE client_results
+
+            SET
+                talk_manager_code = (
+                    SELECT call.talk_manager_code
+                    FROM calls AS call
+                    WHERE call.id =
+                        client_results.source_call_id
+                ),
+                talk_manager_name = (
+                    SELECT call.talk_manager_name
+                    FROM calls AS call
+                    WHERE call.id =
+                        client_results.source_call_id
+                ),
+                updated_at = CURRENT_TIMESTAMP
+
+            WHERE
+                COALESCE(
+                    talk_manager_code,
+                    ''
+                ) = ''
+                AND EXISTS (
+                    SELECT 1
+                    FROM calls AS call
+                    WHERE
+                        call.id =
+                            client_results.source_call_id
+                        AND COALESCE(
+                            call.talk_manager_code,
+                            ''
+                        ) != ''
+                )
+            """
+        )
 
         # -------------------------------------------------
         # ROLLING 30-HOUR CLIENT WINDOWS FROM CALL STARTS
@@ -1866,6 +3055,10 @@ def init_db():
             """
         )
 
+        recompute_client_window_sources(
+            conn
+        )
+
         # -------------------------------------------------
         # WEBHOOK DEDUP KEYS FOR OLD CALLS
         # -------------------------------------------------
@@ -2240,6 +3433,24 @@ def init_db():
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS
+            idx_calls_lead_source_manual
+
+            ON calls(lead_source_manual_code)
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_calls_lead_source_auto
+
+            ON calls(lead_source_auto_code)
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
             idx_calls_internal_contact
 
             ON calls(is_internal_contact)
@@ -2336,6 +3547,43 @@ def init_db():
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS
+            idx_client_windows_lead_source
+
+            ON client_windows(
+                lead_source_code,
+                started_at
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_call_transcriptions_queue
+
+            ON call_transcriptions(
+                status,
+                next_attempt_at,
+                lease_until
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_call_transcriptions_source
+
+            ON call_transcriptions(
+                lead_source_code,
+                completed_at
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
             idx_client_results_client_window
 
             ON client_results(
@@ -2387,10 +3635,71 @@ init_db()
 # SMS
 # =========================================================
 
+def build_after_hours_missed_sms(
+    start_time,
+) -> str | None:
+
+    try:
+        timestamp = int(
+            start_time
+            or 0
+        )
+
+        if timestamp <= 0:
+            return None
+
+        call_time = datetime.fromtimestamp(
+            timestamp,
+            UZ_TZ,
+        )
+
+    except (
+        OSError,
+        OverflowError,
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+    minute_of_day = (
+        call_time.hour * 60
+        + call_time.minute
+    )
+
+    if (
+        MISSED_CALL_WORK_START_MINUTES
+        <= minute_of_day
+        < MISSED_CALL_WORK_END_MINUTES
+    ):
+        return None
+
+    before_opening = (
+        minute_of_day
+        < MISSED_CALL_WORK_START_MINUTES
+    )
+
+    return AFTER_HOURS_MISSED_SMS_TEXT.format(
+        day_ru=(
+            "Сегодня"
+            if before_opening
+            else "Завтра"
+        ),
+        day_uz=(
+            "Bugun"
+            if before_opening
+            else "Ertaga"
+        ),
+        work_start=(
+            MISSED_CALL_WORK_START_LABEL
+        ),
+    )
+
+
 def reserve_client_sms(
     call_id: int,
     client_number: str,
     sender_user_login: str | None,
+    message_kind: str = "promo",
 ):
 
     client_key = normalize_phone(
@@ -2500,17 +3809,24 @@ def reserve_client_sms(
                 client_number,
                 client_key,
                 sender_user_login,
+                message_kind,
                 status,
                 reserved_at
             )
 
-            VALUES (?, ?, ?, ?, 'reserved', ?)
+            VALUES (?, ?, ?, ?, ?, 'reserved', ?)
             """,
             (
                 call_id,
                 client_number,
                 client_key,
                 sender_user_login,
+                (
+                    str(
+                        message_kind
+                        or "promo"
+                    )[:50]
+                ),
                 now_ts,
             ),
         )
@@ -3028,27 +4344,6 @@ def prepare_recording(
             None,
         )
 
-    try:
-
-        response = HTTP.get(
-            recording_url,
-            timeout=60,
-        )
-
-        response.raise_for_status()
-
-    except Exception as exc:
-
-        print(
-            "RECORDING DOWNLOAD ERROR:",
-            exc,
-        )
-
-        return (
-            None,
-            None,
-        )
-
     with tempfile.TemporaryDirectory() as tmpdir:
 
         source_path = (
@@ -3061,9 +4356,20 @@ def prepare_recording(
             / "call.ogg"
         )
 
-        source_path.write_bytes(
-            response.content
-        )
+        try:
+            download_recording_limited(
+                recording_url,
+                source_path,
+            )
+        except Exception as exc:
+            print(
+                "RECORDING DOWNLOAD ERROR:",
+                type(exc).__name__,
+            )
+            return (
+                None,
+                None,
+            )
 
         # -------------------------------------------------
         # AUDIO DURATION
@@ -3184,6 +4490,1337 @@ def prepare_recording(
             audio_duration,
             voice_bytes,
         )
+
+
+# =========================================================
+# DURABLE CALL TRANSCRIPTION
+# =========================================================
+
+TRANSCRIPTION_CLASSIFIER_VERSION = "lead-source-v2"
+
+
+def recording_host_is_allowed(
+    recording_url: str,
+) -> bool:
+
+    parsed = urlparse(
+        recording_url
+    )
+
+    if parsed.scheme.casefold() != "https":
+        return False
+
+    if parsed.username or parsed.password:
+        return False
+
+    try:
+        parsed_port = parsed.port
+    except ValueError:
+        return False
+
+    if parsed_port not in {
+        None,
+        443,
+    }:
+        return False
+
+    host = (
+        parsed.hostname
+        or ""
+    ).casefold()
+
+    if not host:
+        return False
+
+    host_allowed = any(
+        (
+            host.endswith(
+                allowed
+            )
+            if allowed.startswith(".")
+            else host == allowed
+        )
+        for allowed in TRANSCRIPTION_ALLOWED_HOSTS
+    )
+
+    if not host_allowed:
+        return False
+
+    try:
+        addresses = socket.getaddrinfo(
+            host,
+            443,
+            type=socket.SOCK_STREAM,
+        )
+    except OSError:
+        return False
+
+    for address in addresses:
+        ip_text = address[4][0]
+
+        try:
+            ip = ipaddress.ip_address(
+                ip_text
+            )
+        except ValueError:
+            return False
+
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            return False
+
+    return bool(
+        addresses
+    )
+
+
+def enqueue_transcription_in_transaction(
+    conn,
+    call_id: int,
+):
+    now_ts = int(
+        datetime.now(
+            timezone.utc
+        ).timestamp()
+    )
+
+    call = conn.execute(
+        """
+        SELECT
+            canonical.id,
+            canonical.recording,
+            canonical.answered,
+            canonical.is_internal_contact
+
+        FROM calls AS original
+
+        JOIN calls AS canonical
+            ON canonical.id = COALESCE(
+                original.duplicate_of_call_id,
+                original.id
+            )
+
+        WHERE original.id = ?
+
+        LIMIT 1
+        """,
+        (
+            call_id,
+        ),
+    ).fetchone()
+
+    if not call:
+        return {
+            "queued": False,
+            "reason": "call_not_found",
+        }
+
+    if (
+        not call["answered"]
+        or call["is_internal_contact"]
+        or not call["recording"]
+    ):
+        return {
+            "queued": False,
+            "reason": "not_applicable",
+        }
+
+    cursor = conn.execute(
+        """
+        INSERT OR IGNORE INTO call_transcriptions (
+            call_id,
+            status,
+            attempts,
+            next_attempt_at,
+            provider,
+            model,
+            queued_at,
+            updated_at
+        )
+
+        VALUES (?, 'queued', 0, ?, 'openai', ?, ?, ?)
+        """,
+        (
+            call["id"],
+            now_ts,
+            TRANSCRIPTION_MODEL,
+            now_ts,
+            now_ts,
+        ),
+    )
+
+    return {
+        "queued": cursor.rowcount == 1,
+        "reason": (
+            "queued"
+            if cursor.rowcount == 1
+            else "already_queued"
+        ),
+    }
+
+
+def enqueue_transcription(
+    call_id: int,
+):
+
+    if not TRANSCRIPTION_ENABLED:
+        return {
+            "queued": False,
+            "reason": "disabled",
+        }
+
+    with connect_db() as conn:
+        result = enqueue_transcription_in_transaction(
+            conn,
+            call_id,
+        )
+        conn.commit()
+
+    if _transcription_worker:
+        _transcription_worker.wake()
+
+    return result
+
+
+def claim_transcription_job():
+
+    now_ts = int(
+        datetime.now(
+            timezone.utc
+        ).timestamp()
+    )
+
+    lease_token = uuid.uuid4().hex
+
+    with connect_db() as conn:
+
+        conn.execute(
+            "BEGIN IMMEDIATE"
+        )
+
+        conn.execute(
+            """
+            UPDATE call_transcriptions
+
+            SET
+                status = 'error',
+                lease_token = NULL,
+                lease_until = NULL,
+                error = COALESCE(
+                    error,
+                    'Истёк lease последней попытки'
+                ),
+                updated_at = ?
+
+            WHERE
+                status = 'processing'
+                AND attempts >= ?
+                AND COALESCE(
+                    lease_until,
+                    0
+                ) < ?
+            """,
+            (
+                now_ts,
+                TRANSCRIPTION_MAX_ATTEMPTS,
+                now_ts,
+            ),
+        )
+
+        job = conn.execute(
+            """
+            SELECT
+                transcription.call_id,
+                transcription.attempts,
+                call.recording
+
+            FROM call_transcriptions
+                AS transcription
+
+            JOIN calls AS call
+                ON call.id = transcription.call_id
+
+            WHERE
+                transcription.attempts < ?
+                AND (
+                    (
+                        transcription.status = 'queued'
+                        AND COALESCE(
+                            transcription.next_attempt_at,
+                            0
+                        ) <= ?
+                    )
+                    OR (
+                        transcription.status = 'processing'
+                        AND COALESCE(
+                            transcription.lease_until,
+                            0
+                        ) < ?
+                    )
+                )
+
+            ORDER BY
+                COALESCE(
+                    transcription.next_attempt_at,
+                    transcription.queued_at
+                ),
+                transcription.call_id
+
+            LIMIT 1
+            """,
+            (
+                TRANSCRIPTION_MAX_ATTEMPTS,
+                now_ts,
+                now_ts,
+            ),
+        ).fetchone()
+
+        if not job:
+            conn.commit()
+            return None
+
+        claimed = conn.execute(
+            """
+            UPDATE call_transcriptions
+
+            SET
+                status = 'processing',
+                attempts = attempts + 1,
+                lease_token = ?,
+                lease_until = ?,
+                started_at = ?,
+                updated_at = ?,
+                error = NULL
+
+            WHERE
+                call_id = ?
+                AND (
+                    status = 'queued'
+                    OR COALESCE(
+                        lease_until,
+                        0
+                    ) < ?
+                )
+            """,
+            (
+                lease_token,
+                now_ts
+                    + TRANSCRIPTION_LEASE_SECONDS,
+                now_ts,
+                now_ts,
+                job["call_id"],
+                now_ts,
+            ),
+        )
+
+        conn.commit()
+
+    if claimed.rowcount != 1:
+        return None
+
+    return {
+        "call_id": job["call_id"],
+        "attempts": int(
+            job["attempts"]
+            or 0
+        ) + 1,
+        "recording": job["recording"],
+        "lease_token": lease_token,
+    }
+
+
+def download_recording_limited(
+    recording_url: str,
+    target_path: Path,
+):
+
+    if not recording_host_is_allowed(
+        recording_url
+    ):
+        raise ValueError(
+            "Недопустимый адрес записи"
+        )
+
+    started_at = time.monotonic()
+
+    with requests.Session() as session, session.get(
+        recording_url,
+        stream=True,
+        timeout=(15, 60),
+        allow_redirects=False,
+    ) as response:
+
+        if 300 <= response.status_code < 400:
+            raise ValueError(
+                "Редиректы для записи запрещены"
+            )
+
+        response.raise_for_status()
+
+        content_length = response.headers.get(
+            "Content-Length"
+        )
+
+        if (
+            content_length
+            and int(content_length)
+                > TRANSCRIPTION_MAX_BYTES
+        ):
+            raise ValueError(
+                "Запись слишком большая"
+            )
+
+        total = 0
+        digest = hashlib.sha256()
+
+        with target_path.open(
+            "wb"
+        ) as target:
+
+            for chunk in response.iter_content(
+                chunk_size=64 * 1024
+            ):
+                if (
+                    time.monotonic()
+                    - started_at
+                    > TRANSCRIPTION_TIMEOUT_SECONDS
+                ):
+                    raise TimeoutError(
+                        "Превышено общее время загрузки записи"
+                    )
+
+                if not chunk:
+                    continue
+
+                total += len(
+                    chunk
+                )
+
+                if total > TRANSCRIPTION_MAX_BYTES:
+                    raise ValueError(
+                        "Запись слишком большая"
+                    )
+
+                digest.update(
+                    chunk
+                )
+                target.write(
+                    chunk
+                )
+
+    return digest.hexdigest()
+
+
+def normalize_transcription_audio(
+    source_path: Path,
+    target_path: Path,
+):
+
+    probe = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(source_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    duration = float(
+        probe.stdout.strip()
+        or 0
+    )
+
+    if duration <= 0:
+        raise ValueError(
+            "Пустая запись"
+        )
+
+    if duration > TRANSCRIPTION_MAX_DURATION_SECONDS:
+        raise ValueError(
+            "Запись длиннее разрешённого лимита"
+        )
+
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(source_path),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "libopus",
+            "-b:a",
+            "24k",
+            str(target_path),
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=120,
+    )
+
+
+def transcribe_audio_file(
+    audio_path: Path,
+):
+
+    if not TRANSCRIPTION_API_KEY:
+        raise RuntimeError(
+            "TRANSCRIPTION_API_KEY не указан"
+        )
+
+    parsed = urlparse(
+        TRANSCRIPTION_API_URL
+    )
+
+    if parsed.scheme.casefold() != "https":
+        raise RuntimeError(
+            "TRANSCRIPTION_API_URL должен использовать HTTPS"
+        )
+
+    session = requests.Session()
+
+    with audio_path.open(
+        "rb"
+    ) as audio_file:
+
+        response = session.post(
+            TRANSCRIPTION_API_URL,
+            headers={
+                "Authorization": (
+                    "Bearer "
+                    + TRANSCRIPTION_API_KEY
+                ),
+            },
+            data={
+                "model": TRANSCRIPTION_MODEL,
+                "response_format": "json",
+                "prompt": (
+                    "TEXNIKACH, OLX, Instagram, Telegram, "
+                    "объявление, e'lon, eski mijoz. "
+                    "Разговор может быть на русском или узбекском."
+                ),
+            },
+            files={
+                "file": (
+                    "call.ogg",
+                    audio_file,
+                    "audio/ogg",
+                ),
+            },
+            timeout=(15, TRANSCRIPTION_TIMEOUT_SECONDS),
+        )
+
+    response.raise_for_status()
+    result = response.json()
+
+    transcript = str(
+        result.get(
+            "text"
+        )
+        or ""
+    ).strip()
+
+    if not transcript:
+        raise RuntimeError(
+            "Сервис вернул пустую расшифровку"
+        )
+
+    language = result.get(
+        "language"
+    )
+
+    languages = result.get(
+        "languages"
+    )
+
+    if not language and languages:
+        first_language = languages[0]
+        language = (
+            first_language.get("code")
+            if isinstance(
+                first_language,
+                dict,
+            )
+            else str(
+                first_language
+            )
+        )
+
+    return {
+        "text": transcript,
+        "language": language,
+    }
+
+
+def detect_lead_source_from_transcript(
+    transcript: str,
+):
+
+    normalized = str(
+        transcript
+        or ""
+    ).casefold()
+
+    normalized = normalized.replace(
+        "’",
+        "'",
+    ).replace(
+        "ʻ",
+        "'",
+    ).replace(
+        "‘",
+        "'",
+    )
+
+    normalized = re.sub(
+        r"\s+",
+        " ",
+        normalized,
+    ).strip()
+
+    # A platform name alone is not proof of acquisition. For example,
+    # "I will send the catalogue in Telegram" describes the next action,
+    # not where the customer came from. We only accept a platform when the
+    # nearby phrase also contains acquisition intent. The numerical value is
+    # a rule score used to rank competing candidates; it is not a measured
+    # statistical probability.
+    acquisition_intent = re.compile(
+        (
+            r"(?:наш(?:[её]л|л[аио])\w*|увидел\w*|узнал\w*|"
+            r"увидела\w*|узнала\w*|звоню\s+по|обращаюсь\s+по|"
+            r"переш[её]л\w*|номер\w*\s+(?:наш[её]л\w*|увидел\w*)|"
+            r"topdim|ko[' ]?rdim|kordim|bildim|"
+            r"qayerdan|raqam\w*\s+(?:topdim|oldim)|"
+            r"qo[' ]?ng[' ]?iroq\s+qil\w*)"
+        ),
+        flags=re.IGNORECASE,
+    )
+
+    negative_context = re.compile(
+        (
+            r"(?:не\s+(?:наш[её]л\w*|видел\w*|увидел\w*)|"
+            r"нас\s+(?:там\s+)?нет|не\s+из|не\s+по|"
+            r"yo[' ]?q|emas)"
+        ),
+        flags=re.IGNORECASE,
+    )
+
+    seller_action = re.compile(
+        (
+            r"(?:отправлю|пришлю|скину|покажу|напишите|пишите|"
+            r"подпишитесь|наш\s+канал|наш\s+каталог|"
+            r"каталог\w*\s+(?:в|через)|ссылк\w*\s+(?:в|на)|"
+            r"yubor\w*|yoz\w*|kanalimiz)"
+        ),
+        flags=re.IGNORECASE,
+    )
+
+    platform_rules = [
+        (
+            "olx",
+            re.compile(
+                r"\b(?:olx|олх|оликс|олекс)(?:dan)?\b",
+                flags=re.IGNORECASE,
+            ),
+        ),
+        (
+            "instagram",
+            re.compile(
+                r"\b(?:instagram|инстаграм|insta|инста)\w*\b",
+                flags=re.IGNORECASE,
+            ),
+        ),
+        (
+            "telegram_channel",
+            re.compile(
+                r"\b(?:telegram|телеграм)\w*\b",
+                flags=re.IGNORECASE,
+            ),
+        ),
+    ]
+
+    candidates = {}
+
+    def remember_candidate(
+        code,
+        rule_score,
+        match,
+    ):
+        start = max(
+            0,
+            match.start() - 70,
+        )
+        end = min(
+            len(normalized),
+            match.end() + 70,
+        )
+        evidence = normalized[
+            start:end
+        ].strip()
+        previous = candidates.get(
+            code
+        )
+
+        if (
+            not previous
+            or rule_score
+                > previous["confidence"]
+        ):
+            candidates[code] = {
+                "code": code,
+                "confidence": rule_score,
+                "rule_score": rule_score,
+                "evidence": evidence,
+            }
+
+    for code, platform_pattern in platform_rules:
+        for match in platform_pattern.finditer(
+            normalized
+        ):
+            context_start = max(
+                0,
+                match.start() - 90,
+            )
+            context_end = min(
+                len(normalized),
+                match.end() + 90,
+            )
+            context = normalized[
+                context_start:context_end
+            ]
+
+            if negative_context.search(
+                context
+            ):
+                continue
+
+            if seller_action.search(
+                context
+            ):
+                continue
+
+            explicit_from_platform = bool(
+                re.search(
+                    (
+                        r"(?:из|с|через)\s+"
+                        + platform_pattern.pattern
+                        + r"|"
+                        + platform_pattern.pattern
+                        + r"(?:dan|дан)\b"
+                    ),
+                    context,
+                    flags=re.IGNORECASE,
+                )
+            )
+
+            if not (
+                acquisition_intent.search(
+                    context
+                )
+                or explicit_from_platform
+            ):
+                continue
+
+            remember_candidate(
+                code,
+                0.90,
+                match,
+            )
+
+    # A direct "calling from/about your advertisement" phrase is treated as
+    # OLX for this business because the user explicitly requested that rule.
+    advertisement_pattern = re.compile(
+        (
+            r"\b(?:звоню|обращаюсь)\s+по\s+(?:ваш\w*\s+)?"
+            r"объ?явлен\w*\b|"
+            r"\b(?:из|с)\s+объ?явлен\w*\b|"
+            r"\b(?:e[' ]?lon|эълон)\w*(?:dan|дан)\b"
+        ),
+        flags=re.IGNORECASE,
+    )
+
+    advertisement_match = advertisement_pattern.search(
+        normalized
+    )
+
+    if advertisement_match:
+        remember_candidate(
+            "olx",
+            0.82,
+            advertisement_match,
+        )
+
+    old_client_pattern = re.compile(
+        (
+            r"\b(?:стар\w+ клиент\w*|раньше покупал\w*|"
+            r"уже покупал\w*|покупал\w* у вас|"
+            r"eski mijoz\w*|oldin olgan\w*|"
+            r"avval olgan\w*)\b"
+        ),
+        flags=re.IGNORECASE,
+    )
+    old_client_match = old_client_pattern.search(
+        normalized
+    )
+
+    if old_client_match:
+        remember_candidate(
+            "old_client",
+            0.94,
+            old_client_match,
+        )
+
+    ordered = sorted(
+        candidates.values(),
+        key=lambda item: item[
+            "confidence"
+        ],
+        reverse=True,
+    )
+
+    selected = None
+
+    if ordered:
+        if (
+            len(ordered) == 1
+            or ordered[0]["confidence"]
+                - ordered[1]["confidence"]
+                >= 0.15
+        ):
+            selected = ordered[0]
+
+    return {
+        "code": (
+            selected["code"]
+            if selected
+            else None
+        ),
+        "confidence": (
+            selected["confidence"]
+            if selected
+            else None
+        ),
+        "evidence": (
+            selected["evidence"]
+            if selected
+            else None
+        ),
+        "candidates": ordered,
+    }
+
+
+def complete_transcription_job(
+    job: dict,
+    transcript_result: dict,
+    audio_sha256: str,
+):
+
+    detected = detect_lead_source_from_transcript(
+        transcript_result["text"]
+    )
+
+    now_ts = int(
+        datetime.now(
+            timezone.utc
+        ).timestamp()
+    )
+
+    with connect_db() as conn:
+
+        conn.execute(
+            "BEGIN IMMEDIATE"
+        )
+
+        updated = conn.execute(
+            """
+            UPDATE call_transcriptions
+
+            SET
+                status = 'completed',
+                lease_token = NULL,
+                lease_until = NULL,
+                provider = 'openai',
+                model = ?,
+                language = ?,
+                transcript_text = ?,
+                audio_sha256 = ?,
+                error = NULL,
+                lead_source_code = ?,
+                lead_source_confidence = ?,
+                lead_source_evidence = ?,
+                lead_source_candidates_json = ?,
+                classifier_version = ?,
+                completed_at = ?,
+                updated_at = ?
+
+            WHERE
+                call_id = ?
+                AND status = 'processing'
+                AND lease_token = ?
+            """,
+            (
+                TRANSCRIPTION_MODEL,
+                transcript_result.get(
+                    "language"
+                ),
+                transcript_result["text"],
+                audio_sha256,
+                detected["code"],
+                detected["confidence"],
+                detected["evidence"],
+                json.dumps(
+                    detected["candidates"],
+                    ensure_ascii=False,
+                ),
+                TRANSCRIPTION_CLASSIFIER_VERSION,
+                now_ts,
+                now_ts,
+                job["call_id"],
+                job["lease_token"],
+            ),
+        )
+
+        if updated.rowcount == 1:
+
+            call = conn.execute(
+                """
+                SELECT client_key
+                FROM calls
+                WHERE id = ?
+                LIMIT 1
+                """,
+                (
+                    job["call_id"],
+                ),
+            ).fetchone()
+
+            if detected["code"]:
+                conn.execute(
+                    """
+                    UPDATE calls
+
+                    SET
+                        lead_source_auto_code = ?,
+                        lead_source_auto_method =
+                            'transcript',
+                        lead_source_auto_confidence = ?,
+                        lead_source_auto_evidence = ?
+
+                    WHERE id = ?
+                    """,
+                    (
+                        detected["code"],
+                        detected["confidence"],
+                        detected["evidence"],
+                        job["call_id"],
+                    ),
+                )
+
+            if call and call["client_key"]:
+                recompute_client_window_sources(
+                    conn,
+                    call["client_key"],
+                )
+
+        conn.commit()
+
+    if updated.rowcount == 1:
+        try:
+            call = get_call(
+                job["call_id"]
+            )
+
+            if (
+                call
+                and call["telegram_chat_id"]
+                and call["telegram_message_id"]
+                and not call[
+                    "is_internal_contact"
+                ]
+            ):
+                edit_reply_markup(
+                    call["telegram_chat_id"],
+                    call["telegram_message_id"],
+                    build_call_state_keyboard(
+                        call
+                    ),
+                )
+
+        except Exception as exc:
+            print(
+                "TRANSCRIPTION TELEGRAM REFRESH ERROR:",
+                job["call_id"],
+                type(exc).__name__,
+            )
+
+    return updated.rowcount == 1
+
+
+def fail_transcription_job(
+    job: dict,
+    error,
+    *,
+    retry_allowed: bool = True,
+    delay_override: int | None = None,
+):
+
+    now_ts = int(
+        datetime.now(
+            timezone.utc
+        ).timestamp()
+    )
+
+    retry = bool(
+        retry_allowed
+        and
+        job["attempts"]
+        < TRANSCRIPTION_MAX_ATTEMPTS
+    )
+
+    delay_seconds = min(
+        3600,
+        30
+        * (
+            2
+            ** max(
+                0,
+                job["attempts"] - 1,
+            )
+        ),
+    )
+
+    if delay_override is not None:
+        delay_seconds = max(
+            1,
+            min(
+                24 * 60 * 60,
+                int(delay_override),
+            ),
+        )
+
+    with connect_db() as conn:
+
+        updated = conn.execute(
+            """
+            UPDATE call_transcriptions
+
+            SET
+                status = ?,
+                next_attempt_at = ?,
+                lease_token = NULL,
+                lease_until = NULL,
+                error = ?,
+                updated_at = ?
+
+            WHERE
+                call_id = ?
+                AND status = 'processing'
+                AND lease_token = ?
+            """,
+            (
+                (
+                    "queued"
+                    if retry
+                    else "error"
+                ),
+                (
+                    now_ts + delay_seconds
+                    if retry
+                    else None
+                ),
+                str(error)[:2000],
+                now_ts,
+                job["call_id"],
+                job["lease_token"],
+            ),
+        )
+
+        conn.commit()
+
+    return updated.rowcount == 1
+
+
+def renew_transcription_lease(
+    job: dict,
+) -> bool:
+
+    now_ts = int(
+        datetime.now(
+            timezone.utc
+        ).timestamp()
+    )
+
+    with connect_db() as conn:
+        updated = conn.execute(
+            """
+            UPDATE call_transcriptions
+
+            SET
+                lease_until = ?,
+                updated_at = ?
+
+            WHERE
+                call_id = ?
+                AND status = 'processing'
+                AND lease_token = ?
+            """,
+            (
+                now_ts
+                    + TRANSCRIPTION_LEASE_SECONDS,
+                now_ts,
+                job["call_id"],
+                job["lease_token"],
+            ),
+        )
+        conn.commit()
+
+    return updated.rowcount == 1
+
+
+def run_transcription_heartbeat(
+    job: dict,
+    stop_event: threading.Event,
+):
+
+    interval = max(
+        10.0,
+        TRANSCRIPTION_LEASE_SECONDS
+        / 3,
+    )
+
+    while not stop_event.wait(
+        interval
+    ):
+        try:
+            if not renew_transcription_lease(
+                job
+            ):
+                return
+        except Exception as exc:
+            print(
+                "TRANSCRIPTION LEASE HEARTBEAT ERROR:",
+                job["call_id"],
+                type(exc).__name__,
+            )
+
+
+def process_one_transcription_job():
+
+    job = claim_transcription_job()
+
+    if not job:
+        return False
+
+    heartbeat_stop = threading.Event()
+    heartbeat = threading.Thread(
+        target=run_transcription_heartbeat,
+        args=(
+            job,
+            heartbeat_stop,
+        ),
+        name=(
+            "transcription-lease-"
+            + str(job["call_id"])
+        ),
+        daemon=True,
+    )
+    heartbeat.start()
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+
+            source_path = Path(
+                tmpdir
+            ) / "source_audio"
+
+            audio_path = Path(
+                tmpdir
+            ) / "call.ogg"
+
+            audio_sha256 = download_recording_limited(
+                job["recording"],
+                source_path,
+            )
+
+            normalize_transcription_audio(
+                source_path,
+                audio_path,
+            )
+
+            transcript_result = transcribe_audio_file(
+                audio_path
+            )
+
+        completed = complete_transcription_job(
+            job,
+            transcript_result,
+            audio_sha256,
+        )
+
+        if completed:
+            print(
+                "TRANSCRIPTION COMPLETED:",
+                job["call_id"],
+            )
+
+    except Exception as exc:
+
+        retry_allowed = True
+        retry_after = None
+
+        if isinstance(
+            exc,
+            requests.HTTPError,
+        ) and exc.response is not None:
+            status_code = exc.response.status_code
+            retry_allowed = (
+                status_code in {
+                    408,
+                    409,
+                    429,
+                }
+                or status_code >= 500
+            )
+            retry_header = exc.response.headers.get(
+                "Retry-After"
+            )
+
+            if retry_header:
+                try:
+                    retry_after = int(
+                        retry_header
+                    )
+                except ValueError:
+                    retry_after = None
+
+        failed = fail_transcription_job(
+            job,
+            repr(exc),
+            retry_allowed=retry_allowed,
+            delay_override=retry_after,
+        )
+
+        if failed:
+            print(
+                "TRANSCRIPTION ERROR:",
+                job["call_id"],
+                type(exc).__name__,
+            )
+
+    finally:
+        heartbeat_stop.set()
+        heartbeat.join(
+            timeout=1,
+        )
+
+    return True
+
+
+class TranscriptionWorker:
+
+    def __init__(self):
+        self._task = None
+        self._stop_event = asyncio.Event()
+        self._wake_event = asyncio.Event()
+
+    async def start(self):
+        if self._task:
+            return
+
+        self._task = asyncio.create_task(
+            self._run(),
+            name="call-transcription-worker",
+        )
+
+    async def stop(self):
+        self._stop_event.set()
+        self._wake_event.set()
+
+        if self._task:
+            await self._task
+            self._task = None
+
+    def wake(self):
+        self._wake_event.set()
+
+    async def _run(self):
+
+        while not self._stop_event.is_set():
+
+            try:
+                processed = await asyncio.to_thread(
+                    process_one_transcription_job
+                )
+            except Exception as exc:
+                print(
+                    "TRANSCRIPTION WORKER ERROR:",
+                    type(exc).__name__,
+                )
+                processed = False
+
+            if processed:
+                continue
+
+            self._wake_event.clear()
+
+            try:
+                await asyncio.wait_for(
+                    self._wake_event.wait(),
+                    timeout=max(
+                        1.0,
+                        TRANSCRIPTION_POLL_SECONDS,
+                    ),
+                )
+            except asyncio.TimeoutError:
+                pass
+
+
+def update_call_audio_duration(
+    call_id: int,
+    audio_duration: int,
+):
+
+    duration = max(
+        0,
+        int(audio_duration),
+    )
+
+    with connect_db() as conn:
+        conn.execute(
+            """
+            UPDATE calls
+
+            SET
+                duration = ?,
+                duration_source = 'audio'
+
+            WHERE id = ?
+            """,
+            (
+                duration,
+                call_id,
+            ),
+        )
+        conn.commit()
 
 
 def get_talk_duration(
@@ -3586,6 +6223,11 @@ def rebuild_client_windows_for_client(
         (
             client_key,
         ),
+    )
+
+    recompute_client_window_sources(
+        conn,
+        client_key,
     )
 
     raw_results = conn.execute(
@@ -4179,6 +6821,41 @@ def save_call(
             or webhook_dedup_key
         )
 
+        merged_user_login = webhook_value(
+            "user_login"
+        )
+
+        merged_src_slot = event_value(
+            "src_slot"
+        )
+
+        if (
+            "src_number" in event
+            and supplied(
+                event.get(
+                    "src_number"
+                )
+            )
+        ):
+            provider_src_number = event.get(
+                "src_number"
+            )
+        else:
+            provider_src_number = (
+                old_value(
+                    "provider_src_number"
+                )
+                or old_value(
+                    "src_number"
+                )
+            )
+
+        device = resolve_call_device(
+            merged_user_login,
+            provider_src_number,
+            merged_src_slot,
+        )
+
         values = (
             db_call_id,
             event_pbx_call_id,
@@ -4191,10 +6868,17 @@ def save_call(
             event_value("direction"),
             event_value("answered"),
             webhook_value("user_id"),
-            webhook_value("user_login"),
-            event_value("src_number"),
+            merged_user_login,
+            device["device_name"],
+            provider_src_number,
+            (
+                device["src_number"]
+                or event_value(
+                    "src_number"
+                )
+            ),
             event_value("src_id"),
-            event_value("src_slot"),
+            merged_src_slot,
             event_created,
             event_value("start_time"),
             event_value("answer_time"),
@@ -4228,6 +6912,8 @@ def save_call(
                     answered = ?,
                     user_id = ?,
                     user_login = ?,
+                    device_name = ?,
+                    provider_src_number = ?,
                     src_number = ?,
                     src_id = ?,
                     src_slot = ?,
@@ -4273,6 +6959,8 @@ def save_call(
                 user_id,
                 user_login,
 
+                device_name,
+                provider_src_number,
                 src_number,
                 src_id,
                 src_slot,
@@ -4307,6 +6995,7 @@ def save_call(
 
                 ?, ?,
 
+                ?, ?,
                 ?, ?, ?,
 
                 ?,
@@ -4328,14 +7017,118 @@ def save_call(
 
             call_id = cursor.lastrowid
 
+        if not is_internal_contact:
+
+            default_manager_code = device[
+                "default_manager_code"
+            ]
+
+            default_manager_name = MANAGERS.get(
+                default_manager_code
+            )
+
+            if default_manager_name:
+                conn.execute(
+                    """
+                    UPDATE calls
+
+                    SET
+                        talk_manager_code = ?,
+                        talk_manager_name = ?,
+                        manager_marked_at = COALESCE(
+                            manager_marked_at,
+                            start_time
+                        ),
+                        manager_marked_username =
+                            COALESCE(
+                                manager_marked_username,
+                                ?
+                            )
+
+                    WHERE
+                        id = ?
+                        AND COALESCE(
+                            talk_manager_code,
+                            ''
+                        ) = ''
+                    """,
+                    (
+                        default_manager_code,
+                        default_manager_name,
+                        (
+                            "Авто: "
+                            + normalize_user_login(
+                                merged_user_login
+                            )
+                        ),
+                        call_id,
+                    ),
+                )
+
+            default_source_code = device[
+                "lead_source_code"
+            ]
+
+            conn.execute(
+                """
+                UPDATE calls
+
+                SET
+                    lead_source_auto_code = ?,
+                    lead_source_auto_method = ?,
+                    lead_source_auto_confidence = ?,
+                    lead_source_auto_evidence = ?
+
+                WHERE
+                    id = ?
+                    AND (
+                        lead_source_auto_method IN (
+                            'sim',
+                            'account'
+                        )
+                        OR (
+                            COALESCE(
+                                lead_source_auto_code,
+                                ''
+                            ) = ''
+                            AND COALESCE(
+                                lead_source_auto_method,
+                                ''
+                            ) = ''
+                        )
+                    )
+                """,
+                (
+                    default_source_code,
+                    device[
+                        "lead_source_method"
+                    ],
+                    device[
+                        "lead_source_confidence"
+                    ],
+                    (
+                        "Авто по SIM/аккаунту: "
+                        + normalize_user_login(
+                            merged_user_login
+                        )
+                        if default_source_code
+                        else None
+                    ),
+                    call_id,
+                ),
+            )
+
         merged_identity_event = {
             "db_call_id": db_call_id,
             "event_pbx_call_id": (
                 event_pbx_call_id
             ),
             "client_number": client_number,
-            "src_number": event_value(
-                "src_number"
+            "src_number": (
+                device["src_number"]
+                or event_value(
+                    "src_number"
+                )
             ),
             "direction": event_value(
                 "direction"
@@ -4412,6 +7205,35 @@ def save_call(
                 conn,
                 client_key,
             )
+
+        # The transcription row is an outbox record: it is committed in the
+        # same transaction as the call, so a process crash cannot leave an
+        # eligible recording permanently unqueued.
+        if TRANSCRIPTION_ENABLED:
+            conn.execute(
+                "SAVEPOINT transcription_outbox"
+            )
+
+            try:
+                enqueue_transcription_in_transaction(
+                    conn,
+                    call_id,
+                )
+                conn.execute(
+                    "RELEASE transcription_outbox"
+                )
+            except Exception as exc:
+                conn.execute(
+                    "ROLLBACK TO transcription_outbox"
+                )
+                conn.execute(
+                    "RELEASE transcription_outbox"
+                )
+                print(
+                    "TRANSCRIPTION OUTBOX ERROR:",
+                    call_id,
+                    type(exc).__name__,
+                )
 
         now_ts = int(
             datetime.now(
@@ -4733,53 +7555,137 @@ def build_telegram_message(
     event: dict,
     webhook: dict,
     talk_duration: int,
+    call=None,
 ):
 
-    direction = event.get(
-        "direction"
-    )
+    if call:
+        direction = call[
+            "direction"
+        ]
 
-    answered = int(
-        event.get(
-            "answered",
-            0,
+        answered = int(
+            call[
+                "answered"
+            ]
+            or 0
         )
-        or 0
-    )
 
-    client_number = (
-        event.get(
-            "client_number"
+        client_number = (
+            call[
+                "client_number"
+            ]
+            or ""
         )
-        or ""
-    )
 
-    client_name = (
-        event.get(
-            "client_name"
+        client_name = (
+            call[
+                "client_name"
+            ]
+            or ""
         )
-        or ""
-    )
 
-    internal_contact_name = (
-        get_internal_contact_name(
-            client_number
+        internal_contact_name = (
+            call[
+                "internal_contact_name"
+            ]
+            if call[
+                "is_internal_contact"
+            ]
+            else None
         )
-    )
+
+        start_time = call[
+            "start_time"
+        ]
+
+        answer_time = call[
+            "answer_time"
+        ]
+
+        talk_duration = int(
+            call[
+                "duration"
+            ]
+            or 0
+        )
+
+    else:
+        direction = event.get(
+            "direction"
+        )
+
+        answered = int(
+            event.get(
+                "answered",
+                0,
+            )
+            or 0
+        )
+
+        client_number = (
+            event.get(
+                "client_number"
+            )
+            or ""
+        )
+
+        client_name = (
+            event.get(
+                "client_name"
+            )
+            or ""
+        )
+
+        internal_contact_name = (
+            get_internal_contact_name(
+                client_number
+            )
+        )
+
+        start_time = event.get(
+            "start_time"
+        )
+
+        answer_time = event.get(
+            "answer_time"
+        )
 
     sim = (
-        event.get(
+        call["src_number"]
+        if call
+        else event.get(
             "src_number"
         )
-        or ""
+    ) or ""
+
+    device = resolve_call_device(
+        (
+            call["user_login"]
+            if call
+            else webhook.get(
+                "user_login"
+            )
+        ),
+        (
+            call["provider_src_number"]
+            if call
+            else event.get(
+                "src_number"
+            )
+        ),
+        (
+            call["src_slot"]
+            if call
+            else event.get(
+                "src_slot"
+            )
+        ),
     )
 
-    start_time = event.get(
-        "start_time"
-    )
-
-    answer_time = event.get(
-        "answer_time"
+    manager_name = (
+        call["talk_manager_name"]
+        if call
+        else None
     )
 
     # -------------------------------------------------
@@ -4906,10 +7812,23 @@ def build_telegram_message(
             f"<b>{format_call_time(start_time)}</b>"
         )
 
+    if device["device_name"]:
+        lines.append(
+            "📱 Устройство: "
+            f"<b>{escape(device['device_name'])}</b>"
+        )
+
     lines.append(
-        "📲 SIM: "
-        f"{escape(sim or '—')}"
+        "📲 "
+        f"{escape(device['sim_label'])}: "
+        f"<b>{escape(sim or '—')}</b>"
     )
+
+    if manager_name:
+        lines.append(
+            "👤 Менеджер: "
+            f"<b>{escape(manager_name)}</b>"
+        )
 
     # -------------------------------------------------
     # BUTTON PROMPT
@@ -4917,6 +7836,7 @@ def build_telegram_message(
 
     if (
         answered
+        and not manager_name
         and not internal_contact_name
     ):
 
@@ -4928,8 +7848,23 @@ def build_telegram_message(
         )
 
     elif (
+        direction == 1
+        and not answered
+        and not manager_name
+        and not internal_contact_name
+    ):
+
+        lines.extend(
+            [
+                "",
+                "<b>Кто совершал исходящий звонок?</b>",
+            ]
+        )
+
+    elif (
         direction == 0
         and not answered
+        and not manager_name
         and not internal_contact_name
     ):
 
@@ -4948,6 +7883,93 @@ def build_telegram_message(
 # =========================================================
 # TELEGRAM KEYBOARDS
 # =========================================================
+
+def get_call_lead_source_name(
+    call_id: int,
+) -> str | None:
+
+    call = get_call(
+        call_id
+    )
+
+    if not call:
+        return None
+
+    return get_lead_source_name(
+        call[
+            "effective_lead_source_code"
+        ]
+    )
+
+
+def build_lead_source_control_row(
+    call_id: int,
+):
+
+    source_name = get_call_lead_source_name(
+        call_id
+    )
+
+    return [
+        {
+            "text": (
+                "📣 Источник: "
+                + source_name
+                if source_name
+                else "📣 Выбрать источник"
+            ),
+            "callback_data": (
+                f"source_menu:{call_id}"
+            ),
+        }
+    ]
+
+
+def build_lead_source_keyboard(
+    call_id: int,
+):
+
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "OLX",
+                    "callback_data": (
+                        f"source:olx:{call_id}"
+                    ),
+                },
+                {
+                    "text": "Instagram",
+                    "callback_data": (
+                        f"source:instagram:{call_id}"
+                    ),
+                },
+            ],
+            [
+                {
+                    "text": "Telegram Kanal",
+                    "callback_data": (
+                        "source:telegram_channel:"
+                        f"{call_id}"
+                    ),
+                },
+                {
+                    "text": "Старый клиент",
+                    "callback_data": (
+                        f"source:old_client:{call_id}"
+                    ),
+                },
+            ],
+            [
+                {
+                    "text": "↩️ Назад",
+                    "callback_data": (
+                        f"source_back:{call_id}"
+                    ),
+                }
+            ],
+        ]
+    }
 
 def build_manager_keyboard(
     call_id: int,
@@ -4991,6 +8013,10 @@ def build_manager_keyboard(
                         f"manager:abbos:{call_id}",
                 },
             ],
+
+            build_lead_source_control_row(
+                call_id
+            ),
         ]
     }
 
@@ -5015,6 +8041,12 @@ def build_sale_keyboard(
                 }
             ]
         )
+
+    keyboard.append(
+        build_lead_source_control_row(
+            call_id
+        )
+    )
 
     keyboard.extend(
         [
@@ -5195,6 +8227,10 @@ def build_selected_keyboard(
                 }
             ],
 
+            build_lead_source_control_row(
+                call_id
+            ),
+
             [
                 {
                     "text":
@@ -5244,6 +8280,9 @@ def build_missed_manager_keyboard(
                         f"manager_selected:{call_id}",
                 }
             ],
+            build_lead_source_control_row(
+                call_id
+            ),
             [
                 {
                     "text":
@@ -5455,11 +8494,37 @@ def get_call(
 
         return conn.execute(
             """
-            SELECT *
+            SELECT
+                calls.*,
+                window.lead_source_code
+                    AS effective_lead_source_code,
+                window.lead_source_origin
+                    AS effective_lead_source_origin,
+                window.lead_source_confidence
+                    AS effective_lead_source_confidence,
+                window.lead_source_evidence
+                    AS effective_lead_source_evidence,
+                result.source_call_id
+                    AS effective_result_call_id,
+                result.sale_status
+                    AS effective_sale_status,
+                result.no_sale_reason
+                    AS effective_no_sale_reason,
+                result.no_sale_reason_code
+                    AS effective_no_sale_reason_code,
+                result.result_category
+                    AS effective_result_category
 
             FROM calls
 
-            WHERE id = ?
+            LEFT JOIN client_windows AS window
+                ON window.id = calls.client_window_id
+
+            LEFT JOIN client_results AS result
+                ON result.client_window_id =
+                    calls.client_window_id
+
+            WHERE calls.id = ?
             """,
             (
                 call_id,
@@ -5492,6 +8557,168 @@ def get_telegram_user_name(
 
         ""
     )
+
+
+def get_selected_result_text(
+    call,
+) -> str | None:
+
+    if call["effective_sale_status"] == "bought":
+        return "✅ Купил"
+
+    if call[
+        "effective_sale_status"
+    ] == "not_bought":
+        return (
+            call["effective_no_sale_reason"]
+            or "Не купил"
+        )
+
+    return None
+
+
+def build_call_state_keyboard(
+    call,
+):
+
+    manager_name = call[
+        "talk_manager_name"
+    ]
+
+    if not manager_name:
+        return build_manager_keyboard(
+            call["id"]
+        )
+
+    if call["answered"]:
+
+        selected_text = get_selected_result_text(
+            call
+        )
+
+        if selected_text:
+            return build_selected_keyboard(
+                call["id"],
+                manager_name,
+                selected_text,
+            )
+
+        return build_sale_keyboard(
+            call["id"],
+            manager_name,
+        )
+
+    return build_missed_manager_keyboard(
+        call["id"],
+        manager_name,
+    )
+
+
+def mark_lead_source(
+    call_id: int,
+    source_code: str,
+    telegram_user: dict,
+):
+
+    source_name = get_lead_source_name(
+        source_code
+    )
+
+    if not source_name:
+        raise ValueError(
+            "Неизвестный источник"
+        )
+
+    now_ts = int(
+        datetime.now(
+            UZ_TZ
+        ).timestamp()
+    )
+
+    with connect_db() as conn:
+
+        conn.execute(
+            "BEGIN IMMEDIATE"
+        )
+
+        call = conn.execute(
+            """
+            SELECT
+                id,
+                client_key,
+                is_internal_contact
+
+            FROM calls
+
+            WHERE id = ?
+
+            LIMIT 1
+            """,
+            (
+                call_id,
+            ),
+        ).fetchone()
+
+        if not call:
+            conn.rollback()
+            raise ValueError(
+                "Звонок не найден"
+            )
+
+        if call["is_internal_contact"]:
+            conn.rollback()
+            raise ValueError(
+                "Для внутреннего контакта источник не нужен"
+            )
+
+        revision = conn.execute(
+            """
+            SELECT
+                COALESCE(
+                    MAX(lead_source_revision),
+                    0
+                ) + 1
+
+            FROM calls
+            """
+        ).fetchone()[0]
+
+        conn.execute(
+            """
+            UPDATE calls
+
+            SET
+                lead_source_manual_code = ?,
+                lead_source_revision = ?,
+                lead_source_marked_at = ?,
+                lead_source_marked_by = ?,
+                lead_source_marked_username = ?
+
+            WHERE id = ?
+            """,
+            (
+                source_code,
+                revision,
+                now_ts,
+                telegram_user.get(
+                    "id"
+                ),
+                get_telegram_user_name(
+                    telegram_user
+                ),
+                call_id,
+            ),
+        )
+
+        if call["client_key"]:
+            recompute_client_window_sources(
+                conn,
+                call["client_key"],
+            )
+
+        conn.commit()
+
+    return source_name
 
 
 # =========================================================
@@ -6056,6 +9283,154 @@ async def telegram_webhook(
     try:
 
         # =================================================
+        # LEAD SOURCE MENU
+        # =================================================
+
+        if callback_data.startswith(
+            "source_menu:"
+        ):
+
+            call_id = int(
+                callback_data.split(
+                    ":",
+                    1,
+                )[1]
+            )
+
+            call = get_call(
+                call_id
+            )
+
+            if not call:
+                answer_callback_query(
+                    callback_id,
+                    "Звонок не найден",
+                )
+                return {"ok": True}
+
+            if call["is_internal_contact"]:
+                answer_callback_query(
+                    callback_id,
+                    "Это внутренний контакт",
+                )
+                return {"ok": True}
+
+            edit_reply_markup(
+                chat_id,
+                message_id,
+                build_lead_source_keyboard(
+                    call_id
+                ),
+            )
+
+            answer_callback_query(
+                callback_id,
+                "Выберите источник клиента",
+            )
+
+            return {"ok": True}
+
+        # =================================================
+        # LEAD SOURCE BACK
+        # =================================================
+
+        if callback_data.startswith(
+            "source_back:"
+        ):
+
+            call_id = int(
+                callback_data.split(
+                    ":",
+                    1,
+                )[1]
+            )
+
+            call = get_call(
+                call_id
+            )
+
+            if not call:
+                answer_callback_query(
+                    callback_id,
+                    "Звонок не найден",
+                )
+                return {"ok": True}
+
+            edit_reply_markup(
+                chat_id,
+                message_id,
+                build_call_state_keyboard(
+                    call
+                ),
+            )
+
+            answer_callback_query(
+                callback_id,
+                "Назад",
+            )
+
+            return {"ok": True}
+
+        # =================================================
+        # LEAD SOURCE SELECTED
+        # =================================================
+
+        if callback_data.startswith(
+            "source:"
+        ):
+
+            parts = callback_data.split(
+                ":"
+            )
+
+            if len(parts) != 3:
+                answer_callback_query(
+                    callback_id,
+                    "Ошибка кнопки",
+                )
+                return {"ok": True}
+
+            source_code = parts[1]
+            call_id = int(
+                parts[2]
+            )
+
+            source_name = mark_lead_source(
+                call_id,
+                source_code,
+                telegram_user,
+            )
+
+            call = get_call(
+                call_id
+            )
+
+            edit_reply_markup(
+                chat_id,
+                message_id,
+                build_call_state_keyboard(
+                    call
+                ),
+            )
+
+            answer_callback_query(
+                callback_id,
+                f"📣 Источник: {source_name}",
+            )
+
+            print(
+                "LEAD SOURCE:",
+                call_id,
+                source_code,
+            )
+
+            return {
+                "ok": True,
+                "call_id": call_id,
+                "lead_source": source_code,
+            }
+
+        # =================================================
         # MANAGER SELECTED
         # =================================================
 
@@ -6131,20 +9506,15 @@ async def telegram_webhook(
                 telegram_user,
             )
 
+            call = get_call(
+                call_id
+            )
+
             edit_reply_markup(
                 chat_id,
                 message_id,
-
-                (
-                    build_sale_keyboard(
-                        call_id,
-                        manager_name,
-                    )
-                    if call["answered"]
-                    else build_missed_manager_keyboard(
-                        call_id,
-                        manager_name,
-                    )
+                build_call_state_keyboard(
+                    call
                 ),
             )
 
@@ -10250,6 +13620,188 @@ def stats_ratings_daily(
 
 
 # =========================================================
+# LEAD SOURCE STATISTICS
+# =========================================================
+
+@app.get(
+    "/stats/sources"
+)
+def stats_sources(
+    period: str = "today",
+    date_from: str | None = None,
+    date_to: str | None = None,
+):
+
+    p = get_period(
+        period,
+        date_from,
+        date_to,
+    )
+
+    with connect_db() as conn:
+
+        rows = conn.execute(
+            """
+            WITH outcomes AS (
+                SELECT
+                    window.id,
+                    window.client_key,
+                    COALESCE(
+                        NULLIF(
+                            window.lead_source_code,
+                            ''
+                        ),
+                        'unmarked'
+                    ) AS source_code,
+                    result.id AS result_id,
+                    result.result_category,
+                    COALESCE(
+                        result.attribution_time,
+                        latest_call.start_time
+                    ) AS attribution_time
+
+                FROM client_windows AS window
+
+                JOIN reporting_calls AS latest_call
+                    ON latest_call.id =
+                        window.latest_call_id
+
+                LEFT JOIN client_results AS result
+                    ON result.client_window_id =
+                        window.id
+            )
+
+            SELECT
+                source_code,
+                COUNT(*) AS client_windows,
+                COUNT(
+                    DISTINCT client_key
+                ) AS unique_clients,
+                SUM(
+                    CASE
+                        WHEN result_category = 'bought'
+                        THEN 1 ELSE 0
+                    END
+                ) AS bought,
+                SUM(
+                    CASE
+                        WHEN result_category = 'lost'
+                        THEN 1 ELSE 0
+                    END
+                ) AS lost,
+                SUM(
+                    CASE
+                        WHEN result_category = 'pending'
+                        THEN 1 ELSE 0
+                    END
+                ) AS pending,
+                SUM(
+                    CASE
+                        WHEN result_category = 'non_target'
+                        THEN 1 ELSE 0
+                    END
+                ) AS non_target,
+                SUM(
+                    CASE
+                        WHEN result_id IS NULL
+                        THEN 1 ELSE 0
+                    END
+                ) AS unmarked
+
+            FROM outcomes
+
+            WHERE
+                attribution_time >= ?
+                AND attribution_time < ?
+
+            GROUP BY source_code
+
+            ORDER BY client_windows DESC
+            """,
+            (
+                p["start_ts"],
+                p["end_ts"],
+            ),
+        ).fetchall()
+
+    results = []
+
+    for row in rows:
+
+        client_windows = int(
+            row["client_windows"]
+            or 0
+        )
+        bought = int(
+            row["bought"]
+            or 0
+        )
+        lost = int(
+            row["lost"]
+            or 0
+        )
+        non_target = int(
+            row["non_target"]
+            or 0
+        )
+        eligible = max(
+            0,
+            client_windows - non_target,
+        )
+        completed = bought + lost
+
+        results.append(
+            {
+                "source_code": row[
+                    "source_code"
+                ],
+                "source": (
+                    get_lead_source_name(
+                        row["source_code"]
+                    )
+                    or "Не указан"
+                ),
+                "client_windows": client_windows,
+                "unique_clients": int(
+                    row["unique_clients"]
+                    or 0
+                ),
+                "bought": bought,
+                "lost": lost,
+                "pending": int(
+                    row["pending"]
+                    or 0
+                ),
+                "non_target": non_target,
+                "unmarked": int(
+                    row["unmarked"]
+                    or 0
+                ),
+                "overall_conversion": (
+                    round(
+                        bought / eligible * 100,
+                        1,
+                    )
+                    if eligible
+                    else 0
+                ),
+                "completed_conversion": (
+                    round(
+                        bought / completed * 100,
+                        1,
+                    )
+                    if completed
+                    else 0
+                ),
+            }
+        )
+
+    return {
+        "results": results
+    }
+
+
+# =========================================================
 # SIM
 # =========================================================
 
@@ -10273,6 +13825,26 @@ def stats_sims(
         rows = conn.execute(
             """
             SELECT
+
+                COALESCE(
+                    NULLIF(
+                        device_name,
+                        ''
+                    ),
+                    NULLIF(
+                        user_login,
+                        ''
+                    ),
+                    'Неизвестно'
+                )
+                    AS device,
+
+                user_login,
+
+                MAX(
+                    account_name
+                )
+                    AS account_name,
 
                 COALESCE(
                     NULLIF(
@@ -10377,6 +13949,8 @@ def stats_sims(
                 ) = 0
 
             GROUP BY
+                device,
+                user_login,
                 sim,
                 src_slot
 
@@ -10392,8 +13966,26 @@ def stats_sims(
     return {
         "results": [
             {
+                "device":
+                    row["device"],
+
+                "user_login":
+                    row["user_login"]
+                    or "",
+
+                "account_name":
+                    row["account_name"]
+                    or "",
+
                 "sim":
                     row["sim"],
+
+                "sim_label":
+                    resolve_call_device(
+                        row["user_login"],
+                        row["sim"],
+                        row["src_slot"],
+                    )["sim_label"],
 
                 "slot":
                     row["src_slot"],
@@ -10516,7 +14108,13 @@ def stats_recent(
                 calls.talk_manager_name
                     AS talk_manager_name,
 
+                calls.device_name,
+                calls.user_login,
                 src_number,
+                calls.src_slot,
+
+                client_window.lead_source_code,
+                client_window.lead_source_origin,
 
                 start_time,
 
@@ -10545,8 +14143,14 @@ def stats_recent(
             LEFT JOIN client_results
                 AS client_result
 
-                ON client_result.source_call_id =
-                    calls.id
+                ON client_result.client_window_id =
+                    calls.client_window_id
+
+            LEFT JOIN client_windows
+                AS client_window
+
+                ON client_window.id =
+                    calls.client_window_id
 
             WHERE
                 start_time >= ?
@@ -10642,6 +14246,31 @@ def stats_recent(
                         "src_number"
                     ]
                     or "—",
+
+                "device":
+                    row["device_name"]
+                    or row["user_login"]
+                    or "—",
+
+                "sim_label":
+                    resolve_call_device(
+                        row["user_login"],
+                        row["src_number"],
+                        row["src_slot"],
+                    )["sim_label"],
+
+                "lead_source_code":
+                    row["lead_source_code"],
+
+                "lead_source":
+                    get_lead_source_name(
+                        row["lead_source_code"]
+                    )
+                    or "—",
+
+                "lead_source_origin":
+                    row["lead_source_origin"]
+                    or "",
 
                 "local_time":
                     local_time,
@@ -10758,6 +14387,8 @@ def rating_details(
                 call.answered,
                 call.user_id,
                 call.user_login,
+                call.device_name,
+                call.provider_src_number,
                 call.src_number,
                 call.src_id,
                 call.src_slot,
@@ -10775,6 +14406,19 @@ def rating_details(
                 call.talk_manager_name,
                 call.manager_marked_at,
                 call.manager_marked_username,
+                source_call.lead_source_auto_code,
+                source_call.lead_source_auto_method,
+                source_call.lead_source_auto_confidence,
+                source_call.lead_source_auto_evidence,
+                source_call.lead_source_manual_code,
+                client_window.lead_source_revision,
+                source_call.lead_source_marked_at,
+                source_call.lead_source_marked_username,
+                client_window.lead_source_code,
+                client_window.lead_source_origin,
+                client_window.lead_source_call_id,
+                client_window.lead_source_confidence,
+                client_window.lead_source_evidence,
                 client_result.sale_status,
                 client_result.no_sale_reason,
                 client_result.no_sale_reason_code,
@@ -10807,6 +14451,21 @@ def rating_details(
                 rating.device_data_json,
                 rating.device_data_updated_at
 
+                ,transcription.status
+                    AS transcription_status
+                ,transcription.model
+                    AS transcription_model
+                ,transcription.language
+                    AS transcription_language
+                ,transcription.transcript_text
+                    AS transcript_text
+                ,transcription.error
+                    AS transcription_error
+                ,transcription.completed_at
+                    AS transcription_completed_at
+                ,transcription.lead_source_candidates_json
+                    AS lead_source_candidates_json
+
             FROM calls AS call
 
             JOIN call_ratings AS rating
@@ -10815,7 +14474,24 @@ def rating_details(
             LEFT JOIN client_results
                 AS client_result
 
-                ON client_result.source_call_id =
+                ON client_result.client_window_id =
+                    call.client_window_id
+
+            LEFT JOIN client_windows
+                AS client_window
+
+                ON client_window.id =
+                    call.client_window_id
+
+            LEFT JOIN calls AS source_call
+
+                ON source_call.id =
+                    client_window.lead_source_call_id
+
+            LEFT JOIN call_transcriptions
+                AS transcription
+
+                ON transcription.call_id =
                     call.id
 
             WHERE
@@ -10895,9 +14571,44 @@ def rating_details(
                 },
             },
             {
+                "title": "Источник клиента",
+                "items": {
+                    "Основной источник": (
+                        get_lead_source_name(
+                            row["lead_source_code"]
+                        )
+                        or "Не указан"
+                    ),
+                    "Способ определения": row["lead_source_origin"] or "—",
+                    "Звонок источника": row["lead_source_call_id"] or "—",
+                    "Уверенность": row["lead_source_confidence"],
+                    "Основание": row["lead_source_evidence"] or "—",
+                    "Автоисточник": (
+                        get_lead_source_name(
+                            row["lead_source_auto_code"]
+                        )
+                        or "—"
+                    ),
+                    "Автоправило": row["lead_source_auto_method"] or "—",
+                    "Уверенность авто": row["lead_source_auto_confidence"],
+                    "Основание авто": row["lead_source_auto_evidence"] or "—",
+                    "Ручной источник": (
+                        get_lead_source_name(
+                            row["lead_source_manual_code"]
+                        )
+                        or "—"
+                    ),
+                    "Источник изменён": format_uz_datetime(row["lead_source_marked_at"]),
+                    "Кто изменил": row["lead_source_marked_username"] or "—",
+                    "Ревизия": row["lead_source_revision"],
+                },
+            },
+            {
                 "title": "SIM и аккаунт",
                 "items": {
+                    "Устройство": row["device_name"] or "—",
                     "SIM / номер телефона": row["src_number"] or "—",
+                    "Номер от провайдера": row["provider_src_number"] or "—",
                     "SIM ID": row["src_id"],
                     "SIM слот": row["src_slot"],
                     "Пользователь": row["user_login"] or "—",
@@ -10906,6 +14617,20 @@ def rating_details(
                     "ID аккаунта": row["account_id"],
                     "Время события": row["event_created"] or "—",
                     "Запись создана": row["call_created_at"] or "—",
+                },
+            },
+            {
+                "title": "Расшифровка звонка",
+                "items": {
+                    "Статус": row["transcription_status"] or "Не запускалась",
+                    "Модель": row["transcription_model"] or "—",
+                    "Язык": row["transcription_language"] or "—",
+                    "Готово": format_uz_datetime(row["transcription_completed_at"]),
+                    "Текст": row["transcript_text"] or "—",
+                    "Кандидаты источника": parse_saved_json(
+                        row["lead_source_candidates_json"]
+                    ),
+                    "Ошибка": row["transcription_error"] or "—",
                 },
             },
             {
@@ -12262,6 +15987,48 @@ tbody tr:last-child td {
     <div class="panel-header">
 
         <h2>
+            Источники клиентов
+        </h2>
+
+    </div>
+
+    <div class="table-wrap">
+
+        <table>
+
+            <thead>
+
+            <tr>
+                <th>Источник</th>
+                <th>Группы 30 ч</th>
+                <th>Клиенты</th>
+                <th>Купил</th>
+                <th>Потерян</th>
+                <th>В работе</th>
+                <th>Не целевой</th>
+                <th>Не отмечен</th>
+                <th>Общая конв.</th>
+                <th>Заверш. конв.</th>
+            </tr>
+
+            </thead>
+
+            <tbody
+                id="sources_body"
+            ></tbody>
+
+        </table>
+
+    </div>
+
+</div>
+
+
+<div class="panel">
+
+    <div class="panel-header">
+
+        <h2>
             SIM-карты
         </h2>
 
@@ -12275,7 +16042,9 @@ tbody tr:last-child td {
 
             <tr>
 
-                <th>SIM</th>
+                <th>Устройство</th>
+                <th>Название SIM</th>
+                <th>Номер</th>
                 <th>Слот</th>
                 <th>Звонки</th>
                 <th>Клиенты</th>
@@ -12322,6 +16091,7 @@ tbody tr:last-child td {
                 <th>Направление</th>
                 <th>Статус</th>
                 <th>Менеджер</th>
+                <th>Источник</th>
                 <th>SIM</th>
                 <th>Разговор</th>
                 <th>Результат</th>
@@ -13244,6 +17014,62 @@ async function loadRatingsDaily() {
 }
 
 
+async function loadSources() {
+
+    const data =
+        await getJson(
+            "/stats/sources"
+        );
+
+    const body =
+        document.getElementById(
+            "sources_body"
+        );
+
+    body.innerHTML = "";
+
+    if (data.results.length === 0) {
+        const tr = document.createElement("tr");
+        const td = document.createElement("td");
+        td.colSpan = 10;
+        td.className = "empty";
+        td.textContent = "Пока нет данных";
+        tr.appendChild(td);
+        body.appendChild(tr);
+        return;
+    }
+
+    data.results.forEach(
+        row => {
+            const tr = document.createElement("tr");
+
+            const values = [
+                row.source,
+                row.client_windows,
+                row.unique_clients,
+                row.bought,
+                row.lost,
+                row.pending,
+                row.non_target,
+                row.unmarked,
+                row.overall_conversion + "%",
+                row.completed_conversion + "%",
+            ];
+
+            values.forEach(
+                value => {
+                    const td = document.createElement("td");
+                    td.textContent = value;
+                    tr.appendChild(td);
+                }
+            );
+
+            body.appendChild(tr);
+        }
+    );
+}
+
+
 async function loadSims() {
 
     const data =
@@ -13272,6 +17098,10 @@ async function loadSims() {
 
 
             const values = [
+
+                row.device,
+
+                row.sim_label,
 
                 row.sim,
 
@@ -13692,6 +17522,16 @@ async function loadRecent() {
                 row.manager;
 
 
+            const leadSource =
+                document.createElement(
+                    "td"
+                );
+
+
+            leadSource.textContent =
+                row.lead_source;
+
+
             const customerRating =
                 document.createElement(
                     "td"
@@ -13705,20 +17545,6 @@ async function loadRecent() {
                 customerRating.textContent =
                     row.customer_rating
                     + " ★";
-
-            } else if (
-                row.rating_sms_status
-                === "sent"
-            ) {
-                customerRating.textContent =
-                    "Ожидаем";
-
-            } else if (
-                row.rating_sms_status
-                === "error"
-            ) {
-                customerRating.textContent =
-                    "SMS ошибка";
 
             } else {
                 customerRating.textContent =
@@ -13737,7 +17563,11 @@ async function loadRecent() {
 
 
             sim.textContent =
-                row.sim;
+                row.device
+                + " · "
+                + row.sim_label
+                + " · "
+                + row.sim;
 
 
             const duration =
@@ -13909,6 +17739,11 @@ async function loadRecent() {
 
 
             tr.appendChild(
+                leadSource
+            );
+
+
+            tr.appendChild(
                 sim
             );
 
@@ -13957,6 +17792,8 @@ async function loadAll() {
                 loadManagers(),
 
                 loadRatingsDaily(),
+
+                loadSources(),
 
                 loadSims(),
 
@@ -14176,12 +18013,39 @@ async def moizvonki_webhook(
     request: Request,
 ):
 
-    data = await request.json()
-
-    print(
-        "MOIZVONKI:",
-        data,
+    webhook_started_monotonic = (
+        time.monotonic()
     )
+    webhook_received_at = int(
+        datetime.now(
+            timezone.utc
+        ).timestamp()
+    )
+
+    if MOIZVONKI_WEBHOOK_SECRET:
+        received_secret = (
+            request.headers.get(
+                "X-Moizvonki-Webhook-Secret"
+            )
+            or request.headers.get(
+                "X-Webhook-Secret"
+            )
+            or request.query_params.get(
+                "secret"
+            )
+            or ""
+        )
+
+        if not secrets.compare_digest(
+            received_secret,
+            MOIZVONKI_WEBHOOK_SECRET,
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Invalid Moizvonki secret",
+            )
+
+    data = await request.json()
 
     webhook = (
         data.get(
@@ -14195,6 +18059,90 @@ async def moizvonki_webhook(
             "event"
         )
         or {}
+    )
+
+    def event_timestamp(
+        key: str,
+    ) -> int | None:
+        try:
+            value = int(
+                event.get(
+                    key
+                )
+                or 0
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            return None
+
+        return value or None
+
+    event_ready_at = (
+        event_timestamp(
+            "upload_time"
+        )
+        or event_timestamp(
+            "event_created"
+        )
+    )
+    call_ended_at = event_timestamp(
+        "end_time"
+    )
+
+    phone_to_provider_seconds = (
+        event_ready_at
+        - call_ended_at
+        if event_ready_at
+        and call_ended_at
+        else None
+    )
+    provider_to_webhook_seconds = (
+        webhook_received_at
+        - event_ready_at
+        if event_ready_at
+        else None
+    )
+    total_delivery_seconds = (
+        webhook_received_at
+        - call_ended_at
+        if call_ended_at
+        else None
+    )
+
+    print(
+        "MOIZVONKI EVENT:",
+        webhook.get(
+            "action"
+        ),
+        event.get(
+            "db_call_id"
+        ),
+        webhook.get(
+            "user_login"
+        ),
+    )
+
+    print(
+        "MOIZVONKI DELIVERY LATENCY:",
+        json.dumps(
+            {
+                "db_call_id": event.get(
+                    "db_call_id"
+                ),
+                "phone_to_provider_seconds": (
+                    phone_to_provider_seconds
+                ),
+                "provider_to_webhook_seconds": (
+                    provider_to_webhook_seconds
+                ),
+                "total_seconds": (
+                    total_delivery_seconds
+                ),
+            },
+            ensure_ascii=False,
+        ),
     )
 
     if (
@@ -14229,25 +18177,6 @@ async def moizvonki_webhook(
     )
 
     # -----------------------------------------------------
-    # RECORDING
-    # -----------------------------------------------------
-
-    audio_duration = None
-    voice_bytes = None
-
-    if (
-        answered
-        and recording
-    ):
-
-        (
-            audio_duration,
-            voice_bytes,
-        ) = prepare_recording(
-            recording
-        )
-
-    # -----------------------------------------------------
     # DURATION
     # -----------------------------------------------------
 
@@ -14256,18 +18185,23 @@ async def moizvonki_webhook(
         duration_source,
     ) = get_talk_duration(
         event,
-        audio_duration,
+        None,
     )
 
     # -----------------------------------------------------
     # SAVE
     # -----------------------------------------------------
 
+    save_started = time.monotonic()
     save_result = save_call(
         webhook,
         event,
         talk_duration,
         duration_source,
+    )
+    save_seconds = (
+        time.monotonic()
+        - save_started
     )
 
     call_id = (
@@ -14275,6 +18209,24 @@ async def moizvonki_webhook(
             "call_id"
         ]
     )
+
+    saved_call = get_call(
+        call_id
+    )
+
+    if saved_call:
+        answered = int(
+            saved_call["answered"]
+            or 0
+        )
+        direction = int(
+            saved_call["direction"]
+            or 0
+        )
+        recording = (
+            saved_call["recording"]
+            or recording
+        )
 
     telegram_already_sent = (
         save_result[
@@ -14295,26 +18247,207 @@ async def moizvonki_webhook(
     )
 
     client_number = (
-        event.get(
-            "client_number"
+        (
+            saved_call["client_number"]
+            if saved_call
+            else event.get(
+                "client_number"
+            )
         )
         or ""
     )
 
     sender_user_login = (
-        webhook.get(
+        (
+            saved_call["user_login"]
+            if saved_call
+            else None
+        )
+        or webhook.get(
             "user_login"
         )
         or MOIZVONKI_USER_NAME
     )
 
+    call_start_time = (
+        (
+            saved_call["start_time"]
+            if saved_call
+            else None
+        )
+        or event.get(
+            "start_time"
+        )
+    )
+
+    voice_bytes = None
+
+    try:
+        transcription = enqueue_transcription(
+            call_id
+        )
+        transcription_status = transcription[
+            "reason"
+        ]
+    except Exception as exc:
+        transcription_status = "queue_error"
+        print(
+            "TRANSCRIPTION QUEUE ERROR:",
+            call_id,
+            type(exc).__name__,
+        )
+
+    # -----------------------------------------------------
+    # TELEGRAM
+    # -----------------------------------------------------
+
+    # Telegram must not wait for the two client SMS API calls.  Apart from
+    # making call notifications noticeably faster, this also keeps a slow
+    # SMS gateway from holding the FastAPI event loop.
+    telegram_status = (
+        "already_sent"
+        if telegram_already_sent
+        else (
+            "not_sent"
+            if telegram_claimed
+            else "in_progress"
+        )
+    )
+    recording_seconds = 0.0
+    telegram_seconds = 0.0
+
+    if telegram_claimed:
+
+        # Only the request that atomically claimed Telegram delivery may
+        # download the recording. Duplicate webhooks never repeat this work.
+        if answered and recording:
+            recording_started = (
+                time.monotonic()
+            )
+            (
+                audio_duration,
+                voice_bytes,
+            ) = await asyncio.to_thread(
+                prepare_recording,
+                recording,
+            )
+
+            if audio_duration is not None:
+                talk_duration = int(
+                    audio_duration
+                )
+                duration_source = "audio"
+                update_call_audio_duration(
+                    call_id,
+                    talk_duration,
+                )
+                saved_call = get_call(
+                    call_id
+                )
+
+            recording_seconds = (
+                time.monotonic()
+                - recording_started
+            )
+
+        text = build_telegram_message(
+            event,
+            webhook,
+            talk_duration,
+            call=saved_call,
+        )
+
+        result_keyboard = None
+
+        if not is_internal_contact:
+            result_keyboard = (
+                build_call_state_keyboard(
+                    saved_call
+                )
+            )
+
+        telegram_started = time.monotonic()
+
+        try:
+
+            if (
+                answered
+                and voice_bytes
+            ):
+                telegram_result = (
+                    await asyncio.to_thread(
+                        send_voice_bytes,
+                        voice_bytes,
+                        text,
+                        reply_markup=
+                            result_keyboard,
+                    )
+                )
+
+            else:
+                telegram_result = (
+                    await asyncio.to_thread(
+                        send_text_message,
+                        text,
+                        reply_markup=
+                            result_keyboard,
+                    )
+                )
+
+            mark_telegram_sent(
+                call_id,
+                telegram_result,
+            )
+
+            telegram_status = "sent"
+
+        except Exception as exc:
+
+            telegram_status = "error"
+
+            release_telegram_claim(
+                call_id
+            )
+
+            print(
+                "TELEGRAM ERROR:",
+                repr(exc),
+            )
+
+        telegram_seconds = (
+            time.monotonic()
+            - telegram_started
+        )
+
     # -----------------------------------------------------
     # AUTO SMS
     # -----------------------------------------------------
 
+    sms_started = time.monotonic()
     sms_status = "not_sent"
+    sms_kind = "promo"
+    sms_text = SMS_TEXT
 
-    if is_internal_contact:
+    if (
+        direction == 0
+        and not answered
+    ):
+        after_hours_text = (
+            build_after_hours_missed_sms(
+                call_start_time
+            )
+        )
+
+        if after_hours_text:
+            sms_kind = (
+                "after_hours_missed"
+            )
+            sms_text = after_hours_text
+
+    if not AUTO_SMS_ENABLED:
+        sms_status = "disabled"
+
+    elif is_internal_contact:
         sms_status = "internal_contact"
 
     else:
@@ -14323,6 +18456,7 @@ async def moizvonki_webhook(
             call_id,
             client_number,
             sender_user_login,
+            sms_kind,
         )
 
         if reservation["reserved"]:
@@ -14333,9 +18467,11 @@ async def moizvonki_webhook(
 
             try:
 
-                sms_result = send_client_sms(
+                sms_result = await asyncio.to_thread(
+                    send_client_sms,
                     client_number,
                     sender_user_login,
+                    sms_text,
                 )
 
                 mark_sms_sent(
@@ -14349,6 +18485,7 @@ async def moizvonki_webhook(
                 print(
                     "AUTO SMS SENT:",
                     call_id,
+                    sms_kind,
                     client_number,
                     sender_user_login,
                 )
@@ -14366,6 +18503,7 @@ async def moizvonki_webhook(
                 print(
                     "AUTO SMS ERROR:",
                     call_id,
+                    sms_kind,
                     client_number,
                     repr(exc),
                 )
@@ -14375,13 +18513,22 @@ async def moizvonki_webhook(
                 "reason"
             ]
 
+    sms_seconds = (
+        time.monotonic()
+        - sms_started
+    )
+
     # -----------------------------------------------------
     # CUSTOMER RATING SMS
     # -----------------------------------------------------
 
+    rating_sms_started = time.monotonic()
     rating_sms_status = "not_applicable"
 
-    if (
+    if not RATING_SMS_ENABLED:
+        rating_sms_status = "disabled"
+
+    elif (
         answered
 
         and
@@ -14426,7 +18573,8 @@ async def moizvonki_webhook(
                 )
 
                 rating_sms_result = (
-                    send_client_sms(
+                    await asyncio.to_thread(
+                        send_client_sms,
                         client_number,
                         sender_user_login,
                         rating_text,
@@ -14473,92 +18621,10 @@ async def moizvonki_webhook(
                 ]
             )
 
-    # -----------------------------------------------------
-    # TELEGRAM
-    # -----------------------------------------------------
-
-    telegram_status = (
-        "already_sent"
-        if telegram_already_sent
-        else (
-            "not_sent"
-            if telegram_claimed
-            else "in_progress"
-        )
+    rating_sms_seconds = (
+        time.monotonic()
+        - rating_sms_started
     )
-
-    if telegram_claimed:
-
-        text = build_telegram_message(
-            event,
-            webhook,
-            talk_duration,
-        )
-
-        result_keyboard = None
-
-        if (
-            not is_internal_contact
-
-            and
-
-            (
-                answered
-                or (
-                    direction == 0
-                    and not answered
-                )
-            )
-        ):
-            result_keyboard = (
-                build_manager_keyboard(
-                    call_id
-                )
-            )
-
-        try:
-
-            if (
-                answered
-                and voice_bytes
-            ):
-                telegram_result = (
-                    send_voice_bytes(
-                        voice_bytes,
-                        text,
-                        reply_markup=
-                            result_keyboard,
-                    )
-                )
-
-            else:
-                telegram_result = (
-                    send_text_message(
-                        text,
-                        reply_markup=
-                            result_keyboard,
-                    )
-                )
-
-            mark_telegram_sent(
-                call_id,
-                telegram_result,
-            )
-
-            telegram_status = "sent"
-
-        except Exception as exc:
-
-            telegram_status = "error"
-
-            release_telegram_claim(
-                call_id
-            )
-
-            print(
-                "TELEGRAM ERROR:",
-                repr(exc),
-            )
 
     duplicate = (
         not telegram_claimed
@@ -14576,6 +18642,52 @@ async def moizvonki_webhook(
                 "db_call_id"
             ),
         )
+
+    total_processing_seconds = (
+        time.monotonic()
+        - webhook_started_monotonic
+    )
+
+    print(
+        "MOIZVONKI PIPELINE TIMING:",
+        json.dumps(
+            {
+                "call_id": call_id,
+                "auto_sms_enabled": (
+                    AUTO_SMS_ENABLED
+                ),
+                "rating_sms_enabled": (
+                    RATING_SMS_ENABLED
+                ),
+                "sms_kind": sms_kind,
+                "save_seconds": round(
+                    save_seconds,
+                    3,
+                ),
+                "promo_sms_seconds": round(
+                    sms_seconds,
+                    3,
+                ),
+                "rating_sms_seconds": round(
+                    rating_sms_seconds,
+                    3,
+                ),
+                "recording_seconds": round(
+                    recording_seconds,
+                    3,
+                ),
+                "telegram_seconds": round(
+                    telegram_seconds,
+                    3,
+                ),
+                "total_seconds": round(
+                    total_processing_seconds,
+                    3,
+                ),
+            },
+            ensure_ascii=False,
+        ),
+    )
 
     return {
         "ok":
@@ -14602,6 +18714,12 @@ async def moizvonki_webhook(
         "sms":
             sms_status,
 
+        "sms_kind":
+            sms_kind,
+
         "rating_sms":
             rating_sms_status,
+
+        "transcription":
+            transcription_status,
     }

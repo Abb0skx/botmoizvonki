@@ -1,0 +1,14 @@
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+.DS_Store
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/delivery-state.pickle*
+venv/
+.venv/
