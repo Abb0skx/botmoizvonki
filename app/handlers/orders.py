@@ -424,10 +424,16 @@ async def _send_post_delivery_prompt(
     if not order.delivery_chat_id:
         return
     try:
+        courier = " ".join(
+            (order.courier_name or order.assigned_courier_name or "Курьер").split()
+        )[:100]
+        product = " ".join((order.product or "Без модели").split())[:200]
         await context.bot.send_message(
             chat_id=order.delivery_chat_id,
-            text=f"{order.courier_name or order.assigned_courier_name or 'Курьер'}, "
-            "отправьте фото и цену товара 📸💰",
+            text=(
+                f"🚚 Заказ №{order.order_number} · {product}\n"
+                f"{courier}, отправьте фото и цену товара 📸💰"
+            ),
         )
     except Exception:
         logger.exception("Could not send optional delivery prompt for order %s", order.id)

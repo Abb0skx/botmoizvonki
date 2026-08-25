@@ -872,6 +872,7 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
             prompt = bot.send_message.await_args
             self.assertEqual(
                 prompt.kwargs["text"],
+                f"🚚 Заказ №{order.order_number} · A56\n"
                 "Courier, отправьте фото и цену товара 📸💰",
             )
 
