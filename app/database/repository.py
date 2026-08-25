@@ -8,7 +8,7 @@ from typing import Any
 
 from app.models import Order, OrderEvent
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 SQLITE_INT_MAX = 2**63 - 1
 KNOWN_STATUSES = frozenset({
     "draft",
@@ -75,6 +75,11 @@ CREATE TABLE IF NOT EXISTS orders (
     delivery_time TEXT,
     comment TEXT,
     status TEXT NOT NULL DEFAULT 'draft',
+    cancelled_by_id INTEGER,
+    cancelled_by_name TEXT,
+    cancelled_by_username TEXT,
+    cancelled_at TEXT,
+    cancelled_from_status TEXT,
     assigned_courier_id INTEGER,
     assigned_courier_name TEXT,
     courier_id INTEGER,
@@ -121,7 +126,10 @@ CREATE TABLE IF NOT EXISTS order_events (
     event_type TEXT NOT NULL,
     actor_id INTEGER,
     actor_name TEXT,
+    actor_username TEXT,
     actor_role TEXT,
+    courier_id INTEGER,
+    courier_name TEXT,
     from_status TEXT,
     to_status TEXT,
     changed_fields TEXT NOT NULL DEFAULT '[]',
@@ -187,6 +195,17 @@ MIGRATION_COLUMNS = {
     "sync_attempted_at": "TEXT",
     "courier_read_at": "TEXT",
     "picked_up_at": "TEXT",
+    "cancelled_by_id": "INTEGER",
+    "cancelled_by_name": "TEXT",
+    "cancelled_by_username": "TEXT",
+    "cancelled_at": "TEXT",
+    "cancelled_from_status": "TEXT",
+}
+
+ORDER_EVENT_MIGRATION_COLUMNS = {
+    "actor_username": "TEXT",
+    "courier_id": "INTEGER",
+    "courier_name": "TEXT",
 }
 
 CLEANUP_MIGRATION_COLUMNS = {
@@ -220,6 +239,8 @@ class OrderRepository:
         "second_location_url", "second_latitude", "second_longitude",
         "second_address_text", "second_district", "second_mahalla",
         "delivery_time", "comment", "status",
+        "cancelled_by_id", "cancelled_by_name", "cancelled_by_username",
+        "cancelled_at", "cancelled_from_status",
         "assigned_courier_id", "assigned_courier_name",
         "courier_id", "courier_name", "delivery_photo", "received_usd",
         "received_uzs", "delivered_at", "courier_read_at", "picked_up_at", "time_started", "delivery_chat_id",
@@ -276,6 +297,17 @@ class OrderRepository:
             for column, definition in MIGRATION_COLUMNS.items():
                 if column not in existing:
                     self._add_column_if_missing(db, "orders", column, definition)
+            event_existing = {
+                row[1] for row in db.execute("PRAGMA table_info(order_events)")
+            }
+            for column, definition in ORDER_EVENT_MIGRATION_COLUMNS.items():
+                if column not in event_existing:
+                    self._add_column_if_missing(
+                        db,
+                        "order_events",
+                        column,
+                        definition,
+                    )
             cleanup_existing = {
                 row[1] for row in db.execute("PRAGMA table_info(telegram_cleanup_queue)")
             }
@@ -347,6 +379,15 @@ class OrderRepository:
         if "status" in fields and fields["status"] not in KNOWN_STATUSES:
             raise ValueError(f"Unknown order status: {fields['status']!r}")
         if (
+            "cancelled_from_status" in fields
+            and fields["cancelled_from_status"] is not None
+            and fields["cancelled_from_status"] not in KNOWN_STATUSES
+        ):
+            raise ValueError(
+                "Unknown cancellation source status: "
+                f"{fields['cancelled_from_status']!r}"
+            )
+        if (
             "payment_status" in fields
             and fields["payment_status"] not in KNOWN_PAYMENT_STATUSES
         ):
@@ -395,7 +436,10 @@ class OrderRepository:
         event_type: str,
         actor_id: int | None = None,
         actor_name: str | None = None,
+        actor_username: str | None = None,
         actor_role: str | None = None,
+        courier_id: int | None = None,
+        courier_name: str | None = None,
         from_status: str | None = None,
         to_status: str | None = None,
         changed_fields: set[str] | list[str] | tuple[str, ...] = (),
@@ -410,16 +454,19 @@ class OrderRepository:
         )
         cursor = db.execute(
             """INSERT INTO order_events
-               (order_id, order_number, event_type, actor_id, actor_name, actor_role,
-                from_status, to_status, changed_fields, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (order_id, order_number, event_type, actor_id, actor_name, actor_username, actor_role,
+                courier_id, courier_name, from_status, to_status, changed_fields, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 order_id,
                 order_number,
                 event_type,
                 actor_id,
                 actor_name,
+                actor_username,
                 actor_role,
+                courier_id,
+                courier_name,
                 from_status,
                 to_status,
                 serialized_fields,
@@ -646,6 +693,38 @@ class OrderRepository:
             row = db.execute(query, parameters).fetchone()
         return Order.from_row(row) if row else None
 
+    @staticmethod
+    def _event_courier_snapshot(
+        row: sqlite3.Row,
+        *,
+        event_courier_id: int | None,
+        event_courier_name: str | None,
+        actor_id: int | None,
+        actor_name: str | None,
+        actor_role: str | None,
+    ) -> tuple[int | None, str | None]:
+        """Keep the business courier separate from the event's human actor."""
+        courier_id = (
+            event_courier_id
+            if event_courier_id is not None
+            else (row["courier_id"] or row["assigned_courier_id"])
+        )
+        courier_name = event_courier_name
+        if courier_name is None and courier_id is not None:
+            if row["courier_id"] is not None and courier_id == row["courier_id"]:
+                courier_name = row["courier_name"]
+            elif (
+                row["assigned_courier_id"] is not None
+                and courier_id == row["assigned_courier_id"]
+            ):
+                courier_name = row["assigned_courier_name"]
+        if actor_role == "courier" and actor_id is not None:
+            if courier_id is None:
+                courier_id = actor_id
+            if courier_name is None and courier_id == actor_id:
+                courier_name = actor_name
+        return courier_id, courier_name
+
     def update(
         self,
         order_id: int,
@@ -653,7 +732,10 @@ class OrderRepository:
         expected_updated_at: str | None = None,
         actor_id: int | None = None,
         actor_name: str | None = None,
+        actor_username: str | None = None,
         actor_role: str | None = None,
+        event_courier_id: int | None = None,
+        event_courier_name: str | None = None,
         **fields: Any,
     ) -> Order | None:
         invalid = set(fields) - self.editable_fields
@@ -689,6 +771,16 @@ class OrderRepository:
                 return None
             row = db.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
             if not publication_only:
+                effective_courier_id, effective_courier_name = (
+                    self._event_courier_snapshot(
+                        row,
+                        event_courier_id=event_courier_id,
+                        event_courier_name=event_courier_name,
+                        actor_id=actor_id,
+                        actor_name=actor_name,
+                        actor_role=actor_role,
+                    )
+                )
                 self._insert_event(
                     db,
                     order_id=order_id,
@@ -700,7 +792,10 @@ class OrderRepository:
                     ),
                     actor_id=actor_id,
                     actor_name=actor_name,
+                    actor_username=actor_username,
                     actor_role=actor_role,
+                    courier_id=effective_courier_id,
+                    courier_name=effective_courier_name,
                     from_status=previous["status"],
                     to_status=row["status"],
                     changed_fields=changed_fields,
@@ -718,7 +813,10 @@ class OrderRepository:
         expected_updated_at: str | None = None,
         actor_id: int | None = None,
         actor_name: str | None = None,
+        actor_username: str | None = None,
         actor_role: str | None = None,
+        event_courier_id: int | None = None,
+        event_courier_name: str | None = None,
         event_type: str | None = None,
         cleanup_messages: list[tuple[int, int]] | tuple[tuple[int, int], ...] = (),
         **fields: Any,
@@ -819,6 +917,16 @@ class OrderRepository:
             if event_actor_name is None and previous and event_actor_id == previous["courier_id"]:
                 event_actor_name = previous["courier_name"]
             event_actor_role = actor_role or ("courier" if event_actor_id is not None else None)
+            effective_courier_id, effective_courier_name = (
+                self._event_courier_snapshot(
+                    row,
+                    event_courier_id=event_courier_id,
+                    event_courier_name=event_courier_name,
+                    actor_id=event_actor_id,
+                    actor_name=event_actor_name,
+                    actor_role=event_actor_role,
+                )
+            )
             self._insert_event(
                 db,
                 order_id=order_id,
@@ -829,7 +937,10 @@ class OrderRepository:
                 ),
                 actor_id=event_actor_id,
                 actor_name=event_actor_name,
+                actor_username=actor_username,
                 actor_role=event_actor_role,
+                courier_id=effective_courier_id,
+                courier_name=effective_courier_name,
                 from_status=previous["status"],
                 to_status=row["status"],
                 changed_fields=changed_fields,
@@ -1063,18 +1174,33 @@ class OrderRepository:
         *,
         actor_id: int | None = None,
         actor_name: str | None = None,
+        actor_username: str | None = None,
         actor_role: str | None = None,
+        event_courier_id: int | None = None,
+        event_courier_name: str | None = None,
         changed_fields: set[str] | list[str] | tuple[str, ...] = (),
     ) -> OrderEvent | None:
         """Append an explicit audit event without changing the order."""
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             order = db.execute(
-                "SELECT order_number, status FROM orders WHERE id=?",
+                """SELECT order_number, status, courier_id, courier_name,
+                          assigned_courier_id, assigned_courier_name
+                   FROM orders WHERE id=?""",
                 (order_id,),
             ).fetchone()
             if not order:
                 return None
+            effective_courier_id, effective_courier_name = (
+                self._event_courier_snapshot(
+                    order,
+                    event_courier_id=event_courier_id,
+                    event_courier_name=event_courier_name,
+                    actor_id=actor_id,
+                    actor_name=actor_name,
+                    actor_role=actor_role,
+                )
+            )
             row = self._insert_event(
                 db,
                 order_id=order_id,
@@ -1082,7 +1208,10 @@ class OrderRepository:
                 event_type=event_type,
                 actor_id=actor_id,
                 actor_name=actor_name,
+                actor_username=actor_username,
                 actor_role=actor_role,
+                courier_id=effective_courier_id,
+                courier_name=effective_courier_name,
                 from_status=order["status"],
                 to_status=order["status"],
                 changed_fields=changed_fields,

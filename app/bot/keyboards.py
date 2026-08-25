@@ -225,7 +225,6 @@ def _pickup_rows(order: Order) -> list[list[InlineKeyboardButton]]:
     if (
         order.status == "pending"
         and order.assigned_courier_id
-        and order.courier_read_at
     ):
         return [[InlineKeyboardButton(
             f"📦 {courier_name} забрал товар",
@@ -385,12 +384,6 @@ def location_channel_keyboard(
 def courier_keyboard(order: Order) -> InlineKeyboardMarkup:
     rows = _location_rows(order)
     if order.status == "pending":
-        read_text = (
-            "✅ Прочитано · еду на склад"
-            if order.courier_read_at
-            else "👀 Заказ прочитан"
-        )
-        rows.append([InlineKeyboardButton(read_text, callback_data=f"read:{order.id}")])
         rows.append([InlineKeyboardButton("❌ Отменён", callback_data=f"cancel:{order.id}")])
     elif order.status == "picked_up":
         rows += [

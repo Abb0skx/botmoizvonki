@@ -97,7 +97,7 @@ class CourierWorkflowKeyboardTests(unittest.TestCase):
             client_phone="+998901333999", product="A58", status="picked_up",
         )
 
-        self.assertEqual(self._callbacks(courier_keyboard(pending)), ["read:7", "cancel:7"])
+        self.assertEqual(self._callbacks(courier_keyboard(pending)), ["cancel:7"])
         self.assertEqual(self._callbacks(courier_keyboard(picked)), ["onway:8", "cancel:8"])
         self.assertEqual(
             self._callbacks(on_way_keyboard(picked)),

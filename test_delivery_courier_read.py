@@ -62,7 +62,7 @@ class CourierReadWorkflowTests(unittest.IsolatedAsyncioTestCase):
             delivery_message_id=77,
         )
 
-    async def test_courier_confirms_read_once_and_card_visibly_changes(self):
+    async def test_legacy_read_button_is_retired_without_recording_read(self):
         order = self.assigned_order()
         query = SimpleNamespace(
             data=f"read:{order.id}",
@@ -71,14 +71,7 @@ class CourierReadWorkflowTests(unittest.IsolatedAsyncioTestCase):
             answer=AsyncMock(),
             edit_message_text=AsyncMock(),
         )
-        bot = SimpleNamespace(
-            send_message=AsyncMock(side_effect=[
-                SimpleNamespace(chat_id=-1004459657817, message_id=88),
-                SimpleNamespace(chat_id=-1004459657817, message_id=89),
-            ]),
-            edit_message_text=AsyncMock(),
-            set_message_reaction=AsyncMock(),
-        )
+        bot = SimpleNamespace()
         context = SimpleNamespace(
             application=SimpleNamespace(bot_data={
                 "settings": SimpleNamespace(
@@ -90,71 +83,38 @@ class CourierReadWorkflowTests(unittest.IsolatedAsyncioTestCase):
             bot=bot,
         )
 
-        await courier_action(SimpleNamespace(callback_query=query), context)
+        finish = AsyncMock(return_value=True)
+        with patch("app.handlers.orders._finish_status_change", new=finish):
+            await courier_action(SimpleNamespace(callback_query=query), context)
 
         read = self.repo.get(order.id)
         self.assertEqual(read.status, "pending")
-        self.assertIsNotNone(read.courier_read_at)
-        self.assertEqual(read.courier_id, ABBOS_ID)
-        self.assertEqual(read.courier_name, "Abbos")
-        query.answer.assert_awaited_once_with("✅ Прочитано · еду на склад 🏬")
-        bot.set_message_reaction.assert_awaited_once_with(
-            chat_id=ABBOS_GROUP_ID,
-            message_id=77,
-            reaction="👀",
-            is_big=True,
-        )
-        changed_text = query.edit_message_text.await_args.args[0]
-        read_time = datetime.fromisoformat(read.courier_read_at).astimezone(TASHKENT).strftime("%H:%M")
-        self.assertIn(f"Заказ прочитан {read_time}", changed_text)
-        self.assertIn("Курьер едет на склад", changed_text)
+        self.assertIsNone(read.courier_read_at)
+        self.assertIsNone(read.courier_id)
+        self.assertIsNone(read.courier_name)
+        query.answer.assert_awaited_once_with("Кнопка прочтения больше не используется")
+        finish.assert_awaited_once()
         callbacks = [
             button.callback_data
-            for row in query.edit_message_text.await_args.kwargs["reply_markup"].inline_keyboard
+            for row in finish.await_args.args[4].inline_keyboard
             for button in row
+            if button.callback_data
         ]
-        self.assertIn(f"read:{order.id}", callbacks)
-        self.assertTrue(any(
-            "Заказ №1 прочитан" in call.kwargs["text"]
-            and "едет на склад" in call.kwargs["text"]
-            and call.kwargs["chat_id"] == -1004459657817
-            for call in bot.send_message.await_args_list
-        ))
-        log_markup = next(
-            call.kwargs["reply_markup"]
-            for call in bot.send_message.await_args_list
-            if "Заказ №1 прочитан" in call.kwargs.get("text", "")
-        )
-        self.assertTrue(any(
-            button.callback_data == f"pickup_log:{order.id}:{ABBOS_ID}"
-            for row in log_markup.inline_keyboard
-            for button in row
-        ))
-        self.assertFalse(any(call.args and call.args[0] == 11 for call in bot.send_message.await_args_list))
+        self.assertNotIn(f"read:{order.id}", callbacks)
+        self.assertIn(f"cancel:{order.id}", callbacks)
         events = self.repo.list_events(order.id)
         read_events = [event for event in events if event.event_type == "courier_read"]
-        self.assertEqual(len(read_events), 1)
-        self.assertEqual(read_events[0].actor_role, "courier")
+        self.assertEqual(read_events, [])
 
-        query.answer.reset_mock()
-        query.edit_message_text.reset_mock()
-        await courier_action(SimpleNamespace(callback_query=query), context)
-        self.assertIn("Уже прочитано", query.answer.await_args.args[0])
-        query.edit_message_text.assert_not_awaited()
-        self.assertEqual(
-            len([event for event in self.repo.list_events(order.id) if event.event_type == "courier_read"]),
-            1,
-        )
-
-    def test_keyboard_and_cards_show_read_confirmation(self):
+    def test_keyboard_has_no_read_action_but_historical_log_keeps_time(self):
         order = self.assigned_order()
-        unread_button = next(
-            button
+        callbacks = [
+            button.callback_data
             for row in courier_keyboard(order).inline_keyboard
             for button in row
-            if button.callback_data == f"read:{order.id}"
-        )
-        self.assertEqual(unread_button.text, "👀 Заказ прочитан")
+            if button.callback_data
+        ]
+        self.assertEqual(callbacks, [f"cancel:{order.id}"])
 
         order = self.repo.update(
             order.id,
@@ -162,14 +122,15 @@ class CourierReadWorkflowTests(unittest.IsolatedAsyncioTestCase):
             courier_id=ABBOS_ID,
             courier_name="Abbos",
         )
-        read_button = next(
-            button
+        callbacks = [
+            button.callback_data
             for row in courier_keyboard(order).inline_keyboard
             for button in row
-            if button.callback_data == f"read:{order.id}"
-        )
-        self.assertEqual(read_button.text, "✅ Прочитано · еду на склад")
-        self.assertIn("🏬 Едет на склад за товаром", courier_card(order))
+            if button.callback_data
+        ]
+        self.assertEqual(callbacks, [f"cancel:{order.id}"])
+        self.assertNotIn("Заказ прочитан", courier_card(order))
+        self.assertNotIn("Едет на склад", courier_card(order))
         read_time = datetime.fromisoformat(order.courier_read_at).astimezone(TASHKENT).strftime("%H:%M")
         self.assertIn(f"👀 Заказ прочитан {read_time}", orders_channel_card(order))
 
@@ -482,7 +443,7 @@ class CourierWarehouseMovementTests(unittest.IsolatedAsyncioTestCase):
             assigned_courier_name="Abbos",
         )
 
-    def test_read_after_delivery_starts_estimated_trip_to_warehouse(self):
+    def test_historical_read_does_not_change_estimated_return_to_warehouse(self):
         now = datetime.now(TASHKENT).replace(microsecond=0)
         completed = self.assigned("A56", 41.320)
         completed = self.repo.transition(
@@ -513,12 +474,13 @@ class CourierWarehouseMovementTests(unittest.IsolatedAsyncioTestCase):
         monitor = build_delivery_monitor(self.repo)
         route = next(route for route in monitor["routes"] if route["courier_id"] == ABBOS_ID)
         courier = next(item for item in monitor["couriers"] if item["id"] == ABBOS_ID)
-        self.assertEqual(route["movement_kind"], "warehouse")
+        self.assertEqual(route["movement_kind"], "return")
         self.assertEqual(route["return_path"][0], [completed.latitude, completed.longitude])
         self.assertEqual(route["return_path"][-1], [WAREHOUSE["latitude"], WAREHOUSE["longitude"]])
-        self.assertEqual(route["movement_started_at"], read_at.isoformat())
-        self.assertTrue(courier["heading_to_warehouse"])
-        self.assertEqual(monitor["summary"]["heading_to_warehouse"], 1)
+        self.assertEqual(route["movement_started_at"], completed.delivered_at)
+        self.assertNotIn("heading_to_warehouse", courier)
+        self.assertNotIn("heading_to_warehouse", monitor["summary"])
+        self.assertEqual(courier["waiting_pickup"], 1)
 
         report = build_delivery_stats(self.repo, now.date())
         read_row = next(row for row in report["orders"] if row["id"] == waiting.id)
@@ -537,7 +499,7 @@ class CourierWarehouseMovementTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("прочитал заказ", telegram_log)
         self.assertIn("выехал на склад", telegram_log)
 
-    async def test_warehouse_movement_gets_road_eta_and_return_layer(self):
+    async def test_return_movement_gets_road_eta_and_return_layer(self):
         started = (datetime.now(TASHKENT) - timedelta(minutes=5)).isoformat()
         points = [[41.320, 69.279], [WAREHOUSE["latitude"], WAREHOUSE["longitude"]]]
         routing = Mock()
@@ -555,14 +517,14 @@ class CourierWarehouseMovementTests(unittest.IsolatedAsyncioTestCase):
                 "dark_paths": [],
                 "current_path": [],
                 "return_path": points,
-                "movement_kind": "warehouse",
+                "movement_kind": "return",
                 "movement_started_at": started,
             }],
         }
 
         result = await enrich_monitor_routes(state, routing)
         route = result["routes"][0]
-        self.assertEqual(route["movement"]["kind"], "warehouse")
+        self.assertEqual(route["movement"]["kind"], "return")
         self.assertEqual(route["return_road_path"], points)
         self.assertEqual(route["movement"]["distance_km"], 4.2)
         self.assertIsNotNone(route["movement"]["eta_at"])

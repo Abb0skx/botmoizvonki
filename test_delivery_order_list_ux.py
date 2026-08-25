@@ -312,6 +312,58 @@ class CallbackAcknowledgementTests(unittest.IsolatedAsyncioTestCase):
             for call in bot.send_message.await_args_list
         ))
 
+    async def test_published_pending_reassignment_requires_confirmation_without_read_receipt(self):
+        order = self.repo.create(manager_id=11, manager_name="Manager", data=_order_data())
+        order = self.repo.update(
+            order.id,
+            status="pending",
+            assigned_courier_id=7636344727,
+            assigned_courier_name="Olmas",
+            courier_read_at=None,
+            delivery_chat_id=-5111626405,
+            delivery_message_id=50,
+            manager_chat_id=11,
+            manager_message_id=90,
+        )
+        query = SimpleNamespace(
+            data=f"courier_assign:{order.id}:202134293",
+            from_user=SimpleNamespace(id=11, full_name="Manager", username=None),
+            message=SimpleNamespace(chat_id=11, message_id=90),
+            answer=AsyncMock(),
+            edit_message_reply_markup=AsyncMock(),
+        )
+        bot = SimpleNamespace(send_message=AsyncMock())
+        context = SimpleNamespace(
+            bot=bot,
+            application=SimpleNamespace(bot_data={
+                "settings": SimpleNamespace(
+                    manager_ids=frozenset({11}),
+                    courier_ids=frozenset({7636344727, 202134293}),
+                    delivery_group_id=-100,
+                    location_channel_id=-1002,
+                ),
+                "repo": self.repo,
+            }),
+        )
+
+        await courier_assignment_action(SimpleNamespace(callback_query=query), context)
+
+        unchanged = self.repo.get(order.id)
+        self.assertEqual(unchanged.assigned_courier_id, 7636344727)
+        bot.send_message.assert_not_awaited()
+        callbacks = [
+            button.callback_data
+            for row in query.edit_message_reply_markup.await_args.kwargs[
+                "reply_markup"
+            ].inline_keyboard
+            for button in row
+        ]
+        self.assertIn(
+            f"courier_force_assign:{order.id}:202134293",
+            callbacks,
+        )
+        self.assertIn("мог уже увидеть заказ", query.answer.await_args.args[0])
+
     async def test_failed_reassignment_keeps_old_courier_and_card(self):
         order = self.repo.create(manager_id=11, manager_name="Manager", data=_order_data())
         order = self.repo.update(
@@ -325,7 +377,7 @@ class CallbackAcknowledgementTests(unittest.IsolatedAsyncioTestCase):
             manager_message_id=90,
         )
         query = SimpleNamespace(
-            data=f"courier_assign:{order.id}:202134293",
+            data=f"courier_force_assign:{order.id}:202134293",
             from_user=SimpleNamespace(id=11, full_name="Manager", username=None),
             message=SimpleNamespace(chat_id=11, message_id=90),
             answer=AsyncMock(),

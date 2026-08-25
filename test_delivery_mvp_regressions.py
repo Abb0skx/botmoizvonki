@@ -257,7 +257,7 @@ class ActiveEditNotificationTests(unittest.IsolatedAsyncioTestCase):
         )
         return context, update
 
-    def pending_order(self, *, read: bool):
+    def pending_order(self, *, read: bool, published: bool = True):
         order = self.repo.create(
             manager_id=11,
             manager_name="Otabek",
@@ -274,8 +274,8 @@ class ActiveEditNotificationTests(unittest.IsolatedAsyncioTestCase):
             assigned_courier_id=202134293,
             assigned_courier_name="Abbos",
             courier_read_at="2026-08-24T10:00:00+05:00" if read else None,
-            delivery_chat_id=-5216093690,
-            delivery_message_id=77,
+            delivery_chat_id=-5216093690 if published else None,
+            delivery_message_id=77 if published else None,
             manager_chat_id=11,
             manager_message_id=55,
         )
@@ -304,8 +304,30 @@ class ActiveEditNotificationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(all("A57 Pro" in call["text"] for call in warnings))
 
-    async def test_edit_before_courier_read_does_not_send_warning(self):
+    async def test_edit_of_published_pending_warns_without_read_receipt(self):
         order = self.pending_order(read=False)
+        context, update = self.context_and_update(order, "A57 Pro")
+
+        async def synchronized(_context, order_id):
+            return self.repo.get(order_id), True
+
+        with patch("app.handlers.orders._sync_order", side_effect=synchronized):
+            await save_edit(update, context)
+
+        self.assertEqual(self.repo.get(order.id).product, "A57 Pro")
+        warnings = [
+            call.kwargs
+            for call in context.bot.send_message.await_args_list
+            if "изменён менеджером" in call.kwargs.get("text", "")
+        ]
+        self.assertEqual(len(warnings), 2)
+        self.assertEqual(
+            {call["chat_id"] for call in warnings},
+            {-5216093690, -1004459657817},
+        )
+
+    async def test_edit_of_unpublished_pending_does_not_send_warning(self):
+        order = self.pending_order(read=False, published=False)
         context, update = self.context_and_update(order, "A57 Pro")
 
         async def synchronized(_context, order_id):

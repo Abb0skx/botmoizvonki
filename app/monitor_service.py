@@ -109,14 +109,9 @@ def _attention(order: Order) -> str | None:
         if minutes is not None and minutes >= 10:
             return f"Не отправлен курьеру {minutes} мин"
     if order.status == "pending":
-        if order.courier_read_at:
-            minutes = _minutes_since(order.courier_read_at)
-            if minutes is not None and minutes >= 45:
-                return f"Едет на склад / ждёт товар {minutes} мин"
-        else:
-            minutes = _minutes_since(order.created_at)
-            if minutes is not None and minutes >= 30:
-                return f"Ждёт прочтения {minutes} мин"
+        minutes = _minutes_since(order.created_at)
+        if minutes is not None and minutes >= 30:
+            return f"Ждёт забора товара {minutes} мин"
     elif order.status == "picked_up":
         minutes = _minutes_since(order.picked_up_at)
         if minutes is not None and minutes >= 20:
@@ -215,6 +210,9 @@ def _order_payload(order: Order) -> dict[str, Any]:
         "deadline_at": deadline.isoformat(timespec="seconds") if deadline else None,
         "overdue": bool(deadline and datetime.now(TASHKENT) >= deadline),
         "created_time": _time(order.created_at),
+        # Kept in the API for historical audit compatibility only. The live
+        # monitor must not infer courier movement or an operational state from
+        # a legacy read confirmation.
         "read_time": _time(order.courier_read_at),
         "read_at": order.courier_read_at,
         "picked_up_time": _time(order.picked_up_at),
@@ -245,14 +243,6 @@ def _courier_route(
     current_orders = [order for order in active if order.status == "on_way"]
     current = current_orders[-1] if current_orders else None
     remaining = [order for order in active if order is not current]
-    read_orders = [
-        order for order in active
-        if order.status == "pending" and order.courier_read_at
-    ]
-    warehouse_read_at = min(
-        (local_datetime(order.courier_read_at) for order in read_orders),
-        default=None,
-    )
 
     dark_paths: list[list[list[float]]] = []
     current_path: list[list[float]] = []
@@ -386,16 +376,9 @@ def _courier_route(
                 })
 
     current_target = _order_payload(current) if current else None
-    movement_kind = "delivery" if current_path else (
-        "warehouse" if return_path and warehouse_read_at else ("return" if return_path else None)
-    )
+    movement_kind = "delivery" if current_path else ("return" if return_path else None)
     if current:
         movement_started_at = current.time_started
-    elif return_path and warehouse_read_at:
-        movement_start = warehouse_read_at
-        if last_completed_at and last_completed_at > movement_start:
-            movement_start = last_completed_at
-        movement_started_at = movement_start.isoformat()
     else:
         movement_started_at = (
             last_completed_at.isoformat() if return_path and last_completed_at else None
@@ -412,9 +395,6 @@ def _courier_route(
         "planned_order_ids": planned_order_ids,
         "movement_kind": movement_kind,
         "movement_started_at": movement_started_at,
-        "heading_to_warehouse": bool(read_orders and not current),
-        "warehouse_started_at": warehouse_read_at.isoformat() if warehouse_read_at else None,
-        "warehouse_order_numbers": [order.order_number for order in read_orders],
         "courier_marker": _midpoint(current_path or return_path),
         "current_target": current_target,
     }
@@ -468,19 +448,11 @@ def build_delivery_monitor(repo: OrderRepository) -> dict[str, Any]:
             "dark_color": COURIER_DARK_COLORS[courier.user_id],
             "completed_today": len(completed),
             "remaining": len(active),
-            "new_orders": sum(
-                order.status == "pending" and not order.courier_read_at for order in active
-            ),
             "waiting_pickup": sum(
-                order.status == "pending" and bool(order.courier_read_at) for order in active
+                order.status == "pending" for order in active
             ),
             "picked_up": sum(order.status == "picked_up" for order in active),
             "on_way": sum(order.status == "on_way" for order in active),
-            "heading_to_warehouse": route["heading_to_warehouse"],
-            "warehouse_started_time": (
-                _time(route["warehouse_started_at"])
-            ),
-            "warehouse_order_numbers": route["warehouse_order_numbers"],
             "attention": sum(_attention(order) is not None for order in active),
             "current_target": route["current_target"],
         })
@@ -520,9 +492,6 @@ def build_delivery_monitor(repo: OrderRepository) -> dict[str, Any]:
             "planned_order_ids": [],
             "movement_kind": None,
             "movement_started_at": None,
-            "heading_to_warehouse": False,
-            "warehouse_started_at": None,
-            "warehouse_order_numbers": [],
             "courier_marker": None,
             "current_target": None,
         })
@@ -554,19 +523,11 @@ def build_delivery_monitor(repo: OrderRepository) -> dict[str, Any]:
                 order.status == "draft" or _courier_id(order) is None
                 for order in active_orders
             ),
-            "new_orders": sum(
-                order.status == "pending" and not order.courier_read_at
-                for order in active_orders
-            ),
             "waiting_pickup": sum(
-                order.status == "pending" and bool(order.courier_read_at)
-                for order in active_orders
+                order.status == "pending" for order in active_orders
             ),
             "picked_up": sum(order.status == "picked_up" for order in active_orders),
             "on_way": sum(order.status == "on_way" for order in active_orders),
-            "heading_to_warehouse": sum(
-                bool(card["heading_to_warehouse"]) for card in courier_cards
-            ),
             "completed_today": report["summary"]["completed"],
             "cancelled_today": report["summary"]["cancelled"],
             "attention": sum(_attention(order) is not None for order in active_orders),
@@ -597,8 +558,8 @@ def build_delivery_monitor(repo: OrderRepository) -> dict[str, Any]:
         "routes": routes,
         "stops": map_stops,
         "disclaimer": (
-            "Значок курьера показывает расчётную позицию на дорожном маршруте по времени "
-            "от подтверждённого действия: «Заказ прочитан» — к складу, «Еду к заказу» — "
-            "к клиенту. GPS-геолокация и текущие пробки не используются."
+            "Значок курьера показывает расчётную позицию после нажатия "
+            "«Еду к заказу» и при расчётном возврате на склад после доставки. "
+            "До начала выезда текущая позиция курьера неизвестна. GPS-геолокация и текущие пробки не используются."
         ),
     }

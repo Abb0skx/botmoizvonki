@@ -267,6 +267,19 @@ def _edited_value_text(order, field: str) -> str:
     return "обновлено"
 
 
+def _courier_may_have_seen_order(order) -> bool:
+    """Treat every published pending card as acknowledged for safety checks."""
+    return bool(
+        order.courier_read_at
+        or order.status in {"picked_up", "on_way"}
+        or (
+            order.status == "pending"
+            and order.delivery_chat_id
+            and order.delivery_message_id
+        )
+    )
+
+
 async def _notify_active_order_edit(
     context: ContextTypes.DEFAULT_TYPE,
     order,
@@ -378,6 +391,33 @@ async def _is_orders_channel_member(
     return status == "restricted" and bool(getattr(member, "is_member", False))
 
 
+async def _delivery_group_membership(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    user_id: int,
+) -> bool | None:
+    """Return current delivery-group membership, or ``None`` on API failure.
+
+    Cancellation is deliberately available to every member of the canonical
+    courier group, not just configured couriers.  Telegram only guarantees
+    lookups for arbitrary members while the bot is an administrator; startup
+    validation enforces that prerequisite for every delivery group.
+    """
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+    except Exception:
+        logger.exception(
+            "Could not verify delivery-group membership for user %s in chat %s",
+            user_id,
+            chat_id,
+        )
+        return None
+    status = str(getattr(member, "status", ""))
+    if status in {"creator", "administrator", "member"}:
+        return True
+    return status == "restricted" and bool(getattr(member, "is_member", False))
+
+
 def _courier_waiting_pickup_text(
     repo: OrderRepository,
     courier_id: int,
@@ -478,14 +518,6 @@ def _delivery_message(order):
         return courier_card(order, "📸 <b>Курьер подтверждает доставку</b>"), delivery_pending_keyboard(order)
     if order.status == "awaiting_amount":
         return courier_card(order, "💰 <b>Фото получено, ожидается сумма</b>"), delivery_pending_keyboard(order)
-    if order.status == "pending" and order.courier_read_at:
-        return (
-            courier_card(
-                order,
-                "🟡🟡🟡\n🏬 <b>Курьер едет на склад</b>",
-            ),
-            courier_keyboard(order),
-        )
     return courier_card(order), courier_keyboard(order)
 
 
@@ -1188,14 +1220,11 @@ async def validate_delivery_configuration(application: Application) -> None:
             delivery_group_id,
             application.bot.id,
         )
-        if delivery_member.status in {"left", "kicked"}:
-            raise RuntimeError(f"The delivery bot must be a member of group {delivery_group_id}")
-        if delivery_member.status == "restricted" and not getattr(
-            delivery_member,
-            "can_send_messages",
-            False,
-        ):
-            raise RuntimeError(f"The delivery bot cannot send to group {delivery_group_id}")
+        if delivery_member.status not in {"administrator", "creator"}:
+            raise RuntimeError(
+                "The delivery bot must be an administrator in group "
+                f"{delivery_group_id} to verify who cancels orders"
+            )
 
     # A configured courier who cannot see their own group receives no order at
     # all, so own-group membership is fatal. The private location channel is
@@ -2334,7 +2363,7 @@ async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             _schedule_sync_retry(context, order.id)
     if (
         sent
-        and (previous.courier_read_at or previous.status in {"picked_up", "on_way"})
+        and _courier_may_have_seen_order(previous)
         and field in _EDIT_FIELD_LABELS
     ):
         await _notify_active_order_edit(
@@ -2523,7 +2552,7 @@ async def courier_assignment_action(update: Update, context: ContextTypes.DEFAUL
         return
 
     force_assignment = action == "courier_force_assign"
-    if (order.courier_read_at or order.status in {"picked_up", "on_way"}) and not force_assignment:
+    if _courier_may_have_seen_order(order) and not force_assignment:
         source = "orders_channel" if orders_channel_source else "manager"
         await query.edit_message_reply_markup(
             reply_markup=courier_reassignment_confirmation_keyboard(
@@ -2538,7 +2567,7 @@ async def courier_assignment_action(update: Update, context: ContextTypes.DEFAUL
         elif order.status == "picked_up":
             consequence = "Будет снята отметка о получении товара"
         else:
-            consequence = "Будет отменена поездка курьера на склад"
+            consequence = "Старый курьер мог уже увидеть заказ"
         await query.answer(
             f"{consequence}. Нажмите подтверждение ещё раз.",
             show_alert=True,
@@ -2764,14 +2793,11 @@ async def manager_pickup_action(update: Update, context: ContextTypes.DEFAULT_TY
         if (
             order.status != "pending"
             or not order.assigned_courier_id
-            or not order.courier_read_at
         ):
-            message = (
-                "Сначала курьер должен прочитать заказ"
-                if order.status == "pending" and not order.courier_read_at
-                else "Заказ уже изменился или курьер не выбран"
+            await query.answer(
+                "Заказ уже изменился или курьер не выбран",
+                show_alert=True,
             )
-            await query.answer(message, show_alert=True)
             return
         timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
         updated = repo.transition(
@@ -2847,6 +2873,193 @@ async def manager_pickup_action(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
 
+def _group_cancel_source_is_current(order, query, settings: Settings) -> bool:
+    message = getattr(query, "message", None)
+    return bool(
+        message
+        and order.delivery_chat_id
+        and order.delivery_message_id
+        and message.chat_id == order.delivery_chat_id
+        and getattr(message, "message_id", None) == order.delivery_message_id
+        and order.delivery_chat_id == _target_delivery_group(settings, order)
+    )
+
+
+def _group_actor_role(settings: Settings, user_id: int) -> str:
+    if user_id in _allowed_courier_ids(settings):
+        return "courier"
+    if user_id in frozenset(getattr(settings, "manager_ids", ())):
+        return "manager"
+    return "group_member"
+
+
+def _group_actor_text(user) -> str:
+    username = (getattr(user, "username", None) or "").strip().lstrip("@")
+    suffix = f" (@{escape(username)})" if username else ""
+    return f"<b>{escape(_name(user))}</b>{suffix}"
+
+
+async def group_cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cancel or restore an order by any accountable member of its group."""
+    query = update.callback_query
+    user = getattr(query, "from_user", None)
+    if not user or getattr(user, "is_bot", False):
+        await query.answer(
+            "Отмена доступна только участнику группы с личного аккаунта.",
+            show_alert=True,
+        )
+        return
+    action, raw_id = query.data.split(":")
+    settings: Settings = context.application.bot_data["settings"]
+    repo: OrderRepository = context.application.bot_data["repo"]
+    order = repo.get(int(raw_id))
+    if not order:
+        await query.answer("Заказ не найден", show_alert=True)
+        return
+    if not _group_cancel_source_is_current(order, query, settings):
+        await query.answer(
+            "Эта карточка устарела. Используйте актуальное сообщение заказа.",
+            show_alert=True,
+        )
+        return
+    actor_name = _name(user)
+    actor_username = (getattr(user, "username", None) or "").strip().lstrip("@") or None
+    actor_role = _group_actor_role(settings, user.id)
+    async with _order_sync_lock(context.application, order.id):
+        current = repo.get(order.id)
+        if not current or not _group_cancel_source_is_current(current, query, settings):
+            await query.answer(
+                "Заказ уже изменился. Используйте актуальную карточку.",
+                show_alert=True,
+            )
+            return
+        membership = await _delivery_group_membership(
+            context,
+            current.delivery_chat_id,
+            user.id,
+        )
+        if membership is None:
+            await query.answer(
+                "Не удалось проверить участие в группе. Повторите ещё раз.",
+                show_alert=True,
+            )
+            return
+        if not membership:
+            await query.answer(
+                "Кнопка доступна только участникам этой группы доставки.",
+                show_alert=True,
+            )
+            return
+
+        if action == "cancel":
+            if current.status == "cancelled":
+                await query.answer("Заказ уже отменён", show_alert=True)
+                return
+            if current.status not in DELIVERY_ACTIVE_STATUSES:
+                await query.answer("Заказ уже закрыт", show_alert=True)
+                return
+            timestamp = datetime.now(ZoneInfo("Asia/Tashkent"))
+            updated = repo.transition(
+                current.id,
+                DELIVERY_ACTIVE_STATUSES,
+                expected_updated_at=current.updated_at,
+                status="cancelled",
+                cancelled_by_id=user.id,
+                cancelled_by_name=actor_name,
+                cancelled_by_username=actor_username,
+                cancelled_at=timestamp.isoformat(timespec="seconds"),
+                cancelled_from_status=current.status,
+                actor_id=user.id,
+                actor_name=actor_name,
+                actor_username=actor_username,
+                actor_role=actor_role,
+                event_type="order_cancelled",
+            )
+            if not updated:
+                await query.answer(
+                    "Заказ уже изменился. Используйте актуальную карточку.",
+                    show_alert=True,
+                )
+                return
+            await query.answer("Заказ отменён")
+            await _finish_status_change_locked(
+                context,
+                query,
+                updated,
+                courier_card(updated, "❌ <b>Заказ отменён</b>"),
+                courier_cancelled_keyboard(updated),
+            )
+            await _notify_log(
+                context,
+                f"❌ <b>Заказ №{updated.order_number}</b> отменён\n"
+                f"👤 Отменил: {_group_actor_text(user)}\n"
+                f"🆔 Telegram ID: <code>{user.id}</code>\n"
+                f"🕒 {timestamp:%H:%M}",
+                reply_markup=log_order_keyboard(updated),
+            )
+            return
+
+        if current.status != "cancelled":
+            await query.answer("Этот заказ уже нельзя вернуть", show_alert=True)
+            return
+        target_status = current.cancelled_from_status
+        if target_status in {"awaiting_photo", "awaiting_amount"}:
+            target_status = "on_way" if current.time_started else (
+                "picked_up" if current.picked_up_at else "pending"
+            )
+        if target_status not in {"pending", "picked_up", "on_way"}:
+            target_status = "picked_up" if current.picked_up_at else "pending"
+
+        transition_fields = {"status": target_status}
+        transition_options = {}
+        effective_courier_id = current.courier_id or current.assigned_courier_id
+        if target_status == "on_way":
+            if not effective_courier_id:
+                target_status = "picked_up" if current.picked_up_at else "pending"
+                transition_fields = {"status": target_status, "time_started": None}
+            else:
+                transition_fields["courier_id"] = effective_courier_id
+                transition_options = {
+                    "guard_courier_id": effective_courier_id,
+                    "require_no_other_on_way_for_courier": True,
+                }
+        updated = repo.transition(
+            current.id,
+            {"cancelled"},
+            expected_updated_at=current.updated_at,
+            actor_id=user.id,
+            actor_name=actor_name,
+            actor_username=actor_username,
+            actor_role=actor_role,
+            event_type="order_cancel_restored",
+            **transition_options,
+            **transition_fields,
+        )
+        if not updated:
+            conflict = (
+                repo.get_on_way_for_courier(effective_courier_id, exclude_order_id=current.id)
+                if target_status == "on_way" and effective_courier_id
+                else None
+            )
+            message = (
+                f"Сначала завершите заказ №{conflict.order_number}"
+                if conflict
+                else "Заказ уже изменился. Используйте актуальную карточку."
+            )
+            await query.answer(message, show_alert=True)
+            return
+        await query.answer("Заказ возвращён")
+        text, keyboard = _delivery_message(updated)
+        await _finish_status_change_locked(context, query, updated, text, keyboard)
+        await _notify_log(
+            context,
+            f"↩️ <b>Заказ №{updated.order_number}</b> · отмена снята\n"
+            f"👤 Вернул: {_group_actor_text(user)}\n"
+            f"🚚 Курьер: {escape(updated.assigned_courier_name or updated.courier_name or '—')}",
+            reply_markup=log_order_keyboard(updated),
+        )
+
+
 async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     settings: Settings = context.application.bot_data["settings"]
@@ -2879,43 +3092,10 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     ):
         await query.answer("Эта карточка устарела. Используйте актуальное сообщение заказа.", show_alert=True)
         return
-    if action == "undo_cancel":
-        if order.status != "cancelled" or order.courier_id != query.from_user.id:
-            await query.answer("Этот заказ уже нельзя вернуть", show_alert=True); return
-        target_status = "picked_up" if order.picked_up_at else "pending"
-        reset = {
-            "status": target_status,
-            "time_started": None,
-            "delivery_photo": None,
-            "received_usd": None,
-            "received_uzs": None,
-            "delivered_at": None,
-        }
-        if target_status == "pending":
-            reset.update(courier_id=None, courier_name=None)
-        order = repo.transition(
-            order.id,
-            {"cancelled"},
-            guard_courier_id=query.from_user.id,
-            require_unassigned_or_same=True,
-            **reset,
-        )
-        if not order:
-            await query.answer("Этот заказ уже нельзя вернуть", show_alert=True); return
-        await query.answer("Заказ возвращён")
-        await _finish_status_change(
-            context,
-            query,
-            order,
-            courier_card(order, "↩️ <b>Отмена снята, заказ снова активен</b>"),
-            courier_keyboard(order),
-        )
-        await _notify_log(
-            context,
-            f"↩️ <b>Заказ №{order.order_number}</b> · отмена снята\n"
-            f"🚚 Курьер: {escape(order.assigned_courier_name or order.courier_name or '—')}",
-            reply_markup=log_order_keyboard(order),
-        )
+    if action == "read":
+        await query.answer("Кнопка прочтения больше не используется")
+        text, keyboard = _delivery_message(order)
+        await _finish_status_change(context, query, order, text, keyboard)
         return
     if action == "undo_complete":
         if order.status not in {"awaiting_photo", "awaiting_amount", "completed"} or order.courier_id != query.from_user.id:
@@ -2968,61 +3148,6 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "courier_id": query.from_user.id,
         "courier_name": configured_courier.name if configured_courier else _name(query.from_user),
     }
-    if action == "read":
-        if order.status != "pending":
-            await query.answer("Заказ уже перешёл на следующий этап", show_alert=True)
-            return
-        if order.courier_read_at:
-            read_at = datetime.fromisoformat(order.courier_read_at).astimezone(
-                ZoneInfo("Asia/Tashkent")
-            )
-            await query.answer(f"Уже прочитано в {read_at:%H:%M} · вы едете на склад 🏬")
-            return
-        timestamp = datetime.now(ZoneInfo("Asia/Tashkent"))
-        order = repo.transition(
-            order.id,
-            {"pending"},
-            expected_updated_at=order.updated_at,
-            status="pending",
-            courier_read_at=timestamp.isoformat(timespec="seconds"),
-            guard_courier_id=query.from_user.id,
-            require_unassigned_or_same=True,
-            actor_id=query.from_user.id,
-            actor_name=courier["courier_name"],
-            actor_role="courier",
-            event_type="courier_read",
-            **courier,
-        )
-        if not order:
-            await query.answer("Заказ уже изменился. Откройте свежую карточку.", show_alert=True)
-            return
-        await query.answer("✅ Прочитано · еду на склад 🏬")
-        set_reaction = getattr(context.bot, "set_message_reaction", None)
-        if callable(set_reaction):
-            try:
-                # Telegram shows a large native reaction animation when the
-                # group allows this emoji. The edited card below remains the
-                # durable confirmation when reactions are disabled.
-                await set_reaction(
-                    chat_id=query.message.chat_id,
-                    message_id=query.message.message_id,
-                    reaction="👀",
-                    is_big=True,
-                )
-            except Exception:
-                logger.info(
-                    "Could not animate read reaction for order %s; card confirmation remains active",
-                    order.id,
-                )
-        text, keyboard = _delivery_message(order)
-        await _finish_status_change(context, query, order, text, keyboard)
-        await _notify_log(
-            context,
-            f"👀 <b>Заказ №{order.order_number} прочитан {timestamp:%H:%M}</b>\n"
-            f"🏬 {escape(order.courier_name or order.assigned_courier_name or '—')} едет на склад.",
-            reply_markup=log_read_keyboard(order),
-        )
-        return
     if action == "undo_onway":
         target_status = "picked_up" if order.picked_up_at else "pending"
         reset = {
@@ -3092,28 +3217,6 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             on_way_keyboard(order),
         )
         await _notify_on_way_log(context, order)
-    elif action == "cancel":
-        order = repo.transition(
-            order.id, {"pending", "picked_up", "on_way", "awaiting_photo", "awaiting_amount"},
-            status="cancelled", guard_courier_id=query.from_user.id,
-            require_unassigned_or_same=True, **courier,
-        )
-        if not order:
-            await query.answer("Заказ уже обработан другим курьером", show_alert=True); return
-        await query.answer("Заказ отменён")
-        await _finish_status_change(
-            context,
-            query,
-            order,
-            courier_card(order, "❌ <b>Заказ отменён</b>"),
-            courier_cancelled_keyboard(order),
-        )
-        await _notify_log(
-            context,
-            f"❌ <b>Заказ №{order.order_number}</b> отменён курьером "
-            f"{escape(_name(query.from_user))}.",
-            reply_markup=log_order_keyboard(order),
-        )
     elif action == "complete":
         timestamp = datetime.now().astimezone()
         order = repo.transition(
@@ -3408,6 +3511,13 @@ def register_handlers(application: Application) -> None:
         manager_pickup_action,
         pattern=r"^(?:(?:pickup|undo_pickup):\d+|(?:pickup_log|undo_pickup_log):\d+:\d+)$",
     ))
-    application.add_handler(CallbackQueryHandler(courier_action, pattern=r"^(read|onway|undo_onway|complete|cancel|undo_cancel|undo_complete):\d+$"))
+    application.add_handler(CallbackQueryHandler(
+        group_cancel_action,
+        pattern=r"^(?:cancel|undo_cancel):\d+$",
+    ))
+    application.add_handler(CallbackQueryHandler(
+        courier_action,
+        pattern=r"^(?:read|onway|undo_onway|complete|undo_complete):\d+$",
+    ))
     application.add_handler(edit_conversation, group=1)
     application.add_handler(MessageHandler(filters.PHOTO | (filters.TEXT & ~filters.COMMAND), delivery_input), group=2)

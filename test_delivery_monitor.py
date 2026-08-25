@@ -51,9 +51,6 @@ class PickupWorkflowTests(unittest.IsolatedAsyncioTestCase):
             status="pending",
             assigned_courier_id=ABBOS_ID,
             assigned_courier_name="Abbos",
-            courier_id=ABBOS_ID,
-            courier_name="Abbos",
-            courier_read_at=datetime.now(TASHKENT).isoformat(timespec="seconds"),
             manager_chat_id=11,
             manager_message_id=90 + order.id,
             delivery_chat_id=-5216093690,
@@ -257,8 +254,8 @@ class DeliveryMonitorServiceTests(unittest.TestCase):
         route = next(item for item in monitor["routes"] if item["courier_id"] == ABBOS_ID)
 
         self.assertEqual(monitor["summary"]["active"], 2)
-        self.assertEqual(monitor["summary"]["new_orders"], 1)
-        self.assertEqual(monitor["summary"]["waiting_pickup"], 0)
+        self.assertNotIn("new_orders", monitor["summary"])
+        self.assertEqual(monitor["summary"]["waiting_pickup"], 1)
         self.assertEqual(monitor["summary"]["on_way"], 1)
         self.assertEqual(monitor["manager_counts"], [{"name": "Otabek", "orders": 3}])
         self.assertEqual(route["current_target"]["order_number"], current.order_number)

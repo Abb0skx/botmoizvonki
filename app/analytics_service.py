@@ -140,7 +140,8 @@ def build_delivery_analytics(
         events = [
             event
             for event in events_by_order.get(order.id, [])
-            if event.actor_role == "courier" and event.actor_id is not None
+            if event.courier_id is not None
+            or (event.actor_role == "courier" and event.actor_id is not None)
         ]
         completed = [
             event
@@ -150,17 +151,22 @@ def build_delivery_analytics(
         if completed:
             # The first actual fulfilment is immutable attribution for the
             # order's creation-period analytics, even if it is later reopened.
-            return completed[0].actor_id
+            return completed[0].courier_id or completed[0].actor_id
         lifecycle = [
             event
             for event in events
-            if event.event_type == "courier_read"
+            if "assigned_courier_id" in event.changed_fields
+            or event.event_type == "courier_read"
             or (
                 _status_changed(event)
                 and event.to_status in {"picked_up", "on_way", "cancelled"}
             )
         ]
-        return lifecycle[-1].actor_id if lifecycle else _courier_id(order)
+        return (
+            lifecycle[-1].courier_id or lifecycle[-1].actor_id
+            if lifecycle
+            else _courier_id(order)
+        )
 
     created_orders = [
         (order, created.date())
