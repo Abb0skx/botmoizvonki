@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
-from app.bot.keyboards import manager_sent_keyboard, orders_channel_keyboard
+from app.bot.keyboards import courier_keyboard, manager_sent_keyboard, orders_channel_keyboard
 from app.database import OrderRepository
 from app.handlers.orders import courier_action, manager_pickup_action
 from app.monitor_service import WAREHOUSE, build_delivery_monitor
@@ -60,9 +60,12 @@ class PickupWorkflowTests(unittest.IsolatedAsyncioTestCase):
     async def test_manager_marks_and_undoes_goods_pickup(self):
         order = self.assigned_order()
         query = SimpleNamespace(
-            data=f"pickup:{order.id}",
+            data=f"group_pickup:{order.id}",
             from_user=SimpleNamespace(id=11, full_name="Otabek", username=None),
-            message=SimpleNamespace(chat_id=11, message_id=order.manager_message_id),
+            message=SimpleNamespace(
+                chat_id=order.delivery_chat_id,
+                message_id=order.delivery_message_id,
+            ),
             answer=AsyncMock(),
         )
         context = SimpleNamespace(
@@ -73,10 +76,10 @@ class PickupWorkflowTests(unittest.IsolatedAsyncioTestCase):
             bot=SimpleNamespace(),
         )
 
-        async def synchronized(_context, order_id):
-            return self.repo.get(order_id), True
-
-        with patch("app.handlers.orders._sync_order", side_effect=synchronized):
+        with patch(
+            "app.handlers.orders._finish_status_change_locked",
+            new=AsyncMock(return_value=True),
+        ):
             await manager_pickup_action(SimpleNamespace(callback_query=query), context)
 
         picked_up = self.repo.get(order.id)
@@ -85,9 +88,12 @@ class PickupWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(picked_up.courier_id, ABBOS_ID)
         self.assertIn("Товар у курьера", query.answer.await_args.args[0])
 
-        query.data = f"undo_pickup:{order.id}"
+        query.data = f"group_undo_pickup:{order.id}"
         query.answer.reset_mock()
-        with patch("app.handlers.orders._sync_order", side_effect=synchronized):
+        with patch(
+            "app.handlers.orders._finish_status_change_locked",
+            new=AsyncMock(return_value=True),
+        ):
             await manager_pickup_action(SimpleNamespace(callback_query=query), context)
 
         pending = self.repo.get(order.id)
@@ -132,22 +138,28 @@ class PickupWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
     def test_pickup_buttons_follow_order_state(self):
         pending = self.assigned_order()
-        callbacks = [
+        group_callbacks = [
+            button.callback_data
+            for row in courier_keyboard(pending).inline_keyboard
+            for button in row
+            if button.callback_data
+        ]
+        self.assertEqual(group_callbacks.count(f"group_pickup:{pending.id}"), 1)
+        pickup_button = next(
+            button
+            for row in courier_keyboard(pending).inline_keyboard
+            for button in row
+            if button.callback_data == f"group_pickup:{pending.id}"
+        )
+        self.assertEqual(pickup_button.text, "📦 Abbos забрал товар")
+        outside_callbacks = [
             button.callback_data
             for keyboard in (manager_sent_keyboard(pending), orders_channel_keyboard(pending))
             for row in keyboard.inline_keyboard
             for button in row
             if button.callback_data
         ]
-        self.assertEqual(callbacks.count(f"pickup:{pending.id}"), 2)
-        labels = [
-            button.text
-            for keyboard in (manager_sent_keyboard(pending), orders_channel_keyboard(pending))
-            for row in keyboard.inline_keyboard
-            for button in row
-            if button.callback_data == f"pickup:{pending.id}"
-        ]
-        self.assertEqual(labels, ["📦 Abbos забрал товар", "📦 Abbos забрал товар"])
+        self.assertNotIn(f"group_pickup:{pending.id}", outside_callbacks)
 
         picked = self.repo.transition(
             pending.id,
@@ -157,18 +169,26 @@ class PickupWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
         callbacks = [
             button.callback_data
-            for row in manager_sent_keyboard(picked).inline_keyboard
+            for row in courier_keyboard(picked).inline_keyboard
             for button in row
             if button.callback_data
         ]
-        self.assertIn(f"undo_pickup:{picked.id}", callbacks)
+        self.assertIn(f"group_undo_pickup:{picked.id}", callbacks)
         undo_button = next(
             button
-            for row in manager_sent_keyboard(picked).inline_keyboard
+            for row in courier_keyboard(picked).inline_keyboard
             for button in row
-            if button.callback_data == f"undo_pickup:{picked.id}"
+            if button.callback_data == f"group_undo_pickup:{picked.id}"
         )
         self.assertEqual(undo_button.text, "↩️ Отменить: Abbos забрал товар")
+        outside_callbacks = [
+            button.callback_data
+            for keyboard in (manager_sent_keyboard(picked), orders_channel_keyboard(picked))
+            for row in keyboard.inline_keyboard
+            for button in row
+            if button.callback_data
+        ]
+        self.assertNotIn(f"group_undo_pickup:{picked.id}", outside_callbacks)
 
 
 class DeliveryMonitorServiceTests(unittest.TestCase):
