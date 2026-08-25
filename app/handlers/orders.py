@@ -32,7 +32,7 @@ from app.database import OrderRepository
 from app.monitor_service import build_delivery_monitor
 from app.utils import (
     completed_card, courier_card, enrich_location, extract_text_address, manager_card,
-    normalize_payment, normalize_seller, parse_amount,
+    map_url_provider, normalize_payment, normalize_seller, parse_amount,
     parse_order_details,
 )
 from app.utils.formatters import (
@@ -42,7 +42,7 @@ from app.utils.formatters import (
 from app.utils.couriers import (
     courier_group_id, courier_option,
 )
-from app.utils.parsers import display_phone
+from app.utils.parsers import display_phone, extract_http_urls
 
 logger = logging.getLogger(__name__)
 SELLER, PRODUCT, DETAILS, SECOND_LOCATION, PAYMENT, DELIVERY_TIME, COMMENT, EDIT_VALUE = range(8)
@@ -63,6 +63,7 @@ MAIN_MENU_TEXTS = {
     "📋 Все заказы",
     "📊 Статистика",
 }
+LOCATION_INPUT_FILTER = filters.LOCATION | filters.VENUE | filters.TEXT | filters.CAPTION
 
 
 def _orders_channel_id(context: ContextTypes.DEFAULT_TYPE) -> int | None:
@@ -128,7 +129,7 @@ def _allowed(user_id: int, allowed: frozenset[int]) -> bool:
 
 
 def _text(message, *, maximum: int, required: bool = True) -> str | None:
-    value = (message.text or "").strip()
+    value = (getattr(message, "text", None) or getattr(message, "caption", None) or "").strip()
     if value.casefold() == "пропустить" and not required:
         return None
     if required and not value:
@@ -441,12 +442,58 @@ async def daily_delivery_log_action(
     await update.callback_query.answer("Хронология в Log отключена", show_alert=True)
 
 
+def _message_location_urls(message) -> list[str]:
+    """Extract visible and hidden Telegram map links in message order."""
+    candidates: list[str] = []
+    for text in (getattr(message, "text", None), getattr(message, "caption", None)):
+        if not text:
+            continue
+        candidates.extend(extract_http_urls(text))
+
+    entity_groups = (
+        (getattr(message, "entities", None) or [], getattr(message, "parse_entity", None)),
+        (
+            getattr(message, "caption_entities", None) or [],
+            getattr(message, "parse_caption_entity", None),
+        ),
+    )
+    for entities, parse_entity in entity_groups:
+        for entity in entities:
+            entity_type = getattr(entity, "type", "")
+            entity_type = getattr(entity_type, "value", entity_type)
+            candidate = getattr(entity, "url", None) if entity_type == "text_link" else None
+            if entity_type == "url" and callable(parse_entity):
+                try:
+                    candidate = parse_entity(entity)
+                except (TypeError, ValueError):
+                    candidate = None
+            if candidate:
+                candidates.append(str(candidate))
+
+    result: list[str] = []
+    for candidate in candidates:
+        candidate = candidate.strip().rstrip(".,;:!?)>]}")
+        if map_url_provider(candidate) is not None and candidate not in result:
+            result.append(candidate)
+    return result[:2]
+
+
 async def _location_values(message) -> dict:
-    if message.location:
-        latitude, longitude = message.location.latitude, message.location.longitude
+    native_location = getattr(message, "location", None)
+    venue = getattr(message, "venue", None)
+    if native_location is None and venue is not None:
+        native_location = getattr(venue, "location", None)
+    if native_location:
+        latitude, longitude = native_location.latitude, native_location.longitude
         url = f"https://yandex.uz/maps/?ll={longitude:.6f}%2C{latitude:.6f}&z=17"
     else:
-        url = message.text or ""
+        urls = _message_location_urls(message)
+        if not urls:
+            raise ValueError(
+                "Отправьте Telegram Location или ссылку Google, Яндекс, 2GIS, Apple Maps, "
+                "OpenStreetMap или Waze."
+            )
+        url = urls[0]
         latitude = longitude = None
     values = await enrich_location(latitude, longitude, url)
     return _validated_location(values)
@@ -455,7 +502,8 @@ async def _location_values(message) -> dict:
 def _validated_location(values: dict) -> dict:
     if values["latitude"] is None or values["longitude"] is None:
         raise ValueError(
-            "Не удалось определить координаты. Отправьте Telegram Location или полную ссылку Яндекс Карт."
+            "Не удалось определить координаты. Отправьте точку через «Поделиться» в приложении карт "
+            "или Telegram Location."
         )
     if not (37.0 <= values["latitude"] <= 46.0 and 55.0 <= values["longitude"] <= 74.0):
         raise ValueError("Координаты находятся за пределами Узбекистана. Проверьте локацию.")
@@ -1763,12 +1811,14 @@ def _merge_location(draft: dict, values: dict) -> int:
 
 async def _capture_order_details(message, draft: dict) -> list[str]:
     recognized: list[str] = []
-    if message.location:
+    if getattr(message, "location", None) or getattr(message, "venue", None):
         location_number = _merge_location(draft, await _location_values(message))
         recognized.append(f"локация {location_number}")
         return recognized
 
-    parsed = parse_order_details(message.text or "")
+    parsed = parse_order_details(
+        getattr(message, "text", None) or getattr(message, "caption", None) or ""
+    )
     phones = list(parsed.get("client_phones") or [])
     if phones:
         count = _merge_phones(draft, phones)
@@ -1777,7 +1827,7 @@ async def _capture_order_details(message, draft: dict) -> list[str]:
         draft["amount_usd"] = parsed.get("amount_usd")
         draft["amount_uzs"] = parsed.get("amount_uzs")
         recognized.append("цена")
-    for raw_url in list(parsed.get("location_urls") or []):
+    for raw_url in _message_location_urls(message):
         values = _validated_location(await enrich_location(None, None, str(raw_url)))
         location_number = _merge_location(draft, values)
         label = f"локация {location_number}"
@@ -1796,7 +1846,12 @@ async def details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     incoming_text = (update.message.text or "").strip()
     if draft.get("awaiting_text_location"):
-        if update.message.location:
+        has_location_input = bool(
+            getattr(update.message, "location", None)
+            or getattr(update.message, "venue", None)
+            or _message_location_urls(update.message)
+        )
+        if has_location_input:
             draft.pop("awaiting_text_location", None)
             try:
                 recognized = await _capture_order_details(update.message, draft)
@@ -2143,6 +2198,11 @@ async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         elif field == "amount": values["amount_usd"], values["amount_uzs"] = parse_amount(update.message.text or "")
         elif field in {"location", "second_location"}:
             prefix = "second_" if field == "second_location" else ""
+            has_location_input = bool(
+                getattr(update.message, "location", None)
+                or getattr(update.message, "venue", None)
+                or _message_location_urls(update.message)
+            )
             if incoming_text == DELETE_SECOND_LOCATION_TEXT:
                 if field != "second_location":
                     raise ValueError("Основную локацию нельзя удалить")
@@ -2155,14 +2215,14 @@ async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                     "second_mahalla": None,
                 }
                 edit.pop("awaiting_text_location", None)
-            elif incoming_text == TEXT_LOCATION_BUTTON and not update.message.location:
+            elif incoming_text == TEXT_LOCATION_BUTTON and not has_location_input:
                 edit["awaiting_text_location"] = True
                 await update.message.reply_text(
                     "Напишите адрес текстом.",
                     reply_markup=edit_input_keyboard(field),
                 )
                 return EDIT_VALUE
-            elif edit.get("awaiting_text_location") and not update.message.location:
+            elif edit.get("awaiting_text_location") and not has_location_input:
                 address = _text(update.message, maximum=1000)
                 values = {
                     f"{prefix}location_url": None,
@@ -3425,9 +3485,9 @@ def register_handlers(application: Application) -> None:
         states={
             SELLER: [creation_menu, creation_stats, MessageHandler(filters.TEXT & ~filters.COMMAND, seller)],
             PRODUCT: [creation_menu, creation_stats, MessageHandler(filters.TEXT & ~filters.COMMAND, product)],
-            DETAILS: [creation_menu, creation_stats, MessageHandler((filters.LOCATION | filters.TEXT) & ~filters.COMMAND, details)],
-            SECOND_LOCATION: [creation_menu, creation_stats, MessageHandler((filters.LOCATION | filters.TEXT) & ~filters.COMMAND, second_location)],
-            PAYMENT: [creation_menu, creation_stats, MessageHandler((filters.LOCATION | filters.TEXT) & ~filters.COMMAND, payment)],
+            DETAILS: [creation_menu, creation_stats, MessageHandler(LOCATION_INPUT_FILTER & ~filters.COMMAND, details)],
+            SECOND_LOCATION: [creation_menu, creation_stats, MessageHandler(LOCATION_INPUT_FILTER & ~filters.COMMAND, second_location)],
+            PAYMENT: [creation_menu, creation_stats, MessageHandler(LOCATION_INPUT_FILTER & ~filters.COMMAND, payment)],
             DELIVERY_TIME: [creation_menu, creation_stats, MessageHandler(filters.TEXT & ~filters.COMMAND, delivery_time)],
             COMMENT: [creation_menu, creation_stats, MessageHandler(filters.TEXT & ~filters.COMMAND, comment)],
         },
@@ -3443,7 +3503,7 @@ def register_handlers(application: Application) -> None:
     edit_conversation = ConversationHandler(
         entry_points=[CallbackQueryHandler(begin_edit, pattern=r"^edit:\d+:")],
         states={
-            EDIT_VALUE: [MessageHandler((filters.LOCATION | filters.TEXT) & ~filters.COMMAND, save_edit)],
+            EDIT_VALUE: [MessageHandler(LOCATION_INPUT_FILTER & ~filters.COMMAND, save_edit)],
         },
         fallbacks=[
             CommandHandler("start", _end_edit_on_global_command),

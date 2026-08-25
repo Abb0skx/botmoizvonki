@@ -1,5 +1,6 @@
 import re
-from urllib.parse import unquote
+from html import unescape
+from urllib.parse import parse_qs, unquote, urlsplit
 
 
 _URL_RE = re.compile(r"https?://[^\s<>]+", re.I)
@@ -22,6 +23,64 @@ _EXPLICIT_UZS_RE = re.compile(
     re.I,
 )
 MAX_STORED_AMOUNT = (1 << 63) - 1
+
+
+_MAP_PROVIDER_ROOTS: dict[str, tuple[str, ...]] = {
+    "google": (
+        "google.com",
+        "google.co.uz",
+        "google.ru",
+        "goo.gl",
+        "share.google",
+    ),
+    "yandex": ("yandex.com", "yandex.ru", "yandex.uz", "yandex.kz"),
+    "2gis": ("2gis.com", "2gis.ru", "2gis.uz", "2gis.kz"),
+    "osm": ("openstreetmap.org", "osm.org"),
+    "waze": ("waze.com",),
+    "here": ("here.com",),
+    "apple": ("maps.apple",),
+}
+_MAP_PROVIDER_EXACT_HOSTS = {
+    "maps.app.goo.gl": "google",
+    "maps.apple.com": "apple",
+    "maps.apple": "apple",
+}
+
+
+def map_url_provider(url: str) -> str | None:
+    """Return the supported provider for a safe HTTP(S) map URL."""
+    try:
+        parts = urlsplit(url.strip())
+        port = parts.port
+    except ValueError:
+        return None
+    if parts.scheme.casefold() not in {"http", "https"}:
+        return None
+    if parts.username is not None or parts.password is not None:
+        return None
+    if port not in {None, 80, 443}:
+        return None
+    host = (parts.hostname or "").rstrip(".").casefold()
+    if not host:
+        return None
+    if host in _MAP_PROVIDER_EXACT_HOSTS:
+        return _MAP_PROVIDER_EXACT_HOSTS[host]
+    for provider, roots in _MAP_PROVIDER_ROOTS.items():
+        if any(host == root or host.endswith(f".{root}") for root in roots):
+            return provider
+    return None
+
+
+def extract_http_urls(value: str, maximum: int = 20) -> list[str]:
+    """Extract distinct visible HTTP(S) links without interpreting their purpose."""
+    result: list[str] = []
+    for match in _URL_RE.finditer(value):
+        url = match.group(0).rstrip(".,;:!?)>]}")
+        if url and url not in result:
+            result.append(url)
+        if len(result) >= maximum:
+            break
+    return result
 
 
 def normalize_phone(value: str) -> str:
@@ -211,23 +270,197 @@ def parse_order_details(value: str) -> dict[str, str | int | None | list[str]]:
 
 def parse_location_url(url: str) -> tuple[float | None, float | None, str]:
     url = url.strip()
-    if len(url) > 2048 or not re.match(r"https?://[^\s]+$", url, re.I):
+    if len(url) > 8192 or not re.match(r"https?://[^\s]+$", url, re.I):
         raise ValueError("Отправьте геолокацию или ссылку на карту")
-    decoded = unquote(url)
-    patterns = [
-        (r"[?&]ll=([\d.-]+),([\d.-]+)", "lonlat"),
-        (r"[?&]pt=([\d.-]+),([\d.-]+)", "lonlat"),
-        (r"[?&]whatshere\[point\]=([\d.-]+),([\d.-]+)", "lonlat"),
-        (r"[?&]q=([\d.-]+),([\d.-]+)", "latlon"),
-        (r"[?&]rtext=(?:[^&~]*~)?([\d.-]+),([\d.-]+)", "latlon"),
-        (r"/@([\d.-]+),([\d.-]+)", "latlon"),
-        (r"!3d([\d.-]+)!4d([\d.-]+)", "latlon"),
-    ]
-    for pattern, orientation in patterns:
-        match = re.search(pattern, decoded, re.I)
-        if match:
-            first, second = map(float, match.groups())
-            latitude, longitude = (second, first) if orientation == "lonlat" else (first, second)
-            if -90 <= latitude <= 90 and -180 <= longitude <= 180:
-                return latitude, longitude, url
+    provider = map_url_provider(url)
+    if provider is None:
+        return None, None, url
+
+    decoded = unescape(url)
+    # Redirect targets are sometimes nested in a percent-encoded query value.
+    for _ in range(2):
+        next_value = unquote(decoded)
+        if next_value == decoded:
+            break
+        decoded = next_value
+    parts = urlsplit(decoded)
+    query = {
+        key.casefold(): values
+        for key, values in parse_qs(parts.query, keep_blank_values=True).items()
+    }
+
+    def pair(value: str, orientation: str) -> tuple[float, float] | None:
+        match = re.search(
+            r"(?<![\d.])-?\d{1,3}(?:\.\d+)?\s*[,;]\s*-?\d{1,3}(?:\.\d+)?(?![\d.])",
+            value,
+        )
+        if not match:
+            return None
+        first_text, second_text = re.split(r"\s*[,;]\s*", match.group(0), maxsplit=1)
+        first, second = float(first_text), float(second_text)
+        latitude, longitude = (second, first) if orientation == "lonlat" else (first, second)
+        if -90 <= latitude <= 90 and -180 <= longitude <= 180:
+            return latitude, longitude
+        return None
+
+    def value_for(*names: str) -> list[str]:
+        values: list[str] = []
+        for name in names:
+            values.extend(query.get(name.casefold(), []))
+        return values
+
+    def first_pair(values: list[str], orientation: str) -> tuple[float, float] | None:
+        for value in values:
+            result = pair(value, orientation)
+            if result is not None:
+                return result
+        return None
+
+    coordinates: tuple[float, float] | None = None
+    if provider == "google":
+        coordinates = first_pair(value_for("destination", "daddr", "query", "q"), "latlon")
+        is_directions = "/maps/dir/" in parts.path.casefold()
+        if coordinates is None and is_directions:
+            route_path = parts.path.split("/@", 1)[0].split("/data=", 1)[0]
+            route_pairs = re.findall(
+                r"-?\d{1,2}(?:\.\d+)?\s*,\s*-?\d{1,3}(?:\.\d+)?",
+                route_path,
+            )
+            if route_pairs:
+                coordinates = pair(route_pairs[-1], "latlon")
+        if coordinates is None:
+            # Exact POI coordinates win over the /@ camera centre.
+            exact_matches = re.findall(
+                r"!3d(-?\d{1,2}(?:\.\d+)?)!4d(-?\d{1,3}(?:\.\d+)?)",
+                decoded,
+                re.I,
+            )
+            if exact_matches:
+                exact = exact_matches[-1] if is_directions else exact_matches[0]
+                coordinates = pair(",".join(exact), "latlon")
+        if coordinates is None and is_directions:
+            legacy_route = re.findall(
+                r"!2d(-?\d{1,3}(?:\.\d+)?)!3d(-?\d{1,2}(?:\.\d+)?)",
+                decoded,
+                re.I,
+            )
+            if legacy_route:
+                longitude_text, latitude_text = legacy_route[-1]
+                coordinates = pair(f"{latitude_text},{longitude_text}", "latlon")
+        if coordinates is None:
+            camera = re.search(
+                r"/@(-?\d{1,2}(?:\.\d+)?),(-?\d{1,3}(?:\.\d+)?)",
+                decoded,
+                re.I,
+            )
+            if camera:
+                coordinates = pair(",".join(camera.groups()), "latlon")
+        if coordinates is None:
+            coordinates = first_pair(value_for("center", "ll"), "latlon")
+
+    elif provider == "yandex":
+        coordinates = first_pair(value_for("whatshere[point]", "pt"), "lonlat")
+        if coordinates is None:
+            # rtext is origin~destination and uses latitude,longitude.
+            for route in value_for("rtext"):
+                route_pairs = re.findall(
+                    r"-?\d{1,2}(?:\.\d+)?\s*,\s*-?\d{1,3}(?:\.\d+)?",
+                    route,
+                )
+                if route_pairs:
+                    coordinates = pair(route_pairs[-1], "latlon")
+                    if coordinates is not None:
+                        break
+        if coordinates is None:
+            coordinates = first_pair(value_for("ll"), "lonlat")
+
+    elif provider == "apple":
+        coordinates = first_pair(
+            value_for("coordinate", "destination", "daddr", "ll", "sll", "near", "center", "q"),
+            "latlon",
+        )
+
+    elif provider == "waze":
+        coordinates = first_pair(value_for("ll"), "latlon")
+        if coordinates is None:
+            match = re.search(
+                r"(?:^|[?&])to=ll\.(-?\d{1,2}(?:\.\d+)?),(-?\d{1,3}(?:\.\d+)?)",
+                decoded,
+                re.I,
+            )
+            if match:
+                coordinates = pair(",".join(match.groups()), "latlon")
+
+    elif provider == "osm":
+        lat_values, lon_values = value_for("mlat"), value_for("mlon")
+        if lat_values and lon_values:
+            coordinates = pair(f"{lat_values[0]},{lon_values[0]}", "latlon")
+        if coordinates is None:
+            for route in value_for("route"):
+                route_pairs = re.findall(
+                    r"-?\d{1,2}(?:\.\d+)?\s*[,;]\s*-?\d{1,3}(?:\.\d+)?",
+                    route,
+                )
+                if len(route_pairs) >= 2:
+                    coordinates = pair(route_pairs[-1], "latlon")
+                    if coordinates is not None:
+                        break
+        if coordinates is None:
+            viewport = re.search(
+                r"(?:#|[?&])map=\d+(?:\.\d+)?/(-?\d{1,2}(?:\.\d+)?)/(-?\d{1,3}(?:\.\d+)?)",
+                decoded,
+                re.I,
+            )
+            if viewport:
+                coordinates = pair(",".join(viewport.groups()), "latlon")
+
+    elif provider == "2gis":
+        # Object/path coordinates are more precise than viewport parameter m.
+        route_path = re.search(r"/directions/points/(.+)$", parts.path, re.I)
+        if route_path:
+            route_pairs = re.findall(
+                r"-?\d{1,3}(?:\.\d+)?\s*,\s*-?\d{1,2}(?:\.\d+)?",
+                route_path.group(1),
+            )
+            if route_pairs:
+                coordinates = pair(route_pairs[-1], "lonlat")
+        path_match = None
+        if coordinates is None:
+            path_match = re.search(
+                r"/(?:geo|firm)/[^/?#]*/(-?\d{1,3}(?:\.\d+)?),(-?\d{1,2}(?:\.\d+)?)(?:[/?#]|$)",
+                parts.path,
+                re.I,
+            )
+        if coordinates is None and path_match is None:
+            path_match = re.search(
+                r"/geo/(-?\d{1,3}(?:\.\d+)?),(-?\d{1,2}(?:\.\d+)?)(?:[/?#]|$)",
+                parts.path,
+                re.I,
+            )
+        if path_match:
+            coordinates = pair(",".join(path_match.groups()), "lonlat")
+        if coordinates is None:
+            state = re.search(
+                r"(?:^|[=/])center/(-?\d{1,3}(?:\.\d+)?),(-?\d{1,2}(?:\.\d+)?)(?:/|$)",
+                decoded,
+                re.I,
+            )
+            if state:
+                coordinates = pair(",".join(state.groups()), "lonlat")
+        if coordinates is None:
+            coordinates = first_pair(value_for("m"), "lonlat")
+
+    elif provider == "here":
+        coordinates = first_pair(value_for("map", "destination"), "latlon")
+        if coordinates is None:
+            path_match = re.search(
+                r"/l/(-?\d{1,2}(?:\.\d+)?),(-?\d{1,3}(?:\.\d+)?)",
+                parts.path,
+                re.I,
+            )
+            if path_match:
+                coordinates = pair(",".join(path_match.groups()), "latlon")
+
+    if coordinates is not None:
+        return coordinates[0], coordinates[1], url
     return None, None, url

@@ -5,6 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import httpx
+
 from app.bot.keyboards import (
     all_locations_keyboard, completed_keyboard, courier_cancelled_keyboard, courier_keyboard,
     delivery_pending_keyboard, location_channel_keyboard, manager_cancelled_keyboard,
@@ -14,7 +16,7 @@ from app.database import OrderRepository
 from app.database.repository import MIGRATION_COLUMNS, SCHEMA
 from app.handlers.orders import (
     DETAILS, PAYMENT, SECOND_LOCATION, _courier_waiting_pickup_text,
-    _publish_location, courier_action, delivery_input, details,
+    _location_values, _message_location_urls, _publish_location, courier_action, delivery_input, details,
     location_label_action, product, save_edit, second_location,
 )
 from app.utils.formatters import (
@@ -22,10 +24,46 @@ from app.utils.formatters import (
     telegram_location_url, telegram_message_url, yandex_map_url,
     yandex_route_url,
 )
-from app.utils.geocoding import extract_address, extract_text_address, resolve_map_url
+from app.utils.geocoding import (
+    _cache_map_resolution, _map_url_cache, extract_address, extract_text_address,
+    resolve_map_url,
+)
 from app.utils.parsers import normalize_phone, parse_amount, parse_location_url, parse_order_details
 from app.utils.payments import PAID_AT_ASSEMBLY, normalize_payment
 from app.utils.sellers import normalize_seller
+
+
+class _FakeResponseContext:
+    def __init__(self, response):
+        self.response = response
+
+    async def __aenter__(self):
+        return self.response
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+
+class _FakeMapClient:
+    """Exercise resolver redirect logic with either get() or stream()."""
+
+    def __init__(self, response_for):
+        self.response_for = response_for
+        self.requested_urls: list[str] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+    async def get(self, url, *args, **kwargs):
+        self.requested_urls.append(str(url))
+        return self.response_for(str(url))
+
+    def stream(self, method, url, *args, **kwargs):
+        self.requested_urls.append(str(url))
+        return _FakeResponseContext(self.response_for(str(url)))
 
 
 class ParserTests(unittest.TestCase):
@@ -108,6 +146,134 @@ class ParserTests(unittest.TestCase):
             (41.311081, 69.240562),
         )
 
+    def test_google_official_query_and_destination_urls(self):
+        cases = (
+            (
+                "https://www.google.com/maps/search/?api=1&query=41.311081%2C69.240562",
+                (41.311081, 69.240562),
+            ),
+            (
+                "https://www.google.com/maps/dir/?api=1&origin=41.338586%2C69.272757"
+                "&destination=41.311081%2C69.240562",
+                (41.311081, 69.240562),
+            ),
+            (
+                "https://maps.google.com/maps?daddr=41.311081%2C69.240562",
+                (41.311081, 69.240562),
+            ),
+            (
+                "https://www.google.com/maps/@?api=1&center=41.300000%2C69.200000"
+                "&query=41.311081%2C69.240562",
+                (41.311081, 69.240562),
+            ),
+        )
+        for url, expected in cases:
+            with self.subTest(url=url):
+                self.assertEqual(parse_location_url(url)[:2], expected)
+
+    def test_google_exact_place_marker_wins_over_map_view_center(self):
+        url = (
+            "https://www.google.com/maps/place/TEXNIKACH/"
+            "@41.300000,69.200000,14z/data=!4m6!3m5!8m2!3d41.311081!4d69.240562"
+        )
+
+        self.assertEqual(parse_location_url(url)[:2], (41.311081, 69.240562))
+
+    def test_google_browser_directions_uses_the_last_exact_point(self):
+        url = (
+            "https://www.google.com/maps/dir/Warehouse/Client/"
+            "@41.300000,69.200000/data=!3d41.338586!4d69.272757"
+            "!3d41.311081!4d69.240562"
+        )
+
+        self.assertEqual(parse_location_url(url)[:2], (41.311081, 69.240562))
+
+    def test_yandex_whatshere_marker_wins_over_map_view_center(self):
+        url = (
+            "https://yandex.uz/maps/?ll=69.200000%2C41.300000"
+            "&whatshere%5Bpoint%5D=69.240562%2C41.311081&z=13"
+        )
+
+        self.assertEqual(parse_location_url(url)[:2], (41.311081, 69.240562))
+
+    def test_apple_waze_openstreetmap_and_2gis_coordinates(self):
+        cases = (
+            (
+                "https://maps.apple.com/?ll=41.311081%2C69.240562&q=Client+41.1%2C69.1",
+                (41.311081, 69.240562),
+            ),
+            (
+                "https://maps.apple.com/?q=41.311081%2C69.240562",
+                (41.311081, 69.240562),
+            ),
+            (
+                "https://www.waze.com/ul?ll=41.311081%2C69.240562&navigate=yes",
+                (41.311081, 69.240562),
+            ),
+            (
+                "https://www.openstreetmap.org/?mlat=41.311081&mlon=69.240562"
+                "#map=13/41.300000/69.200000",
+                (41.311081, 69.240562),
+            ),
+            (
+                "https://www.openstreetmap.org/directions?"
+                "route=41.338586%2C69.272757%3B41.311081%2C69.240562",
+                (41.311081, 69.240562),
+            ),
+            (
+                "https://2gis.uz/tashkent?m=69.240562%2C41.311081%2F18",
+                (41.311081, 69.240562),
+            ),
+            (
+                "https://2gis.uz/tashkent/firm/700000010/69.240562,41.311081"
+                "?m=69.200000%2C41.300000%2F12",
+                (41.311081, 69.240562),
+            ),
+            (
+                "https://2gis.ru/museum?return_url=https%3A%2F%2F2gis.ru%2Ftashkent"
+                "%3FqueryState%3Dcenter%252F69.240562%252C41.311081%252Fzoom%252F16",
+                (41.311081, 69.240562),
+            ),
+            (
+                "https://2gis.uz/directions/points/69.200000,41.300000%7C"
+                "69.240562,41.311081",
+                (41.311081, 69.240562),
+            ),
+        )
+        for url, expected in cases:
+            with self.subTest(url=url):
+                self.assertEqual(parse_location_url(url)[:2], expected)
+
+    def test_map_url_is_extracted_from_wrapper_text(self):
+        url = "https://maps.apple.com/?ll=41.311081%2C69.240562"
+        parsed = parse_order_details(f"Вот локация клиента: {url} (второй подъезд).")
+
+        self.assertEqual(parsed["location_urls"], [url])
+
+    def test_hidden_telegram_text_link_is_extracted(self):
+        url = "https://maps.app.goo.gl/AbCdEf123"
+        entity = SimpleNamespace(type="text_link", url=url, offset=0, length=8)
+        message = SimpleNamespace(
+            text="Локация",
+            caption=None,
+            entities=(entity,),
+            caption_entities=(),
+        )
+
+        self.assertEqual(_message_location_urls(message), [url])
+
+    def test_unrelated_link_does_not_hide_two_following_map_links(self):
+        google = "https://maps.google.com/?q=41.311081,69.240562"
+        yandex = "https://yandex.uz/maps/?ll=69.250000%2C41.320000"
+        message = SimpleNamespace(
+            text=f"https://texnikach.uz/catalog\n{google}\n{yandex}",
+            caption=None,
+            entities=(),
+            caption_entities=(),
+        )
+
+        self.assertEqual(_message_location_urls(message), [google, yandex])
+
     def test_short_map_link_is_preserved(self):
         lat, lon, url = parse_location_url("https://yandex.com/maps/-/short")
         self.assertEqual((lat, lon), (None, None))
@@ -140,6 +306,25 @@ class ParserTests(unittest.TestCase):
 
 
 class MapUrlTests(unittest.IsolatedAsyncioTestCase):
+    async def test_map_resolution_cache_stays_bounded(self):
+        previous = dict(_map_url_cache)
+        _map_url_cache.clear()
+        try:
+            for index in range(257):
+                _cache_map_resolution(
+                    f"https://maps.app.goo.gl/cache-{index}",
+                    41.3,
+                    69.2,
+                    f"https://www.google.com/maps/?q=41.3,69.2&item={index}",
+                    3600,
+                )
+            self.assertEqual(len(_map_url_cache), 256)
+            self.assertNotIn("https://maps.app.goo.gl/cache-0", _map_url_cache)
+            self.assertIn("https://maps.app.goo.gl/cache-256", _map_url_cache)
+        finally:
+            _map_url_cache.clear()
+            _map_url_cache.update(previous)
+
     async def test_resolve_parsed_yandex_url_without_network(self):
         result = await resolve_map_url("https://yandex.uz/maps/?ll=69.240562%2C41.311081")
         self.assertEqual(result[:2], (41.311081, 69.240562))
@@ -147,6 +332,119 @@ class MapUrlTests(unittest.IsolatedAsyncioTestCase):
     async def test_reject_non_map_domain(self):
         with self.assertRaises(ValueError):
             await resolve_map_url("https://example.com/?q=41.3,69.2")
+
+    async def test_resolve_allowed_google_short_redirect(self):
+        short_url = "https://maps.app.goo.gl/AbCdEf123"
+        resolved_url = (
+            "https://www.google.com/maps/search/?api=1"
+            "&query=41.311081%2C69.240562"
+        )
+
+        def response_for(url):
+            if url == short_url:
+                return httpx.Response(
+                    302,
+                    headers={"location": resolved_url},
+                    request=httpx.Request("GET", short_url),
+                )
+            return httpx.Response(
+                200,
+                request=httpx.Request("GET", resolved_url),
+            )
+
+        client = _FakeMapClient(response_for)
+
+        with patch("app.utils.geocoding.httpx.AsyncClient", return_value=client):
+            result = await resolve_map_url(short_url)
+
+        self.assertEqual(result[:2], (41.311081, 69.240562))
+        self.assertEqual(result[2], resolved_url)
+
+    async def test_resolve_short_link_from_bounded_html_map_metadata(self):
+        short_url = "https://maps.app.goo.gl/HtmlMetadata123"
+        resolved_url = (
+            "https://www.google.com/maps/search/?api=1"
+            "&query=41.311081%2C69.240562"
+        )
+        html = (
+            '<html><head><meta property="og:url" content="'
+            + resolved_url.replace("&", "&amp;")
+            + '"></head></html>'
+        )
+        client = _FakeMapClient(
+            lambda url: httpx.Response(
+                200,
+                content=html.encode(),
+                headers={"content-type": "text/html; charset=utf-8"},
+                request=httpx.Request("GET", url),
+            )
+        )
+
+        with patch("app.utils.geocoding.httpx.AsyncClient", return_value=client):
+            result = await resolve_map_url(short_url)
+
+        self.assertEqual(result[:2], (41.311081, 69.240562))
+        self.assertEqual(result[2], resolved_url)
+
+    async def test_short_redirect_to_unapproved_host_fails_closed(self):
+        short_url = "https://maps.app.goo.gl/UnsafeRedirect123"
+
+        def response_for(url):
+            return httpx.Response(
+                302,
+                headers={
+                    "location": "https://maps.attacker.example/?q=41.311081,69.240562",
+                },
+                request=httpx.Request("GET", url),
+            )
+
+        client = _FakeMapClient(response_for)
+
+        with patch("app.utils.geocoding.httpx.AsyncClient", return_value=client):
+            result = await resolve_map_url(short_url)
+
+        self.assertEqual(result, (None, None, short_url))
+        self.assertEqual(client.requested_urls, [short_url])
+
+    async def test_embedded_static_map_viewport_is_not_used_as_customer_location(self):
+        short_url = "https://maps.app.goo.gl/NoCoordinates123"
+        html = (
+            '<img src="https://maps.google.com/maps/api/staticmap?'
+            'center=41.2975104%2C69.2617216&amp;zoom=12">'
+        )
+        client = _FakeMapClient(
+            lambda url: httpx.Response(
+                200,
+                content=html.encode(),
+                request=httpx.Request("GET", url),
+            )
+        )
+
+        with patch("app.utils.geocoding.httpx.AsyncClient", return_value=client):
+            result = await resolve_map_url(short_url)
+
+        self.assertEqual(result, (None, None, short_url))
+
+    async def test_yandex_object_page_uses_only_coordinates_tied_to_its_org_id(self):
+        object_url = "https://yandex.uz/maps/org/texnikach/133297049157/"
+        html = (
+            '<div data-object="search-result" data-id="999" '
+            'data-coordinates="69.100000,41.100000"></div>'
+            '<div data-object="search-result" data-id="133297049157" '
+            'data-coordinates="69.248501,41.316772"></div>'
+        )
+        client = _FakeMapClient(
+            lambda url: httpx.Response(
+                200,
+                content=html.encode(),
+                request=httpx.Request("GET", url),
+            )
+        )
+
+        with patch("app.utils.geocoding.httpx.AsyncClient", return_value=client):
+            result = await resolve_map_url(object_url)
+
+        self.assertEqual(result[:2], (41.316772, 69.248501))
 
 
 class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
@@ -168,6 +466,44 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
             effective_chat=SimpleNamespace(id=1, type="private"),
             effective_user=SimpleNamespace(id=1, full_name="Manager", username=None),
         )
+
+    async def test_edit_location_accepts_a_labelled_google_link(self):
+        message = SimpleNamespace(
+            text="Локация: https://maps.google.com/?q=41.311081,69.240562",
+            caption=None,
+            location=None,
+            venue=None,
+            entities=(),
+            caption_entities=(),
+        )
+        address = {"address_text": None, "district": None, "mahalla": None}
+
+        with patch("app.utils.geocoding.reverse_geocode", AsyncMock(return_value=address)):
+            values = await _location_values(message)
+
+        self.assertEqual((values["latitude"], values["longitude"]), (41.311081, 69.240562))
+
+    async def test_venue_replaces_text_location_prompt(self):
+        context = self.context()
+        context.user_data["draft"]["awaiting_text_location"] = True
+        update = self.update(None)
+        update.message.venue = SimpleNamespace(
+            location=SimpleNamespace(latitude=41.311081, longitude=69.240562)
+        )
+        update.message.caption = None
+        update.message.entities = ()
+        update.message.caption_entities = ()
+        address = {"address_text": None, "district": None, "mahalla": None}
+
+        with patch("app.utils.geocoding.reverse_geocode", AsyncMock(return_value=address)):
+            state = await details(update, context)
+
+        self.assertEqual(state, DETAILS)
+        self.assertEqual(
+            (context.user_data["draft"]["latitude"], context.user_data["draft"]["longitude"]),
+            (41.311081, 69.240562),
+        )
+        self.assertNotIn("awaiting_text_location", context.user_data["draft"])
 
     async def test_product_step_uses_short_details_prompt(self):
         update = self.update("A57 Pro")
