@@ -16,7 +16,8 @@ from app.database import OrderRepository
 from app.database.repository import MIGRATION_COLUMNS, SCHEMA
 from app.handlers.orders import (
     DETAILS, PAYMENT, SECOND_LOCATION, _courier_waiting_pickup_text,
-    _location_values, _message_location_urls, _publish_location, courier_action, delivery_input, details,
+    _location_values, _message_location_urls, _publish_location,
+    _waiting_pickup_reminder_messages, courier_action, delivery_input, details,
     location_label_action, product, save_edit, second_location,
 )
 from app.utils.formatters import (
@@ -445,6 +446,132 @@ class MapUrlTests(unittest.IsolatedAsyncioTestCase):
             result = await resolve_map_url(object_url)
 
         self.assertEqual(result[:2], (41.316772, 69.248501))
+
+
+class PickupReminderMessageTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.repo = OrderRepository(Path(self.tempdir.name) / "delivery.db")
+        self.repo.initialize()
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+
+    def create_order(
+        self,
+        product: str,
+        *,
+        status: str = "pending",
+        courier_id: int | None = 1799690992,
+        courier_name: str | None = "Muzrob & Oka",
+        seller_name: str = "Ali",
+    ):
+        order = self.repo.create(
+            manager_id=101,
+            manager_name="Manager",
+            data={
+                "seller_name": seller_name,
+                "client_phone": "+998901333999",
+                "product": product,
+                "amount_usd": 100,
+            },
+        )
+        return self.repo.update(
+            order.id,
+            status=status,
+            assigned_courier_id=courier_id,
+            assigned_courier_name=courier_name,
+        )
+
+    def test_reminder_is_empty_without_assigned_pending_orders(self):
+        self.create_order(
+            "Pending without courier",
+            courier_id=None,
+            courier_name=None,
+        )
+        self.create_order("Already picked up", status="picked_up")
+        self.create_order("Already on way", status="on_way")
+
+        self.assertEqual(_waiting_pickup_reminder_messages(self.repo), [])
+
+    def test_reminder_filters_and_groups_pending_orders_by_courier(self):
+        muzrob_orders = [
+            self.create_order("A57 Pro"),
+            self.create_order("A56"),
+        ]
+        olmas_orders = [
+            self.create_order(
+                "iPhone 16",
+                courier_id=7636344727,
+                courier_name="Olmas <Lead>",
+                seller_name="Abbos",
+            ),
+            self.create_order(
+                "Samsung S25",
+                courier_id=7636344727,
+                courier_name="Olmas <Lead>",
+                seller_name="Otabek",
+            ),
+        ]
+        excluded = [
+            self.create_order(
+                "Unassigned",
+                courier_id=None,
+                courier_name=None,
+            ),
+            self.create_order("Picked up", status="picked_up"),
+            self.create_order("On way", status="on_way"),
+            self.create_order("Completed", status="completed"),
+            self.create_order("Cancelled", status="cancelled"),
+        ]
+
+        messages = _waiting_pickup_reminder_messages(self.repo)
+        combined = "\n".join(messages)
+
+        self.assertEqual(len(messages), 1)
+        for order in [*muzrob_orders, *olmas_orders]:
+            self.assertEqual(combined.count(f"Заказ №{order.order_number} ·"), 1)
+        for order in excluded:
+            self.assertNotIn(f"Заказ №{order.order_number} ·", combined)
+
+        # A courier name is a group heading, not repeated on every order row.
+        self.assertEqual(combined.count("Muzrob &amp; Oka"), 1)
+        self.assertEqual(combined.count("Olmas &lt;Lead&gt;"), 1)
+        lines = combined.splitlines()
+        self.assertTrue(
+            any("Muzrob &amp; Oka" in line and "<b>" in line for line in lines)
+        )
+        self.assertTrue(
+            any("Olmas &lt;Lead&gt;" in line and "<b>" in line for line in lines)
+        )
+        self.assertIn("забрали", combined.casefold())
+
+    def test_reminder_paginates_losslessly_and_escapes_html(self):
+        orders = [
+            self.create_order(
+                f"MODEL-{index:02d} " + "<&>" * 44,
+                courier_name="Muzrob <Courier & Co>",
+                seller_name="Ali <Manager & Co>",
+            )
+            for index in range(24)
+        ]
+
+        messages = _waiting_pickup_reminder_messages(self.repo)
+        combined = "\n".join(messages)
+
+        self.assertGreater(len(messages), 1)
+        self.assertTrue(all(len(message) <= 4096 for message in messages))
+        for order in orders:
+            self.assertEqual(combined.count(f"Заказ №{order.order_number} ·"), 1)
+        self.assertTrue(
+            all("Muzrob &lt;Courier &amp; Co&gt;" in message for message in messages)
+        )
+        self.assertIn("Ali &lt;Manager &amp; Co&gt;", combined)
+        self.assertIn("&lt;&amp;&gt;", combined)
+        self.assertNotIn("<Courier", combined)
+        self.assertNotIn("<Manager", combined)
+        self.assertNotIn("<&>", combined)
+        self.assertTrue(all("забрали" in message.casefold() for message in messages))
 
 
 class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):

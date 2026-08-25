@@ -15,14 +15,22 @@ from telegram.error import BadRequest, RetryAfter, TimedOut
 
 from app.bot.application import (
     HEALTH_SIGNAL_FILENAME,
+    PICKUP_REMINDER_INTERVAL,
+    PICKUP_REMINDER_TASK_KEY,
     SYNC_RECONCILIATION_BATCH_SIZE,
     _delivery_sync_worker,
+    _pickup_reminder_worker,
+    _pickup_reminder_slot,
+    _seconds_until_next_pickup_reminder,
+    _start_pickup_reminder_worker,
     error_handler,
     _sleep_with_health_signal,
     _start_delivery_sync_worker,
     _touch_health_signal,
     initialize_delivery_runtime,
     reconcile_pending_orders,
+    send_waiting_pickup_reminders,
+    shutdown_delivery_runtime,
 )
 
 
@@ -43,12 +51,14 @@ class DeliveryRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 AsyncMock(side_effect=TimedOut()),
             ),
             patch("app.bot.application._start_delivery_sync_worker") as start_worker,
+            patch("app.bot.application._start_pickup_reminder_worker") as start_reminders,
         ):
             with self.assertLogs("app.bot.application", level="WARNING"):
                 await initialize_delivery_runtime(application)
 
         self.assertFalse(application.bot_data["delivery_preflight_validated"])
         start_worker.assert_called_once_with(application)
+        start_reminders.assert_called_once_with(application)
 
     async def test_startup_rate_limit_is_treated_as_temporary(self):
         application = self.application()
@@ -58,12 +68,14 @@ class DeliveryRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 AsyncMock(side_effect=RetryAfter(7)),
             ),
             patch("app.bot.application._start_delivery_sync_worker") as start_worker,
+            patch("app.bot.application._start_pickup_reminder_worker") as start_reminders,
         ):
             with self.assertLogs("app.bot.application", level="WARNING"):
                 await initialize_delivery_runtime(application)
 
         self.assertFalse(application.bot_data["delivery_preflight_validated"])
         start_worker.assert_called_once_with(application)
+        start_reminders.assert_called_once_with(application)
 
     async def test_confirmed_invalid_chat_configuration_remains_fatal(self):
         application = self.application()
@@ -170,6 +182,110 @@ class DeliveryRuntimeTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
 
         application.stop_running.assert_called_once()
+
+    def test_pickup_reminder_is_aligned_to_the_next_half_hour(self):
+        timestamp = PICKUP_REMINDER_INTERVAL * 10 + 1_200
+
+        self.assertEqual(_pickup_reminder_slot(timestamp), 10)
+        self.assertEqual(_seconds_until_next_pickup_reminder(timestamp), 600)
+        self.assertEqual(
+            _seconds_until_next_pickup_reminder(PICKUP_REMINDER_INTERVAL * 11),
+            PICKUP_REMINDER_INTERVAL,
+        )
+
+    async def test_pickup_reminder_waits_until_boundary_before_first_snapshot(self):
+        application = self.application()
+        sleeps = AsyncMock(side_effect=[None, asyncio.CancelledError()])
+        publish = AsyncMock()
+
+        with (
+            patch("app.bot.application.asyncio.sleep", sleeps),
+            patch(
+                "app.bot.application._seconds_until_next_pickup_reminder",
+                return_value=125.0,
+            ),
+            patch("app.bot.application._pickup_reminder_slot", return_value=42),
+            patch("app.bot.application.send_waiting_pickup_reminders", publish),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await _pickup_reminder_worker(application)
+
+        self.assertEqual(sleeps.await_args_list[0].args, (125.0,))
+        publish.assert_awaited_once_with(application, slot=42)
+
+    async def test_pickup_reminder_retries_next_cycle_after_failure(self):
+        application = self.application()
+        sleeps = AsyncMock(side_effect=[None, None, asyncio.CancelledError()])
+        publish = AsyncMock(side_effect=[RuntimeError("temporary"), None])
+
+        with (
+            patch("app.bot.application.asyncio.sleep", sleeps),
+            patch(
+                "app.bot.application._seconds_until_next_pickup_reminder",
+                return_value=1.0,
+            ),
+            patch(
+                "app.bot.application._pickup_reminder_slot",
+                side_effect=[42, 43],
+            ),
+            patch("app.bot.application.send_waiting_pickup_reminders", publish),
+        ):
+            with self.assertLogs("app.bot.application", level="ERROR"):
+                with self.assertRaises(asyncio.CancelledError):
+                    await _pickup_reminder_worker(application)
+
+        self.assertEqual(publish.await_count, 2)
+
+    async def test_pickup_reminder_sends_every_digest_page_to_log(self):
+        repo = SimpleNamespace(claim_periodic_job=Mock(return_value=True))
+        settings = SimpleNamespace(orders_channel_id=-1004459657817)
+        application = self.application(repo=repo, settings=settings)
+        messages = ["первая", "вторая"]
+        notify = AsyncMock()
+
+        with (
+            patch(
+                "app.bot.application._waiting_pickup_reminder_messages",
+                return_value=messages,
+            ) as formatter,
+            patch("app.bot.application._notify_log", notify),
+        ):
+            sent = await send_waiting_pickup_reminders(application, slot=42)
+
+        self.assertEqual(sent, 2)
+        repo.claim_periodic_job.assert_called_once_with(
+            "waiting_pickup:-1004459657817",
+            42,
+        )
+        formatter.assert_called_once_with(repo)
+        self.assertEqual([call.args[1] for call in notify.await_args_list], messages)
+
+    async def test_pickup_reminder_duplicate_slot_is_not_built_or_sent(self):
+        repo = SimpleNamespace(claim_periodic_job=Mock(return_value=False))
+        settings = SimpleNamespace(orders_channel_id=-1004459657817)
+        application = self.application(repo=repo, settings=settings)
+
+        with (
+            patch("app.bot.application._waiting_pickup_reminder_messages") as formatter,
+            patch("app.bot.application._notify_log", AsyncMock()) as notify,
+        ):
+            sent = await send_waiting_pickup_reminders(application, slot=42)
+
+        self.assertEqual(sent, 0)
+        formatter.assert_not_called()
+        notify.assert_not_awaited()
+
+    async def test_pickup_reminder_is_singleton_and_shutdown_cancels_it(self):
+        application = self.application()
+
+        _start_pickup_reminder_worker(application)
+        first = application.bot_data[PICKUP_REMINDER_TASK_KEY]
+        _start_pickup_reminder_worker(application)
+
+        self.assertIs(application.bot_data[PICKUP_REMINDER_TASK_KEY], first)
+        await shutdown_delivery_runtime(application)
+        self.assertTrue(first.cancelled())
+        self.assertNotIn(PICKUP_REMINDER_TASK_KEY, application.bot_data)
 
     async def test_worker_stops_polling_after_later_confirmed_preflight_error(self):
         with tempfile.TemporaryDirectory() as directory:

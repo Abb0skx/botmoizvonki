@@ -416,6 +416,69 @@ def _courier_waiting_pickup_text(
     return "\n".join(lines)
 
 
+def _waiting_pickup_reminder_messages(repo: OrderRepository) -> list[str]:
+    """Build lossless, Telegram-sized Log reminders for uncollected products."""
+    waiting = [
+        order
+        for order in repo.list_active()
+        if order.status == "pending" and order.assigned_courier_id is not None
+    ]
+    if not waiting:
+        return []
+    waiting.sort(key=lambda order: (
+        (order.assigned_courier_name or "").casefold(),
+        order.order_number,
+    ))
+
+    entries: list[tuple[str, str]] = []
+    for index, order in enumerate(waiting, start=1):
+        courier = " ".join(
+            (order.assigned_courier_name or order.courier_name or "Курьер").split()
+        )[:60]
+        seller = " ".join(
+            (order.seller_name or order.manager_name or "—").split()
+        )[:60]
+        product = " ".join((order.product or "Без модели").split())[:140]
+        entries.append(
+            (
+                courier,
+                f"{index}. Заказ №{order.order_number} · "
+                f"{escape(seller)} · {escape(product)}",
+            )
+        )
+
+    # Keep enough headroom for the repeated title/footer and part counter.
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    current_courier: str | None = None
+    for courier, line in entries:
+        courier_changed = courier != current_courier
+        addition = (
+            ([""] if current else [])
+            + [f"🚚 <b>{escape(courier)}</b>"]
+            if courier_changed
+            else []
+        ) + [line]
+        if current and len("\n".join([*current, *addition])) > 3300:
+            chunks.append(current)
+            current = [f"🚚 <b>{escape(courier)}</b>", line]
+        else:
+            current.extend(addition)
+        current_courier = courier
+    if current:
+        chunks.append(current)
+
+    messages: list[str] = []
+    for part, chunk in enumerate(chunks, start=1):
+        part_text = f" · часть {part}/{len(chunks)}" if len(chunks) > 1 else ""
+        messages.append(
+            f"⏰ <b>Заказы ещё не забраны</b>{part_text}\n\n"
+            + "\n".join(chunk)
+            + "\n\n❓ Курьеры, забрали товары?"
+        )
+    return messages
+
+
 async def _send_post_delivery_prompt(
     context: ContextTypes.DEFAULT_TYPE,
     order,

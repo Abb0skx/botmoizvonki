@@ -8,7 +8,7 @@ from typing import Any
 
 from app.models import Order, OrderEvent
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 SQLITE_INT_MAX = 2**63 - 1
 KNOWN_STATUSES = frozenset({
     "draft",
@@ -161,6 +161,12 @@ CREATE TABLE IF NOT EXISTS telegram_cleanup_queue (
 );
 CREATE INDEX IF NOT EXISTS idx_cleanup_queue_retry
 ON telegram_cleanup_queue(attempts, id);
+CREATE TABLE IF NOT EXISTS periodic_job_claims (
+    job_name TEXT NOT NULL,
+    slot INTEGER NOT NULL CHECK(slot >= 0),
+    claimed_at TEXT NOT NULL,
+    PRIMARY KEY(job_name, slot)
+) WITHOUT ROWID;
 """
 
 MIGRATION_COLUMNS = {
@@ -356,6 +362,23 @@ class OrderRepository:
             current_version = int(db.execute("PRAGMA user_version").fetchone()[0])
             if current_version < SCHEMA_VERSION:
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+    def claim_periodic_job(self, job_name: str, slot: int) -> bool:
+        """Atomically claim one wall-clock slot across all bot processes."""
+        clean_name = job_name.strip() if isinstance(job_name, str) else ""
+        if not clean_name:
+            raise ValueError("job_name cannot be empty")
+        if isinstance(slot, bool) or not isinstance(slot, int) or slot < 0:
+            raise ValueError("slot must be a non-negative integer")
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            cursor = db.execute(
+                """INSERT INTO periodic_job_claims(job_name, slot, claimed_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(job_name, slot) DO NOTHING""",
+                (clean_name, slot, now()),
+            )
+        return cursor.rowcount == 1
 
     @staticmethod
     def _validate_money(field: str, value: Any) -> None:
