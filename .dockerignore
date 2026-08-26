@@ -10,5 +10,11 @@ data/*.db
 data/*.db-shm
 data/*.db-wal
 data/delivery-state.pickle*
+# Google service-account credentials must only be supplied through Coolify
+# secrets or a runtime-mounted secret file, never copied into an image.
+**/sheets-auto-update-*.json
+**/*service-account*.json
+**/*service_account*.json
+**/google-credentials*.json
 venv/
 .venv/
