@@ -40,6 +40,11 @@ from fastapi import (
 from fastapi.responses import HTMLResponse
 
 from instagram_bot import router as instagram_router
+from price_server.router import (
+    router as price_server_router,
+    start_price_server,
+    stop_price_server,
+)
 from reviews.router import router as reviews_router
 from telegram_business.router import router as telegram_business_router
 from telegram_business.router import get_service as get_telegram_business_service
@@ -58,6 +63,10 @@ app.include_router(
 )
 
 app.include_router(
+    price_server_router
+)
+
+app.include_router(
     reviews_router
 )
 
@@ -73,6 +82,8 @@ _transcription_worker = None
 async def start_telegram_business():
     global _telegram_business_scheduler
     global _transcription_worker
+
+    await start_price_server()
 
     if telegram_business_settings.enabled:
         service = get_telegram_business_service()
@@ -96,6 +107,8 @@ async def start_telegram_business():
 
 @app.on_event("shutdown")
 async def stop_telegram_business():
+    await stop_price_server()
+
     if _telegram_business_scheduler:
         await _telegram_business_scheduler.stop()
 
@@ -9145,42 +9158,6 @@ def mark_sale_not_bought(
         "not_bought",
         telegram_user,
         reason_code=reason_code,
-    )
-
-
-# =========================================================
-# PRICE PAGE
-# =========================================================
-
-PRICE_HTML_FILE = Path(
-    "/app/price/index.html"
-)
-
-
-@app.get(
-    "/price",
-    response_class=HTMLResponse,
-)
-async def price_page():
-
-    if not PRICE_HTML_FILE.exists():
-
-        return HTMLResponse(
-            content=(
-                "<h1>Price page not found</h1>"
-            ),
-            status_code=404,
-        )
-
-    html_content = (
-        PRICE_HTML_FILE.read_text(
-            encoding="utf-8"
-        )
-    )
-
-    return HTMLResponse(
-        content=html_content,
-        status_code=200,
     )
 
 

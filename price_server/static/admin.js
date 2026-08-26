@@ -1,0 +1,280 @@
+(() => {
+    "use strict";
+
+    const actionHeader = {"X-Requested-With": "TexnikachPriceAdmin"};
+
+    const style = document.createElement("style");
+    style.textContent = `
+        .price-server-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: .5rem;
+            margin-left: auto;
+        }
+        .price-server-action {
+            border: 1px solid rgba(14, 82, 54, .24);
+            border-radius: 999px;
+            background: #fff;
+            color: #164e3b;
+            cursor: pointer;
+            font: inherit;
+            font-size: .84rem;
+            font-weight: 650;
+            padding: .58rem .85rem;
+        }
+        .price-server-action:hover { background: #eef8f3; }
+        .price-server-action:disabled { cursor: wait; opacity: .55; }
+        .price-server-action.primary { background: #176b4b; color: #fff; }
+        .price-server-toast {
+            position: fixed;
+            z-index: 10000;
+            right: 1rem;
+            bottom: 1rem;
+            max-width: min(28rem, calc(100vw - 2rem));
+            border-radius: .8rem;
+            box-shadow: 0 12px 35px rgba(0, 0, 0, .22);
+            background: #173f32;
+            color: #fff;
+            padding: .9rem 1rem;
+        }
+        .price-server-toast.error { background: #8f2d2d; }
+        .price-server-job-panel {
+            margin: 1rem auto 1.5rem;
+            max-width: 72rem;
+            border: 1px solid rgba(14, 82, 54, .18);
+            border-radius: 1rem;
+            background: #f8fcfa;
+            padding: 1rem;
+        }
+        .price-server-job-heading {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 1rem;
+        }
+        .price-server-job-heading h2 { margin: 0; font-size: 1.15rem; }
+        .price-server-job-list { display: grid; gap: .65rem; margin-top: .8rem; }
+        .price-server-job-row {
+            display: grid;
+            grid-template-columns: minmax(9rem, 1fr) minmax(12rem, 2fr) auto auto;
+            align-items: center;
+            gap: .65rem;
+            border-radius: .7rem;
+            background: #fff;
+            padding: .7rem .8rem;
+        }
+        .price-server-job-status { color: #47645a; font-size: .86rem; }
+        .price-server-empty { color: #60766e; margin: .7rem 0 0; }
+        @media (max-width: 680px) {
+            .price-server-actions { width: 100%; margin-left: 0; }
+            .price-server-action { flex: 1 1 auto; }
+            .price-server-job-row { grid-template-columns: 1fr; }
+        }
+    `;
+    document.head.appendChild(style);
+
+    const toast = (message, error = false) => {
+        const previous = document.querySelector(".price-server-toast");
+        if (previous) previous.remove();
+        const element = document.createElement("div");
+        element.className = `price-server-toast${error ? " error" : ""}`;
+        element.setAttribute("role", error ? "alert" : "status");
+        element.textContent = message;
+        document.body.appendChild(element);
+        window.setTimeout(() => element.remove(), error ? 9000 : 5000);
+    };
+
+    const request = async (path, payload = {}) => {
+        const response = await fetch(path, {
+            method: "POST",
+            credentials: "same-origin",
+            headers: {
+                ...actionHeader,
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify(payload),
+        });
+        let body = {};
+        try { body = await response.json(); } catch (_) { /* no-op */ }
+        if (!response.ok) {
+            throw new Error(body.detail || `Ошибка сервера: ${response.status}`);
+        }
+        return body;
+    };
+
+    const run = async (button, path, payload, successText) => {
+        const buttons = button.closest(".price-server-actions").querySelectorAll("button");
+        buttons.forEach((item) => { item.disabled = true; });
+        try {
+            const result = await request(path, payload);
+            toast(`${successText} Задача #${result.job_id}.`);
+            await refreshJobs();
+        } catch (error) {
+            toast(error instanceof Error ? error.message : "Неизвестная ошибка", true);
+        } finally {
+            buttons.forEach((item) => { item.disabled = false; });
+        }
+    };
+
+    const makeButton = (label, title, className = "") => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = `price-server-action ${className}`.trim();
+        button.textContent = label;
+        button.title = title;
+        return button;
+    };
+
+    const sectionTitles = new Map(
+        [...document.querySelectorAll(".major-price-section[id]")].map((section) => [
+            section.id,
+            section.getAttribute("aria-label") || section.id,
+        ])
+    );
+    const jobPanel = document.createElement("section");
+    jobPanel.className = "price-server-job-panel";
+    const jobHeading = document.createElement("div");
+    jobHeading.className = "price-server-job-heading";
+    const jobTitle = document.createElement("h2");
+    jobTitle.textContent = "Расписание Telegram";
+    const refresh = makeButton("Обновить", "Обновить список заданий");
+    const jobList = document.createElement("div");
+    jobList.className = "price-server-job-list";
+    jobHeading.append(jobTitle, refresh);
+    jobPanel.append(jobHeading, jobList);
+
+    const pageMain = document.querySelector("main") || document.body;
+    pageMain.insertBefore(jobPanel, pageMain.firstChild);
+
+    const statusNames = {
+        pending: "запланировано",
+        running: "отправляется",
+        done: "выполнено",
+        failed: "ошибка",
+        needs_review: "нужна проверка",
+        cancelled: "отменено",
+    };
+    const actionNames = {send: "Новый пост", edit: "Обновление поста"};
+    const tashkentDate = new Intl.DateTimeFormat("ru-RU", {
+        timeZone: "Asia/Tashkent",
+        day: "2-digit",
+        month: "2-digit",
+        year: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+    });
+
+    async function refreshJobs() {
+        refresh.disabled = true;
+        try {
+            const response = await fetch("/price/api/v1/jobs", {
+                credentials: "same-origin",
+                cache: "no-store",
+            });
+            if (!response.ok) throw new Error(`Ошибка расписания: ${response.status}`);
+            const body = await response.json();
+            const jobs = Array.isArray(body.jobs) ? body.jobs : [];
+            const active = new Set(["pending", "running"]);
+            jobs.sort((left, right) => {
+                const leftActive = active.has(left.status);
+                const rightActive = active.has(right.status);
+                if (leftActive !== rightActive) return leftActive ? -1 : 1;
+                const comparison = String(left.execute_at).localeCompare(String(right.execute_at));
+                return leftActive ? comparison : -comparison;
+            });
+            jobList.replaceChildren();
+
+            if (!jobs.length) {
+                const empty = document.createElement("p");
+                empty.className = "price-server-empty";
+                empty.textContent = "Запланированных и выполненных заданий пока нет.";
+                jobList.appendChild(empty);
+                return;
+            }
+
+            jobs.slice(0, 100).forEach((job) => {
+                const row = document.createElement("div");
+                row.className = "price-server-job-row";
+                const date = document.createElement("time");
+                date.dateTime = String(job.execute_at || "");
+                const parsed = new Date(job.execute_at);
+                date.textContent = Number.isNaN(parsed.getTime())
+                    ? String(job.execute_at || "—")
+                    : tashkentDate.format(parsed);
+                const name = document.createElement("span");
+                name.textContent = sectionTitles.get(job.section_key) || job.section_key || "Раздел";
+                const state = document.createElement("span");
+                state.className = "price-server-job-status";
+                state.textContent = `${actionNames[job.action] || job.action}: ${statusNames[job.status] || job.status}`;
+                row.append(date, name, state);
+
+                if (job.status === "pending") {
+                    const cancel = makeButton("Отменить", "Отменить запланированное задание");
+                    cancel.addEventListener("click", async () => {
+                        if (!window.confirm("Отменить эту публикацию?")) return;
+                        cancel.disabled = true;
+                        try {
+                            await request(`/price/api/v1/jobs/${encodeURIComponent(job.job_id)}/cancel`);
+                            toast(`Задача #${job.job_id} отменена.`);
+                            await refreshJobs();
+                        } catch (error) {
+                            toast(error instanceof Error ? error.message : "Ошибка отмены", true);
+                        } finally {
+                            cancel.disabled = false;
+                        }
+                    });
+                    row.appendChild(cancel);
+                }
+                jobList.appendChild(row);
+            });
+        } catch (error) {
+            jobList.replaceChildren();
+            const failed = document.createElement("p");
+            failed.className = "price-server-empty";
+            failed.textContent = error instanceof Error ? error.message : "Не удалось загрузить расписание.";
+            jobList.appendChild(failed);
+        } finally {
+            refresh.disabled = false;
+        }
+    }
+
+    refresh.addEventListener("click", refreshJobs);
+
+    document.querySelectorAll(".major-price-section[id]").forEach((section) => {
+        const toolbar = section.querySelector(".major-section-toolbar");
+        if (!toolbar || toolbar.querySelector(".price-server-actions")) return;
+
+        const key = section.id;
+        const actions = document.createElement("div");
+        actions.className = "price-server-actions";
+
+        const send = makeButton("Отправить сейчас", "Создать новый пост в канале", "primary");
+        send.addEventListener("click", () => {
+            if (!window.confirm("Отправить этот прайс новым постом прямо сейчас?")) return;
+            run(send, `/price/api/v1/sections/${encodeURIComponent(key)}/send-now`, {}, "Отправка поставлена в очередь.");
+        });
+
+        const edit = makeButton("Обновить пост", "Изменить последний актуальный пост этого раздела");
+        edit.addEventListener("click", () => {
+            if (!window.confirm("Обновить существующий пост этого раздела?")) return;
+            run(edit, `/price/api/v1/sections/${encodeURIComponent(key)}/edit-current`, {}, "Обновление поставлено в очередь.");
+        });
+
+        const tomorrow = makeButton("Завтра 09:30", "Отправить новый пост завтра в 09:30 по Ташкенту");
+        tomorrow.addEventListener("click", () => {
+            run(tomorrow, `/price/api/v1/sections/${encodeURIComponent(key)}/schedule`, {when: "tomorrow_0930", mode: "send"}, "Публикация запланирована.");
+        });
+
+        const schedule = makeButton("Выбрать время", "Назначить дату и время публикации");
+        schedule.addEventListener("click", () => {
+            const value = window.prompt("Дата и время по Ташкенту (ГГГГ-ММ-ДД ЧЧ:ММ):");
+            if (!value) return;
+            run(schedule, `/price/api/v1/sections/${encodeURIComponent(key)}/schedule`, {when: value, mode: "send"}, "Публикация запланирована.");
+        });
+
+        actions.append(send, edit, tomorrow, schedule);
+        toolbar.appendChild(actions);
+    });
+
+    refreshJobs();
+})();
