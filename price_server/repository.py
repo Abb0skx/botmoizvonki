@@ -13,14 +13,16 @@ import re
 import secrets
 import sqlite3
 import uuid
+from calendar import monthrange
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from .config import PriceSettings
+from .calendar_plan import CALENDAR_PLAN_ENTRIES
 
 
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -98,6 +100,23 @@ CREATE TABLE IF NOT EXISTS telegram_posts (
 CREATE INDEX IF NOT EXISTS idx_telegram_posts_section
  ON telegram_posts(section_key,channel_id,part_no);
 
+CREATE TABLE IF NOT EXISTS telegram_deletion_queue (
+ deletion_id INTEGER PRIMARY KEY AUTOINCREMENT,
+ record_key TEXT NOT NULL UNIQUE,
+ section_key TEXT NOT NULL,
+ channel_id TEXT NOT NULL,
+ message_id INTEGER NOT NULL CHECK(message_id>0),
+ status TEXT NOT NULL DEFAULT 'pending',
+ attempts INTEGER NOT NULL DEFAULT 0,
+ max_attempts INTEGER NOT NULL DEFAULT 12,
+ next_attempt_at TEXT,
+ last_error TEXT,
+ created_at TEXT NOT NULL,
+ updated_at TEXT NOT NULL,
+ completed_at TEXT);
+CREATE INDEX IF NOT EXISTS idx_telegram_deletions_due
+ ON telegram_deletion_queue(status,next_attempt_at,deletion_id);
+
 CREATE TABLE IF NOT EXISTS publication_jobs (
  job_id INTEGER PRIMARY KEY AUTOINCREMENT,
  dedupe_key TEXT NOT NULL UNIQUE,
@@ -152,6 +171,19 @@ CREATE TABLE IF NOT EXISTS price_runtime_state (
  state_key TEXT PRIMARY KEY,
  state_value TEXT NOT NULL,
  updated_at TEXT NOT NULL);
+
+CREATE TABLE IF NOT EXISTS calendar_publication_plan (
+ day_of_month INTEGER NOT NULL CHECK(day_of_month BETWEEN 1 AND 30),
+ slot INTEGER NOT NULL CHECK(slot>=1),
+ subposition INTEGER NOT NULL CHECK(subposition>=1),
+ requested_label TEXT NOT NULL,
+ section_key TEXT NOT NULL,
+ publish_time TEXT NOT NULL DEFAULT '09:30',
+ enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+ updated_at TEXT NOT NULL,
+ PRIMARY KEY(day_of_month,slot,subposition));
+CREATE INDEX IF NOT EXISTS idx_calendar_plan_day
+ ON calendar_publication_plan(day_of_month,slot,subposition);
 
 CREATE TABLE IF NOT EXISTS sheets_outbox (
  outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -369,6 +401,25 @@ class PriceRepository:
             db.execute("PRAGMA journal_mode=WAL")
             db.execute("PRAGMA synchronous=NORMAL")
             db.executescript(SCHEMA)
+            now = _iso(_now())
+            db.execute("DELETE FROM calendar_publication_plan")
+            db.executemany(
+                """INSERT INTO calendar_publication_plan(
+                     day_of_month,slot,subposition,requested_label,section_key,
+                     publish_time,enabled,updated_at)
+                     VALUES(?,?,?,?,?,'09:30',1,?)""",
+                [
+                    (
+                        entry.day,
+                        entry.slot,
+                        entry.subposition,
+                        entry.requested_label,
+                        entry.section_key,
+                        now,
+                    )
+                    for entry in CALENDAR_PLAN_ENTRIES
+                ],
+            )
             db.commit()
         finally:
             db.close()
@@ -764,13 +815,31 @@ class PriceRepository:
                         f"telegram_post:{values['record_key']}:{registry_hash}",
                         at, at, 12,
                     )
-            if enqueue_sheet_sync:
-                new_keys = {item["record_key"] for item in results}
-                for old in old_rows:
-                    if old["record_key"] in new_keys:
-                        continue
+            new_keys = {item["record_key"] for item in results}
+            for old in old_rows:
+                if old["record_key"] in new_keys:
+                    continue
+                db.execute(
+                    """UPDATE telegram_posts SET status='superseded',
+                       updated_at=? WHERE record_key=?""",
+                    (_iso(at), old["record_key"]),
+                )
+                db.execute(
+                    """INSERT INTO telegram_deletion_queue(
+                         record_key,section_key,channel_id,message_id,status,
+                         attempts,max_attempts,created_at,updated_at)
+                         VALUES(?,?,?,?,'pending',0,12,?,?)
+                         ON CONFLICT(record_key) DO NOTHING""",
+                    (
+                        old["record_key"], old["section_key"],
+                        old["channel_id"], old["message_id"],
+                        _iso(at), _iso(at),
+                    ),
+                )
+                if enqueue_sheet_sync:
                     old_payload = dict(old)
                     old_payload["is_current"] = 0
+                    old_payload["status"] = "superseded"
                     old_payload["updated_at"] = _iso(at)
                     self._queue_outbox_tx(
                         db, "telegram_post", old["record_key"], "upsert", old_payload,
@@ -837,6 +906,151 @@ class PriceRepository:
                 (_key(section_key), str(channel_id)),
             ).fetchone()
         return row is not None
+
+    def claim_telegram_deletions(
+        self,
+        now_utc: datetime | str,
+        *,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Claim durable deletions for superseded Telegram posts."""
+        now = _dt(now_utc, "now_utc")
+        bounded = min(100, max(1, int(limit)))
+        with self._tx(True) as db:
+            db.execute(
+                """UPDATE telegram_deletion_queue SET status='pending',
+                   updated_at=? WHERE status='running'""",
+                (_iso(now),),
+            )
+            rows = db.execute(
+                """SELECT * FROM telegram_deletion_queue
+                   WHERE status='pending'
+                     AND (next_attempt_at IS NULL OR next_attempt_at<=?)
+                   ORDER BY deletion_id LIMIT ?""",
+                (_iso(now), bounded),
+            ).fetchall()
+            claimed: list[dict[str, Any]] = []
+            for row in rows:
+                cursor = db.execute(
+                    """UPDATE telegram_deletion_queue SET status='running',
+                       attempts=attempts+1,updated_at=?
+                       WHERE deletion_id=? AND status='pending'""",
+                    (_iso(now), row["deletion_id"]),
+                )
+                if cursor.rowcount == 1:
+                    updated = db.execute(
+                        "SELECT * FROM telegram_deletion_queue WHERE deletion_id=?",
+                        (row["deletion_id"],),
+                    ).fetchone()
+                    if updated is not None:
+                        claimed.append(dict(updated))
+            return claimed
+
+    def complete_telegram_deletion(
+        self,
+        deletion_id: int,
+        now_utc: datetime | str,
+    ) -> bool:
+        at = _dt(now_utc, "now_utc")
+        with self._tx(True) as db:
+            row = db.execute(
+                """SELECT * FROM telegram_deletion_queue
+                   WHERE deletion_id=? AND status='running'""",
+                (int(deletion_id),),
+            ).fetchone()
+            if row is None:
+                return False
+            db.execute(
+                """UPDATE telegram_deletion_queue SET status='done',
+                   last_error=NULL,next_attempt_at=NULL,updated_at=?,completed_at=?
+                   WHERE deletion_id=? AND status='running'""",
+                (_iso(at), _iso(at), int(deletion_id)),
+            )
+            db.execute(
+                """UPDATE telegram_posts SET status='deleted',is_current=0,
+                   last_error=NULL,updated_at=? WHERE record_key=?""",
+                (_iso(at), row["record_key"]),
+            )
+            post = db.execute(
+                "SELECT * FROM telegram_posts WHERE record_key=?",
+                (row["record_key"],),
+            ).fetchone()
+            if post is not None:
+                payload = dict(post)
+                digest = hashlib.sha256(_dump(payload).encode()).hexdigest()
+                self._queue_outbox_tx(
+                    db, "telegram_post", row["record_key"], "upsert", payload,
+                    f"telegram_post:{row['record_key']}:deleted:{digest}",
+                    at, at, 12,
+                )
+            self._audit(
+                db, "telegram_post_deleted", "telegram_post",
+                row["record_key"], {"message_id": row["message_id"]}, at,
+            )
+            return True
+
+    def retry_telegram_deletion(
+        self,
+        deletion_id: int,
+        now_utc: datetime | str,
+        error: Any,
+        *,
+        permanent: bool = False,
+    ) -> bool:
+        at = _dt(now_utc, "now_utc")
+        safe_error = str(error or "Telegram deletion failed")[:1000]
+        with self._tx(True) as db:
+            row = db.execute(
+                """SELECT * FROM telegram_deletion_queue
+                   WHERE deletion_id=? AND status='running'""",
+                (int(deletion_id),),
+            ).fetchone()
+            if row is None:
+                return False
+            exhausted = int(row["attempts"]) >= int(row["max_attempts"])
+            status = "failed" if permanent or exhausted else "pending"
+            next_attempt = None if exhausted else _iso(
+                at + timedelta(seconds=min(3600, 2 ** min(int(row["attempts"]), 11)))
+            )
+            db.execute(
+                """UPDATE telegram_deletion_queue SET status=?,last_error=?,
+                   next_attempt_at=?,updated_at=?,completed_at=?
+                   WHERE deletion_id=? AND status='running'""",
+                (
+                    status, safe_error, next_attempt, _iso(at),
+                    _iso(at) if exhausted else None, int(deletion_id),
+                ),
+            )
+            db.execute(
+                """UPDATE telegram_posts SET status=CASE WHEN ?='failed'
+                   THEN 'delete_failed' ELSE status END,last_error=?,updated_at=?
+                   WHERE record_key=?""",
+                (status, safe_error, _iso(at), row["record_key"]),
+            )
+            if status == "failed":
+                post = db.execute(
+                    "SELECT * FROM telegram_posts WHERE record_key=?",
+                    (row["record_key"],),
+                ).fetchone()
+                if post is not None:
+                    payload = dict(post)
+                    digest = hashlib.sha256(_dump(payload).encode()).hexdigest()
+                    self._queue_outbox_tx(
+                        db, "telegram_post", row["record_key"], "upsert",
+                        payload,
+                        f"telegram_post:{row['record_key']}:delete_failed:{digest}",
+                        at, at, 12,
+                    )
+            return True
+
+    def list_telegram_deletions(self, *, limit: int = 500) -> list[dict[str, Any]]:
+        with self._read() as db:
+            rows = db.execute(
+                """SELECT * FROM telegram_deletion_queue
+                   ORDER BY deletion_id DESC LIMIT ?""",
+                (min(5000, max(1, int(limit))),),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def enqueue_job(
         self,
@@ -1198,12 +1412,132 @@ class PriceRepository:
         return datetime.combine(next_date, wall_time, tzinfo=zone).astimezone(timezone.utc)
 
     def materialize_due_schedules(self, now_utc: datetime | str,
-                                  horizon_days: int = 1) -> int:
-        """Compatibility hook; recurring rows reschedule themselves on completion."""
-        _dt(now_utc, "now_utc")
+                                  horizon_days: int = 2) -> int:
+        """Create durable 09:30 jobs from the monthly calendar plan."""
+        now = _dt(now_utc, "now_utc")
         if not 0 <= int(horizon_days) <= 31:
             raise ValueError("horizon_days must be between 0 and 31")
-        return 0
+        if self.settings is None or not self.settings.telegram_channel_id:
+            return 0
+        zone = ZoneInfo(self.settings.timezone)
+        horizon = now + timedelta(days=int(horizon_days))
+        local_date = now.astimezone(zone).date()
+        last_date = horizon.astimezone(zone).date()
+        dates: list[date] = []
+        while local_date <= last_date:
+            dates.append(local_date)
+            local_date += timedelta(days=1)
+
+        created = 0
+        with self._tx(True) as db:
+            for target_date in dates:
+                execute = datetime.combine(
+                    target_date,
+                    time(9, 30),
+                    tzinfo=zone,
+                ).astimezone(timezone.utc)
+                if execute <= now or execute > horizon:
+                    continue
+                plan_days: list[int] = []
+                if 1 <= target_date.day <= 30:
+                    plan_days.append(target_date.day)
+                if target_date.day == 1:
+                    previous = target_date - timedelta(days=1)
+                    previous_last_day = monthrange(
+                        previous.year, previous.month
+                    )[1]
+                    plan_days.extend(range(previous_last_day + 1, 31))
+                for plan_day in plan_days:
+                    rows = db.execute(
+                        """SELECT * FROM calendar_publication_plan
+                           WHERE day_of_month=? AND enabled=1
+                           ORDER BY slot,subposition""",
+                        (plan_day,),
+                    ).fetchall()
+                    for row in rows:
+                        section_exists = db.execute(
+                            """SELECT 1 FROM price_sections AS s
+                               JOIN price_snapshots AS p
+                                 ON p.snapshot_id=s.snapshot_id
+                               WHERE p.is_current=1 AND s.section_key=?""",
+                            (row["section_key"],),
+                        ).fetchone()
+                        if section_exists is None:
+                            continue
+                        execute_iso = _iso(execute)
+                        existing = db.execute(
+                            """SELECT 1 FROM publication_jobs
+                               WHERE section_key=? AND action='send'
+                                 AND execute_at=? AND status!='cancelled'
+                               LIMIT 1""",
+                            (row["section_key"], execute_iso),
+                        ).fetchone()
+                        if existing is not None:
+                            continue
+                        unique = (
+                            f"calendar:{target_date.isoformat()}:{plan_day}:"
+                            f"{row['slot']}:{row['subposition']}:"
+                            f"{row['section_key']}"
+                        )
+                        payload = {
+                            "source": "price_calendar",
+                            "calendar_date": target_date.isoformat(),
+                            "plan_day": plan_day,
+                            "slot": row["slot"],
+                            "subposition": row["subposition"],
+                        }
+                        cursor = db.execute(
+                            """INSERT INTO publication_jobs(
+                                 dedupe_key,action,section_key,channel_id,
+                                 channel_key,snapshot_policy,execute_at,
+                                 schedule_type,schedule_json,status,attempts,
+                                 max_attempts,payload_json,created_at,updated_at)
+                                 VALUES(?,'send',?,?,?,'latest',?,'once','{}',
+                                        'pending',0,8,?,?,?)
+                                 ON CONFLICT(dedupe_key) DO NOTHING""",
+                            (
+                                unique,
+                                row["section_key"],
+                                self.settings.telegram_channel_id,
+                                self.settings.telegram_channel_username,
+                                execute_iso,
+                                _dump(payload),
+                                _iso(now),
+                                _iso(now),
+                            ),
+                        )
+                        if cursor.rowcount == 1:
+                            job_id = int(cursor.lastrowid)
+                            created += 1
+                            self._audit(
+                                db, "calendar_job_materialized",
+                                "publication_job", job_id, payload, now,
+                            )
+        return created
+
+    def list_calendar_plan(self) -> list[dict[str, Any]]:
+        with self._read() as db:
+            rows = db.execute(
+                """SELECT plan.day_of_month,plan.slot,plan.subposition,
+                          plan.requested_label,plan.section_key,
+                          section.title AS section_name,plan.publish_time,
+                          plan.enabled
+                   FROM calendar_publication_plan AS plan
+                   LEFT JOIN price_sections AS section
+                     ON section.section_key=plan.section_key
+                    AND section.snapshot_id=(
+                      SELECT snapshot_id FROM price_snapshots WHERE is_current=1
+                    )
+                   ORDER BY plan.day_of_month,plan.slot,plan.subposition"""
+            ).fetchall()
+        return [
+            {
+                **dict(row),
+                "enabled": bool(row["enabled"]),
+                "timezone": self.timezone,
+            }
+            for row in rows
+        ]
 
     def get_job(self, job_id: int) -> dict[str, Any] | None:
         """Return one publication job."""

@@ -7,6 +7,7 @@ with the `botmoizvonki` FastAPI application and owns:
 - durable price snapshots in SQLite;
 - Telegram send, edit and delayed-publication jobs;
 - a 24-hour delayed-post preview channel with administrator-only cancellation;
+- an authoritative day-of-month publication plan at 09:30 Asia/Tashkent;
 - `chat_id` / `message_id` registry and its `Product Sort` mirror.
 
 Delayed jobs enter the preview channel only when their execution time is no
@@ -15,6 +16,13 @@ removes preview posts after completion/cancellation, and deletes Telegram
 service notices such as pin notifications. `PRICE_POST_INDEX_SHEET_NAME`
 contains one row for every current price section, including blank IDs for
 sections that have never been published.
+
+The monthly plan covers days 1 through 30. If the preceding month ends on day
+28, the day-29 and day-30 entries are folded into the next month's day 1; if it
+ends on day 29, day 30 is folded into day 1. Day 31 has no separate plan. The
+SQLite plan is mirrored to `PRICE_CALENDAR_SHEET_NAME`. A successful new
+publication supersedes and durably deletes the previous Telegram messages for
+the same section.
 
 The local generator remains in the other project:
 `Price2024DB/Cod/Price.py`. It reads local/Google data, builds the price and

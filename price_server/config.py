@@ -44,6 +44,7 @@ class PriceSettings:
     telegram_preview_channel_id: str = ""
     post_index_sheet_name: str = "Price Post IDs"
     telegram_updates_limit: int = 100
+    calendar_sheet_name: str = "Price Auto Schedule"
 
     @classmethod
     def load(cls) -> "PriceSettings":
@@ -106,6 +107,12 @@ class PriceSettings:
             telegram_updates_limit=_int(
                 "PRICE_TELEGRAM_UPDATES_LIMIT", 100
             ),
+            calendar_sheet_name=(
+                os.getenv(
+                    "PRICE_CALENDAR_SHEET_NAME", "Price Auto Schedule"
+                ).strip()
+                or "Price Auto Schedule"
+            ),
         )
 
     def validate_runtime(self) -> None:
@@ -133,6 +140,10 @@ class PriceSettings:
         if len(self.post_index_sheet_name) > 100:
             raise RuntimeError(
                 "PRICE_POST_INDEX_SHEET_NAME must be at most 100 characters"
+            )
+        if len(self.calendar_sheet_name) > 100:
+            raise RuntimeError(
+                "PRICE_CALENDAR_SHEET_NAME must be at most 100 characters"
             )
 
     @property

@@ -9,7 +9,11 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .config import PriceSettings
-from .sheets_registry import ProductSortPostIndex, ProductSortPostRegistry
+from .sheets_registry import (
+    ProductSortCalendarRegistry,
+    ProductSortPostIndex,
+    ProductSortPostRegistry,
+)
 from .telegram_api import (
     TelegramClient,
     TelegramMessage,
@@ -75,6 +79,8 @@ class PricePublicationService:
         self._registry: ProductSortPostRegistry | None = None
         self._index_registry: ProductSortPostIndex | None = None
         self._last_index_hash = ""
+        self._calendar_registry: ProductSortCalendarRegistry | None = None
+        self._last_calendar_hash = ""
 
     def _section_for_job(self, job: Any):
         section_key = str(_value(job, "section_key", "")).strip()
@@ -479,6 +485,37 @@ class PricePublicationService:
                 cleaned += 1
         return cleaned
 
+    def cleanup_superseded_posts(self, *, limit: int = 50) -> int:
+        """Delete replaced channel posts without risking duplicate publishes."""
+        now = datetime.now(timezone.utc)
+        claimed = self.repository.claim_telegram_deletions(now, limit=limit)
+        completed = 0
+        for item in claimed:
+            try:
+                self.telegram.delete_message(
+                    item["channel_id"],
+                    int(item["message_id"]),
+                )
+            except Exception as exc:
+                self.repository.retry_telegram_deletion(
+                    item["deletion_id"],
+                    datetime.now(timezone.utc),
+                    exc,
+                    permanent=not bool(getattr(exc, "retryable", True)),
+                )
+                LOG.warning(
+                    "price_superseded_post_delete_failed deletion_id=%s type=%s",
+                    item["deletion_id"],
+                    type(exc).__name__,
+                )
+                continue
+            if self.repository.complete_telegram_deletion(
+                item["deletion_id"],
+                datetime.now(timezone.utc),
+            ):
+                completed += 1
+        return completed
+
     @staticmethod
     def _is_service_channel_post(message: Mapping[str, Any]) -> bool:
         service_fields = {
@@ -663,4 +700,23 @@ class PricePublicationService:
             self._index_registry.upsert(records)
             self._last_index_hash = index_hash
             completed += len(records)
+
+        calendar_records = self.repository.list_calendar_plan()
+        calendar_stable = json.dumps(
+            calendar_records,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        calendar_hash = hashlib.sha256(
+            calendar_stable.encode("utf-8")
+        ).hexdigest()
+        if calendar_records and calendar_hash != self._last_calendar_hash:
+            if self._calendar_registry is None:
+                self._calendar_registry = ProductSortCalendarRegistry(
+                    self.settings
+                )
+            self._calendar_registry.replace(calendar_records)
+            self._last_calendar_hash = calendar_hash
+            completed += len(calendar_records)
         return completed

@@ -102,6 +102,35 @@ def snapshot(at: datetime, price: int = 100):
     return validate_sync_payload(payload)
 
 
+def snapshot_with_sections(at: datetime, section_keys: list[str]):
+    sections = []
+    for position, section_key in enumerate(section_keys):
+        section = {
+            "position": position,
+            "section_key": section_key,
+            "title": section_key,
+            "plain_text": f"**【 {section_key} 】**\nModel: 100",
+            "clipboard_html": f"<div>{section_key}</div>",
+            "telegram_blocks": [f"<b>{section_key}</b>\nModel: 100"],
+            "changed_recently": False,
+        }
+        section["content_hash"] = section_content_hash(section)
+        sections.append(section)
+    payload = {
+        "schema_version": 1,
+        "generated_at": at.isoformat(),
+        "timezone": "Asia/Tashkent",
+        "html_document": "<!doctype html><html><body>calendar</body></html>",
+        "products": [
+            {"product_id": index + 1, "section_key": key}
+            for index, key in enumerate(section_keys)
+        ],
+        "sections": sections,
+    }
+    payload["content_sha256"] = canonical_content_hash(payload)
+    return validate_sync_payload(payload)
+
+
 class PriceRepositoryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -171,6 +200,30 @@ class PriceRepositoryTests(unittest.TestCase):
         )
         self.assertEqual(edited["message_ids"], [101])
         self.assertIn("110", fake.edited[-1][2])
+
+        replacement = service.execute_job(
+            {
+                "action": "send",
+                "section_key": "phones-test",
+                "channel_id": settings.telegram_channel_id,
+                "snapshot_policy": "latest",
+            }
+        )
+        self.assertEqual(replacement["message_ids"], [102])
+        deletions = self.repo.list_telegram_deletions()
+        self.assertEqual(len(deletions), 1)
+        self.assertEqual(deletions[0]["message_id"], 101)
+        self.assertEqual(service.cleanup_superseded_posts(), 1)
+        self.assertIn((settings.telegram_channel_id, 101), fake.deleted)
+        self.assertEqual(
+            self.repo.get_telegram_post(
+                "phones-test", settings.telegram_channel_id
+            )["message_id"],
+            102,
+        )
+        self.assertEqual(
+            self.repo.list_telegram_deletions()[0]["status"], "done"
+        )
 
         job = self.repo.enqueue_job(
             "phones-test",
@@ -323,6 +376,115 @@ class PriceRepositoryTests(unittest.TestCase):
         })
         self.assertEqual(service.poll_preview_updates(), 1)
         self.assertIn((settings.telegram_preview_channel_id, 777), fake.deleted)
+
+    def test_calendar_materializes_without_duplicate_manual_jobs(self):
+        calendar_db = Path(self.temp.name) / "calendar.db"
+        settings = PriceSettings(
+            enabled=True,
+            db_path=calendar_db,
+            legacy_html_path=Path(self.temp.name) / "legacy.html",
+            admin_username="admin",
+            admin_password="secret",
+            sync_api_key="sync",
+            telegram_bot_token="fake-token",
+            telegram_channel_id="-1001234567890",
+            telegram_channel_username="testchannel",
+            product_sort_sheet_id="sheet",
+            posts_sheet_name="Telegram Posts",
+            timezone="Asia/Tashkent",
+            scheduler_poll_seconds=1,
+            sync_max_bytes=2_000_000,
+        )
+        repo = PriceRepository(settings)
+        now = datetime(2026, 8, 26, 14, 0, tzinfo=timezone.utc)
+        keys = [
+            "wearables-xiaomi",
+            "wearables-samsung",
+            "wearables-iqibla",
+        ]
+        repo.ingest_snapshot(snapshot_with_sections(now, keys))
+        execute_at = datetime(2026, 8, 27, 4, 30, tzinfo=timezone.utc)
+        for section_key in keys[:2]:
+            repo.enqueue_job(
+                section_key,
+                "send",
+                execute_at,
+                channel_id=settings.telegram_channel_id,
+                now=now,
+            )
+
+        self.assertEqual(len(repo.list_calendar_plan()), 95)
+        self.assertEqual(repo.materialize_due_schedules(now, horizon_days=1), 1)
+        self.assertEqual(repo.materialize_due_schedules(now, horizon_days=1), 0)
+        jobs = [job for job in repo.list_jobs(limit=20) if job["execute_at"] == execute_at.isoformat(timespec="microseconds")]
+        self.assertEqual({job["section_key"] for job in jobs}, set(keys))
+        iqibla = next(job for job in jobs if job["section_key"] == "wearables-iqibla")
+        self.assertEqual(iqibla["payload"]["source"], "price_calendar")
+        self.assertEqual(iqibla["payload"]["plan_day"], 27)
+
+    def test_calendar_folds_missing_february_days_into_march_first(self):
+        calendar_db = Path(self.temp.name) / "february-calendar.db"
+        settings = PriceSettings(
+            enabled=True,
+            db_path=calendar_db,
+            legacy_html_path=Path(self.temp.name) / "legacy.html",
+            admin_username="admin",
+            admin_password="secret",
+            sync_api_key="sync",
+            telegram_bot_token="fake-token",
+            telegram_channel_id="-1001234567890",
+            telegram_channel_username="testchannel",
+            product_sort_sheet_id="sheet",
+            posts_sheet_name="Telegram Posts",
+            timezone="Asia/Tashkent",
+            scheduler_poll_seconds=1,
+            sync_max_bytes=2_000_000,
+        )
+        repo = PriceRepository(settings)
+        plan = repo.list_calendar_plan()
+        overflow_keys = sorted({
+            row["section_key"]
+            for row in plan
+            if row["day_of_month"] in {1, 29, 30}
+        })
+        now = datetime(2027, 2, 28, 10, 0, tzinfo=timezone.utc)
+        repo.ingest_snapshot(snapshot_with_sections(now, overflow_keys))
+        self.assertEqual(repo.materialize_due_schedules(now, horizon_days=1), 12)
+        jobs = repo.list_jobs(limit=50)
+        self.assertEqual(len(jobs), 12)
+        self.assertEqual(
+            {job["payload"]["plan_day"] for job in jobs},
+            {1, 29, 30},
+        )
+
+        leap_settings = PriceSettings(
+            **{
+                **settings.__dict__,
+                "db_path": Path(self.temp.name) / "leap-calendar.db",
+            }
+        )
+        leap_repo = PriceRepository(leap_settings)
+        leap_plan = leap_repo.list_calendar_plan()
+        leap_keys = sorted({
+            row["section_key"]
+            for row in leap_plan
+            if row["day_of_month"] in {1, 30}
+        })
+        leap_now = datetime(2028, 2, 29, 10, 0, tzinfo=timezone.utc)
+        leap_repo.ingest_snapshot(
+            snapshot_with_sections(leap_now, leap_keys)
+        )
+        self.assertEqual(
+            leap_repo.materialize_due_schedules(leap_now, horizon_days=1),
+            9,
+        )
+        self.assertEqual(
+            {
+                job["payload"]["plan_day"]
+                for job in leap_repo.list_jobs(limit=50)
+            },
+            {1, 30},
+        )
 
 
 class PricePageAuthTests(unittest.TestCase):

@@ -260,22 +260,31 @@ class PriceScheduler:
         if not self.configured:
             return 0
         now = self.clock()
+        await self._materialize_schedules(now)
         for method_name, args, log_name in (
             ("poll_preview_updates", (), "price_preview_update_poll_failed"),
             ("cleanup_terminal_previews", (), "price_preview_cleanup_failed"),
+            (
+                "cleanup_superseded_posts",
+                (),
+                "price_superseded_post_cleanup_failed",
+            ),
             ("ensure_scheduled_previews", (now,), "price_preview_creation_failed"),
         ):
             try:
                 await self._service_call(method_name, *args)
             except Exception:
                 LOG.exception(log_name)
-        await self._materialize_schedules(now)
         processed = await self._process_due_jobs()
         if processed:
             try:
                 await self._service_call("cleanup_terminal_previews")
             except Exception:
                 LOG.exception("price_preview_cleanup_failed")
+            try:
+                await self._service_call("cleanup_superseded_posts")
+            except Exception:
+                LOG.exception("price_superseded_post_cleanup_failed")
         await self._sync_sheets_outbox()
         return processed
 

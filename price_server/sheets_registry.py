@@ -45,6 +45,19 @@ POST_INDEX_HEADERS = (
     "updated_at",
 )
 
+CALENDAR_HEADERS = (
+    "day_of_month",
+    "slot",
+    "subposition",
+    "requested_label",
+    "section_key",
+    "section_name",
+    "publish_time",
+    "timezone",
+    "enabled",
+    "updated_at",
+)
+
 
 class RegistryNotConfigured(RuntimeError):
     """Google Sheets credentials are not available in this process."""
@@ -326,4 +339,72 @@ class ProductSortPostIndex:
                 "values": [values],
             })
         worksheet.batch_update(requests, value_input_option="RAW")
+        return len(records)
+
+
+@dataclass
+class ProductSortCalendarRegistry:
+    """Human-readable mirror of the authoritative monthly calendar."""
+
+    settings: PriceSettings
+    client: Any | None = None
+
+    def _worksheet(self):
+        import gspread
+
+        client = self.client or _google_client()
+        book = client.open_by_key(self.settings.product_sort_sheet_id)
+        try:
+            worksheet = book.worksheet(self.settings.calendar_sheet_name)
+        except gspread.WorksheetNotFound:
+            worksheet = book.add_worksheet(
+                title=self.settings.calendar_sheet_name,
+                rows=1000,
+                cols=len(CALENDAR_HEADERS),
+            )
+            worksheet.update(
+                range_name=f"A1:{_column_letter(len(CALENDAR_HEADERS))}1",
+                values=[list(CALENDAR_HEADERS)],
+                value_input_option="RAW",
+            )
+            worksheet.freeze(rows=1)
+        return worksheet
+
+    def replace(self, records: Iterable[Mapping[str, Any]]) -> int:
+        records = list(records)
+        worksheet = self._worksheet()
+        now = datetime.now(timezone.utc).isoformat()
+        values = [list(CALENDAR_HEADERS)]
+        for source in records:
+            payload = dict(source)
+            payload["updated_at"] = now
+            values.append([
+                _cell(payload.get(header)) for header in CALENDAR_HEADERS
+            ])
+        last_column = _column_letter(len(CALENDAR_HEADERS))
+        worksheet.clear()
+        worksheet.update(
+            range_name=f"A1:{last_column}{max(1, len(values))}",
+            values=values,
+            value_input_option="RAW",
+        )
+        worksheet.freeze(rows=1)
+        worksheet.format(
+            f"A1:{last_column}1",
+            {
+                "backgroundColor": {
+                    "red": 0.34,
+                    "green": 0.22,
+                    "blue": 0.52,
+                },
+                "textFormat": {
+                    "bold": True,
+                    "foregroundColor": {
+                        "red": 1,
+                        "green": 1,
+                        "blue": 1,
+                    },
+                },
+            },
+        )
         return len(records)
