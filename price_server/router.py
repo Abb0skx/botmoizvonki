@@ -162,6 +162,7 @@ async def price_health() -> dict[str, Any]:
         "status": status,
         "snapshot_available": snapshot_available,
         "telegram_configured": settings.telegram_configured,
+        "preview_configured": settings.preview_configured,
         "scheduler_running": bool(_scheduler and _scheduler.running),
     }
 
@@ -263,6 +264,7 @@ async def price_state(request: Request) -> dict[str, Any]:
     return {
         "snapshot": snapshot,
         "telegram_configured": settings.telegram_configured,
+        "preview_configured": settings.preview_configured,
         "scheduler_running": bool(_scheduler and _scheduler.running),
     }
 
@@ -270,17 +272,30 @@ async def price_state(request: Request) -> dict[str, Any]:
 @router.get("/price/api/v1/sections")
 async def price_sections(request: Request) -> dict[str, Any]:
     _admin(request)
+    current_posts = get_repository().list_telegram_posts(
+        channel_id=settings.telegram_channel_id,
+        current_only=True,
+        limit=5000,
+    )
+    message_ids: dict[str, list[int]] = {}
+    for post in current_posts:
+        message_ids.setdefault(post["section_key"], []).append(
+            int(post["message_id"])
+        )
     summaries = []
     for section in get_repository().list_sections():
-        summaries.append(
-            {
+        summary = {
                 key: section.get(key)
                 for key in (
                     "snapshot_id", "section_key", "position", "title",
                     "content_hash", "product_count", "changed_recent",
                 )
-            }
+        }
+        summary["current_post_ids"] = message_ids.get(
+            section["section_key"], []
         )
+        summary["can_edit"] = bool(summary["current_post_ids"])
+        summaries.append(summary)
     return {"sections": summaries}
 
 
@@ -299,6 +314,11 @@ async def price_jobs(request: Request) -> dict[str, Any]:
 def _enqueue(section_key: str, action: str, execute_at: datetime) -> dict[str, Any]:
     _section_or_404(section_key)
     get_service()
+    if action == "edit" and not get_repository().has_current_telegram_post(
+        section_key,
+        settings.telegram_channel_id,
+    ):
+        raise HTTPException(status_code=409, detail="current_post_not_found")
     job = get_repository().enqueue_job(
         section_key,
         action,
@@ -374,10 +394,7 @@ async def schedule_section(section_key: str, request: Request) -> dict[str, Any]
 @router.post("/price/api/v1/jobs/{job_id}/cancel")
 async def cancel_price_job(job_id: int, request: Request) -> dict[str, Any]:
     _admin(request, action=True)
-    cancelled = get_repository().cancel_job(
-        job_id,
-        now=datetime.now(timezone.utc),
-    )
+    cancelled = get_service().cancel_scheduled_job(job_id)
     if not cancelled:
         raise HTTPException(status_code=409, detail="job_cannot_be_cancelled")
     return {"status": "cancelled", "job_id": job_id}

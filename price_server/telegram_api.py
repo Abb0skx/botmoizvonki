@@ -314,18 +314,23 @@ class TelegramClient:
         html_text: str,
         *,
         disable_web_page_preview: bool = True,
+        reply_markup: Mapping[str, Any] | None = None,
+        channel_username: str | None = None,
     ) -> TelegramMessage:
         if telegram_text_units(html_text) > TELEGRAM_MESSAGE_LIMIT:
             raise TelegramContentTooLong("Telegram message exceeds 4096 units")
 
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": html_text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": disable_web_page_preview,
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = dict(reply_markup)
         result = self._request(
             "sendMessage",
-            {
-                "chat_id": chat_id,
-                "text": html_text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": disable_web_page_preview,
-            },
+            payload,
             ambiguous_on_transport_error=True,
         )
         if not isinstance(result, Mapping) or not result.get("message_id"):
@@ -346,7 +351,9 @@ class TelegramClient:
             post_url=build_post_url(
                 result_chat_id,
                 message_id,
-                self.channel_username,
+                self.channel_username
+                if channel_username is None
+                else channel_username,
             ),
             html=html_text,
             content_hash=self._hash(html_text),
@@ -373,6 +380,7 @@ class TelegramClient:
         html_text: str,
         *,
         disable_web_page_preview: bool = True,
+        channel_username: str | None = None,
     ) -> TelegramMessage:
         if telegram_text_units(html_text) > TELEGRAM_MESSAGE_LIMIT:
             raise TelegramContentTooLong("Telegram message exceeds 4096 units")
@@ -392,7 +400,9 @@ class TelegramClient:
             post_url=build_post_url(
                 chat_id,
                 int(message_id),
-                self.channel_username,
+                self.channel_username
+                if channel_username is None
+                else channel_username,
             ),
             html=html_text,
             content_hash=self._hash(html_text),
@@ -404,3 +414,57 @@ class TelegramClient:
             {"chat_id": chat_id, "message_id": int(message_id)},
         )
         return bool(result)
+
+    def get_updates(
+        self,
+        *,
+        offset: int | None = None,
+        limit: int = 100,
+    ) -> list[Mapping[str, Any]]:
+        payload: dict[str, Any] = {
+            "limit": min(100, max(1, int(limit))),
+            "timeout": 0,
+            "allowed_updates": [
+                "callback_query",
+                "channel_post",
+                "edited_channel_post",
+            ],
+        }
+        if offset is not None:
+            payload["offset"] = int(offset)
+        result = self._request("getUpdates", payload)
+        if not isinstance(result, Sequence) or isinstance(
+            result, (str, bytes, bytearray)
+        ):
+            raise TelegramAPIError("Telegram getUpdates response is not a list")
+        return [item for item in result if isinstance(item, Mapping)]
+
+    def answer_callback_query(
+        self,
+        callback_query_id: str,
+        *,
+        text: str = "",
+        show_alert: bool = False,
+    ) -> bool:
+        payload: dict[str, Any] = {
+            "callback_query_id": str(callback_query_id),
+            "show_alert": bool(show_alert),
+        }
+        if text:
+            payload["text"] = str(text)[:200]
+        return bool(self._request("answerCallbackQuery", payload))
+
+    def get_chat_member(
+        self,
+        chat_id: str | int,
+        user_id: int,
+    ) -> Mapping[str, Any]:
+        result = self._request(
+            "getChatMember",
+            {"chat_id": chat_id, "user_id": int(user_id)},
+        )
+        if not isinstance(result, Mapping):
+            raise TelegramAPIError(
+                "Telegram getChatMember response is not an object"
+            )
+        return result

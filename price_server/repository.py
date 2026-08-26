@@ -128,6 +128,31 @@ CREATE INDEX IF NOT EXISTS idx_publication_jobs_due
 CREATE INDEX IF NOT EXISTS idx_publication_jobs_section
  ON publication_jobs(section_key,created_at DESC);
 
+CREATE TABLE IF NOT EXISTS scheduled_preview_posts (
+ job_id INTEGER NOT NULL,
+ part_no INTEGER NOT NULL CHECK(part_no>=1),
+ part_count INTEGER NOT NULL CHECK(part_count>=1),
+ section_key TEXT NOT NULL,
+ channel_id TEXT NOT NULL,
+ message_id INTEGER NOT NULL CHECK(message_id>0),
+ post_url TEXT NOT NULL DEFAULT '',
+ content_hash TEXT NOT NULL DEFAULT '',
+ html_text TEXT NOT NULL DEFAULT '',
+ status TEXT NOT NULL DEFAULT 'active',
+ last_error TEXT,
+ created_at TEXT NOT NULL,
+ updated_at TEXT NOT NULL,
+ PRIMARY KEY(job_id,part_no),
+ UNIQUE(channel_id,message_id),
+ FOREIGN KEY(job_id) REFERENCES publication_jobs(job_id) ON DELETE CASCADE);
+CREATE INDEX IF NOT EXISTS idx_scheduled_previews_status
+ ON scheduled_preview_posts(status,job_id,part_no);
+
+CREATE TABLE IF NOT EXISTS price_runtime_state (
+ state_key TEXT PRIMARY KEY,
+ state_value TEXT NOT NULL,
+ updated_at TEXT NOT NULL);
+
 CREATE TABLE IF NOT EXISTS sheets_outbox (
  outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
  dedupe_key TEXT NOT NULL UNIQUE,
@@ -799,6 +824,20 @@ class PriceRepository:
 
     list_posts = list_telegram_posts
 
+    def has_current_telegram_post(
+        self,
+        section_key: str,
+        channel_id: str,
+    ) -> bool:
+        with self._read() as db:
+            row = db.execute(
+                """SELECT 1 FROM telegram_posts
+                   WHERE section_key=? AND channel_id=? AND is_current=1
+                   LIMIT 1""",
+                (_key(section_key), str(channel_id)),
+            ).fetchone()
+        return row is not None
+
     def enqueue_job(
         self,
         section_key: str,
@@ -885,6 +924,230 @@ class PriceRepository:
             return result
 
     enqueue_publication_job = enqueue_job
+
+    def list_jobs_for_preview(
+        self,
+        now_utc: datetime | str,
+        *,
+        horizon_hours: int = 24,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return pending delayed jobs entering the preview window."""
+        now = _dt(now_utc, "now_utc")
+        horizon = now + timedelta(hours=max(1, min(24, int(horizon_hours))))
+        with self._read() as db:
+            rows = db.execute(
+                """SELECT j.* FROM publication_jobs AS j
+                   WHERE j.status='pending' AND j.execute_at>?
+                     AND j.execute_at<=?
+                     AND NOT EXISTS (
+                       SELECT 1 FROM scheduled_preview_posts AS p
+                       WHERE p.job_id=j.job_id AND p.status='active')
+                   ORDER BY j.execute_at,j.job_id LIMIT ?""",
+                (_iso(now), _iso(horizon), min(500, max(1, int(limit)))),
+            ).fetchall()
+        return [item for row in rows if (item := self._job(row)) is not None]
+
+    def record_scheduled_preview(
+        self,
+        job_id: int,
+        section_key: str,
+        channel_id: str,
+        *,
+        part_no: int,
+        part_count: int,
+        message_id: int,
+        post_url: str = "",
+        content_hash: str = "",
+        html_text: str = "",
+        now: datetime | str | None = None,
+    ) -> dict[str, Any]:
+        at = _dt(now, "now", default=True)
+        values = (
+            int(job_id), int(part_no), int(part_count), _key(section_key),
+            str(channel_id), int(message_id), str(post_url)[:2048],
+            str(content_hash)[:128], str(html_text), _iso(at), _iso(at),
+        )
+        if values[1] < 1 or values[2] < values[1] or values[5] < 1:
+            raise ValueError("preview part and message IDs must be positive")
+        with self._tx(True) as db:
+            if db.execute(
+                "SELECT 1 FROM publication_jobs WHERE job_id=?", (values[0],)
+            ).fetchone() is None:
+                raise ValueError("preview job does not exist")
+            db.execute(
+                """INSERT INTO scheduled_preview_posts(
+                     job_id,part_no,part_count,section_key,channel_id,message_id,
+                     post_url,content_hash,html_text,status,created_at,updated_at)
+                     VALUES(?,?,?,?,?,?,?,?,?,'active',?,?)
+                     ON CONFLICT(job_id,part_no) DO UPDATE SET
+                      part_count=excluded.part_count,section_key=excluded.section_key,
+                      channel_id=excluded.channel_id,message_id=excluded.message_id,
+                      post_url=excluded.post_url,content_hash=excluded.content_hash,
+                      html_text=excluded.html_text,status='active',last_error=NULL,
+                      updated_at=excluded.updated_at""",
+                values,
+            )
+            row = db.execute(
+                "SELECT * FROM scheduled_preview_posts WHERE job_id=? AND part_no=?",
+                (values[0], values[1]),
+            ).fetchone()
+            assert row is not None
+            self._audit(
+                db, "scheduled_preview_recorded", "publication_job", values[0],
+                {"part_no": values[1], "message_id": values[5]}, at,
+            )
+            return dict(row)
+
+    def list_scheduled_previews(
+        self,
+        *,
+        job_id: int | None = None,
+        status: str | Sequence[str] | None = None,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        where: list[str] = []
+        params: list[Any] = []
+        if job_id is not None:
+            where.append("job_id=?")
+            params.append(int(job_id))
+        if status is not None:
+            statuses = [status] if isinstance(status, str) else list(status)
+            if statuses:
+                where.append(
+                    "status IN (" + ",".join("?" for _ in statuses) + ")"
+                )
+                params.extend(str(item) for item in statuses)
+        clause = " WHERE " + " AND ".join(where) if where else ""
+        params.append(min(5000, max(1, int(limit))))
+        with self._read() as db:
+            rows = db.execute(
+                "SELECT * FROM scheduled_preview_posts" + clause
+                + " ORDER BY job_id,part_no LIMIT ?",
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def set_scheduled_preview_status(
+        self,
+        job_id: int,
+        status: str,
+        *,
+        error: str = "",
+        now: datetime | str | None = None,
+    ) -> int:
+        at = _dt(now, "now", default=True)
+        normalized = str(status).strip()[:50]
+        if not normalized:
+            raise ValueError("preview status is required")
+        with self._tx(True) as db:
+            cursor = db.execute(
+                """UPDATE scheduled_preview_posts
+                   SET status=?,last_error=?,updated_at=? WHERE job_id=?""",
+                (normalized, str(error)[:1000] or None, _iso(at), int(job_id)),
+            )
+            if cursor.rowcount:
+                self._audit(
+                    db, "scheduled_preview_status_changed", "publication_job",
+                    int(job_id), {"status": normalized}, at,
+                )
+            return max(0, cursor.rowcount)
+
+    def list_terminal_previews(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        with self._read() as db:
+            rows = db.execute(
+                """SELECT p.* FROM scheduled_preview_posts AS p
+                   JOIN publication_jobs AS j ON j.job_id=p.job_id
+                   WHERE p.status='active'
+                     AND j.status IN ('done','failed','cancelled','needs_review')
+                   ORDER BY p.job_id,p.part_no LIMIT ?""",
+                (min(1000, max(1, int(limit))),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_runtime_state(self, key: str, default: str = "") -> str:
+        with self._read() as db:
+            row = db.execute(
+                "SELECT state_value FROM price_runtime_state WHERE state_key=?",
+                (str(key),),
+            ).fetchone()
+        return str(row["state_value"]) if row is not None else str(default)
+
+    def set_runtime_state(
+        self,
+        key: str,
+        value: Any,
+        *,
+        now: datetime | str | None = None,
+    ) -> None:
+        at = _dt(now, "now", default=True)
+        with self._tx(True) as db:
+            db.execute(
+                """INSERT INTO price_runtime_state(state_key,state_value,updated_at)
+                   VALUES(?,?,?) ON CONFLICT(state_key) DO UPDATE SET
+                   state_value=excluded.state_value,updated_at=excluded.updated_at""",
+                (str(key)[:200], str(value), _iso(at)),
+            )
+
+    def build_post_index_records(
+        self,
+        main_channel_id: str,
+        preview_channel_id: str = "",
+    ) -> list[dict[str, Any]]:
+        """Build one current-ID registry row for every snapshot section."""
+        main_channel = str(main_channel_id)
+        preview_channel = str(preview_channel_id)
+        with self._read() as db:
+            sections = db.execute(
+                """SELECT s.section_key,s.title,s.position
+                   FROM price_sections AS s JOIN price_snapshots AS p
+                     ON p.snapshot_id=s.snapshot_id
+                   WHERE p.is_current=1 ORDER BY s.position,s.section_key"""
+            ).fetchall()
+            main_posts = db.execute(
+                """SELECT section_key,message_id,post_url,updated_at
+                   FROM telegram_posts WHERE channel_id=? AND is_current=1
+                   ORDER BY section_key,part_no""",
+                (main_channel,),
+            ).fetchall()
+            previews = db.execute(
+                """SELECT p.section_key,p.job_id,p.message_id,j.execute_at
+                   FROM scheduled_preview_posts AS p
+                   JOIN publication_jobs AS j ON j.job_id=p.job_id
+                   WHERE p.channel_id=? AND p.status='active'
+                     AND j.status='pending'
+                   ORDER BY p.section_key,j.execute_at,p.job_id,p.part_no""",
+                (preview_channel,),
+            ).fetchall() if preview_channel else []
+        main_by_section: dict[str, list[sqlite3.Row]] = {}
+        for row in main_posts:
+            main_by_section.setdefault(row["section_key"], []).append(row)
+        preview_by_section: dict[str, list[sqlite3.Row]] = {}
+        for row in previews:
+            preview_by_section.setdefault(row["section_key"], []).append(row)
+        records: list[dict[str, Any]] = []
+        for section in sections:
+            key = section["section_key"]
+            current = main_by_section.get(key, [])
+            pending = preview_by_section.get(key, [])
+            records.append({
+                "section_key": key,
+                "section_name": section["title"],
+                "position": section["position"],
+                "main_channel_id": main_channel,
+                "main_message_ids": [row["message_id"] for row in current],
+                "main_post_urls": [row["post_url"] for row in current],
+                "has_current_post": bool(current),
+                "preview_channel_id": preview_channel,
+                "preview_job_ids": list(dict.fromkeys(
+                    row["job_id"] for row in pending
+                )),
+                "preview_message_ids": [row["message_id"] for row in pending],
+                "preview_execute_at": list(dict.fromkeys(
+                    row["execute_at"] for row in pending
+                )),
+            })
+        return records
 
     @staticmethod
     def _parse_schedule_time(value: Any, fallback: time) -> time:

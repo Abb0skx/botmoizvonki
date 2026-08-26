@@ -30,6 +30,21 @@ REGISTRY_HEADERS = (
     "last_error",
 )
 
+POST_INDEX_HEADERS = (
+    "section_key",
+    "section_name",
+    "position",
+    "main_channel_id",
+    "main_message_ids",
+    "main_post_urls",
+    "has_current_post",
+    "preview_channel_id",
+    "preview_job_ids",
+    "preview_message_ids",
+    "preview_execute_at",
+    "updated_at",
+)
+
 
 class RegistryNotConfigured(RuntimeError):
     """Google Sheets credentials are not available in this process."""
@@ -208,4 +223,107 @@ class ProductSortPostRegistry:
             requests,
             value_input_option="RAW",
         )
+        return len(records)
+
+
+@dataclass
+class ProductSortPostIndex:
+    """One row per current price section, including blank unsent IDs."""
+
+    settings: PriceSettings
+    client: Any | None = None
+
+    def _worksheet(self):
+        import gspread
+
+        client = self.client or _google_client()
+        book = client.open_by_key(self.settings.product_sort_sheet_id)
+        try:
+            worksheet = book.worksheet(self.settings.post_index_sheet_name)
+        except gspread.WorksheetNotFound:
+            worksheet = book.add_worksheet(
+                title=self.settings.post_index_sheet_name,
+                rows=1000,
+                cols=len(POST_INDEX_HEADERS),
+            )
+            worksheet.update(
+                range_name=f"A1:{_column_letter(len(POST_INDEX_HEADERS))}1",
+                values=[list(POST_INDEX_HEADERS)],
+                value_input_option="RAW",
+            )
+            worksheet.freeze(rows=1)
+            worksheet.format(
+                f"A1:{_column_letter(len(POST_INDEX_HEADERS))}1",
+                {
+                    "backgroundColor": {
+                        "red": 0.12,
+                        "green": 0.30,
+                        "blue": 0.48,
+                    },
+                    "textFormat": {
+                        "bold": True,
+                        "foregroundColor": {
+                            "red": 1,
+                            "green": 1,
+                            "blue": 1,
+                        },
+                    },
+                },
+            )
+        return worksheet
+
+    def upsert(self, records: Iterable[Mapping[str, Any]]) -> int:
+        records = list(records)
+        if not records:
+            return 0
+        worksheet = self._worksheet()
+        existing = worksheet.get_all_values()
+        headers = (
+            [str(value).strip() for value in existing[0]]
+            if existing else []
+        )
+        if not headers:
+            headers = list(POST_INDEX_HEADERS)
+        missing = [name for name in POST_INDEX_HEADERS if name not in headers]
+        if missing:
+            headers.extend(missing)
+        key_index = headers.index("section_key")
+        row_by_key = {
+            row[key_index]: row_number
+            for row_number, row in enumerate(existing[1:], start=2)
+            if key_index < len(row) and row[key_index]
+        }
+        now = datetime.now(timezone.utc).isoformat()
+        next_row = max(2, len(existing) + 1)
+        updates: dict[int, list[Any]] = {}
+        for source in records:
+            payload = dict(source)
+            section_key = str(payload.get("section_key") or "").strip()
+            if not section_key:
+                raise ValueError("Post index row has no section_key")
+            payload["section_key"] = section_key
+            payload["updated_at"] = now
+            row_number = row_by_key.get(section_key)
+            if row_number is None:
+                row_number = next_row
+                next_row += 1
+                row_by_key[section_key] = row_number
+            updates[row_number] = [_cell(payload.get(name)) for name in headers]
+
+        last_column = _column_letter(len(headers))
+        requests = []
+        current_headers = [
+            str(value).strip() for value in (existing[0] if existing else [])
+        ]
+        if not existing or headers != current_headers:
+            requests.append({
+                "range": f"A1:{last_column}1",
+                "values": [headers],
+            })
+        for row_number, values in sorted(updates.items()):
+            requests.append({
+                "range": f"A{row_number}:{last_column}{row_number}",
+                "values": [values],
+            })
+        worksheet.batch_update(requests, value_input_option="RAW")
         return len(records)

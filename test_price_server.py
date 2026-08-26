@@ -26,9 +26,12 @@ from starlette.requests import Request
 class FakeTelegram:
     def __init__(self):
         self.next_id = 100
-        self.sent: list[tuple[str, str]] = []
+        self.sent: list[tuple[str, str, dict]] = []
         self.edited: list[tuple[str, int, str]] = []
         self.deleted: list[tuple[str, int]] = []
+        self.updates: list[dict] = []
+        self.callback_answers: list[tuple[str, str, bool]] = []
+        self.member_status = "administrator"
 
     @staticmethod
     def _message(chat_id: str, message_id: int, html_text: str) -> TelegramMessage:
@@ -42,9 +45,9 @@ class FakeTelegram:
             content_hash=hashlib.sha256(html_text.encode()).hexdigest(),
         )
 
-    def send_message(self, chat_id, html_text):
+    def send_message(self, chat_id, html_text, **kwargs):
         self.next_id += 1
-        self.sent.append((str(chat_id), html_text))
+        self.sent.append((str(chat_id), html_text, kwargs))
         return self._message(str(chat_id), self.next_id, html_text)
 
     def edit_message(self, chat_id, message_id, html_text):
@@ -54,6 +57,19 @@ class FakeTelegram:
     def delete_message(self, chat_id, message_id):
         self.deleted.append((str(chat_id), int(message_id)))
         return True
+
+    def get_updates(self, **_kwargs):
+        updates, self.updates = self.updates, []
+        return updates
+
+    def answer_callback_query(self, callback_query_id, *, text="", show_alert=False):
+        self.callback_answers.append(
+            (str(callback_query_id), str(text), bool(show_alert))
+        )
+        return True
+
+    def get_chat_member(self, _chat_id, _user_id):
+        return {"status": self.member_status}
 
 
 def snapshot(at: datetime, price: int = 100):
@@ -202,6 +218,111 @@ class PriceRepositoryTests(unittest.TestCase):
             self.repo.get_job(cancellable["job_id"])["status"],
             "cancelled",
         )
+
+    def test_delayed_preview_window_cancel_button_and_post_index(self):
+        self.repo.ingest_snapshot(snapshot(self.now))
+        fake = FakeTelegram()
+        settings = PriceSettings(
+            enabled=True,
+            db_path=Path(self.temp.name) / "price.db",
+            legacy_html_path=Path(self.temp.name) / "legacy.html",
+            admin_username="admin",
+            admin_password="secret",
+            sync_api_key="sync",
+            telegram_bot_token="fake-token",
+            telegram_channel_id="-1001234567890",
+            telegram_channel_username="testchannel",
+            product_sort_sheet_id="sheet",
+            posts_sheet_name="Telegram Posts",
+            timezone="Asia/Tashkent",
+            scheduler_poll_seconds=1,
+            sync_max_bytes=2_000_000,
+            telegram_preview_channel_id="-1003922029862",
+        )
+        service = PricePublicationService(
+            settings,
+            self.repo,
+            telegram=fake,
+        )
+        job = self.repo.enqueue_job(
+            "phones-test",
+            "send",
+            self.now + timedelta(hours=25),
+            channel_id=settings.telegram_channel_id,
+            now=self.now,
+        )
+        self.assertEqual(service.ensure_scheduled_previews(self.now), 0)
+        self.assertEqual(fake.sent, [])
+
+        entered_window = self.now + timedelta(hours=2)
+        self.assertEqual(service.ensure_scheduled_previews(entered_window), 1)
+        previews = self.repo.list_scheduled_previews(job_id=job["job_id"])
+        self.assertEqual(len(previews), 1)
+        self.assertEqual(fake.sent[0][0], settings.telegram_preview_channel_id)
+        button = fake.sent[0][2]["reply_markup"]["inline_keyboard"][0][0]
+        self.assertEqual(button["callback_data"], f"price_cancel:{job['job_id']}")
+
+        index = self.repo.build_post_index_records(
+            settings.telegram_channel_id,
+            settings.telegram_preview_channel_id,
+        )
+        self.assertEqual(len(index), 1)
+        self.assertFalse(index[0]["has_current_post"])
+        self.assertEqual(index[0]["main_message_ids"], [])
+        self.assertEqual(index[0]["preview_message_ids"], [101])
+
+        fake.updates.append({
+            "update_id": 10,
+            "callback_query": {
+                "id": "callback-1",
+                "data": f"price_cancel:{job['job_id']}",
+                "from": {"id": 55},
+                "message": {
+                    "message_id": 101,
+                    "chat": {"id": int(settings.telegram_preview_channel_id)},
+                },
+            },
+        })
+        self.assertEqual(service.poll_preview_updates(), 1)
+        self.assertEqual(self.repo.get_job(job["job_id"])["status"], "cancelled")
+        self.assertIn((settings.telegram_preview_channel_id, 101), fake.deleted)
+        self.assertEqual(
+            self.repo.list_scheduled_previews(job_id=job["job_id"])[0]["status"],
+            "cancelled",
+        )
+        self.assertEqual(fake.callback_answers[-1][1], "Публикация отменена")
+
+    def test_preview_channel_service_message_is_deleted(self):
+        self.repo.ingest_snapshot(snapshot(self.now))
+        fake = FakeTelegram()
+        settings = PriceSettings(
+            enabled=True,
+            db_path=Path(self.temp.name) / "price.db",
+            legacy_html_path=Path(self.temp.name) / "legacy.html",
+            admin_username="admin",
+            admin_password="secret",
+            sync_api_key="sync",
+            telegram_bot_token="fake-token",
+            telegram_channel_id="-1001234567890",
+            telegram_channel_username="testchannel",
+            product_sort_sheet_id="sheet",
+            posts_sheet_name="Telegram Posts",
+            timezone="Asia/Tashkent",
+            scheduler_poll_seconds=1,
+            sync_max_bytes=2_000_000,
+            telegram_preview_channel_id="-1003922029862",
+        )
+        service = PricePublicationService(settings, self.repo, telegram=fake)
+        fake.updates.append({
+            "update_id": 11,
+            "channel_post": {
+                "message_id": 777,
+                "chat": {"id": int(settings.telegram_preview_channel_id)},
+                "pinned_message": {"message_id": 101},
+            },
+        })
+        self.assertEqual(service.poll_preview_updates(), 1)
+        self.assertIn((settings.telegram_preview_channel_id, 777), fake.deleted)
 
 
 class PricePageAuthTests(unittest.TestCase):

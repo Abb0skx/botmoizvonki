@@ -152,6 +152,17 @@ class PriceScheduler:
             return await result
         return result
 
+    async def _service_call(self, method_name: str, *args) -> Any:
+        method = getattr(self.service, method_name, None)
+        if method is None:
+            return None
+        if inspect.iscoroutinefunction(method):
+            return await method(*args)
+        result = await asyncio.to_thread(method, *args)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
     async def _complete(self, job: Any, result: Any) -> None:
         job_id = self._job_value(job, "job_id")
         lease_token = self._job_value(job, "lease_token")
@@ -249,8 +260,22 @@ class PriceScheduler:
         if not self.configured:
             return 0
         now = self.clock()
+        for method_name, args, log_name in (
+            ("poll_preview_updates", (), "price_preview_update_poll_failed"),
+            ("cleanup_terminal_previews", (), "price_preview_cleanup_failed"),
+            ("ensure_scheduled_previews", (now,), "price_preview_creation_failed"),
+        ):
+            try:
+                await self._service_call(method_name, *args)
+            except Exception:
+                LOG.exception(log_name)
         await self._materialize_schedules(now)
         processed = await self._process_due_jobs()
+        if processed:
+            try:
+                await self._service_call("cleanup_terminal_previews")
+            except Exception:
+                LOG.exception("price_preview_cleanup_failed")
         await self._sync_sheets_outbox()
         return processed
 

@@ -240,41 +240,67 @@
 
     refresh.addEventListener("click", refreshJobs);
 
-    document.querySelectorAll(".major-price-section[id]").forEach((section) => {
-        const toolbar = section.querySelector(".major-section-toolbar");
-        if (!toolbar || toolbar.querySelector(".price-server-actions")) return;
+    const loadEditableSections = async () => {
+        try {
+            const response = await fetch("/price/api/v1/sections", {
+                credentials: "same-origin",
+                cache: "no-store",
+            });
+            if (!response.ok) return new Set();
+            const body = await response.json();
+            return new Set(
+                (Array.isArray(body.sections) ? body.sections : [])
+                    .filter((section) => section && section.can_edit)
+                    .map((section) => String(section.section_key || ""))
+                    .filter(Boolean)
+            );
+        } catch (_) {
+            return new Set();
+        }
+    };
 
-        const key = section.id;
-        const actions = document.createElement("div");
-        actions.className = "price-server-actions";
+    const initializeActions = async () => {
+        const editableSections = await loadEditableSections();
+        document.querySelectorAll(".major-price-section[id]").forEach((section) => {
+            const toolbar = section.querySelector(".major-section-toolbar");
+            if (!toolbar || toolbar.querySelector(".price-server-actions")) return;
 
-        const send = makeButton("Отправить сейчас", "Создать новый пост в канале", "primary");
-        send.addEventListener("click", () => {
-            if (!window.confirm("Отправить этот прайс новым постом прямо сейчас?")) return;
-            run(send, `/price/api/v1/sections/${encodeURIComponent(key)}/send-now`, {}, "Отправка поставлена в очередь.");
+            const key = section.id;
+            const actions = document.createElement("div");
+            actions.className = "price-server-actions";
+
+            const send = makeButton("Отправить сейчас", "Создать новый пост в канале", "primary");
+            send.addEventListener("click", () => {
+                if (!window.confirm("Отправить этот прайс новым постом прямо сейчас?")) return;
+                run(send, `/price/api/v1/sections/${encodeURIComponent(key)}/send-now`, {}, "Отправка поставлена в очередь.");
+            });
+
+            const tomorrow = makeButton("Завтра 09:30", "Отправить новый пост завтра в 09:30 по Ташкенту");
+            tomorrow.addEventListener("click", () => {
+                run(tomorrow, `/price/api/v1/sections/${encodeURIComponent(key)}/schedule`, {when: "tomorrow_0930", mode: "send"}, "Публикация запланирована.");
+            });
+
+            const schedule = makeButton("Выбрать время", "Назначить дату и время публикации");
+            schedule.addEventListener("click", () => {
+                const value = window.prompt("Дата и время по Ташкенту (ГГГГ-ММ-ДД ЧЧ:ММ):");
+                if (!value) return;
+                run(schedule, `/price/api/v1/sections/${encodeURIComponent(key)}/schedule`, {when: value, mode: "send"}, "Публикация запланирована.");
+            });
+
+            actions.append(send);
+            if (editableSections.has(key)) {
+                const edit = makeButton("Обновить пост", "Изменить последний актуальный пост этого раздела");
+                edit.addEventListener("click", () => {
+                    if (!window.confirm("Обновить существующий пост этого раздела?")) return;
+                    run(edit, `/price/api/v1/sections/${encodeURIComponent(key)}/edit-current`, {}, "Обновление поставлено в очередь.");
+                });
+                actions.append(edit);
+            }
+            actions.append(tomorrow, schedule);
+            toolbar.appendChild(actions);
         });
-
-        const edit = makeButton("Обновить пост", "Изменить последний актуальный пост этого раздела");
-        edit.addEventListener("click", () => {
-            if (!window.confirm("Обновить существующий пост этого раздела?")) return;
-            run(edit, `/price/api/v1/sections/${encodeURIComponent(key)}/edit-current`, {}, "Обновление поставлено в очередь.");
-        });
-
-        const tomorrow = makeButton("Завтра 09:30", "Отправить новый пост завтра в 09:30 по Ташкенту");
-        tomorrow.addEventListener("click", () => {
-            run(tomorrow, `/price/api/v1/sections/${encodeURIComponent(key)}/schedule`, {when: "tomorrow_0930", mode: "send"}, "Публикация запланирована.");
-        });
-
-        const schedule = makeButton("Выбрать время", "Назначить дату и время публикации");
-        schedule.addEventListener("click", () => {
-            const value = window.prompt("Дата и время по Ташкенту (ГГГГ-ММ-ДД ЧЧ:ММ):");
-            if (!value) return;
-            run(schedule, `/price/api/v1/sections/${encodeURIComponent(key)}/schedule`, {when: value, mode: "send"}, "Публикация запланирована.");
-        });
-
-        actions.append(send, edit, tomorrow, schedule);
-        toolbar.appendChild(actions);
-    });
+    };
 
     refreshJobs();
+    initializeActions();
 })();

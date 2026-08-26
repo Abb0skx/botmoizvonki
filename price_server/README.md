@@ -6,7 +6,15 @@ with the `botmoizvonki` FastAPI application and owns:
 - password protection for `/price`;
 - durable price snapshots in SQLite;
 - Telegram send, edit and delayed-publication jobs;
+- a 24-hour delayed-post preview channel with administrator-only cancellation;
 - `chat_id` / `message_id` registry and its `Product Sort` mirror.
+
+Delayed jobs enter the preview channel only when their execution time is no
+more than 24 hours away. The bot polls callback and channel-service updates,
+removes preview posts after completion/cancellation, and deletes Telegram
+service notices such as pin notifications. `PRICE_POST_INDEX_SHEET_NAME`
+contains one row for every current price section, including blank IDs for
+sections that have never been published.
 
 The local generator remains in the other project:
 `Price2024DB/Cod/Price.py`. It reads local/Google data, builds the price and

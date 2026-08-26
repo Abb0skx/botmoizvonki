@@ -41,6 +41,9 @@ class PriceSettings:
     timezone: str
     scheduler_poll_seconds: int
     sync_max_bytes: int
+    telegram_preview_channel_id: str = ""
+    post_index_sheet_name: str = "Price Post IDs"
+    telegram_updates_limit: int = 100
 
     @classmethod
     def load(cls) -> "PriceSettings":
@@ -91,6 +94,18 @@ class PriceSettings:
             sync_max_bytes=_int(
                 "PRICE_SYNC_MAX_BYTES", 10 * 1024 * 1024
             ),
+            telegram_preview_channel_id=os.getenv(
+                "PRICE_TELEGRAM_PREVIEW_CHANNEL_ID", ""
+            ).strip(),
+            post_index_sheet_name=(
+                os.getenv(
+                    "PRICE_POST_INDEX_SHEET_NAME", "Price Post IDs"
+                ).strip()
+                or "Price Post IDs"
+            ),
+            telegram_updates_limit=_int(
+                "PRICE_TELEGRAM_UPDATES_LIMIT", 100
+            ),
         )
 
     def validate_runtime(self) -> None:
@@ -105,10 +120,31 @@ class PriceSettings:
             raise RuntimeError("PRICE_ADMIN_PASSWORD is not configured")
         if not self.sync_api_key:
             raise RuntimeError("PRICE_SYNC_API_KEY is not configured")
+        if self.telegram_preview_channel_id:
+            preview = self.telegram_preview_channel_id
+            if not (preview.startswith("-100") and preview[4:].isdigit()):
+                raise RuntimeError(
+                    "PRICE_TELEGRAM_PREVIEW_CHANNEL_ID must be a -100 channel ID"
+                )
+            if preview == self.telegram_channel_id:
+                raise RuntimeError(
+                    "Preview and publication channels must be different"
+                )
+        if len(self.post_index_sheet_name) > 100:
+            raise RuntimeError(
+                "PRICE_POST_INDEX_SHEET_NAME must be at most 100 characters"
+            )
 
     @property
     def telegram_configured(self) -> bool:
         return bool(
             self.telegram_bot_token
             and self.telegram_channel_id
+        )
+
+    @property
+    def preview_configured(self) -> bool:
+        return bool(
+            self.telegram_bot_token
+            and self.telegram_preview_channel_id
         )

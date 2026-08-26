@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import uuid
 from collections.abc import Mapping, Sequence
@@ -8,7 +9,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .config import PriceSettings
-from .sheets_registry import ProductSortPostRegistry
+from .sheets_registry import ProductSortPostIndex, ProductSortPostRegistry
 from .telegram_api import (
     TelegramClient,
     TelegramMessage,
@@ -72,6 +73,8 @@ class PricePublicationService:
             channel_username=settings.telegram_channel_username,
         )
         self._registry: ProductSortPostRegistry | None = None
+        self._index_registry: ProductSortPostIndex | None = None
+        self._last_index_hash = ""
 
     def _section_for_job(self, job: Any):
         section_key = str(_value(job, "section_key", "")).strip()
@@ -345,6 +348,237 @@ class PricePublicationService:
             "post_urls": [message.post_url for message in messages],
         }
 
+    @staticmethod
+    def _preview_markup(job_id: int) -> dict[str, Any]:
+        return {
+            "inline_keyboard": [[{
+                "text": "❌ Отменить публикацию",
+                "callback_data": f"price_cancel:{int(job_id)}",
+            }]]
+        }
+
+    def create_scheduled_preview(self, job: Any) -> dict[str, Any]:
+        """Publish a durable preview for one delayed job."""
+        channel_id = self.settings.telegram_preview_channel_id
+        if not channel_id:
+            return {"status": "preview_disabled", "message_ids": []}
+        job_id = int(_value(job, "job_id"))
+        section = self._section_for_job(job)
+        chunks = self._section_blocks(section)
+        sent: list[TelegramMessage] = []
+        try:
+            for index, chunk in enumerate(chunks, start=1):
+                message = self.telegram.send_message(
+                    channel_id,
+                    chunk,
+                    reply_markup=(
+                        self._preview_markup(job_id)
+                        if index == 1 else None
+                    ),
+                    channel_username="",
+                )
+                sent.append(message)
+                self.repository.record_scheduled_preview(
+                    job_id,
+                    str(_value(section, "section_key")),
+                    channel_id,
+                    part_no=index,
+                    part_count=len(chunks),
+                    message_id=message.message_id,
+                    post_url=message.post_url,
+                    content_hash=message.content_hash,
+                    html_text=message.html,
+                )
+        except Exception as exc:
+            if sent:
+                try:
+                    self.repository.set_scheduled_preview_status(
+                        job_id, "active", error=str(exc)
+                    )
+                except Exception:
+                    LOG.exception(
+                        "price_partial_preview_persistence_failed job_id=%s",
+                        job_id,
+                    )
+                raise PartialPublicationError(
+                    "Telegram preview is partial and needs review"
+                ) from exc
+            raise
+        return {
+            "status": "previewed",
+            "job_id": job_id,
+            "message_ids": [message.message_id for message in sent],
+        }
+
+    def ensure_scheduled_previews(self, now: datetime) -> int:
+        if not self.settings.preview_configured:
+            return 0
+        created = 0
+        for job in self.repository.list_jobs_for_preview(
+            now,
+            horizon_hours=24,
+            limit=100,
+        ):
+            try:
+                self.create_scheduled_preview(job)
+                created += 1
+            except Exception:
+                LOG.exception(
+                    "price_scheduled_preview_failed job_id=%s",
+                    _value(job, "job_id"),
+                )
+        return created
+
+    def delete_scheduled_preview(
+        self,
+        job_id: int,
+        *,
+        status: str = "deleted",
+    ) -> bool:
+        previews = self.repository.list_scheduled_previews(
+            job_id=int(job_id),
+            status="active",
+        )
+        if not previews:
+            return True
+        try:
+            for preview in previews:
+                self.telegram.delete_message(
+                    preview["channel_id"],
+                    int(preview["message_id"]),
+                )
+        except Exception as exc:
+            self.repository.set_scheduled_preview_status(
+                int(job_id), "active", error=str(exc)
+            )
+            return False
+        self.repository.set_scheduled_preview_status(int(job_id), status)
+        return True
+
+    def cancel_scheduled_job(self, job_id: int) -> bool:
+        cancelled = self.repository.cancel_job(
+            int(job_id),
+            now=datetime.now(timezone.utc),
+        )
+        if cancelled:
+            self.delete_scheduled_preview(int(job_id), status="cancelled")
+        return bool(cancelled)
+
+    def cleanup_terminal_previews(self) -> int:
+        job_ids = list(dict.fromkeys(
+            int(item["job_id"])
+            for item in self.repository.list_terminal_previews(limit=500)
+        ))
+        cleaned = 0
+        for job_id in job_ids:
+            job = self.repository.get_job(job_id) or {}
+            if self.delete_scheduled_preview(
+                job_id,
+                status=str(job.get("status") or "deleted"),
+            ):
+                cleaned += 1
+        return cleaned
+
+    @staticmethod
+    def _is_service_channel_post(message: Mapping[str, Any]) -> bool:
+        service_fields = {
+            "pinned_message", "new_chat_title", "new_chat_photo",
+            "delete_chat_photo", "group_chat_created",
+            "supergroup_chat_created", "channel_chat_created",
+            "message_auto_delete_timer_changed", "video_chat_scheduled",
+            "video_chat_started", "video_chat_ended",
+            "video_chat_participants_invited", "forum_topic_created",
+            "forum_topic_closed", "forum_topic_reopened",
+            "general_forum_topic_hidden", "general_forum_topic_unhidden",
+            "write_access_allowed", "users_shared", "chat_shared",
+        }
+        return any(field in message for field in service_fields)
+
+    def _handle_cancel_callback(self, callback: Mapping[str, Any]) -> None:
+        callback_id = str(callback.get("id") or "")
+        data = str(callback.get("data") or "")
+        message = callback.get("message")
+        sender = callback.get("from")
+        if not (
+            callback_id and data.startswith("price_cancel:")
+            and isinstance(message, Mapping)
+            and isinstance(sender, Mapping)
+        ):
+            return
+        chat = message.get("chat")
+        if not isinstance(chat, Mapping) or str(chat.get("id")) != str(
+            self.settings.telegram_preview_channel_id
+        ):
+            self.telegram.answer_callback_query(
+                callback_id, text="Недоступно", show_alert=True
+            )
+            return
+        try:
+            job_id = int(data.split(":", 1)[1])
+            user_id = int(sender.get("id"))
+        except (TypeError, ValueError):
+            self.telegram.answer_callback_query(
+                callback_id, text="Некорректная команда", show_alert=True
+            )
+            return
+        member = self.telegram.get_chat_member(chat["id"], user_id)
+        if str(member.get("status") or "") not in {"administrator", "creator"}:
+            self.telegram.answer_callback_query(
+                callback_id,
+                text="Отмена доступна только администраторам",
+                show_alert=True,
+            )
+            return
+        cancelled = self.cancel_scheduled_job(job_id)
+        self.telegram.answer_callback_query(
+            callback_id,
+            text=("Публикация отменена" if cancelled else "Задание уже обработано"),
+            show_alert=not cancelled,
+        )
+
+    def poll_preview_updates(self) -> int:
+        if not self.settings.preview_configured:
+            return 0
+        raw_offset = self.repository.get_runtime_state(
+            "telegram_update_offset", "0"
+        )
+        try:
+            offset = max(0, int(raw_offset))
+        except ValueError:
+            offset = 0
+        updates = self.telegram.get_updates(
+            offset=offset or None,
+            limit=self.settings.telegram_updates_limit,
+        )
+        processed = 0
+        for update in updates:
+            update_id = int(update.get("update_id", -1))
+            callback = update.get("callback_query")
+            if isinstance(callback, Mapping):
+                self._handle_cancel_callback(callback)
+            for field in ("channel_post", "edited_channel_post"):
+                message = update.get(field)
+                if not isinstance(message, Mapping):
+                    continue
+                chat = message.get("chat")
+                if (
+                    isinstance(chat, Mapping)
+                    and str(chat.get("id")) == str(
+                        self.settings.telegram_preview_channel_id
+                    )
+                    and self._is_service_channel_post(message)
+                    and message.get("message_id")
+                ):
+                    self.telegram.delete_message(
+                        chat["id"], int(message["message_id"])
+                    )
+            if update_id >= 0:
+                self.repository.set_runtime_state(
+                    "telegram_update_offset", update_id + 1
+                )
+            processed += 1
+        return processed
+
     def execute_job(self, job: Any) -> dict[str, Any]:
         section = self._section_for_job(job)
         channel_id = str(
@@ -369,9 +603,6 @@ class PricePublicationService:
             limit=limit,
             lease_seconds=180,
         )
-        if not claimed:
-            return 0
-
         supported = [
             item
             for item in claimed
@@ -389,31 +620,47 @@ class PricePublicationService:
                 permanent=True,
             )
 
-        if not supported:
-            return 0
-        if self._registry is None:
-            self._registry = ProductSortPostRegistry(self.settings)
+        completed = 0
+        if supported:
+            if self._registry is None:
+                self._registry = ProductSortPostRegistry(self.settings)
+            try:
+                self._registry.upsert([item["payload"] for item in supported])
+            except Exception as exc:
+                retry_after = getattr(exc, "retry_after", None)
+                for item in supported:
+                    self.repository.retry_outbox(
+                        item["outbox_id"],
+                        item["lease_token"],
+                        now,
+                        str(exc),
+                        retry_after_seconds=retry_after,
+                    )
+                raise
 
-        try:
-            self._registry.upsert([item["payload"] for item in supported])
-        except Exception as exc:
-            retry_after = getattr(exc, "retry_after", None)
             for item in supported:
-                self.repository.retry_outbox(
+                if self.repository.complete_outbox(
                     item["outbox_id"],
                     item["lease_token"],
-                    now,
-                    str(exc),
-                    retry_after_seconds=retry_after,
-                )
-            raise
+                    datetime.now(timezone.utc),
+                ):
+                    completed += 1
 
-        completed = 0
-        for item in supported:
-            if self.repository.complete_outbox(
-                item["outbox_id"],
-                item["lease_token"],
-                datetime.now(timezone.utc),
-            ):
-                completed += 1
+        records = self.repository.build_post_index_records(
+            self.settings.telegram_channel_id,
+            self.settings.telegram_preview_channel_id,
+        )
+        stable = json.dumps(
+            records,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        index_hash = hashlib.sha256(stable.encode("utf-8")).hexdigest()
+        if records and index_hash != self._last_index_hash:
+            if self._index_registry is None:
+                self._index_registry = ProductSortPostIndex(self.settings)
+            self._index_registry.upsert(records)
+            self._last_index_hash = index_hash
+            completed += len(records)
         return completed
