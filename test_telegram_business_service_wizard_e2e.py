@@ -424,9 +424,10 @@ def test_night_ambiguous_search_creates_model_callback_buttons(harness: Harness)
     sent = harness.api.sent[-1]
     assert request["wizard_state"] == "model"
     assert request["exact_model"] is None
-    assert "несколько похожих моделей" in sent["text"]
-    assert callback_data(sent["reply_markup"], "Выбрать 1")
-    assert callback_data(sent["reply_markup"], "Выбрать 2")
+    assert "Выберите модель" in sent["text"]
+    assert callback_data(sent["reply_markup"], "1. Samsung Galaxy S25")
+    assert callback_data(sent["reply_markup"], "2. Samsung Galaxy S25 Plus")
+    assert all(len(row) == 1 for row in sent["reply_markup"]["inline_keyboard"])
 
 
 def test_exact_product_without_attributes_starts_at_fulfillment(harness: Harness):

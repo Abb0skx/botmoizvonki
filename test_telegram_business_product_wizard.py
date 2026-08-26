@@ -67,8 +67,10 @@ def test_ambiguous_model_step_is_capped_linked_and_callback_safe():
     assert "Phone &lt;A&gt;" in step.text
     assert '<a href="https://t.me/Texnikach_Phone/100">' in step.text
     assert "evil.test" not in step.text
-    assert any(button.url for button in step.keyboard[0])
-    assert not any(button.url for button in step.keyboard[1])
+    assert all(len(row) == 1 for row in step.keyboard[:5])
+    assert all(row[0].action == "select_model" for row in step.keyboard[:5])
+    assert all(row[0].url is None for row in step.keyboard[:5])
+    assert "<A>" in step.keyboard[0][0].text
 
     markup = step.inline_keyboard(
         lambda action, choice_id: f"w:{action}:{choice_id or '-'}"
@@ -96,7 +98,7 @@ def test_memory_step_uses_only_real_distinct_values_and_filters_exactly():
     assert step.code == "memory"
     assert [choice.value for choice in step.choices] == ["8/256Gb", "12/512Gb"]
     assert "Выберите память" in step.text
-    assert "xotirani tanlang" in step.text
+    assert "xotirani tanlang" in step.text.casefold()
     selected = variants_for_choice(variants, step, step.choices[0].choice_id)
     assert {item.product_id for item in selected} == {1, 2}
 
@@ -118,7 +120,7 @@ def test_mm_values_are_rendered_as_size_not_memory(values):
     step = build_attribute_step(variants, "uz")
     assert step is not None
     assert step.code == "size"
-    assert "o‘lchamni tanlang" in step.text
+    assert "o‘lchamni tanlang" in step.text.casefold()
     assert all(
         button.action != "select_memory"
         for row in step.keyboard
@@ -283,8 +285,8 @@ def test_fulfillment_step_uses_only_button_specs_and_navigation():
     step = build_fulfillment_step("bi")
 
     assert step.code == "fulfillment"
-    assert "доставка или самовывоз" in step.text
-    assert "yetkazib berish" in step.text
+    assert "доставка или самовывоз" in step.text.casefold()
+    assert "yetkazib berish" in step.text.casefold()
     assert actions(step) == [
         "select_delivery",
         "select_pickup",
@@ -306,11 +308,10 @@ def test_delivery_phone_is_manual_and_pickup_phone_is_optional():
     pickup = build_pickup_contact_step("uz")
 
     assert delivery.code == "delivery_phone"
-    assert "текстом" in delivery.text
-    assert "прикрепите контакт" in delivery.text
+    assert "номер или контакт" in delivery.text
     assert actions(delivery) == ["back", "cancel"]
     assert pickup.code == "pickup_contact"
-    assert "majburiy emas" in pickup.text
+    assert "shart emas" in pickup.text
     assert actions(pickup) == [
         "use_telegram_contact",
         "add_phone",
@@ -323,9 +324,9 @@ def test_delivery_location_accepts_supported_manual_formats():
     step = build_delivery_location_step("bi")
 
     assert step.code == "delivery_location"
-    for expected in ("скрепку Telegram", "Google/Yandex Maps", "координаты"):
+    for expected in ("геолокацию", "ссылку на карту", "адрес"):
         assert expected in step.text
-    assert "Telegram skrepkasi" in step.text
+    assert "Geolokatsiya" in step.text
     assert actions(step) == ["back", "cancel"]
 
 
@@ -361,7 +362,7 @@ def test_delivery_review_links_only_safe_model_and_has_disclaimers():
     assert "+998 &lt;90&gt;" in step.text
     assert "Заказ не оформлен" in step.text
     assert "не зарезервирован" in step.text
-    assert "подтвердит менеджер" in step.text
+    assert "подтвердит менеджер" in step.text.casefold()
     assert actions(step) == ["submit", "edit", "back", "cancel"]
     assert "Подтвердить заказ" not in step.text
 

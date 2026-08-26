@@ -36,24 +36,24 @@ ALLOWED_PLACEHOLDERS = frozenset(
 
 TEMPLATES: dict[str, dict[str, str]] = {
     "greeting_model": {
-        "ru": "Здравствуйте! Я автоматический помощник TEXNIKACH. Менеджер ответит вам {manager_time_phrase_ru}. Пока я могу показать цены из нашей базы.",
-        "uz": "Assalomu alaykum! Men TEXNIKACH avtomatik yordamchisiman. Menejer sizga {manager_time_phrase_uz} javob beradi. Hozircha bazamizdagi narxlarni ko‘rsatishim mumkin.",
+        "ru": "Здравствуйте! Я авто-помощник TEXNIKACH. Менеджер ответит {manager_time_phrase_ru}.",
+        "uz": "Assalomu alaykum! Men TEXNIKACH avto-yordamchisiman. Menejer {manager_time_phrase_uz} javob beradi.",
     },
     "greeting_no_model": {
-        "ru": "Здравствуйте! Я автоматический помощник TEXNIKACH. Сейчас нерабочее время. Менеджер ответит вам {manager_time_phrase_ru}.\n\nЯ могу найти нужный товар и показать цены из нашей базы. Доставка или самовывоз возможны только после подтверждения менеджером. Напишите название модели.",
-        "uz": "Assalomu alaykum! Men TEXNIKACH avtomatik yordamchisiman. Hozir ish vaqti tugagan. Menejer sizga {manager_time_phrase_uz} javob beradi.\n\nMen kerakli mahsulotni topib, bazamizdagi narxlarni ko‘rsatishim mumkin. Yetkazib berish yoki do‘kondan olib ketish faqat menejer tasdiqlaganidan keyin mumkin. Model nomini yozing.",
+        "ru": "Здравствуйте! Я авто-помощник TEXNIKACH. Менеджер ответит {manager_time_phrase_ru}. Напишите модель — покажу цену.",
+        "uz": "Assalomu alaykum! Men TEXNIKACH avto-yordamchisiman. Menejer {manager_time_phrase_uz} javob beradi. Modelni yozing — narxini ko‘rsataman.",
     },
     "credit": {
         "ru": "Я автоматический помощник TEXNIKACH. К сожалению, у нас нет кредита и рассрочки. Оплата производится полностью после проверки товара.\n\nАктуальные модели и цены: {catalog_url}",
         "uz": "Men TEXNIKACH avtomatik yordamchisiman. Afsuski, bizda kredit va bo‘lib to‘lash yo‘q. To‘lov mahsulot tekshirilgandan keyin to‘liq amalga oshiriladi.\n\nAktual modellar va narxlar: {catalog_url}",
     },
     "product_result": {
-        "ru": "Цены в базе для {model}:\n\n{variants}\n\nЧтобы ускорить оформление, можете отправить точную модель, память, желаемый цвет, локацию и удобное время.",
-        "uz": "{model} uchun bazadagi narxlar:\n\n{variants}\n\nRasmiylashtirishni tezlashtirish uchun aniq model, xotira, kerakli rang, lokatsiya va qulay vaqtni yuborishingiz mumkin.",
+        "ru": "{model}\n\n{variants}",
+        "uz": "{model}\n\n{variants}",
     },
     "ambiguous": {
-        "ru": "Я нашёл несколько похожих моделей:\n\n{models}\n\nНажмите на название модели, чтобы открыть её страницу, или напишите номер нужной модели.",
-        "uz": "Bir nechta o‘xshash model topildi:\n\n{models}\n\nSahifasini ochish uchun model nomini bosing yoki kerakli model raqamini yozing.",
+        "ru": "Выберите модель:\n\n{models}",
+        "uz": "Modelni tanlang:\n\n{models}",
     },
     "human_handoff": {
         "ru": "Ваше сообщение сохранено и передано менеджеру. Я не буду принимать решение по этому вопросу. Менеджер ответит вам {manager_time_phrase_ru}.",
@@ -80,8 +80,8 @@ TEMPLATES: dict[str, dict[str, str]] = {
         "uz": "Lokatsiyani oldik. Kerakli model nomini yozing. Menejer ma’lumotlarni {manager_time_phrase_uz} tekshiradi.",
     },
     "final": {
-        "ru": "Точную цену и наличие подтвердит менеджер {manager_time_phrase_ru}.\n\nЕсли отправите точную модель, память, желаемый цвет, локацию и удобное время, мы сможем быстрее всё проверить и, при наличии товара, постараемся доставить его в первой половине рабочего дня или в удобное для вас время.\n\nДоставка по Ташкенту бесплатная и обычно занимает 2–3 часа после подтверждения заказа. Доставка и самовывоз возможны только после подтверждения менеджером.\n\nПереписка с ботом не оформляет заказ и не резервирует товар.",
-        "uz": "Aniq narx va mavjudligini menejer {manager_time_phrase_uz} tasdiqlaydi.\n\nAniq model, xotira, kerakli rang, lokatsiya va qulay vaqtni yuborsangiz, ma’lumotlarni tezroq tekshirib, mahsulot mavjud bo‘lsa, uni ish kunining birinchi yarmida yoki sizga qulay vaqtda yetkazib berishga harakat qilamiz.\n\nToshkent bo‘ylab yetkazib berish bepul va buyurtma tasdiqlangandan keyin odatda 2–3 soat davom etadi. Yetkazib berish va do‘kondan olib ketish faqat menejer tasdiqlaganidan keyin mumkin.\n\nBot bilan yozishma buyurtmani rasmiylashtirmaydi va mahsulotni band qilmaydi.",
+        "ru": "Цена и наличие требуют подтверждения менеджера {manager_time_phrase_ru}. Бот не оформляет заказ и не резервирует товар.",
+        "uz": "Narx va mavjudlikni menejer {manager_time_phrase_uz} tasdiqlaydi. Bot buyurtma rasmiylashtirmaydi va mahsulotni band qilmaydi.",
     },
     "product_source_unavailable": {
         "ru": "Сейчас не удалось получить актуальные цены из базы. Цену и наличие проверит менеджер {manager_time_phrase_ru}.",

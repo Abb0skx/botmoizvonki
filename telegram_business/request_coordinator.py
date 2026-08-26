@@ -185,8 +185,8 @@ class NightRequestCoordinator:
         base = build_delivery_phone_step(language)
         text = _localized(
             language,
-            "Напишите необязательный номер телефона для самовывоза, например: +998 90 123 45 67. Или вернитесь назад и оставьте связь через Telegram.",
-            "Do‘kondan olib ketish uchun ixtiyoriy telefon raqamini yozing, masalan: +998 90 123 45 67. Yoki orqaga qaytib, Telegram orqali aloqani qoldiring.",
+            "Отправьте номер или нажмите «Назад» и оставьте Telegram.",
+            "Raqamni yuboring yoki «Orqaga» bosib Telegramni qoldiring.",
         )
         return WizardStep("delivery_phone", text, (), base.keyboard)
 
@@ -220,14 +220,11 @@ class NightRequestCoordinator:
         price = _value(request, "database_price")
         if price:
             if language == "ru":
-                suffix = f"\n\nЦена в текущей базе: {format_price(price, 'ru')}."
+                suffix = f"\n\nЦена: {format_price(price, 'ru')}"
             elif language == "uz":
-                suffix = f"\n\nJoriy bazadagi narx: {format_price(price, 'uz')}."
+                suffix = f"\n\nNarx: {format_price(price, 'uz')}"
             else:
-                suffix = (
-                    f"\n\nЦена в текущей базе: {format_price(price, 'ru')}."
-                    f"\nJoriy bazadagi narx: {format_price(price, 'uz')}."
-                )
+                suffix = f"\n\nЦена / Narx: {format_price(price, 'uz')}"
             step = WizardStep(step.code, step.text + suffix, step.choices, step.keyboard)
         return step
 

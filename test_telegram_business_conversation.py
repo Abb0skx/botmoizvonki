@@ -326,7 +326,7 @@ def test_credit_order_words_are_removed_from_model_query(tmp_path):
     texts = [item["text"] for item in harness.api.sent]
     assert any("нет кредита" in text for text in texts)
     assert any("не могу оформить" in text for text in texts)
-    assert any("Цены в базе" in text for text in texts)
+    assert any("so'm" in text for text in texts)
 
 
 def test_ordinary_night_conversation_is_not_a_failed_product_search(tmp_path):
@@ -436,7 +436,7 @@ def test_location_after_price_sends_final_immediately(tmp_path):
     harness.run_debounce()
     saved = harness.service.repo.session_by_id(session["session_id"])
     assert saved["final_sent"] == 1
-    assert "Точную цену и наличие" in harness.api.sent[-1]["text"]
+    assert "Цена и наличие" in harness.api.sent[-1]["text"]
     with connect(harness.service.repo.path) as db:
         status = db.execute("SELECT status FROM scheduled_actions WHERE dedupe_key=?", (f"final:{session['session_id']}",)).fetchone()[0]
     assert status == "cancelled"
@@ -577,7 +577,7 @@ def test_availability_question_with_model_still_gets_night_price(tmp_path):
     harness.incoming(harness.clock(), "Есть ли в наличии iPhone 16 Pro Max 256?")
     harness.run_debounce()
     assert harness.products.queries == [("iphone 16 pro max", "256 GB", None)]
-    assert any("Цены в базе" in item["text"] for item in harness.api.sent)
+    assert any("so'm" in item["text"] for item in harness.api.sent)
 
 
 def test_processed_message_metadata_is_written_to_sqlite_and_sheets_outbox(tmp_path):
@@ -807,7 +807,7 @@ def test_safe_family_search_typo_and_clickable_bilingual_output():
     assert repo.search("samnsung s25 ulrta").models == ("Samsung Galaxy S25 Ultra",)
     match = repo.search("Samsung S25 Plus")
     text = format_result(match, "bi")
-    assert "Цены в базе / Bazadagi narxlar" in text
+    assert "Samsung Galaxy S25 Plus" in text
     assert '<a href="https://t.me/Texnikach_Phone/1553">' in text
     assert len(text) <= 4096
 
@@ -1525,7 +1525,7 @@ def test_known_clickable_catalog_title_is_recognized_without_price_fetch():
 def test_price_rounding_matches_existing_half_up_catalog_logic():
     variant = ProductVariant("Phone X", "256 GB", "Black", Decimal("14500500"))
     output = format_result(ProductMatch("found", ("Phone X",), (variant,)), "ru")
-    assert "14 501 000 сум" in output
+    assert "14 501 000 so'm" in output
 
 
 def test_unmatched_color_keeps_matching_memory_filter():

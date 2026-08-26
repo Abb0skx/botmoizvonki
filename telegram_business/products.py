@@ -660,7 +660,9 @@ def _format_amount(value: Decimal, language: str) -> str:
     quantum = Decimal("1000") if value > Decimal("10000") else Decimal("1")
     rounded = int((value / quantum).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * quantum)
     amount = f"{rounded:,}".replace(",", " ")
-    return f"{amount} сум" if language == "ru" else f"{amount} so‘m"
+    # Keep one familiar currency spelling in every localized screen.  Mixing
+    # ``сум`` and ``so‘m`` made the same catalogue row look like two prices.
+    return f"{amount} so'm"
 
 
 def _memory_sort(value: str) -> tuple[int, str]:
@@ -765,24 +767,24 @@ def format_result(match: ProductMatch, language: str) -> str:
         lines.insert(0, notice)
 
     if language == "bi":
-        title = f"Цены в базе / Bazadagi narxlar — {safe_model}:"
-        tail = "Можете отправить память, цвет, локацию и время. / Xotira, rang, lokatsiya va qulay vaqtni yuborishingiz mumkin."
+        title = safe_model
+        tail = "Выберите вариант. / Variantni tanlang."
     elif language == "ru":
-        title = f"Цены в базе для {safe_model}:"
-        tail = "Чтобы ускорить оформление, можете отправить точную модель, память, желаемый цвет, локацию и удобное время."
+        title = safe_model
+        tail = "Выберите вариант."
     else:
-        title = f"{safe_model} uchun bazadagi narxlar:"
-        tail = "Rasmiylashtirishni tezlashtirish uchun aniq model, xotira, kerakli rang, lokatsiya va qulay vaqtni yuborishingiz mumkin."
+        title = safe_model
+        tail = "Variantni tanlang."
     return _bounded_html_message(title, lines, tail)
 
 
 def format_ambiguous_result(match: ProductMatch, language: str) -> str:
     if language == "bi":
-        intro = "Найдено несколько моделей / Bir nechta model topildi:"
-        tail = "Нажмите модель или напишите номер. / Modelni bosing yoki raqamini yozing."
+        intro = "Выберите модель / Modelni tanlang:"
+        tail = "Нажмите кнопку ниже. / Quyidagi tugmani bosing."
     else:
-        intro = "Я нашёл несколько похожих моделей:" if language == "ru" else "Bir nechta o‘xshash model topildi:"
-        tail = "Нажмите на название модели, чтобы открыть её страницу, или напишите номер/название." if language == "ru" else "Model sahifasini ochish uchun uning nomini bosing yoki raqami/nomini yozing."
+        intro = "Выберите модель:" if language == "ru" else "Modelni tanlang:"
+        tail = "Нажмите кнопку ниже." if language == "ru" else "Quyidagi tugmani bosing."
     lines = []
     for number, model in enumerate(match.models[:5], 1):
         safe_model = html.escape(model[:300])

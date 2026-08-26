@@ -146,6 +146,39 @@ def _bounded_label(value: str, limit: int = 64) -> str:
     return compact[: max(1, limit - 1)].rstrip() + "…"
 
 
+def _bounded_model_label(value: str, limit: int = 52) -> str:
+    """Keep both the beginning and distinguishing suffix of a model name."""
+
+    compact = " ".join(str(value or "").split())
+    if len(compact) <= limit:
+        return compact
+    tail = min(16, max(8, limit // 3))
+    head = max(1, limit - tail - 1)
+    return compact[:head].rstrip() + "…" + compact[-tail:].lstrip()
+
+
+def _model_button_labels(choices: Sequence[WizardChoice]) -> tuple[str, ...]:
+    """Prefer the distinctive suffix when all choices share a long family."""
+
+    tokenized = [choice.label.split() for choice in choices]
+    prefix = 0
+    if tokenized:
+        shortest = min(len(tokens) for tokens in tokenized)
+        while prefix < shortest and len(
+            {tokens[prefix].casefold() for tokens in tokenized}
+        ) == 1:
+            prefix += 1
+    strip_prefix = prefix >= 2 and all(len(tokens) > prefix for tokens in tokenized)
+    labels = [
+        " ".join(tokens[prefix:] if strip_prefix else tokens)
+        for tokens in tokenized
+    ]
+    # Never collapse two different catalogue choices into the same label.
+    if len({label.casefold() for label in labels}) != len(labels):
+        labels = [choice.label for choice in choices]
+    return tuple(_bounded_model_label(label) for label in labels)
+
+
 def _escaped_value(value: object, limit: int = 500) -> str:
     """Escape a single summary value without cutting an HTML entity."""
 
@@ -301,38 +334,20 @@ def build_model_step(match: ProductMatch, language: str = "bi") -> WizardStep | 
                 f'<a href="{html.escape(choice.url, quote=True)}">{safe_name}</a>'
             )
         lines.append(f"{choice.ordinal}. {safe_name}")
-    ru = (
-        "Я нашёл несколько похожих моделей:\n\n"
-        + "\n".join(lines)
-        + "\n\nВыберите модель кнопкой или отправьте её номер/название."
-    )
-    uz = (
-        "Bir nechta o‘xshash model topildi:\n\n"
-        + "\n".join(lines)
-        + "\n\nModelni tugma orqali tanlang yoki uning raqami/nomini yuboring."
-    )
+    ru = "Выберите модель:\n\n" + "\n".join(lines)
+    uz = "Modelni tanlang:\n\n" + "\n".join(lines)
 
     rows: list[tuple[ButtonSpec, ...]] = []
-    for choice in choices:
-        row = [
-            ButtonSpec(
-                text=_button_text(
-                    language,
-                    f"Выбрать {choice.ordinal}",
-                    f"{choice.ordinal} ni tanlash",
-                ),
-                action="select_model",
-                choice_id=choice.choice_id,
-            )
-        ]
-        if choice.url:
-            row.append(
+    for choice, label in zip(choices, _model_button_labels(choices)):
+        rows.append(
+            (
                 ButtonSpec(
-                    text=_button_text(language, "Открыть ↗", "Ochish ↗"),
-                    url=choice.url,
-                )
+                    text=_bounded_label(f"{choice.ordinal}. {label}", 56),
+                    action="select_model",
+                    choice_id=choice.choice_id,
+                ),
             )
-        rows.append(tuple(row))
+        )
     rows.append(
         (
             ButtonSpec(
@@ -407,33 +422,17 @@ def build_attribute_step(
     kind = detect_attribute_kind(variants)
     if kind is None:
         return None
-    model = (
-        " ".join(str(model_name or "").split())
-        if str(model_name or "").strip()
-        else _single_model(variants)
-    )
+    if not str(model_name or "").strip():
+        _single_model(variants)
     values = _distinct_values(variants, "memory")
     choices = _choices(kind, values)
-    safe_model = html.escape(model[:300])
     if kind == "size":
-        ru = (
-            f"Выберите размер для <b>{safe_model}</b>. "
-            "Кнопка сохраняет пожелание; наличие подтвердит менеджер."
-        )
-        uz = (
-            f"<b>{safe_model}</b> uchun o‘lchamni tanlang. "
-            "Tugma istagingizni saqlaydi; mavjudligini menejer tasdiqlaydi."
-        )
+        ru = "Выберите размер:"
+        uz = "O‘lchamni tanlang:"
         action = "select_size"
     else:
-        ru = (
-            f"Выберите память для <b>{safe_model}</b>. "
-            "Кнопка сохраняет пожелание; наличие подтвердит менеджер."
-        )
-        uz = (
-            f"<b>{safe_model}</b> uchun xotirani tanlang. "
-            "Tugma istagingizni saqlaydi; mavjudligini menejer tasdiqlaydi."
-        )
+        ru = "Выберите память:"
+        uz = "Xotirani tanlang:"
         action = "select_memory"
     rows = _packed_choice_rows(choices, action)
     rows.append(
@@ -467,21 +466,11 @@ def build_color_step(
     values = _distinct_values(variants, "color")
     if not values:
         return None
-    model = (
-        " ".join(str(model_name or "").split())
-        if str(model_name or "").strip()
-        else _single_model(variants)
-    )
+    if not str(model_name or "").strip():
+        _single_model(variants)
     choices = _choices("color", values)
-    safe_model = html.escape(model[:300])
-    ru = (
-        f"Выберите желаемый цвет для <b>{safe_model}</b> или нажмите «Цвет не важен». "
-        "Наличие выбранного варианта подтвердит менеджер."
-    )
-    uz = (
-        f"<b>{safe_model}</b> uchun kerakli rangni tanlang yoki «Rang farqi yo‘q» tugmasini bosing. "
-        "Tanlangan variant mavjudligini menejer tasdiqlaydi."
-    )
+    ru = "Выберите цвет:"
+    uz = "Rangni tanlang:"
     rows = _packed_choice_rows(choices, "select_color")
     rows.append(
         (
@@ -526,16 +515,8 @@ def build_first_product_step(
 def build_fulfillment_step(language: str = "bi") -> WizardStep:
     """Ask for a delivery preference without promising fulfillment."""
 
-    ru = (
-        "Как вам удобнее получить товар: доставка или самовывоз?\n\n"
-        "Это только пожелание. Возможность доставки или самовывоза, цену и "
-        "наличие подтвердит менеджер."
-    )
-    uz = (
-        "Mahsulotni qanday olish qulay: yetkazib berish yoki do‘kondan olib "
-        "ketish?\n\nBu faqat istak. Yetkazib berish yoki olib ketish imkoniyati, "
-        "narx va mavjudligini menejer tasdiqlaydi."
-    )
+    ru = "Доставка или самовывоз?"
+    uz = "Yetkazib berish yoki olib ketish?"
     keyboard = (
         (
             ButtonSpec(
@@ -562,16 +543,8 @@ def build_fulfillment_step(language: str = "bi") -> WizardStep:
 def build_delivery_phone_step(language: str = "bi") -> WizardStep:
     """Request a delivery phone through text or a manually sent Contact."""
 
-    ru = (
-        "Для доставки нужен номер телефона. Отправьте его текстом или вручную "
-        "прикрепите контакт.\n\nНомер будет сохранён только для передачи менеджеру; "
-        "это не оформляет заказ."
-    )
-    uz = (
-        "Yetkazib berish uchun telefon raqami kerak. Uni matn ko‘rinishida "
-        "yuboring yoki kontaktni qo‘lda biriktiring.\n\nRaqam faqat menejerga "
-        "topshirish uchun saqlanadi; bu buyurtmani rasmiylashtirmaydi."
-    )
+    ru = "Отправьте номер или контакт для доставки."
+    uz = "Yetkazib berish uchun raqam yoki kontaktni yuboring."
     return WizardStep(
         code="delivery_phone",
         text=_localized(language, ru, uz),
@@ -587,15 +560,8 @@ def build_pickup_contact_step(
 ) -> WizardStep:
     """Let pickup customers keep Telegram contact or add an optional phone."""
 
-    ru = (
-        "Для самовывоза телефон необязателен. Менеджер может связаться с вами "
-        "в этом Telegram-чате, либо вы можете добавить номер телефона."
-    )
-    uz = (
-        "Do‘kondan olib ketish uchun telefon raqami majburiy emas. Menejer siz "
-        "bilan shu Telegram chatida bog‘lanishi mumkin yoki telefon raqamini "
-        "qo‘shishingiz mumkin."
-    )
+    ru = "Для самовывоза телефон необязателен."
+    uz = "Olib ketish uchun telefon raqami shart emas."
     rows: list[tuple[ButtonSpec, ...]] = [
         (
             ButtonSpec(
@@ -643,16 +609,8 @@ def build_pickup_contact_step(
 def build_delivery_location_step(language: str = "bi") -> WizardStep:
     """Request a delivery location without using unsupported reply keyboards."""
 
-    ru = (
-        "Отправьте локацию для доставки через скрепку Telegram. Также можно "
-        "прислать ссылку Google/Yandex Maps, координаты или написать адрес текстом.\n\n"
-        "Доставку и адрес подтвердит менеджер."
-    )
-    uz = (
-        "Yetkazib berish lokatsiyasini Telegram skrepkasi orqali yuboring. "
-        "Google/Yandex Maps havolasi, koordinatalar yoki matnli manzilni ham "
-        "yuborishingiz mumkin.\n\nYetkazib berish va manzilni menejer tasdiqlaydi."
-    )
+    ru = "Отправьте геолокацию, ссылку на карту или адрес."
+    uz = "Geolokatsiya, xarita havolasi yoki manzilni yuboring."
     return WizardStep(
         code="delivery_location",
         text=_localized(language, ru, uz),
@@ -750,18 +708,14 @@ def build_review_step(
 
     _validate_review_data(data, require_complete=True)
     ru = (
-        "Проверьте данные перед передачей менеджеру:\n\n"
+        "Проверьте:\n\n"
         + "\n".join(_review_lines(data, "ru"))
-        + "\n\nЭто только передача данных менеджеру. Заказ не оформлен, товар "
-        "не зарезервирован. Точную цену, наличие и возможность доставки или "
-        "самовывоза подтвердит менеджер."
+        + "\n\nЗаказ не оформлен, товар не зарезервирован. Подтвердит менеджер."
     )
     uz = (
-        "Menejerga yuborishdan oldin ma’lumotlarni tekshiring:\n\n"
+        "Tekshiring:\n\n"
         + "\n".join(_review_lines(data, "uz"))
-        + "\n\nBu faqat ma’lumotlarni menejerga topshirishdir. Buyurtma "
-        "rasmiylashtirilmagan va mahsulot band qilinmagan. Aniq narx, mavjudlik, "
-        "yetkazib berish yoki olib ketish imkoniyatini menejer tasdiqlaydi."
+        + "\n\nBuyurtma rasmiylashtirilmagan, mahsulot band qilinmagan. Menejer tasdiqlaydi."
     )
     keyboard = (
         (

@@ -86,7 +86,7 @@ class TelegramBusinessUnitTests(unittest.TestCase):
             ProductVariant("Phone <A>","256 GB","White",Decimal("1000000"),2,url),
         )
         text=format_result(ProductMatch("found",("Phone <A>",),variants,(("Phone <A>",url),)),"ru")
-        self.assertIn("Black, White",text); self.assertEqual(text.count("1 000 000 сум"),1)
+        self.assertIn("Black, White",text); self.assertEqual(text.count("1 000 000 so'm"),1)
         self.assertIn("Phone &lt;A&gt;",text); self.assertLessEqual(len(text),4096)
 
     def test_schedule_boundaries_and_session(self):
@@ -139,7 +139,7 @@ class TelegramBusinessUnitTests(unittest.TestCase):
             update={"update_id":1,"business_message":{"business_connection_id":"connection","message_id":10,"date":int(now.timestamp()),"chat":{"id":200,"type":"private"},"from":{"id":200,"language_code":"ru"},"text":"айфон 16 про макс"}}
             self.assertTrue(service.repo.save_update(update,now)); service.process_update(update)
             action=service.repo.due_actions(now+timedelta(seconds=3))[0]; service.repo.claim_action(action["action_id"]); service.execute(action)
-            self.assertTrue(any("Цены в базе" in text for text in api.sent))
+            self.assertTrue(any("14 500 000 so'm" in text for text in api.sent))
             manual={"update_id":2,"business_message":{"business_connection_id":"connection","message_id":11,"date":int(now.timestamp()),"chat":{"id":200,"type":"private"},"from":{"id":100},"text":"Ответ менеджера"}}
             self.assertTrue(service.repo.save_update(manual,now)); service.process_update(manual)
             self.assertFalse(service.repo.may_automate("200",now+timedelta(minutes=1)))

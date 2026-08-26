@@ -374,8 +374,8 @@ def test_ambiguous_callback_selects_exact_model_and_fences_old_buttons(
         harness.products.ambiguous_iphone(),
         model_query="iphone 16 pro",
     )
-    first = callback_data(screen.reply_markup, "Выбрать 1")
-    second = callback_data(screen.reply_markup, "Выбрать 2")
+    first = callback_data(screen.reply_markup, "1. iPhone 16 Pro Max")
+    second = callback_data(screen.reply_markup, "2. iPhone 16 Pro")
 
     edited = click(
         harness,
@@ -441,21 +441,21 @@ def test_exact_model_memory_color_delivery_phone_location_and_submit(
         chat_id=chat_id,
         callback_id="delivery-memory",
     )
-    assert edited is not None and "Выберите желаемый цвет" in edited["text"]
+    assert edited is not None and "Выберите цвет" in edited["text"]
     edited = click(
         harness,
         callback_data(edited["reply_markup"], "Black"),
         chat_id=chat_id,
         callback_id="delivery-color",
     )
-    assert edited is not None and "доставка или самовывоз" in edited["text"]
+    assert edited is not None and "доставка или самовывоз" in edited["text"].casefold()
     edited = click(
         harness,
         callback_data(edited["reply_markup"], "Доставка"),
         chat_id=chat_id,
         callback_id="delivery-method",
     )
-    assert edited is not None and "нужен номер телефона" in edited["text"]
+    assert edited is not None and "номер или контакт" in edited["text"]
 
     enter_text(
         harness,
@@ -465,7 +465,7 @@ def test_exact_model_memory_color_delivery_phone_location_and_submit(
         message_id=2,
         at=harness.now + timedelta(seconds=10),
     )
-    assert "Отправьте локацию" in harness.api.edits[-1]["text"]
+    assert "Отправьте геолокацию" in harness.api.edits[-1]["text"]
     enter_text(
         harness,
         chat_id=chat_id,

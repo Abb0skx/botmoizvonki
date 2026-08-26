@@ -181,7 +181,7 @@ def format_price(value: Any, language: str) -> str:
     quantum = Decimal("1000") if amount > Decimal("10000") else Decimal("1")
     rounded = int((amount / quantum).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * quantum)
     rendered = f"{rounded:,}".replace(",", " ")
-    return f"{rendered} сум" if language == "ru" else f"{rendered} so‘m"
+    return f"{rendered} so'm"
 
 
 def missing_request_fields(request: Mapping[str, Any] | Any) -> tuple[str, ...]:
