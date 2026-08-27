@@ -58,6 +58,26 @@ CALENDAR_HEADERS = (
     "updated_at",
 )
 
+QUICK_LINK_HEADERS = (
+    "quick_post_key",
+    "title",
+    "channel_id",
+    "channel_username",
+    "message_id",
+    "post_url",
+    "linked_section_keys",
+    "target_message_ids",
+    "target_post_urls",
+    "desired_revision",
+    "applied_revision",
+    "status",
+    "last_render_hash",
+    "last_edited_at",
+    "updated_at",
+    "last_sync_at",
+    "last_error",
+)
+
 
 class RegistryNotConfigured(RuntimeError):
     """Google Sheets credentials are not available in this process."""
@@ -407,4 +427,112 @@ class ProductSortCalendarRegistry:
                 },
             },
         )
+        return len(records)
+
+
+@dataclass
+class ProductSortQuickLinkRegistry:
+    """Human-readable mirror of durable Telegram quick-link index posts."""
+
+    settings: PriceSettings
+    client: Any | None = None
+
+    def _worksheet(self):
+        import gspread
+
+        client = self.client or _google_client()
+        book = client.open_by_key(self.settings.product_sort_sheet_id)
+        try:
+            worksheet = book.worksheet(self.settings.quick_links_sheet_name)
+        except gspread.WorksheetNotFound:
+            worksheet = book.add_worksheet(
+                title=self.settings.quick_links_sheet_name,
+                rows=1000,
+                cols=len(QUICK_LINK_HEADERS),
+            )
+            worksheet.update(
+                range_name=f"A1:{_column_letter(len(QUICK_LINK_HEADERS))}1",
+                values=[list(QUICK_LINK_HEADERS)],
+                value_input_option="RAW",
+            )
+            worksheet.freeze(rows=1)
+            worksheet.format(
+                f"A1:{_column_letter(len(QUICK_LINK_HEADERS))}1",
+                {
+                    "backgroundColor": {
+                        "red": 0.48,
+                        "green": 0.25,
+                        "blue": 0.10,
+                    },
+                    "textFormat": {
+                        "bold": True,
+                        "foregroundColor": {
+                            "red": 1,
+                            "green": 1,
+                            "blue": 1,
+                        },
+                    },
+                },
+            )
+        return worksheet
+
+    def upsert(self, records: Iterable[Mapping[str, Any]]) -> int:
+        records = list(records)
+        if not records:
+            return 0
+        worksheet = self._worksheet()
+        existing = worksheet.get_all_values()
+        headers = (
+            [str(value).strip() for value in existing[0]]
+            if existing else []
+        )
+        if not headers:
+            headers = list(QUICK_LINK_HEADERS)
+        missing = [name for name in QUICK_LINK_HEADERS if name not in headers]
+        if missing:
+            headers.extend(missing)
+        normalized_rows = [
+            list(row) + [""] * max(0, len(headers) - len(row))
+            for row in existing[1:]
+        ]
+        key_index = headers.index("quick_post_key")
+        row_by_key = {
+            row[key_index]: row_number
+            for row_number, row in enumerate(normalized_rows, start=2)
+            if key_index < len(row) and row[key_index]
+        }
+        now = datetime.now(timezone.utc).isoformat()
+        updates: dict[int, list[Any]] = {}
+        next_row = max(2, len(existing) + 1)
+        for source in records:
+            payload = dict(source)
+            key = str(payload.get("quick_post_key") or "").strip()
+            if not key:
+                raise ValueError("Quick-link registry row has no key")
+            payload["quick_post_key"] = key
+            payload["last_sync_at"] = now
+            row_number = row_by_key.get(key)
+            if row_number is None:
+                row_number = next_row
+                next_row += 1
+                row_by_key[key] = row_number
+            updates[row_number] = [
+                _cell(payload.get(name)) for name in headers
+            ]
+        last_column = _column_letter(len(headers))
+        current_headers = [
+            str(value).strip() for value in (existing[0] if existing else [])
+        ]
+        requests = []
+        if not existing or headers != current_headers:
+            requests.append({
+                "range": f"A1:{last_column}1",
+                "values": [headers],
+            })
+        for row_number, values in sorted(updates.items()):
+            requests.append({
+                "range": f"A{row_number}:{last_column}{row_number}",
+                "values": [values],
+            })
+        worksheet.batch_update(requests, value_input_option="RAW")
         return len(records)

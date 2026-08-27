@@ -27,6 +27,9 @@ from .calendar_plan import CALENDAR_PLAN_ENTRIES
 
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _SECTION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_TELEGRAM_POST_URL_RE = re.compile(
+    r"^https://t\.me/(?P<username>[A-Za-z0-9_]{5,32})/(?P<message_id>[1-9]\d*)$"
+)
 _ACTION_ALIASES = {
     "send": "send",
     "publish_new": "send",
@@ -135,6 +138,70 @@ CREATE TABLE IF NOT EXISTS manual_deletion_requests (
    ON DELETE CASCADE);
 CREATE INDEX IF NOT EXISTS idx_manual_deletion_requests_status
  ON manual_deletion_requests(status,deletion_id);
+
+CREATE TABLE IF NOT EXISTS telegram_quick_link_posts (
+ quick_post_key TEXT PRIMARY KEY,
+ title TEXT NOT NULL,
+ channel_id TEXT NOT NULL,
+ channel_username TEXT NOT NULL DEFAULT '',
+ message_id INTEGER NOT NULL CHECK(message_id>0),
+ post_url TEXT NOT NULL,
+ template_html TEXT NOT NULL,
+ template_hash TEXT NOT NULL,
+ last_rendered_html TEXT NOT NULL DEFAULT '',
+ last_render_hash TEXT NOT NULL DEFAULT '',
+ status TEXT NOT NULL DEFAULT 'active',
+ last_error TEXT,
+ created_at TEXT NOT NULL,
+ updated_at TEXT NOT NULL,
+ last_edited_at TEXT,
+ UNIQUE(channel_id,message_id));
+
+CREATE TABLE IF NOT EXISTS telegram_quick_link_targets (
+ quick_post_key TEXT NOT NULL,
+ link_key TEXT NOT NULL,
+ section_key TEXT NOT NULL,
+ priority INTEGER NOT NULL DEFAULT 1 CHECK(priority>=1),
+ fallback_url TEXT NOT NULL,
+ PRIMARY KEY(quick_post_key,link_key,section_key),
+ FOREIGN KEY(quick_post_key) REFERENCES telegram_quick_link_posts(quick_post_key)
+   ON DELETE CASCADE);
+CREATE INDEX IF NOT EXISTS idx_quick_link_targets_section
+ ON telegram_quick_link_targets(section_key,quick_post_key,link_key);
+
+CREATE TABLE IF NOT EXISTS telegram_quick_link_applied_targets (
+ quick_post_key TEXT NOT NULL,
+ link_key TEXT NOT NULL,
+ target_channel_id TEXT NOT NULL,
+ target_message_id INTEGER NOT NULL CHECK(target_message_id>0),
+ target_publication_id TEXT NOT NULL DEFAULT '',
+ target_url TEXT NOT NULL,
+ updated_at TEXT NOT NULL,
+ PRIMARY KEY(quick_post_key,link_key),
+ FOREIGN KEY(quick_post_key) REFERENCES telegram_quick_link_posts(quick_post_key)
+   ON DELETE CASCADE);
+CREATE INDEX IF NOT EXISTS idx_quick_link_applied_message
+ ON telegram_quick_link_applied_targets(target_channel_id,target_message_id);
+
+CREATE TABLE IF NOT EXISTS telegram_quick_link_queue (
+ quick_post_key TEXT PRIMARY KEY,
+ desired_revision INTEGER NOT NULL DEFAULT 1 CHECK(desired_revision>=1),
+ claimed_revision INTEGER NOT NULL DEFAULT 0 CHECK(claimed_revision>=0),
+ applied_revision INTEGER NOT NULL DEFAULT 0 CHECK(applied_revision>=0),
+ status TEXT NOT NULL DEFAULT 'pending',
+ attempts INTEGER NOT NULL DEFAULT 0,
+ max_attempts INTEGER NOT NULL DEFAULT 12,
+ next_attempt_at TEXT,
+ lease_token TEXT,
+ lease_expires_at TEXT,
+ last_error TEXT,
+ created_at TEXT NOT NULL,
+ updated_at TEXT NOT NULL,
+ completed_at TEXT,
+ FOREIGN KEY(quick_post_key) REFERENCES telegram_quick_link_posts(quick_post_key)
+   ON DELETE CASCADE);
+CREATE INDEX IF NOT EXISTS idx_quick_link_queue_due
+ ON telegram_quick_link_queue(status,next_attempt_at,quick_post_key);
 
 CREATE TABLE IF NOT EXISTS publication_jobs (
  job_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -967,8 +1034,13 @@ class PriceRepository:
                 at,
                 enqueue_sheet_sync=enqueue_sheet_sync,
             )
+            quick_updates = self._enqueue_quick_link_updates_tx(
+                db, key, channel, at
+            )
             self._audit(db, "telegram_post_set_replaced", "telegram_section",
-                        f"{channel}:{key}", {"parts": len(results)}, at)
+                        f"{channel}:{key}",
+                        {"parts": len(results), "quick_updates": quick_updates},
+                        at)
             return results
 
     def get_telegram_post(self, section_key: str, channel_id: str,
@@ -1047,6 +1119,38 @@ class PriceRepository:
                 """SELECT * FROM telegram_deletion_queue
                    WHERE status='pending'
                      AND (next_attempt_at IS NULL OR next_attempt_at<=?)
+                     AND NOT EXISTS(
+                       SELECT 1 FROM telegram_quick_link_applied_targets AS a
+                       JOIN telegram_quick_link_posts AS p
+                         ON p.quick_post_key=a.quick_post_key
+                       WHERE p.status!='disabled'
+                         AND (
+                           (
+                             a.target_channel_id=telegram_deletion_queue.channel_id
+                             AND a.target_message_id=telegram_deletion_queue.message_id
+                           )
+                           OR (
+                             a.target_publication_id!=''
+                             AND EXISTS(
+                               SELECT 1 FROM telegram_posts AS doomed
+                               WHERE doomed.channel_id=telegram_deletion_queue.channel_id
+                                 AND doomed.message_id=telegram_deletion_queue.message_id
+                                 AND doomed.publication_id=a.target_publication_id
+                             )
+                           )
+                         )
+                     )
+                     AND NOT EXISTS(
+                       SELECT 1 FROM telegram_quick_link_queue AS q
+                       JOIN telegram_quick_link_posts AS p
+                         ON p.quick_post_key=q.quick_post_key
+                       JOIN telegram_quick_link_targets AS t
+                         ON t.quick_post_key=q.quick_post_key
+                       WHERE p.status!='disabled'
+                         AND q.applied_revision<q.desired_revision
+                         AND p.channel_id=telegram_deletion_queue.channel_id
+                         AND t.section_key=telegram_deletion_queue.section_key
+                     )
                    ORDER BY deletion_id LIMIT ?""",
                 (_iso(now), bounded),
             ).fetchall()
@@ -1198,6 +1302,37 @@ class PriceRepository:
                      ON p.channel_id=q.channel_id
                     AND p.message_id=q.message_id
                    WHERE q.status='failed' AND r.deletion_id IS NULL
+                     AND NOT EXISTS(
+                       SELECT 1 FROM telegram_quick_link_applied_targets AS a
+                       JOIN telegram_quick_link_posts AS quick_post
+                         ON quick_post.quick_post_key=a.quick_post_key
+                       WHERE quick_post.status!='disabled'
+                         AND (
+                           (a.target_channel_id=q.channel_id
+                            AND a.target_message_id=q.message_id)
+                           OR (
+                             a.target_publication_id!=''
+                             AND EXISTS(
+                               SELECT 1 FROM telegram_posts AS doomed
+                               WHERE doomed.channel_id=q.channel_id
+                                 AND doomed.message_id=q.message_id
+                                 AND doomed.publication_id=a.target_publication_id
+                             )
+                           )
+                         )
+                     )
+                     AND NOT EXISTS(
+                       SELECT 1 FROM telegram_quick_link_queue AS quick_queue
+                       JOIN telegram_quick_link_posts AS quick_post
+                         ON quick_post.quick_post_key=quick_queue.quick_post_key
+                       JOIN telegram_quick_link_targets AS target
+                         ON target.quick_post_key=quick_queue.quick_post_key
+                       WHERE quick_post.status!='disabled'
+                         AND quick_queue.applied_revision
+                             <quick_queue.desired_revision
+                         AND quick_post.channel_id=q.channel_id
+                         AND target.section_key=q.section_key
+                     )
                    GROUP BY q.deletion_id
                    ORDER BY q.deletion_id
                    LIMIT ?""",
@@ -1259,7 +1394,40 @@ class PriceRepository:
     ) -> dict[str, Any] | None:
         with self._read() as db:
             row = db.execute(
-                "SELECT * FROM manual_deletion_requests WHERE deletion_id=?",
+                """SELECT r.*,
+                          (EXISTS(
+                            SELECT 1
+                            FROM telegram_quick_link_applied_targets AS a
+                            JOIN telegram_quick_link_posts AS p
+                              ON p.quick_post_key=a.quick_post_key
+                            WHERE p.status!='disabled'
+                              AND (
+                                (a.target_channel_id=r.target_channel_id
+                                 AND a.target_message_id=r.target_message_id)
+                                OR (
+                                  a.target_publication_id!=''
+                                  AND EXISTS(
+                                    SELECT 1 FROM telegram_posts AS doomed
+                                    WHERE doomed.channel_id=r.target_channel_id
+                                      AND doomed.message_id=r.target_message_id
+                                      AND doomed.publication_id=a.target_publication_id
+                                  )
+                                )
+                              )
+                          ) OR EXISTS(
+                            SELECT 1
+                            FROM telegram_quick_link_queue AS q
+                            JOIN telegram_quick_link_posts AS p
+                              ON p.quick_post_key=q.quick_post_key
+                            JOIN telegram_quick_link_targets AS t
+                              ON t.quick_post_key=q.quick_post_key
+                            WHERE p.status!='disabled'
+                              AND q.applied_revision<q.desired_revision
+                              AND p.channel_id=r.target_channel_id
+                              AND t.section_key=r.section_key
+                          )) AS quick_link_blocked
+                   FROM manual_deletion_requests AS r
+                   WHERE r.deletion_id=?""",
                 (int(deletion_id),),
             ).fetchone()
         return dict(row) if row is not None else None
@@ -1278,6 +1446,45 @@ class PriceRepository:
                 (int(deletion_id),),
             ).fetchone()
             if request is None:
+                return False
+            blocked = db.execute(
+                """SELECT 1 WHERE EXISTS(
+                     SELECT 1
+                     FROM telegram_quick_link_applied_targets AS a
+                     JOIN telegram_quick_link_posts AS p
+                       ON p.quick_post_key=a.quick_post_key
+                     WHERE p.status!='disabled'
+                       AND (
+                         (a.target_channel_id=? AND a.target_message_id=?)
+                         OR (
+                           a.target_publication_id!=''
+                           AND EXISTS(
+                             SELECT 1 FROM telegram_posts AS doomed
+                             WHERE doomed.channel_id=? AND doomed.message_id=?
+                               AND doomed.publication_id=a.target_publication_id
+                           )
+                         )
+                       )
+                   ) OR EXISTS(
+                     SELECT 1 FROM telegram_quick_link_queue AS q
+                     JOIN telegram_quick_link_posts AS p
+                       ON p.quick_post_key=q.quick_post_key
+                     JOIN telegram_quick_link_targets AS t
+                       ON t.quick_post_key=q.quick_post_key
+                     WHERE p.status!='disabled'
+                       AND q.applied_revision<q.desired_revision
+                       AND p.channel_id=? AND t.section_key=?
+                   )""",
+                (
+                    request["target_channel_id"],
+                    request["target_message_id"],
+                    request["target_channel_id"],
+                    request["target_message_id"],
+                    request["target_channel_id"],
+                    request["section_key"],
+                ),
+            ).fetchone()
+            if blocked is not None:
                 return False
             db.execute(
                 """UPDATE manual_deletion_requests SET status='completed',
@@ -1323,6 +1530,716 @@ class PriceRepository:
                 at,
             )
             return True
+
+    def list_completed_manual_deletion_requests(
+        self,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return completed requests whose helper message still needs removal."""
+        with self._read() as db:
+            rows = db.execute(
+                """SELECT * FROM manual_deletion_requests
+                   WHERE status='completed'
+                   ORDER BY deletion_id
+                   LIMIT ?""",
+                (min(500, max(1, int(limit))),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_manual_deletion_request_removed(
+        self,
+        deletion_id: int,
+        *,
+        request_channel_id: str,
+        request_message_id: int,
+        now: datetime | str | None = None,
+    ) -> bool:
+        """Mark the helper message removed after Telegram confirms deletion."""
+        at = _dt(now, "now", default=True)
+        with self._tx(True) as db:
+            cursor = db.execute(
+                """UPDATE manual_deletion_requests
+                   SET status='removed',last_error=NULL,updated_at=?
+                   WHERE deletion_id=? AND status='completed'
+                     AND request_channel_id=? AND request_message_id=?""",
+                (
+                    _iso(at), int(deletion_id), str(request_channel_id),
+                    int(request_message_id),
+                ),
+            )
+            if cursor.rowcount != 1:
+                return False
+            self._audit(
+                db, "manual_deletion_request_removed", "telegram_deletion",
+                deletion_id,
+                {"request_message_id": int(request_message_id)},
+                at,
+            )
+            return True
+
+    @staticmethod
+    def _quick_link_marker(link_key: str) -> str:
+        return "{{post_url:" + _key(link_key) + "}}"
+
+    @staticmethod
+    def _telegram_message_id_from_url(url: str) -> int:
+        match = _TELEGRAM_POST_URL_RE.fullmatch(str(url or "").strip())
+        if match is None:
+            raise ValueError("quick-link target must be a public Telegram post URL")
+        return int(match.group("message_id"))
+
+    @staticmethod
+    def _queue_quick_link_post_tx(
+        db: sqlite3.Connection,
+        quick_post_key: str,
+        at: datetime,
+    ) -> None:
+        key = _key(quick_post_key)
+        row = db.execute(
+            "SELECT * FROM telegram_quick_link_queue WHERE quick_post_key=?",
+            (key,),
+        ).fetchone()
+        if row is None:
+            db.execute(
+                """INSERT INTO telegram_quick_link_queue(
+                     quick_post_key,desired_revision,claimed_revision,
+                     applied_revision,status,attempts,max_attempts,
+                     next_attempt_at,created_at,updated_at)
+                   VALUES(?,1,0,0,'pending',0,12,?,?,?)""",
+                (key, _iso(at), _iso(at), _iso(at)),
+            )
+            return
+        running = str(row["status"]) == "running"
+        db.execute(
+            """UPDATE telegram_quick_link_queue
+               SET desired_revision=desired_revision+1,
+                   status=?,attempts=?,next_attempt_at=?,last_error=NULL,
+                   completed_at=NULL,updated_at=?
+               WHERE quick_post_key=?""",
+            (
+                "running" if running else "pending",
+                int(row["attempts"]) if running else 0,
+                row["next_attempt_at"] if running else _iso(at),
+                _iso(at), key,
+            ),
+        )
+
+    def _enqueue_quick_link_updates_tx(
+        self,
+        db: sqlite3.Connection,
+        section_key: str,
+        channel_id: str,
+        at: datetime,
+    ) -> int:
+        rows = db.execute(
+            """SELECT DISTINCT p.quick_post_key
+               FROM telegram_quick_link_posts AS p
+               JOIN telegram_quick_link_targets AS t
+                 ON t.quick_post_key=p.quick_post_key
+               WHERE t.section_key=? AND p.channel_id=?
+                 AND p.status!='disabled'
+               ORDER BY p.quick_post_key""",
+            (_key(section_key), str(channel_id)),
+        ).fetchall()
+        for row in rows:
+            self._queue_quick_link_post_tx(
+                db, row["quick_post_key"], at
+            )
+        return len(rows)
+
+    def ensure_quick_link_posts(
+        self,
+        specs: Sequence[Mapping[str, Any]],
+        *,
+        channel_id: str,
+        channel_username: str,
+        enqueue_initial: bool = True,
+        now: datetime | str | None = None,
+    ) -> int:
+        """Idempotently install approved quick-link templates and bindings."""
+        if not isinstance(specs, Sequence) or isinstance(specs, (str, bytes)):
+            raise ValueError("quick-link specs must be a list")
+        channel = str(channel_id).strip()
+        username = str(channel_username).strip().lstrip("@")
+        if not channel or not username:
+            raise ValueError("quick-link channel and username are required")
+        at = _dt(now, "now", default=True)
+        normalized: list[dict[str, Any]] = []
+        seen_posts: set[str] = set()
+        for raw in specs:
+            spec = dict(raw)
+            quick_post_key = _key(spec.get("quick_post_key"))
+            if quick_post_key in seen_posts:
+                raise ValueError("duplicate quick_post_key")
+            seen_posts.add(quick_post_key)
+            title = str(spec.get("title") or quick_post_key).strip()
+            template_html = str(spec.get("template_html") or "")
+            reconcile_on_install = bool(spec.get("reconcile_on_install", False))
+            try:
+                message_id = int(spec.get("message_id"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("quick-link message_id must be positive") from exc
+            if message_id <= 0 or not title or not template_html:
+                raise ValueError("quick-link title, template and message ID are required")
+            raw_targets = spec.get("targets", [])
+            if not isinstance(raw_targets, Sequence) or isinstance(
+                raw_targets, (str, bytes)
+            ):
+                raise ValueError("quick-link targets must be a list")
+            targets: list[dict[str, Any]] = []
+            seen_target_sections: set[tuple[str, str]] = set()
+            seen_link_keys: set[str] = set()
+            for raw_target in raw_targets:
+                target = dict(raw_target)
+                link_key = _key(target.get("link_key"))
+                fallback_url = str(target.get("fallback_url") or "").strip()
+                self._telegram_message_id_from_url(fallback_url)
+                initial_url = str(
+                    target.get("initial_url") or fallback_url
+                ).strip()
+                self._telegram_message_id_from_url(initial_url)
+                section_keys = target.get("section_keys")
+                if section_keys is None:
+                    section_keys = [target.get("section_key")]
+                if not isinstance(section_keys, Sequence) or isinstance(
+                    section_keys, (str, bytes)
+                ) or not section_keys:
+                    raise ValueError("quick-link target needs section_keys")
+                marker = self._quick_link_marker(link_key)
+                if marker not in template_html:
+                    raise ValueError(f"quick-link template misses {marker}")
+                seen_link_keys.add(link_key)
+                for priority, section_key in enumerate(section_keys, start=1):
+                    section = _key(section_key)
+                    unique = (link_key, section)
+                    if unique in seen_target_sections:
+                        raise ValueError("duplicate quick-link target section")
+                    seen_target_sections.add(unique)
+                    targets.append({
+                        "link_key": link_key,
+                        "section_key": section,
+                        "priority": priority,
+                        "fallback_url": fallback_url,
+                        "initial_url": initial_url,
+                    })
+            markers = set(re.findall(
+                r"\{\{post_url:([A-Za-z0-9][A-Za-z0-9_.:-]{0,127})\}\}",
+                template_html,
+            ))
+            if markers != seen_link_keys:
+                raise ValueError("quick-link template has undeclared placeholders")
+            definition = {
+                "quick_post_key": quick_post_key,
+                "title": title,
+                "message_id": message_id,
+                "template_html": template_html,
+                "reconcile_on_install": reconcile_on_install,
+                "targets": targets,
+            }
+            definition["template_hash"] = hashlib.sha256(
+                _dump(definition).encode("utf-8")
+            ).hexdigest()
+            normalized.append(definition)
+
+        changed_count = 0
+        with self._tx(True) as db:
+            if normalized:
+                placeholders = ",".join("?" for _ in normalized)
+                db.execute(
+                    f"""UPDATE telegram_quick_link_posts SET status='disabled',
+                           updated_at=?
+                         WHERE channel_id=? AND quick_post_key NOT IN (
+                           {placeholders}
+                         ) AND status!='disabled'""",
+                    (
+                        _iso(at), channel,
+                        *(spec["quick_post_key"] for spec in normalized),
+                    ),
+                )
+            for spec in normalized:
+                key = spec["quick_post_key"]
+                existing = db.execute(
+                    "SELECT * FROM telegram_quick_link_posts WHERE quick_post_key=?",
+                    (key,),
+                ).fetchone()
+                installing = existing is None
+                changed = existing is None or any((
+                    str(existing["title"]) != spec["title"],
+                    str(existing["channel_id"]) != channel,
+                    str(existing["channel_username"]) != username,
+                    int(existing["message_id"]) != spec["message_id"],
+                    str(existing["template_hash"]) != spec["template_hash"],
+                    str(existing["status"]) == "disabled",
+                ))
+                post_url = f"https://t.me/{username}/{spec['message_id']}"
+                if not changed:
+                    continue
+                db.execute(
+                    """INSERT INTO telegram_quick_link_posts(
+                         quick_post_key,title,channel_id,channel_username,
+                         message_id,post_url,template_html,template_hash,status,
+                         created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,'active',?,?)
+                       ON CONFLICT(quick_post_key) DO UPDATE SET
+                        title=excluded.title,channel_id=excluded.channel_id,
+                        channel_username=excluded.channel_username,
+                        message_id=excluded.message_id,post_url=excluded.post_url,
+                        template_html=excluded.template_html,
+                        template_hash=excluded.template_hash,
+                        status=CASE WHEN telegram_quick_link_posts.status='disabled'
+                              THEN 'active' ELSE telegram_quick_link_posts.status END,
+                        updated_at=excluded.updated_at""",
+                    (
+                        key, spec["title"], channel, username,
+                        spec["message_id"], post_url, spec["template_html"],
+                        spec["template_hash"], _iso(at), _iso(at),
+                    ),
+                )
+                db.execute(
+                    "DELETE FROM telegram_quick_link_targets WHERE quick_post_key=?",
+                    (key,),
+                )
+                db.executemany(
+                    """INSERT INTO telegram_quick_link_targets(
+                         quick_post_key,link_key,section_key,priority,fallback_url)
+                       VALUES(?,?,?,?,?)""",
+                    [
+                        (
+                            key, target["link_key"], target["section_key"],
+                            target["priority"], target["fallback_url"],
+                        )
+                        for target in spec["targets"]
+                    ],
+                )
+                db.execute(
+                    """DELETE FROM telegram_quick_link_applied_targets
+                       WHERE quick_post_key=? AND link_key NOT IN (
+                         SELECT link_key FROM telegram_quick_link_targets
+                         WHERE quick_post_key=?)""",
+                    (key, key),
+                )
+                for target in spec["targets"]:
+                    message_id = self._telegram_message_id_from_url(
+                        target["initial_url"]
+                    )
+                    initial_post = db.execute(
+                        """SELECT publication_id FROM telegram_posts
+                           WHERE channel_id=? AND message_id=?
+                           ORDER BY is_current DESC,updated_at DESC,post_id DESC
+                           LIMIT 1""",
+                        (channel, message_id),
+                    ).fetchone()
+                    initial_publication_id = (
+                        str(initial_post["publication_id"] or "")
+                        if initial_post is not None else ""
+                    )
+                    db.execute(
+                        """INSERT INTO telegram_quick_link_applied_targets(
+                             quick_post_key,link_key,target_channel_id,
+                             target_message_id,target_publication_id,target_url,
+                             updated_at)
+                           VALUES(?,?,?,?,?,?,?)
+                           ON CONFLICT(quick_post_key,link_key) DO NOTHING""",
+                        (
+                            key, target["link_key"], channel, message_id,
+                            initial_publication_id, target["initial_url"],
+                            _iso(at),
+                        ),
+                    )
+                if changed:
+                    changed_count += 1
+                    should_queue = enqueue_initial and (
+                        not installing or spec["reconcile_on_install"]
+                    )
+                    if should_queue:
+                        self._queue_quick_link_post_tx(db, key, at)
+                    self._audit(
+                        db, "quick_link_post_configured", "quick_link_post",
+                        key,
+                        {
+                            "message_id": spec["message_id"],
+                            "targets": len(spec["targets"]),
+                            "queued": should_queue,
+                        },
+                        at,
+                    )
+        return changed_count
+
+    def list_quick_link_posts(self) -> list[dict[str, Any]]:
+        with self._read() as db:
+            rows = db.execute(
+                """SELECT * FROM telegram_quick_link_posts
+                   ORDER BY quick_post_key"""
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_quick_link_post(self, quick_post_key: str) -> dict[str, Any] | None:
+        with self._read() as db:
+            row = db.execute(
+                "SELECT * FROM telegram_quick_link_posts WHERE quick_post_key=?",
+                (_key(quick_post_key),),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def resolve_quick_link_post(
+        self,
+        quick_post_key: str,
+    ) -> dict[str, Any]:
+        """Resolve placeholders from the latest durable part-one post URLs."""
+        key = _key(quick_post_key)
+        with self._read() as db:
+            post = db.execute(
+                "SELECT * FROM telegram_quick_link_posts WHERE quick_post_key=?",
+                (key,),
+            ).fetchone()
+            if post is None:
+                raise ValueError("quick-link post does not exist")
+            targets = db.execute(
+                """SELECT * FROM telegram_quick_link_targets
+                   WHERE quick_post_key=? ORDER BY link_key,priority,section_key""",
+                (key,),
+            ).fetchall()
+            current = db.execute(
+                """SELECT p.section_key,p.channel_id,p.message_id,p.post_url,
+                          p.publication_id
+                   FROM telegram_posts AS p
+                   JOIN telegram_quick_link_targets AS t
+                     ON t.section_key=p.section_key
+                    AND t.quick_post_key=?
+                   WHERE p.channel_id=? AND p.is_current=1 AND p.part_no=1
+                   ORDER BY p.section_key,p.updated_at DESC,p.post_id DESC""",
+                (key, post["channel_id"]),
+            ).fetchall()
+        current_by_section: dict[str, sqlite3.Row] = {}
+        for row in current:
+            current_by_section.setdefault(row["section_key"], row)
+        grouped: dict[str, list[sqlite3.Row]] = {}
+        for row in targets:
+            grouped.setdefault(row["link_key"], []).append(row)
+        resolved: list[dict[str, Any]] = []
+        for link_key, candidates in grouped.items():
+            selected_post = None
+            selected_target = candidates[0]
+            for candidate in candidates:
+                found = current_by_section.get(candidate["section_key"])
+                if found is not None:
+                    selected_post = found
+                    selected_target = candidate
+                    break
+            if selected_post is None:
+                target_url = str(selected_target["fallback_url"])
+                target_channel_id = str(post["channel_id"])
+                target_message_id = self._telegram_message_id_from_url(target_url)
+                target_publication_id = ""
+            else:
+                target_url = str(selected_post["post_url"] or "").strip()
+                if not target_url:
+                    target_url = (
+                        f"https://t.me/{post['channel_username']}/"
+                        f"{selected_post['message_id']}"
+                    )
+                target_channel_id = str(selected_post["channel_id"])
+                target_message_id = int(selected_post["message_id"])
+                target_publication_id = str(
+                    selected_post["publication_id"] or ""
+                )
+            if self._telegram_message_id_from_url(target_url) != target_message_id:
+                raise ValueError("quick-link target URL does not match message ID")
+            resolved.append({
+                "link_key": link_key,
+                "section_key": selected_target["section_key"],
+                "target_channel_id": target_channel_id,
+                "target_message_id": target_message_id,
+                "target_publication_id": target_publication_id,
+                "target_url": target_url,
+            })
+        payload = dict(post)
+        payload["resolved_targets"] = resolved
+        return payload
+
+    def claim_quick_link_updates(
+        self,
+        now_utc: datetime | str,
+        *,
+        limit: int = 20,
+        lease_seconds: int = 120,
+    ) -> list[dict[str, Any]]:
+        now = _dt(now_utc, "now_utc")
+        expires = now + timedelta(
+            seconds=min(3600, max(10, int(lease_seconds)))
+        )
+        with self._tx(True) as db:
+            db.execute(
+                """UPDATE telegram_quick_link_queue SET status='pending',
+                   lease_token=NULL,lease_expires_at=NULL,updated_at=?
+                   WHERE status='running'
+                     AND (lease_expires_at IS NULL OR lease_expires_at<=?)""",
+                (_iso(now), _iso(now)),
+            )
+            rows = db.execute(
+                """SELECT q.* FROM telegram_quick_link_queue AS q
+                   JOIN telegram_quick_link_posts AS p
+                     ON p.quick_post_key=q.quick_post_key
+                   WHERE q.status='pending' AND p.status!='disabled'
+                     AND (q.next_attempt_at IS NULL OR q.next_attempt_at<=?)
+                   ORDER BY q.updated_at,q.quick_post_key LIMIT ?""",
+                (_iso(now), min(100, max(1, int(limit)))),
+            ).fetchall()
+            claimed: list[dict[str, Any]] = []
+            for row in rows:
+                token = secrets.token_urlsafe(24)
+                cursor = db.execute(
+                    """UPDATE telegram_quick_link_queue SET status='running',
+                       attempts=attempts+1,claimed_revision=desired_revision,
+                       lease_token=?,lease_expires_at=?,updated_at=?
+                       WHERE quick_post_key=? AND status='pending'""",
+                    (token, _iso(expires), _iso(now), row["quick_post_key"]),
+                )
+                if cursor.rowcount == 1:
+                    updated = db.execute(
+                        """SELECT * FROM telegram_quick_link_queue
+                           WHERE quick_post_key=?""",
+                        (row["quick_post_key"],),
+                    ).fetchone()
+                    if updated is not None:
+                        claimed.append(dict(updated))
+            return claimed
+
+    def complete_quick_link_update(
+        self,
+        quick_post_key: str,
+        lease_token: str,
+        now_utc: datetime | str,
+        *,
+        rendered_html: str,
+        render_hash: str,
+        resolved_targets: Sequence[Mapping[str, Any]],
+    ) -> bool:
+        now = _dt(now_utc, "now_utc")
+        key = _key(quick_post_key)
+        if _HASH_RE.fullmatch(str(render_hash)) is None:
+            raise ValueError("quick-link render_hash is invalid")
+        with self._tx(True) as db:
+            queue = db.execute(
+                """SELECT * FROM telegram_quick_link_queue
+                   WHERE quick_post_key=? AND status='running'
+                     AND lease_token=?""",
+                (key, str(lease_token)),
+            ).fetchone()
+            if queue is None:
+                return False
+            expected = {
+                row["link_key"]
+                for row in db.execute(
+                    """SELECT DISTINCT link_key
+                       FROM telegram_quick_link_targets
+                       WHERE quick_post_key=?""",
+                    (key,),
+                ).fetchall()
+            }
+            supplied = {str(item.get("link_key") or "") for item in resolved_targets}
+            if supplied != expected:
+                raise ValueError("quick-link resolved targets are incomplete")
+            for item in resolved_targets:
+                link_key = _key(item.get("link_key"))
+                target_url = str(item.get("target_url") or "").strip()
+                parsed_id = self._telegram_message_id_from_url(target_url)
+                target_message_id = int(item.get("target_message_id") or 0)
+                if target_message_id != parsed_id:
+                    raise ValueError("quick-link target message ID mismatch")
+                db.execute(
+                    """INSERT INTO telegram_quick_link_applied_targets(
+                         quick_post_key,link_key,target_channel_id,
+                         target_message_id,target_publication_id,target_url,
+                         updated_at)
+                       VALUES(?,?,?,?,?,?,?)
+                       ON CONFLICT(quick_post_key,link_key) DO UPDATE SET
+                        target_channel_id=excluded.target_channel_id,
+                        target_message_id=excluded.target_message_id,
+                        target_publication_id=excluded.target_publication_id,
+                        target_url=excluded.target_url,
+                        updated_at=excluded.updated_at""",
+                    (
+                        key, link_key, str(item.get("target_channel_id") or ""),
+                        target_message_id,
+                        str(item.get("target_publication_id") or ""),
+                        target_url, _iso(now),
+                    ),
+                )
+            db.execute(
+                """UPDATE telegram_quick_link_posts SET status='active',
+                   last_rendered_html=?,last_render_hash=?,last_error=NULL,
+                   updated_at=?,last_edited_at=? WHERE quick_post_key=?""",
+                (
+                    str(rendered_html), str(render_hash), _iso(now),
+                    _iso(now), key,
+                ),
+            )
+            has_newer = int(queue["desired_revision"]) > int(
+                queue["claimed_revision"]
+            )
+            db.execute(
+                """UPDATE telegram_quick_link_queue SET status=?,
+                   applied_revision=?,attempts=?,next_attempt_at=?,
+                   lease_token=NULL,lease_expires_at=NULL,last_error=NULL,
+                   updated_at=?,completed_at=? WHERE quick_post_key=?
+                     AND status='running' AND lease_token=?""",
+                (
+                    "pending" if has_newer else "done",
+                    int(queue["claimed_revision"]),
+                    0 if has_newer else int(queue["attempts"]),
+                    _iso(now) if has_newer else None,
+                    _iso(now), None if has_newer else _iso(now), key,
+                    str(lease_token),
+                ),
+            )
+            self._audit(
+                db, "quick_link_post_updated", "quick_link_post", key,
+                {
+                    "revision": int(queue["claimed_revision"]),
+                    "targets": len(resolved_targets),
+                    "newer_pending": has_newer,
+                },
+                now,
+            )
+            return True
+
+    def retry_quick_link_update(
+        self,
+        quick_post_key: str,
+        lease_token: str,
+        now_utc: datetime | str,
+        error: Any,
+        *,
+        retry_after_seconds: float | int | None = None,
+        permanent: bool = False,
+    ) -> bool:
+        now = _dt(now_utc, "now_utc")
+        key = _key(quick_post_key)
+        safe_error = str(error or "quick-link update failed").replace(
+            "\n", " "
+        )[:1000]
+        with self._tx(True) as db:
+            row = db.execute(
+                """SELECT * FROM telegram_quick_link_queue
+                   WHERE quick_post_key=? AND status='running'
+                     AND lease_token=?""",
+                (key, str(lease_token)),
+            ).fetchone()
+            if row is None:
+                return False
+            has_newer = int(row["desired_revision"]) > int(
+                row["claimed_revision"]
+            )
+            terminal = (
+                not has_newer
+                and (
+                    permanent
+                    or int(row["attempts"]) >= int(row["max_attempts"])
+                )
+            )
+            if terminal:
+                status, next_attempt = "failed", None
+            else:
+                delay = (
+                    2 ** min(int(row["attempts"]), 11)
+                    if retry_after_seconds is None
+                    else float(retry_after_seconds)
+                )
+                status = "pending"
+                next_attempt = _iso(now if has_newer else (
+                    now + timedelta(seconds=min(86400, max(0, delay)))
+                ))
+            db.execute(
+                """UPDATE telegram_quick_link_queue SET status=?,
+                   attempts=?,next_attempt_at=?,lease_token=NULL,
+                   lease_expires_at=NULL,
+                   last_error=?,updated_at=?,completed_at=?
+                   WHERE quick_post_key=? AND status='running'
+                     AND lease_token=?""",
+                (
+                    status, 0 if has_newer else int(row["attempts"]),
+                    next_attempt, safe_error, _iso(now),
+                    _iso(now) if terminal else None, key, str(lease_token),
+                ),
+            )
+            db.execute(
+                """UPDATE telegram_quick_link_posts SET status='update_error',
+                   last_error=?,updated_at=? WHERE quick_post_key=?""",
+                (safe_error, _iso(now), key),
+            )
+            return True
+
+    def list_quick_link_updates(self) -> list[dict[str, Any]]:
+        with self._read() as db:
+            rows = db.execute(
+                """SELECT * FROM telegram_quick_link_queue
+                   ORDER BY quick_post_key"""
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def build_quick_link_registry_records(self) -> list[dict[str, Any]]:
+        with self._read() as db:
+            posts = db.execute(
+                """SELECT * FROM telegram_quick_link_posts
+                   ORDER BY quick_post_key"""
+            ).fetchall()
+            targets = db.execute(
+                """SELECT t.*,a.target_message_id,a.target_url
+                   FROM telegram_quick_link_targets AS t
+                   LEFT JOIN telegram_quick_link_applied_targets AS a
+                     ON a.quick_post_key=t.quick_post_key
+                    AND a.link_key=t.link_key
+                   ORDER BY t.quick_post_key,t.link_key,t.priority"""
+            ).fetchall()
+            queues = {
+                row["quick_post_key"]: row
+                for row in db.execute(
+                    "SELECT * FROM telegram_quick_link_queue"
+                ).fetchall()
+            }
+        by_post: dict[str, list[sqlite3.Row]] = {}
+        for target in targets:
+            by_post.setdefault(target["quick_post_key"], []).append(target)
+        records: list[dict[str, Any]] = []
+        for post in posts:
+            key = post["quick_post_key"]
+            linked = by_post.get(key, [])
+            queue = queues.get(key)
+            records.append({
+                "quick_post_key": key,
+                "title": post["title"],
+                "channel_id": post["channel_id"],
+                "channel_username": post["channel_username"],
+                "message_id": post["message_id"],
+                "post_url": post["post_url"],
+                "linked_section_keys": list(dict.fromkeys(
+                    row["section_key"] for row in linked
+                )),
+                "target_message_ids": {
+                    row["link_key"]: row["target_message_id"]
+                    for row in linked if row["target_message_id"] is not None
+                },
+                "target_post_urls": {
+                    row["link_key"]: row["target_url"]
+                    for row in linked if row["target_url"]
+                },
+                "desired_revision": (
+                    queue["desired_revision"] if queue is not None else 0
+                ),
+                "applied_revision": (
+                    queue["applied_revision"] if queue is not None else 0
+                ),
+                "status": post["status"],
+                "last_render_hash": post["last_render_hash"],
+                "last_edited_at": post["last_edited_at"],
+                "updated_at": post["updated_at"],
+                "last_error": post["last_error"] or (
+                    queue["last_error"] if queue is not None else None
+                ),
+            })
+        return records
 
     def enqueue_job(
         self,

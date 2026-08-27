@@ -8,6 +8,7 @@ with the `botmoizvonki` FastAPI application and owns:
 - Telegram send, edit and delayed-publication jobs;
 - a 24-hour delayed-post preview channel with administrator-only cancellation;
 - an authoritative day-of-month publication plan at 09:30 Asia/Tashkent;
+- automatic updates of links inside the existing Telegram catalogue posts;
 - `chat_id` / `message_id` registry and its `Product Sort` mirror.
 
 Delayed jobs enter the preview channel only when their execution time is no
@@ -29,6 +30,16 @@ ends on day 29, day 30 is folded into day 1. Day 31 has no separate plan. The
 SQLite plan is mirrored to `PRICE_CALENDAR_SHEET_NAME`. A successful new
 publication supersedes and durably deletes the previous Telegram messages for
 the same section.
+
+The existing quick-link catalogue posts are configured in `quick_links.py`.
+After a successful new price publication, a separate durable queue edits the
+affected catalogue post so its link points to part 1 of the newest publication.
+An edit-current action does not change a link. Superseded messages, including
+all parts of a multipart publication, remain protected until every affected
+catalogue edit succeeds. The quick-post IDs and their applied targets are
+mirrored to `PRICE_QUICK_LINKS_SHEET_NAME`; SQLite remains authoritative.
+Templates use regular emoji because Telegram restricts custom-emoji entities
+for ordinary bots editing channel posts.
 
 The local generator remains in the other project:
 `Price2024DB/Cod/Price.py`. It reads local/Google data, builds the price and

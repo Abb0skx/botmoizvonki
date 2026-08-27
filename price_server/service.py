@@ -10,10 +10,12 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .config import PriceSettings
+from .quick_links import QUICK_LINK_POST_SPECS
 from .sheets_registry import (
     ProductSortCalendarRegistry,
     ProductSortPostIndex,
     ProductSortPostRegistry,
+    ProductSortQuickLinkRegistry,
 )
 from .telegram_api import (
     TelegramClient,
@@ -82,6 +84,9 @@ class PricePublicationService:
         self._last_index_hash = ""
         self._calendar_registry: ProductSortCalendarRegistry | None = None
         self._last_calendar_hash = ""
+        self._quick_link_registry: ProductSortQuickLinkRegistry | None = None
+        self._last_quick_link_hash = ""
+        self._quick_links_ready = False
 
     def _section_for_job(self, job: Any):
         section_key = str(_value(job, "section_key", "")).strip()
@@ -529,6 +534,86 @@ class PricePublicationService:
                 completed += 1
         return completed
 
+    def ensure_quick_link_registry(self) -> int:
+        """Install approved index posts once and queue initial reconciliation."""
+        if not self.settings.telegram_configured:
+            return 0
+        changed = self.repository.ensure_quick_link_posts(
+            QUICK_LINK_POST_SPECS,
+            channel_id=self.settings.telegram_channel_id,
+            channel_username=self.settings.telegram_channel_username,
+            enqueue_initial=True,
+        )
+        self._quick_links_ready = True
+        return changed
+
+    @staticmethod
+    def _render_quick_link(post: Mapping[str, Any]) -> tuple[str, list[dict]]:
+        rendered = str(post.get("template_html") or "")
+        resolved = [
+            dict(item) for item in post.get("resolved_targets", [])
+            if isinstance(item, Mapping)
+        ]
+        for target in resolved:
+            link_key = str(target.get("link_key") or "")
+            marker = "{{post_url:" + link_key + "}}"
+            rendered = rendered.replace(
+                marker,
+                html.escape(str(target.get("target_url") or ""), quote=True),
+            )
+        if "{{post_url:" in rendered:
+            raise PublicationError("Quick-link template has unresolved targets")
+        return rendered, resolved
+
+    def refresh_quick_link_posts(self, *, limit: int = 20) -> int:
+        """Edit quick-link indexes independently from price publication jobs."""
+        now = datetime.now(timezone.utc)
+        claimed = self.repository.claim_quick_link_updates(
+            now,
+            limit=limit,
+            lease_seconds=180,
+        )
+        completed = 0
+        for task in claimed:
+            key = str(task["quick_post_key"])
+            token = str(task["lease_token"])
+            try:
+                post = self.repository.resolve_quick_link_post(key)
+                rendered, resolved = self._render_quick_link(post)
+                render_hash = hashlib.sha256(
+                    rendered.encode("utf-8")
+                ).hexdigest()
+                self.telegram.edit_message(
+                    post["channel_id"],
+                    int(post["message_id"]),
+                    rendered,
+                    channel_username=post["channel_username"],
+                )
+                if self.repository.complete_quick_link_update(
+                    key,
+                    token,
+                    datetime.now(timezone.utc),
+                    rendered_html=rendered,
+                    render_hash=render_hash,
+                    resolved_targets=resolved,
+                ):
+                    completed += 1
+            except Exception as exc:
+                self.repository.retry_quick_link_update(
+                    key,
+                    token,
+                    datetime.now(timezone.utc),
+                    exc,
+                    retry_after_seconds=getattr(exc, "retry_after", None),
+                    permanent=not bool(getattr(exc, "retryable", True)),
+                )
+                LOG.warning(
+                    "price_quick_link_update_failed quick_post_key=%s type=%s",
+                    key,
+                    type(exc).__name__,
+                )
+        return completed
+
     @staticmethod
     def _manual_deletion_markup(deletion_id: int) -> dict[str, Any]:
         return {
@@ -593,6 +678,43 @@ class PricePublicationService:
                 raise
             created += 1
         return created
+
+    def _cleanup_manual_deletion_request_message(
+        self,
+        request: Mapping[str, Any],
+    ) -> bool:
+        deletion_id = int(request["deletion_id"])
+        try:
+            self.telegram.delete_message(
+                request["request_channel_id"],
+                int(request["request_message_id"]),
+            )
+        except Exception as exc:
+            LOG.warning(
+                "price_manual_deletion_request_cleanup_failed "
+                "deletion_id=%s type=%s",
+                deletion_id,
+                type(exc).__name__,
+            )
+            return False
+        return self.repository.mark_manual_deletion_request_removed(
+            deletion_id,
+            request_channel_id=str(request["request_channel_id"]),
+            request_message_id=int(request["request_message_id"]),
+        )
+
+    def cleanup_completed_manual_deletion_requests(
+        self,
+        *,
+        limit: int = 50,
+    ) -> int:
+        """Idempotently remove helper links after SQLite records completion."""
+        return sum(
+            self._cleanup_manual_deletion_request_message(request)
+            for request in self.repository.list_completed_manual_deletion_requests(
+                limit=limit
+            )
+        )
 
     @staticmethod
     def _is_service_channel_post(message: Mapping[str, Any]) -> bool:
@@ -690,13 +812,44 @@ class PricePublicationService:
                 show_alert=True,
             )
             return
+        if not self._quick_links_ready:
+            self.telegram.answer_callback_query(
+                callback_id,
+                text="Реестр быстрых ссылок ещё не готов",
+                show_alert=True,
+            )
+            return
         request = self.repository.get_manual_deletion_request(deletion_id)
-        if not request or str(request.get("status")) != "active" or (
+        if not request or (
             str(request.get("request_channel_id")) != str(chat["id"])
             or int(request.get("request_message_id") or 0) != request_message_id
         ):
             self.telegram.answer_callback_query(
                 callback_id, text="Запрос уже обработан", show_alert=True
+            )
+            return
+        request_status = str(request.get("status") or "")
+        if request_status == "completed":
+            removed = self._cleanup_manual_deletion_request_message(request)
+            self.telegram.answer_callback_query(
+                callback_id,
+                text=(
+                    "Служебная ссылка удалена"
+                    if removed else "Удаление уже отмечено"
+                ),
+                show_alert=False,
+            )
+            return
+        if request_status != "active":
+            self.telegram.answer_callback_query(
+                callback_id, text="Запрос уже обработан", show_alert=True
+            )
+            return
+        if bool(request.get("quick_link_blocked")):
+            self.telegram.answer_callback_query(
+                callback_id,
+                text="Сначала дождитесь обновления быстрой ссылки",
+                show_alert=True,
             )
             return
         try:
@@ -714,18 +867,11 @@ class PricePublicationService:
                 show_alert=True,
             )
             return
-        try:
-            self.telegram.delete_message(chat["id"], request_message_id)
-        except Exception:
-            self.telegram.answer_callback_query(
-                callback_id,
-                text="Не удалось удалить ссылку, попробуйте ещё раз",
-                show_alert=True,
-            )
-            return
         completed = self.repository.complete_manual_deletion(
             deletion_id, datetime.now(timezone.utc)
         )
+        if completed:
+            self._cleanup_manual_deletion_request_message(request)
         self.telegram.answer_callback_query(
             callback_id,
             text=("Удаление отмечено" if completed else "Запрос уже обработан"),
@@ -879,4 +1025,26 @@ class PricePublicationService:
             self._calendar_registry.replace(calendar_records)
             self._last_calendar_hash = calendar_hash
             completed += len(calendar_records)
+
+        quick_link_records = self.repository.build_quick_link_registry_records()
+        quick_link_stable = json.dumps(
+            quick_link_records,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        quick_link_hash = hashlib.sha256(
+            quick_link_stable.encode("utf-8")
+        ).hexdigest()
+        if (
+            quick_link_records
+            and quick_link_hash != self._last_quick_link_hash
+        ):
+            if self._quick_link_registry is None:
+                self._quick_link_registry = ProductSortQuickLinkRegistry(
+                    self.settings
+                )
+            self._quick_link_registry.upsert(quick_link_records)
+            self._last_quick_link_hash = quick_link_hash
+            completed += len(quick_link_records)
         return completed

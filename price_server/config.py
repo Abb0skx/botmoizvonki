@@ -45,6 +45,7 @@ class PriceSettings:
     post_index_sheet_name: str = "Price Post IDs"
     telegram_updates_limit: int = 100
     calendar_sheet_name: str = "Price Auto Schedule"
+    quick_links_sheet_name: str = "Price Quick Links"
 
     @classmethod
     def load(cls) -> "PriceSettings":
@@ -113,6 +114,12 @@ class PriceSettings:
                 ).strip()
                 or "Price Auto Schedule"
             ),
+            quick_links_sheet_name=(
+                os.getenv(
+                    "PRICE_QUICK_LINKS_SHEET_NAME", "Price Quick Links"
+                ).strip()
+                or "Price Quick Links"
+            ),
         )
 
     def validate_runtime(self) -> None:
@@ -144,6 +151,10 @@ class PriceSettings:
         if len(self.calendar_sheet_name) > 100:
             raise RuntimeError(
                 "PRICE_CALENDAR_SHEET_NAME must be at most 100 characters"
+            )
+        if len(self.quick_links_sheet_name) > 100:
+            raise RuntimeError(
+                "PRICE_QUICK_LINKS_SHEET_NAME must be at most 100 characters"
             )
 
     @property

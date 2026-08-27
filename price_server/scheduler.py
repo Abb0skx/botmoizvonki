@@ -261,19 +261,18 @@ class PriceScheduler:
             return 0
         now = self.clock()
         await self._materialize_schedules(now)
+        quick_links_ready = getattr(
+            self.service, "ensure_quick_link_registry", None
+        ) is None
+        if not quick_links_ready:
+            try:
+                await self._service_call("ensure_quick_link_registry")
+                quick_links_ready = True
+            except Exception:
+                LOG.exception("price_quick_link_registry_failed")
         for method_name, args, log_name in (
             ("poll_preview_updates", (), "price_preview_update_poll_failed"),
             ("cleanup_terminal_previews", (), "price_preview_cleanup_failed"),
-            (
-                "cleanup_superseded_posts",
-                (),
-                "price_superseded_post_cleanup_failed",
-            ),
-            (
-                "ensure_manual_deletion_requests",
-                (),
-                "price_manual_deletion_request_failed",
-            ),
             ("ensure_scheduled_previews", (now,), "price_preview_creation_failed"),
         ):
             try:
@@ -286,14 +285,29 @@ class PriceScheduler:
                 await self._service_call("cleanup_terminal_previews")
             except Exception:
                 LOG.exception("price_preview_cleanup_failed")
+        # Link edits may involve several network retries. Run them only after
+        # due publications, then permit deletion of the now-unreferenced posts.
+        for method_name, log_name in (
+            ("refresh_quick_link_posts", "price_quick_link_update_failed"),
+            (
+                "cleanup_superseded_posts",
+                "price_superseded_post_cleanup_failed",
+            ),
+            (
+                "ensure_manual_deletion_requests",
+                "price_manual_deletion_request_failed",
+            ),
+            (
+                "cleanup_completed_manual_deletion_requests",
+                "price_manual_deletion_request_cleanup_failed",
+            ),
+        ):
+            if not quick_links_ready:
+                continue
             try:
-                await self._service_call("cleanup_superseded_posts")
+                await self._service_call(method_name)
             except Exception:
-                LOG.exception("price_superseded_post_cleanup_failed")
-            try:
-                await self._service_call("ensure_manual_deletion_requests")
-            except Exception:
-                LOG.exception("price_manual_deletion_request_failed")
+                LOG.exception(log_name)
         await self._sync_sheets_outbox()
         return processed
 
