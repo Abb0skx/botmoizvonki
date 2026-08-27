@@ -164,6 +164,11 @@ async def price_health() -> dict[str, Any]:
         "telegram_configured": settings.telegram_configured,
         "preview_configured": settings.preview_configured,
         "scheduler_running": bool(_scheduler and _scheduler.running),
+        "quick_link_rotation_configured": bool(
+            settings.telegram_configured
+            and settings.telegram_channel_username
+            and settings.preview_configured
+        ),
     }
 
 
@@ -266,6 +271,9 @@ async def price_state(request: Request) -> dict[str, Any]:
         "telegram_configured": settings.telegram_configured,
         "preview_configured": settings.preview_configured,
         "scheduler_running": bool(_scheduler and _scheduler.running),
+        "quick_link_rotations": get_repository().list_quick_link_rotations(
+            limit=20
+        ),
     }
 
 
@@ -308,7 +316,117 @@ async def price_posts(request: Request) -> dict[str, Any]:
 @router.get("/price/api/v1/jobs")
 async def price_jobs(request: Request) -> dict[str, Any]:
     _admin(request)
-    return {"jobs": get_repository().list_jobs(limit=500)}
+    return {
+        "jobs": get_repository().list_jobs(limit=500),
+        "quick_link_rotations": (
+            get_repository().list_quick_link_rotations(limit=100)
+        ),
+    }
+
+
+@router.get("/price/api/v1/quick-link-rotations")
+async def price_quick_link_rotations(request: Request) -> dict[str, Any]:
+    _admin(request)
+    return {
+        "quick_link_rotations": (
+            get_repository().list_quick_link_rotations(limit=500)
+        )
+    }
+
+
+@router.post(
+    "/price/api/v1/quick-link-rotations/{rotation_id}/reconcile",
+    status_code=202,
+)
+async def reconcile_price_quick_link_rotation(
+    rotation_id: int,
+    request: Request,
+) -> dict[str, Any]:
+    """Resume only a send-ambiguous run using an administrator-verified ID."""
+    _admin(request, action=True)
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="invalid_json")
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=422,
+            detail="request_body_must_be_object",
+        )
+    outcome = str(body.get("outcome") or "sent").strip().casefold()
+    if outcome == "not_sent":
+        if body.get("confirm_no_message_was_published") is not True:
+            raise HTTPException(
+                status_code=422,
+                detail="not_sent_confirmation_required",
+            )
+        resumed = get_repository().confirm_quick_link_rotation_not_sent(
+            rotation_id
+        )
+        if not resumed:
+            raise HTTPException(
+                status_code=409,
+                detail="rotation_cannot_be_reconciled",
+            )
+        return {
+            "status": "queued",
+            "rotation_id": rotation_id,
+            "outcome": "not_sent",
+        }
+    if outcome != "sent":
+        raise HTTPException(
+            status_code=422,
+            detail="rotation_outcome_must_be_sent_or_not_sent",
+        )
+    try:
+        message_id = int(body.get("new_main_message_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=422,
+            detail="new_main_message_id_must_be_positive",
+        )
+    if message_id <= 0:
+        raise HTTPException(
+            status_code=422,
+            detail="new_main_message_id_must_be_positive",
+        )
+    try:
+        resumed = get_repository().reconcile_quick_link_rotation_main_message(
+            rotation_id,
+            message_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    if not resumed:
+        raise HTTPException(
+            status_code=409,
+            detail="rotation_cannot_be_reconciled",
+        )
+    return {
+        "status": "queued",
+        "rotation_id": rotation_id,
+        "outcome": "sent",
+        "new_main_message_id": message_id,
+    }
+
+
+@router.post(
+    "/price/api/v1/quick-link-rotations/{rotation_id}/retry",
+    status_code=202,
+)
+async def retry_price_quick_link_rotation(
+    rotation_id: int,
+    request: Request,
+) -> dict[str, Any]:
+    """Resume a failed run without replaying already persisted phases."""
+    _admin(request, action=True)
+    resumed = get_repository().retry_failed_quick_link_rotation(rotation_id)
+    if not resumed:
+        raise HTTPException(
+            status_code=409,
+            detail="rotation_cannot_be_retried",
+        )
+    return {"status": "queued", "rotation_id": rotation_id}
 
 
 def _enqueue(section_key: str, action: str, execute_at: datetime) -> dict[str, Any]:

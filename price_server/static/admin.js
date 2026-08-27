@@ -153,6 +153,7 @@
         failed: "ошибка",
         needs_review: "нужна проверка",
         cancelled: "отменено",
+        skipped: "пропущено",
     };
     const actionNames = {send: "Новый пост", edit: "Обновление поста"};
     const tashkentDate = new Intl.DateTimeFormat("ru-RU", {
@@ -174,6 +175,9 @@
             if (!response.ok) throw new Error(`Ошибка расписания: ${response.status}`);
             const body = await response.json();
             const jobs = Array.isArray(body.jobs) ? body.jobs : [];
+            const rotations = Array.isArray(body.quick_link_rotations)
+                ? body.quick_link_rotations
+                : [];
             const active = new Set(["pending", "running"]);
             jobs.sort((left, right) => {
                 const leftActive = active.has(left.status);
@@ -184,7 +188,7 @@
             });
             jobList.replaceChildren();
 
-            if (!jobs.length) {
+            if (!jobs.length && !rotations.length) {
                 const empty = document.createElement("p");
                 empty.className = "price-server-empty";
                 empty.textContent = "Запланированных и выполненных заданий пока нет.";
@@ -224,6 +228,92 @@
                         }
                     });
                     row.appendChild(cancel);
+                }
+                jobList.appendChild(row);
+            });
+
+            rotations.slice(0, 30).forEach((rotation) => {
+                const row = document.createElement("div");
+                row.className = "price-server-job-row";
+                const scheduled = document.createElement("time");
+                scheduled.dateTime = String(rotation.scheduled_for || "");
+                const parsed = new Date(rotation.scheduled_for);
+                scheduled.textContent = Number.isNaN(parsed.getTime())
+                    ? String(rotation.scheduled_for || "—")
+                    : tashkentDate.format(parsed);
+                const name = document.createElement("span");
+                name.textContent = `Главный каталог → ${rotation.secondary_title || rotation.secondary_quick_post_key || "раздел"}`;
+                const state = document.createElement("span");
+                state.className = "price-server-job-status";
+                state.textContent = `Ротация: ${statusNames[rotation.status] || rotation.status} · ${rotation.phase || "—"}`;
+                row.append(scheduled, name, state);
+                if (rotation.status === "needs_review") {
+                    const reconcile = makeButton(
+                        "Проверить",
+                        "Указать результат неоднозначной отправки"
+                    );
+                    reconcile.addEventListener("click", async () => {
+                        const value = window.prompt(
+                            "Проверьте основной канал. Введите ID нового главного поста. Если пост точно не появился, введите НЕТ."
+                        );
+                        if (!value) return;
+                        const normalized = value.trim();
+                        let payload;
+                        if (/^\d+$/.test(normalized)) {
+                            payload = {
+                                outcome: "sent",
+                                new_main_message_id: Number(normalized),
+                            };
+                        } else if (normalized.toLocaleUpperCase("ru-RU") === "НЕТ") {
+                            if (!window.confirm(
+                                "Подтверждаете, что новый главный пост не был опубликован? Только после этого отправка будет повторена."
+                            )) return;
+                            payload = {
+                                outcome: "not_sent",
+                                confirm_no_message_was_published: true,
+                            };
+                        } else {
+                            toast("Введите числовой ID поста или слово НЕТ.", true);
+                            return;
+                        }
+                        reconcile.disabled = true;
+                        try {
+                            await request(
+                                `/price/api/v1/quick-link-rotations/${encodeURIComponent(rotation.rotation_id)}/reconcile`,
+                                payload
+                            );
+                            toast(`Ротация #${rotation.rotation_id} продолжена.`);
+                            await refreshJobs();
+                        } catch (error) {
+                            toast(error instanceof Error ? error.message : "Ошибка проверки", true);
+                        } finally {
+                            reconcile.disabled = false;
+                        }
+                    });
+                    row.appendChild(reconcile);
+                } else if (rotation.status === "failed") {
+                    const retry = makeButton(
+                        "Повторить",
+                        "Продолжить с последнего сохранённого этапа"
+                    );
+                    retry.addEventListener("click", async () => {
+                        if (!window.confirm(
+                            "Повторить ротацию с последнего безопасно сохранённого этапа?"
+                        )) return;
+                        retry.disabled = true;
+                        try {
+                            await request(
+                                `/price/api/v1/quick-link-rotations/${encodeURIComponent(rotation.rotation_id)}/retry`
+                            );
+                            toast(`Ротация #${rotation.rotation_id} снова поставлена в очередь.`);
+                            await refreshJobs();
+                        } catch (error) {
+                            toast(error instanceof Error ? error.message : "Ошибка повтора", true);
+                        } finally {
+                            retry.disabled = false;
+                        }
+                    });
+                    row.appendChild(retry);
                 }
                 jobList.appendChild(row);
             });

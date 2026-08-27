@@ -9,6 +9,7 @@ with the `botmoizvonki` FastAPI application and owns:
 - a 24-hour delayed-post preview channel with administrator-only cancellation;
 - an authoritative day-of-month publication plan at 09:30 Asia/Tashkent;
 - automatic updates of links inside the existing Telegram catalogue posts;
+- a durable Tue/Thu/Sat 11:00 rotation of the pinned catalogue post;
 - `chat_id` / `message_id` registry and its `Product Sort` mirror.
 
 Delayed jobs enter the preview channel only when their execution time is no
@@ -38,8 +39,32 @@ An edit-current action does not change a link. Superseded messages, including
 all parts of a multipart publication, remain protected until every affected
 catalogue edit succeeds. The quick-post IDs and their applied targets are
 mirrored to `PRICE_QUICK_LINKS_SHEET_NAME`; SQLite remains authoritative.
-Templates use regular emoji because Telegram restricts custom-emoji entities
-for ordinary bots editing channel posts.
+Templates use minimalist Unicode markers (`▸` for a second level and `•` for a
+direct link) because Telegram restricts custom-emoji entities for ordinary bots
+editing channel posts.
+
+The main catalogue is published every Tuesday, Thursday and Saturday at 11:00
+Asia/Tashkent, after the 09:30 price publications. The new catalogue is pinned
+and the previous catalogue is recycled into one of eight second-level posts in
+this order: smartphones, tablets, audio, wearables, photo/video, VR/glasses,
+home/office, charging, then smartphones again. The previous second-level post
+is queued for deletion; if Telegram's deletion window has expired, the normal
+manual-cleanup link is sent to the preview channel. Quick-post IDs remain
+authoritative in SQLite and are mirrored to `PRICE_QUICK_LINKS_SHEET_NAME`.
+Every rotation run, including old/new message IDs and pin state, is mirrored to
+`PRICE_QUICK_LINK_ROTATIONS_SHEET_NAME`.
+
+Rotation is a forward-only leased state machine. The new `sendMessage` result
+is persisted before pin/edit/swap operations continue. The new catalogue keeps
+the old second-level URL until the previous main has been successfully recycled;
+only then is that one link switched, so every persisted failure phase leaves a
+working destination. If a process stops while the send result is unknown, the
+run becomes `needs_review` and is never resent blindly. The admin page accepts
+either the verified new message ID or an explicit confirmation that no post was
+created. Failed idempotent phases can be retried from the same point. Missed,
+never-started dates are marked `skipped` instead of being posted in a burst
+after downtime. The main post date is stored as publication context, so later
+price-link edits do not change it.
 
 The local generator remains in the other project:
 `Price2024DB/Cod/Price.py`. It reads local/Google data, builds the price and

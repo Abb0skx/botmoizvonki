@@ -105,6 +105,18 @@ class PriceScheduler:
                 LOG.info("price_scheduler_recovered count=%s", recovered)
         except Exception:
             LOG.exception("price_scheduler_recovery_failed")
+        try:
+            recovered = await self._repository_call(
+                "recover_stale_quick_link_rotations",
+                self.clock(),
+            )
+            if recovered:
+                LOG.info(
+                    "price_quick_link_rotations_recovered count=%s",
+                    recovered,
+                )
+        except Exception:
+            LOG.exception("price_quick_link_rotation_recovery_failed")
 
     async def _materialize_schedules(self, now: datetime) -> None:
         # Optional during the first migration: repositories without recurring
@@ -113,6 +125,15 @@ class PriceScheduler:
             await self._repository_call("materialize_due_schedules", now)
         except Exception:
             LOG.exception("price_schedule_materialization_failed")
+
+    async def _materialize_quick_link_rotations(self, now: datetime) -> None:
+        try:
+            await self._repository_call(
+                "materialize_due_quick_link_rotations",
+                now,
+            )
+        except Exception:
+            LOG.exception("price_quick_link_rotation_materialization_failed")
 
     @staticmethod
     def _as_jobs(claimed: Any) -> list[Any]:
@@ -260,7 +281,6 @@ class PriceScheduler:
         if not self.configured:
             return 0
         now = self.clock()
-        await self._materialize_schedules(now)
         quick_links_ready = getattr(
             self.service, "ensure_quick_link_registry", None
         ) is None
@@ -270,6 +290,9 @@ class PriceScheduler:
                 quick_links_ready = True
             except Exception:
                 LOG.exception("price_quick_link_registry_failed")
+        await self._materialize_schedules(now)
+        if quick_links_ready:
+            await self._materialize_quick_link_rotations(now)
         for method_name, args, log_name in (
             ("poll_preview_updates", (), "price_preview_update_poll_failed"),
             ("cleanup_terminal_previews", (), "price_preview_cleanup_failed"),
@@ -285,10 +308,25 @@ class PriceScheduler:
                 await self._service_call("cleanup_terminal_previews")
             except Exception:
                 LOG.exception("price_preview_cleanup_failed")
+        if quick_links_ready:
+            try:
+                processed += int(
+                    await self._service_call(
+                        "process_quick_link_rotations",
+                        self.clock(),
+                    )
+                    or 0
+                )
+            except Exception:
+                LOG.exception("price_quick_link_rotation_failed")
         # Link edits may involve several network retries. Run them only after
         # due publications, then permit deletion of the now-unreferenced posts.
         for method_name, log_name in (
             ("refresh_quick_link_posts", "price_quick_link_update_failed"),
+            (
+                "process_quick_link_rotations",
+                "price_quick_link_rotation_failed",
+            ),
             (
                 "cleanup_superseded_posts",
                 "price_superseded_post_cleanup_failed",
@@ -305,7 +343,13 @@ class PriceScheduler:
             if not quick_links_ready:
                 continue
             try:
-                await self._service_call(method_name)
+                if method_name == "process_quick_link_rotations":
+                    processed += int(
+                        await self._service_call(method_name, self.clock())
+                        or 0
+                    )
+                else:
+                    await self._service_call(method_name)
             except Exception:
                 LOG.exception(log_name)
         await self._sync_sheets_outbox()

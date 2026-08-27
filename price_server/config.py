@@ -46,6 +46,7 @@ class PriceSettings:
     telegram_updates_limit: int = 100
     calendar_sheet_name: str = "Price Auto Schedule"
     quick_links_sheet_name: str = "Price Quick Links"
+    quick_link_rotations_sheet_name: str = "Price Quick Link Rotations"
 
     @classmethod
     def load(cls) -> "PriceSettings":
@@ -120,6 +121,13 @@ class PriceSettings:
                 ).strip()
                 or "Price Quick Links"
             ),
+            quick_link_rotations_sheet_name=(
+                os.getenv(
+                    "PRICE_QUICK_LINK_ROTATIONS_SHEET_NAME",
+                    "Price Quick Link Rotations",
+                ).strip()
+                or "Price Quick Link Rotations"
+            ),
         )
 
     def validate_runtime(self) -> None:
@@ -144,6 +152,14 @@ class PriceSettings:
                 raise RuntimeError(
                     "Preview and publication channels must be different"
                 )
+        if self.telegram_configured and not self.telegram_preview_channel_id:
+            raise RuntimeError(
+                "PRICE_TELEGRAM_PREVIEW_CHANNEL_ID is required for manual cleanup"
+            )
+        if self.telegram_configured and not self.telegram_channel_username:
+            raise RuntimeError(
+                "PRICE_TELEGRAM_CHANNEL_USERNAME is required for public post links"
+            )
         if len(self.post_index_sheet_name) > 100:
             raise RuntimeError(
                 "PRICE_POST_INDEX_SHEET_NAME must be at most 100 characters"
@@ -155,6 +171,10 @@ class PriceSettings:
         if len(self.quick_links_sheet_name) > 100:
             raise RuntimeError(
                 "PRICE_QUICK_LINKS_SHEET_NAME must be at most 100 characters"
+            )
+        if len(self.quick_link_rotations_sheet_name) > 100:
+            raise RuntimeError(
+                "PRICE_QUICK_LINK_ROTATIONS_SHEET_NAME must be at most 100 characters"
             )
 
     @property

@@ -23,6 +23,12 @@ from zoneinfo import ZoneInfo
 
 from .config import PriceSettings
 from .calendar_plan import CALENDAR_PLAN_ENTRIES
+from .quick_links import (
+    CATALOG_QUICK_POST_KEY,
+    QUICK_LINK_ROTATION_ORDER,
+    QUICK_LINK_ROTATION_TIME,
+    QUICK_LINK_ROTATION_WEEKDAYS,
+)
 
 
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -169,6 +175,23 @@ CREATE TABLE IF NOT EXISTS telegram_quick_link_targets (
 CREATE INDEX IF NOT EXISTS idx_quick_link_targets_section
  ON telegram_quick_link_targets(section_key,quick_post_key,link_key);
 
+CREATE TABLE IF NOT EXISTS telegram_quick_link_post_targets (
+ quick_post_key TEXT NOT NULL,
+ link_key TEXT NOT NULL,
+ target_quick_post_key TEXT NOT NULL,
+ PRIMARY KEY(quick_post_key,link_key),
+ FOREIGN KEY(quick_post_key) REFERENCES telegram_quick_link_posts(quick_post_key)
+   ON DELETE CASCADE);
+CREATE INDEX IF NOT EXISTS idx_quick_link_post_targets_target
+ ON telegram_quick_link_post_targets(target_quick_post_key,quick_post_key);
+
+CREATE TABLE IF NOT EXISTS telegram_quick_link_context (
+ quick_post_key TEXT PRIMARY KEY,
+ context_json TEXT NOT NULL DEFAULT '{}',
+ updated_at TEXT NOT NULL,
+ FOREIGN KEY(quick_post_key) REFERENCES telegram_quick_link_posts(quick_post_key)
+   ON DELETE CASCADE);
+
 CREATE TABLE IF NOT EXISTS telegram_quick_link_applied_targets (
  quick_post_key TEXT NOT NULL,
  link_key TEXT NOT NULL,
@@ -202,6 +225,61 @@ CREATE TABLE IF NOT EXISTS telegram_quick_link_queue (
    ON DELETE CASCADE);
 CREATE INDEX IF NOT EXISTS idx_quick_link_queue_due
  ON telegram_quick_link_queue(status,next_attempt_at,quick_post_key);
+
+CREATE TABLE IF NOT EXISTS telegram_quick_link_rotations (
+ rotation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+ dedupe_key TEXT NOT NULL UNIQUE,
+ scheduled_for TEXT NOT NULL,
+ local_date TEXT NOT NULL UNIQUE,
+ rotation_index INTEGER NOT NULL CHECK(rotation_index BETWEEN 0 AND 7),
+ secondary_quick_post_key TEXT NOT NULL,
+ status TEXT NOT NULL DEFAULT 'pending',
+ phase TEXT NOT NULL DEFAULT 'planned',
+ attempts INTEGER NOT NULL DEFAULT 0,
+ max_attempts INTEGER NOT NULL DEFAULT 12,
+ next_attempt_at TEXT,
+ lease_token TEXT,
+ lease_expires_at TEXT,
+ previous_main_message_id INTEGER,
+ previous_main_post_url TEXT NOT NULL DEFAULT '',
+ previous_secondary_message_id INTEGER,
+ previous_secondary_post_url TEXT NOT NULL DEFAULT '',
+ new_main_message_id INTEGER,
+ new_main_post_url TEXT NOT NULL DEFAULT '',
+ main_html TEXT NOT NULL DEFAULT '',
+ main_render_hash TEXT NOT NULL DEFAULT '',
+ main_targets_json TEXT NOT NULL DEFAULT '[]',
+ secondary_html TEXT NOT NULL DEFAULT '',
+ secondary_render_hash TEXT NOT NULL DEFAULT '',
+ secondary_targets_json TEXT NOT NULL DEFAULT '[]',
+ pinned_at TEXT,
+ unpinned_at TEXT,
+ last_error TEXT,
+ created_at TEXT NOT NULL,
+ updated_at TEXT NOT NULL,
+ completed_at TEXT,
+ FOREIGN KEY(secondary_quick_post_key)
+   REFERENCES telegram_quick_link_posts(quick_post_key));
+CREATE INDEX IF NOT EXISTS idx_quick_link_rotations_due
+ ON telegram_quick_link_rotations(status,scheduled_for,next_attempt_at,rotation_id);
+
+CREATE TABLE IF NOT EXISTS telegram_quick_link_retired_posts (
+ retired_id INTEGER PRIMARY KEY AUTOINCREMENT,
+ record_key TEXT NOT NULL UNIQUE,
+ quick_post_key TEXT NOT NULL,
+ title TEXT NOT NULL,
+ channel_id TEXT NOT NULL,
+ channel_username TEXT NOT NULL DEFAULT '',
+ message_id INTEGER NOT NULL CHECK(message_id>0),
+ post_url TEXT NOT NULL DEFAULT '',
+ status TEXT NOT NULL DEFAULT 'pending_delete',
+ last_error TEXT,
+ retired_at TEXT NOT NULL,
+ updated_at TEXT NOT NULL,
+ deleted_at TEXT,
+ UNIQUE(channel_id,message_id));
+CREATE INDEX IF NOT EXISTS idx_quick_link_retired_status
+ ON telegram_quick_link_retired_posts(status,retired_id);
 
 CREATE TABLE IF NOT EXISTS publication_jobs (
  job_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -552,6 +630,19 @@ class PriceRepository:
             return None
         result = dict(row)
         result["payload"] = _load(result.pop("payload_json"), {})
+        return result
+
+    @staticmethod
+    def _rotation(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        result = dict(row)
+        result["main_targets"] = _load(
+            result.pop("main_targets_json"), []
+        )
+        result["secondary_targets"] = _load(
+            result.pop("secondary_targets_json"), []
+        )
         return result
 
     def ingest_snapshot(
@@ -1120,6 +1211,14 @@ class PriceRepository:
                    WHERE status='pending'
                      AND (next_attempt_at IS NULL OR next_attempt_at<=?)
                      AND NOT EXISTS(
+                       SELECT 1 FROM telegram_quick_link_posts AS active_quick
+                       WHERE active_quick.status!='disabled'
+                         AND active_quick.channel_id=
+                             telegram_deletion_queue.channel_id
+                         AND active_quick.message_id=
+                             telegram_deletion_queue.message_id
+                     )
+                     AND NOT EXISTS(
                        SELECT 1 FROM telegram_quick_link_applied_targets AS a
                        JOIN telegram_quick_link_posts AS p
                          ON p.quick_post_key=a.quick_post_key
@@ -1197,6 +1296,14 @@ class PriceRepository:
                    WHERE channel_id=? AND message_id=?""",
                 (_iso(at), row["channel_id"], row["message_id"]),
             )
+            db.execute(
+                """UPDATE telegram_quick_link_retired_posts
+                   SET status='deleted',last_error=NULL,updated_at=?,deleted_at=?
+                   WHERE channel_id=? AND message_id=?""",
+                (
+                    _iso(at), _iso(at), row["channel_id"], row["message_id"],
+                ),
+            )
             posts = db.execute(
                 """SELECT * FROM telegram_posts
                    WHERE channel_id=? AND message_id=?""",
@@ -1258,6 +1365,17 @@ class PriceRepository:
                     row["channel_id"], row["message_id"],
                 ),
             )
+            db.execute(
+                """UPDATE telegram_quick_link_retired_posts
+                   SET status=CASE WHEN ?='failed' THEN 'delete_failed'
+                                   ELSE status END,
+                       last_error=?,updated_at=?
+                   WHERE channel_id=? AND message_id=?""",
+                (
+                    status, safe_error, _iso(at),
+                    row["channel_id"], row["message_id"],
+                ),
+            )
             if status == "failed":
                 posts = db.execute(
                     """SELECT * FROM telegram_posts
@@ -1284,6 +1402,19 @@ class PriceRepository:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def list_quick_link_retired_posts(
+        self,
+        *,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        with self._read() as db:
+            rows = db.execute(
+                """SELECT * FROM telegram_quick_link_retired_posts
+                   ORDER BY retired_id DESC LIMIT ?""",
+                (min(5000, max(1, int(limit))),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def list_unreported_manual_deletions(
         self,
         *,
@@ -1293,15 +1424,28 @@ class PriceRepository:
         with self._read() as db:
             rows = db.execute(
                 """SELECT q.*,
-                          COALESCE(MAX(p.section_name),q.section_key) AS section_name,
-                          COALESCE(MAX(p.post_url),'') AS post_url
+                          COALESCE(
+                            MAX(p.section_name),MAX(retired.title),q.section_key
+                          ) AS section_name,
+                          COALESCE(
+                            MAX(p.post_url),MAX(retired.post_url),''
+                          ) AS post_url
                    FROM telegram_deletion_queue AS q
                    LEFT JOIN manual_deletion_requests AS r
                      ON r.deletion_id=q.deletion_id
                    LEFT JOIN telegram_posts AS p
                      ON p.channel_id=q.channel_id
                     AND p.message_id=q.message_id
+                   LEFT JOIN telegram_quick_link_retired_posts AS retired
+                     ON retired.channel_id=q.channel_id
+                    AND retired.message_id=q.message_id
                    WHERE q.status='failed' AND r.deletion_id IS NULL
+                     AND NOT EXISTS(
+                       SELECT 1 FROM telegram_quick_link_posts AS active_quick
+                       WHERE active_quick.status!='disabled'
+                         AND active_quick.channel_id=q.channel_id
+                         AND active_quick.message_id=q.message_id
+                     )
                      AND NOT EXISTS(
                        SELECT 1 FROM telegram_quick_link_applied_targets AS a
                        JOIN telegram_quick_link_posts AS quick_post
@@ -1353,7 +1497,15 @@ class PriceRepository:
         with self._tx(True) as db:
             deletion = db.execute(
                 """SELECT * FROM telegram_deletion_queue
-                   WHERE deletion_id=? AND status='failed'""",
+                   WHERE deletion_id=? AND status='failed'
+                     AND NOT EXISTS(
+                       SELECT 1 FROM telegram_quick_link_posts AS active_quick
+                       WHERE active_quick.status!='disabled'
+                         AND active_quick.channel_id=
+                             telegram_deletion_queue.channel_id
+                         AND active_quick.message_id=
+                             telegram_deletion_queue.message_id
+                     )""",
                 (int(deletion_id),),
             ).fetchone()
             if deletion is None:
@@ -1396,6 +1548,12 @@ class PriceRepository:
             row = db.execute(
                 """SELECT r.*,
                           (EXISTS(
+                            SELECT 1
+                            FROM telegram_quick_link_posts AS active_quick
+                            WHERE active_quick.status!='disabled'
+                              AND active_quick.channel_id=r.target_channel_id
+                              AND active_quick.message_id=r.target_message_id
+                          ) OR EXISTS(
                             SELECT 1
                             FROM telegram_quick_link_applied_targets AS a
                             JOIN telegram_quick_link_posts AS p
@@ -1449,6 +1607,11 @@ class PriceRepository:
                 return False
             blocked = db.execute(
                 """SELECT 1 WHERE EXISTS(
+                     SELECT 1 FROM telegram_quick_link_posts AS active_quick
+                     WHERE active_quick.status!='disabled'
+                       AND active_quick.channel_id=?
+                       AND active_quick.message_id=?
+                   ) OR EXISTS(
                      SELECT 1
                      FROM telegram_quick_link_applied_targets AS a
                      JOIN telegram_quick_link_posts AS p
@@ -1481,6 +1644,8 @@ class PriceRepository:
                     request["target_channel_id"],
                     request["target_message_id"],
                     request["target_channel_id"],
+                    request["target_message_id"],
+                    request["target_channel_id"],
                     request["section_key"],
                 ),
             ).fetchone()
@@ -1504,6 +1669,15 @@ class PriceRepository:
                    WHERE channel_id=? AND message_id=?""",
                 (
                     _iso(at), request["target_channel_id"],
+                    request["target_message_id"],
+                ),
+            )
+            db.execute(
+                """UPDATE telegram_quick_link_retired_posts
+                   SET status='deleted',last_error=NULL,updated_at=?,deleted_at=?
+                   WHERE channel_id=? AND message_id=?""",
+                (
+                    _iso(at), _iso(at), request["target_channel_id"],
                     request["target_message_id"],
                 ),
             )
@@ -1676,6 +1850,8 @@ class PriceRepository:
             title = str(spec.get("title") or quick_post_key).strip()
             template_html = str(spec.get("template_html") or "")
             reconcile_on_install = bool(spec.get("reconcile_on_install", False))
+            rotating = bool(spec.get("rotating", False))
+            initial_context = dict(spec.get("initial_context") or {})
             try:
                 message_id = int(spec.get("message_id"))
             except (TypeError, ValueError) as exc:
@@ -1729,18 +1905,42 @@ class PriceRepository:
             ))
             if markers != seen_link_keys:
                 raise ValueError("quick-link template has undeclared placeholders")
+            quick_markers = set(re.findall(
+                r"\{\{quick_post_url:([A-Za-z0-9][A-Za-z0-9_.:-]{0,127})\}\}",
+                template_html,
+            ))
+            context_markers = set(re.findall(
+                r"\{\{context:([A-Za-z0-9][A-Za-z0-9_.:-]{0,127})\}\}",
+                template_html,
+            ))
+            if context_markers != set(initial_context):
+                raise ValueError("quick-link context placeholders are incomplete")
             definition = {
                 "quick_post_key": quick_post_key,
                 "title": title,
                 "message_id": message_id,
                 "template_html": template_html,
                 "reconcile_on_install": reconcile_on_install,
+                "rotating": rotating,
+                "initial_context": initial_context,
+                "quick_targets": [
+                    {"link_key": key, "target_quick_post_key": key}
+                    for key in sorted(quick_markers)
+                ],
                 "targets": targets,
             }
             definition["template_hash"] = hashlib.sha256(
                 _dump(definition).encode("utf-8")
             ).hexdigest()
             normalized.append(definition)
+
+        known_posts = {spec["quick_post_key"] for spec in normalized}
+        for spec in normalized:
+            for target in spec["quick_targets"]:
+                if target["target_quick_post_key"] not in known_posts:
+                    raise ValueError("quick-link post target does not exist")
+                if target["target_quick_post_key"] == spec["quick_post_key"]:
+                    raise ValueError("quick-link post cannot target itself")
 
         changed_count = 0
         with self._tx(True) as db:
@@ -1764,15 +1964,40 @@ class PriceRepository:
                     (key,),
                 ).fetchone()
                 installing = existing is None
+                if (
+                    existing is not None
+                    and spec["rotating"]
+                    and str(existing["channel_id"]) != channel
+                ):
+                    raise ValueError(
+                        "quick-link runtime IDs belong to a different channel; "
+                        "explicit migration is required"
+                    )
+                effective_message_id = (
+                    int(existing["message_id"])
+                    if existing is not None and spec["rotating"]
+                    else int(spec["message_id"])
+                )
                 changed = existing is None or any((
                     str(existing["title"]) != spec["title"],
                     str(existing["channel_id"]) != channel,
                     str(existing["channel_username"]) != username,
-                    int(existing["message_id"]) != spec["message_id"],
+                    (
+                        not spec["rotating"]
+                        and int(existing["message_id"]) != spec["message_id"]
+                    ),
                     str(existing["template_hash"]) != spec["template_hash"],
                     str(existing["status"]) == "disabled",
                 ))
-                post_url = f"https://t.me/{username}/{spec['message_id']}"
+                post_url = f"https://t.me/{username}/{effective_message_id}"
+                if existing is not None:
+                    db.execute(
+                        """INSERT INTO telegram_quick_link_context(
+                             quick_post_key,context_json,updated_at)
+                           VALUES(?,?,?)
+                           ON CONFLICT(quick_post_key) DO NOTHING""",
+                        (key, _dump(spec["initial_context"]), _iso(at)),
+                    )
                 if not changed:
                     continue
                 db.execute(
@@ -1792,9 +2017,16 @@ class PriceRepository:
                         updated_at=excluded.updated_at""",
                     (
                         key, spec["title"], channel, username,
-                        spec["message_id"], post_url, spec["template_html"],
+                        effective_message_id, post_url, spec["template_html"],
                         spec["template_hash"], _iso(at), _iso(at),
                     ),
+                )
+                db.execute(
+                    """INSERT INTO telegram_quick_link_context(
+                         quick_post_key,context_json,updated_at)
+                       VALUES(?,?,?)
+                       ON CONFLICT(quick_post_key) DO NOTHING""",
+                    (key, _dump(spec["initial_context"]), _iso(at)),
                 )
                 db.execute(
                     "DELETE FROM telegram_quick_link_targets WHERE quick_post_key=?",
@@ -1813,11 +2045,31 @@ class PriceRepository:
                     ],
                 )
                 db.execute(
+                    """DELETE FROM telegram_quick_link_post_targets
+                       WHERE quick_post_key=?""",
+                    (key,),
+                )
+                db.executemany(
+                    """INSERT INTO telegram_quick_link_post_targets(
+                         quick_post_key,link_key,target_quick_post_key)
+                       VALUES(?,?,?)""",
+                    [
+                        (
+                            key, target["link_key"],
+                            target["target_quick_post_key"],
+                        )
+                        for target in spec["quick_targets"]
+                    ],
+                )
+                db.execute(
                     """DELETE FROM telegram_quick_link_applied_targets
                        WHERE quick_post_key=? AND link_key NOT IN (
                          SELECT link_key FROM telegram_quick_link_targets
+                         WHERE quick_post_key=?
+                         UNION
+                         SELECT link_key FROM telegram_quick_link_post_targets
                          WHERE quick_post_key=?)""",
-                    (key, key),
+                    (key, key, key),
                 )
                 for target in spec["targets"]:
                     message_id = self._telegram_message_id_from_url(
@@ -1858,8 +2110,11 @@ class PriceRepository:
                         db, "quick_link_post_configured", "quick_link_post",
                         key,
                         {
-                            "message_id": spec["message_id"],
-                            "targets": len(spec["targets"]),
+                            "message_id": effective_message_id,
+                            "targets": (
+                                len(spec["targets"])
+                                + len(spec["quick_targets"])
+                            ),
                             "queued": should_queue,
                         },
                         at,
@@ -1900,6 +2155,21 @@ class PriceRepository:
                    WHERE quick_post_key=? ORDER BY link_key,priority,section_key""",
                 (key,),
             ).fetchall()
+            quick_targets = db.execute(
+                """SELECT target.link_key,target.target_quick_post_key,
+                          post.channel_id,post.message_id,post.post_url
+                   FROM telegram_quick_link_post_targets AS target
+                   JOIN telegram_quick_link_posts AS post
+                     ON post.quick_post_key=target.target_quick_post_key
+                   WHERE target.quick_post_key=? AND post.status!='disabled'
+                   ORDER BY target.link_key""",
+                (key,),
+            ).fetchall()
+            context_row = db.execute(
+                """SELECT context_json FROM telegram_quick_link_context
+                   WHERE quick_post_key=?""",
+                (key,),
+            ).fetchone()
             current = db.execute(
                 """SELECT p.section_key,p.channel_id,p.message_id,p.post_url,
                           p.publication_id
@@ -1947,6 +2217,7 @@ class PriceRepository:
             if self._telegram_message_id_from_url(target_url) != target_message_id:
                 raise ValueError("quick-link target URL does not match message ID")
             resolved.append({
+                "target_kind": "price_section",
                 "link_key": link_key,
                 "section_key": selected_target["section_key"],
                 "target_channel_id": target_channel_id,
@@ -1954,8 +2225,33 @@ class PriceRepository:
                 "target_publication_id": target_publication_id,
                 "target_url": target_url,
             })
+        for target in quick_targets:
+            target_url = str(target["post_url"] or "").strip()
+            target_message_id = int(target["message_id"])
+            if not target_url:
+                target_url = (
+                    f"https://t.me/{post['channel_username']}/"
+                    f"{target_message_id}"
+                )
+            if self._telegram_message_id_from_url(target_url) != target_message_id:
+                raise ValueError("quick-link post URL does not match message ID")
+            resolved.append({
+                "target_kind": "quick_post",
+                "link_key": str(target["link_key"]),
+                "target_quick_post_key": str(
+                    target["target_quick_post_key"]
+                ),
+                "target_channel_id": str(target["channel_id"]),
+                "target_message_id": target_message_id,
+                "target_publication_id": "",
+                "target_url": target_url,
+            })
         payload = dict(post)
         payload["resolved_targets"] = resolved
+        payload["context"] = _load(
+            context_row["context_json"] if context_row is not None else None,
+            {},
+        )
         return payload
 
     def claim_quick_link_updates(
@@ -1983,8 +2279,32 @@ class PriceRepository:
                      ON p.quick_post_key=q.quick_post_key
                    WHERE q.status='pending' AND p.status!='disabled'
                      AND (q.next_attempt_at IS NULL OR q.next_attempt_at<=?)
+                     AND NOT EXISTS(
+                       SELECT 1 FROM telegram_quick_link_rotations AS rotation
+                       WHERE (
+                           rotation.status='running'
+                           OR (
+                               rotation.status IN (
+                                   'pending','needs_review','failed'
+                               )
+                               AND rotation.phase!='planned'
+                           )
+                         )
+                         AND rotation.scheduled_for<=?
+                         AND rotation.phase IN (
+                           'planned','send_inflight','main_sent',
+                           'new_pinned','secondary_edited','catalog_edited'
+                         )
+                         AND (
+                           p.quick_post_key=?
+                           OR p.quick_post_key=rotation.secondary_quick_post_key
+                         )
+                     )
                    ORDER BY q.updated_at,q.quick_post_key LIMIT ?""",
-                (_iso(now), min(100, max(1, int(limit)))),
+                (
+                    _iso(now), _iso(now), CATALOG_QUICK_POST_KEY,
+                    min(100, max(1, int(limit))),
+                ),
             ).fetchall()
             claimed: list[dict[str, Any]] = []
             for row in rows:
@@ -2032,10 +2352,12 @@ class PriceRepository:
             expected = {
                 row["link_key"]
                 for row in db.execute(
-                    """SELECT DISTINCT link_key
-                       FROM telegram_quick_link_targets
+                    """SELECT link_key FROM telegram_quick_link_targets
+                       WHERE quick_post_key=?
+                       UNION
+                       SELECT link_key FROM telegram_quick_link_post_targets
                        WHERE quick_post_key=?""",
-                    (key,),
+                    (key, key),
                 ).fetchall()
             }
             supplied = {str(item.get("link_key") or "") for item in resolved_targets}
@@ -2193,6 +2515,20 @@ class PriceRepository:
                     AND a.link_key=t.link_key
                    ORDER BY t.quick_post_key,t.link_key,t.priority"""
             ).fetchall()
+            quick_targets = db.execute(
+                """SELECT t.*,a.target_message_id,a.target_url
+                   FROM telegram_quick_link_post_targets AS t
+                   LEFT JOIN telegram_quick_link_applied_targets AS a
+                     ON a.quick_post_key=t.quick_post_key
+                    AND a.link_key=t.link_key
+                   ORDER BY t.quick_post_key,t.link_key"""
+            ).fetchall()
+            contexts = {
+                row["quick_post_key"]: _load(row["context_json"], {})
+                for row in db.execute(
+                    "SELECT * FROM telegram_quick_link_context"
+                ).fetchall()
+            }
             queues = {
                 row["quick_post_key"]: row
                 for row in db.execute(
@@ -2202,13 +2538,24 @@ class PriceRepository:
         by_post: dict[str, list[sqlite3.Row]] = {}
         for target in targets:
             by_post.setdefault(target["quick_post_key"], []).append(target)
+        quick_by_post: dict[str, list[sqlite3.Row]] = {}
+        for target in quick_targets:
+            quick_by_post.setdefault(
+                target["quick_post_key"], []
+            ).append(target)
         records: list[dict[str, Any]] = []
         for post in posts:
             key = post["quick_post_key"]
             linked = by_post.get(key, [])
+            linked_quick = quick_by_post.get(key, [])
             queue = queues.get(key)
             records.append({
                 "quick_post_key": key,
+                "role": "catalog" if key == CATALOG_QUICK_POST_KEY else "secondary",
+                "rotation_position": (
+                    QUICK_LINK_ROTATION_ORDER.index(key) + 1
+                    if key in QUICK_LINK_ROTATION_ORDER else 0
+                ),
                 "title": post["title"],
                 "channel_id": post["channel_id"],
                 "channel_username": post["channel_username"],
@@ -2217,14 +2564,19 @@ class PriceRepository:
                 "linked_section_keys": list(dict.fromkeys(
                     row["section_key"] for row in linked
                 )),
+                "linked_quick_post_keys": [
+                    row["target_quick_post_key"] for row in linked_quick
+                ],
                 "target_message_ids": {
                     row["link_key"]: row["target_message_id"]
-                    for row in linked if row["target_message_id"] is not None
+                    for row in (*linked, *linked_quick)
+                    if row["target_message_id"] is not None
                 },
                 "target_post_urls": {
                     row["link_key"]: row["target_url"]
-                    for row in linked if row["target_url"]
+                    for row in (*linked, *linked_quick) if row["target_url"]
                 },
+                "context": contexts.get(key, {}),
                 "desired_revision": (
                     queue["desired_revision"] if queue is not None else 0
                 ),
@@ -2240,6 +2592,881 @@ class PriceRepository:
                 ),
             })
         return records
+
+    def materialize_due_quick_link_rotations(
+        self,
+        now_utc: datetime | str,
+        *,
+        horizon_days: int = 7,
+    ) -> int:
+        """Create Tue/Thu/Sat 11:00 catalogue rotations without duplicates."""
+        now = _dt(now_utc, "now_utc")
+        bounded_horizon = min(31, max(0, int(horizon_days)))
+        zone = ZoneInfo(self.timezone)
+        local_today = now.astimezone(zone).date()
+        last_date = (now + timedelta(days=bounded_horizon)).astimezone(
+            zone
+        ).date()
+        hour, minute = (
+            int(part) for part in QUICK_LINK_ROTATION_TIME.split(":", 1)
+        )
+        created = 0
+        with self._tx(True) as db:
+            required = (CATALOG_QUICK_POST_KEY, *QUICK_LINK_ROTATION_ORDER)
+            placeholders = ",".join("?" for _ in required)
+            installed = db.execute(
+                f"""SELECT COUNT(*) AS count
+                    FROM telegram_quick_link_posts
+                    WHERE quick_post_key IN ({placeholders})
+                      AND status!='disabled'""",
+                required,
+            ).fetchone()
+            if installed is None or int(installed["count"]) != len(required):
+                return 0
+            stale = db.execute(
+                """SELECT rotation_id FROM telegram_quick_link_rotations
+                   WHERE status IN ('pending','failed') AND phase='planned'
+                     AND local_date<?
+                   ORDER BY scheduled_for,rotation_id""",
+                (local_today.isoformat(),),
+            ).fetchall()
+            if stale:
+                stale_ids = [int(row["rotation_id"]) for row in stale]
+                placeholders = ",".join("?" for _ in stale_ids)
+                db.execute(
+                    f"""UPDATE telegram_quick_link_rotations
+                        SET status='skipped',phase='skipped',last_error=?,
+                            updated_at=?,completed_at=?,next_attempt_at=NULL,
+                            lease_token=NULL,lease_expires_at=NULL
+                        WHERE rotation_id IN ({placeholders})""",
+                    (
+                        "scheduled occurrence passed while the service was offline",
+                        _iso(now), _iso(now), *stale_ids,
+                    ),
+                )
+                anchor = db.execute(
+                    """SELECT rotation_index
+                       FROM telegram_quick_link_rotations
+                       WHERE status='done'
+                          OR status IN ('running','needs_review','failed')
+                          OR (status='pending' AND phase!='planned')
+                       ORDER BY scheduled_for DESC,rotation_id DESC
+                       LIMIT 1"""
+                ).fetchone()
+                rebased_index = (
+                    (int(anchor["rotation_index"]) + 1)
+                    % len(QUICK_LINK_ROTATION_ORDER)
+                    if anchor is not None else 0
+                )
+                planned = db.execute(
+                    """SELECT rotation_id
+                       FROM telegram_quick_link_rotations
+                       WHERE status='pending' AND phase='planned'
+                       ORDER BY scheduled_for,rotation_id"""
+                ).fetchall()
+                for row in planned:
+                    db.execute(
+                        """UPDATE telegram_quick_link_rotations
+                           SET rotation_index=?,secondary_quick_post_key=?,
+                               updated_at=? WHERE rotation_id=?""",
+                        (
+                            rebased_index,
+                            QUICK_LINK_ROTATION_ORDER[rebased_index],
+                            _iso(now), int(row["rotation_id"]),
+                        ),
+                    )
+                    rebased_index = (
+                        rebased_index + 1
+                    ) % len(QUICK_LINK_ROTATION_ORDER)
+                self._audit(
+                    db,
+                    "quick_link_rotations_skipped_stale",
+                    "quick_link_rotation",
+                    stale_ids[-1],
+                    {"rotation_ids": stale_ids},
+                    now,
+                )
+            last = db.execute(
+                """SELECT rotation_index FROM telegram_quick_link_rotations
+                   WHERE status!='skipped'
+                   ORDER BY scheduled_for DESC,rotation_id DESC LIMIT 1"""
+            ).fetchone()
+            next_index = (
+                (int(last["rotation_index"]) + 1)
+                % len(QUICK_LINK_ROTATION_ORDER)
+                if last is not None else 0
+            )
+            target_date = local_today
+            while target_date <= last_date:
+                if target_date.isoweekday() not in QUICK_LINK_ROTATION_WEEKDAYS:
+                    target_date += timedelta(days=1)
+                    continue
+                execute_at = datetime.combine(
+                    target_date,
+                    time(hour, minute),
+                    tzinfo=zone,
+                ).astimezone(timezone.utc)
+                local_date = target_date.isoformat()
+                existing = db.execute(
+                    """SELECT 1 FROM telegram_quick_link_rotations
+                       WHERE local_date=?""",
+                    (local_date,),
+                ).fetchone()
+                if existing is None:
+                    secondary_key = QUICK_LINK_ROTATION_ORDER[next_index]
+                    cursor = db.execute(
+                        """INSERT INTO telegram_quick_link_rotations(
+                             dedupe_key,scheduled_for,local_date,rotation_index,
+                             secondary_quick_post_key,status,phase,attempts,
+                             max_attempts,created_at,updated_at)
+                           VALUES(?,?,?,?,?,'pending','planned',0,12,?,?)
+                           ON CONFLICT(local_date) DO NOTHING""",
+                        (
+                            f"quick-link-rotation:{local_date}",
+                            _iso(execute_at), local_date, next_index,
+                            secondary_key, _iso(now), _iso(now),
+                        ),
+                    )
+                    if cursor.rowcount == 1:
+                        created += 1
+                        self._audit(
+                            db,
+                            "quick_link_rotation_materialized",
+                            "quick_link_rotation",
+                            cursor.lastrowid,
+                            {
+                                "scheduled_for": _iso(execute_at),
+                                "secondary_quick_post_key": secondary_key,
+                            },
+                            now,
+                        )
+                        next_index = (
+                            next_index + 1
+                        ) % len(QUICK_LINK_ROTATION_ORDER)
+                target_date += timedelta(days=1)
+        return created
+
+    @staticmethod
+    def _recover_quick_link_rotations_tx(
+        db: sqlite3.Connection,
+        now: datetime,
+    ) -> int:
+        uncertain = db.execute(
+            """UPDATE telegram_quick_link_rotations
+               SET status='needs_review',lease_token=NULL,
+                   lease_expires_at=NULL,last_error=?,updated_at=?,
+                   completed_at=?
+               WHERE status='running' AND phase='send_inflight'
+                 AND (lease_expires_at IS NULL OR lease_expires_at<=?)""",
+            (
+                "sendMessage outcome is unknown after worker interruption",
+                _iso(now), _iso(now), _iso(now),
+            ),
+        ).rowcount
+        retryable = db.execute(
+            """UPDATE telegram_quick_link_rotations
+               SET status='pending',lease_token=NULL,lease_expires_at=NULL,
+                   next_attempt_at=?,updated_at=?
+               WHERE status='running' AND phase!='send_inflight'
+                 AND (lease_expires_at IS NULL OR lease_expires_at<=?)""",
+            (_iso(now), _iso(now), _iso(now)),
+        ).rowcount
+        return max(0, uncertain) + max(0, retryable)
+
+    def recover_stale_quick_link_rotations(
+        self,
+        now_utc: datetime | str,
+    ) -> int:
+        now = _dt(now_utc, "now_utc")
+        with self._tx(True) as db:
+            return self._recover_quick_link_rotations_tx(db, now)
+
+    def claim_due_quick_link_rotation(
+        self,
+        now_utc: datetime | str,
+        *,
+        lease_seconds: int = 180,
+    ) -> dict[str, Any] | None:
+        now = _dt(now_utc, "now_utc")
+        expires = now + timedelta(
+            seconds=min(3600, max(10, int(lease_seconds)))
+        )
+        with self._tx(True) as db:
+            self._recover_quick_link_rotations_tx(db, now)
+            row = db.execute(
+                """SELECT rotation.*
+                   FROM telegram_quick_link_rotations AS rotation
+                   WHERE rotation.status='pending'
+                     AND rotation.scheduled_for<=?
+                     AND (rotation.next_attempt_at IS NULL
+                          OR rotation.next_attempt_at<=?)
+                     AND NOT EXISTS(
+                       SELECT 1 FROM telegram_quick_link_rotations AS earlier
+                       WHERE earlier.rotation_id<rotation.rotation_id
+                         AND earlier.status NOT IN ('done','skipped')
+                     )
+                     AND NOT EXISTS(
+                       SELECT 1 FROM publication_jobs AS job
+                       WHERE job.status IN ('pending','running','needs_review')
+                         AND job.execute_at<=rotation.scheduled_for
+                         AND json_extract(job.payload_json,'$.source')
+                             ='price_calendar'
+                         AND json_extract(job.payload_json,'$.calendar_date')
+                             =rotation.local_date
+                     )
+                     AND (
+                       rotation.phase!='planned'
+                       OR NOT EXISTS(
+                         SELECT 1 FROM telegram_quick_link_queue AS q
+                         WHERE q.status IN ('pending','running')
+                       )
+                     )
+                   ORDER BY rotation.scheduled_for,rotation.rotation_id
+                   LIMIT 1""",
+                (_iso(now), _iso(now)),
+            ).fetchone()
+            if row is None:
+                return None
+            token = secrets.token_urlsafe(24)
+            cursor = db.execute(
+                """UPDATE telegram_quick_link_rotations
+                   SET status='running',attempts=attempts+1,lease_token=?,
+                       lease_expires_at=?,updated_at=?
+                   WHERE rotation_id=? AND status='pending'""",
+                (
+                    token, _iso(expires), _iso(now), row["rotation_id"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            claimed = db.execute(
+                """SELECT * FROM telegram_quick_link_rotations
+                   WHERE rotation_id=?""",
+                (row["rotation_id"],),
+            ).fetchone()
+        return self._rotation(claimed)
+
+    def get_quick_link_rotation(
+        self,
+        rotation_id: int,
+    ) -> dict[str, Any] | None:
+        with self._read() as db:
+            row = db.execute(
+                """SELECT * FROM telegram_quick_link_rotations
+                   WHERE rotation_id=?""",
+                (int(rotation_id),),
+            ).fetchone()
+        return self._rotation(row)
+
+    def list_quick_link_rotations(
+        self,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        with self._read() as db:
+            rows = db.execute(
+                """SELECT rotation.*,post.title AS secondary_title
+                   FROM telegram_quick_link_rotations AS rotation
+                   LEFT JOIN telegram_quick_link_posts AS post
+                     ON post.quick_post_key=rotation.secondary_quick_post_key
+                   ORDER BY rotation.scheduled_for DESC,rotation.rotation_id DESC
+                   LIMIT ?""",
+                (min(1000, max(1, int(limit))),),
+            ).fetchall()
+        return [self._rotation(row) for row in rows if row is not None]
+
+    def mark_quick_link_rotation_send_inflight(
+        self,
+        rotation_id: int,
+        lease_token: str,
+        *,
+        previous_main_message_id: int,
+        previous_main_post_url: str,
+        previous_secondary_message_id: int,
+        previous_secondary_post_url: str,
+        main_html: str,
+        main_render_hash: str,
+        main_targets: Sequence[Mapping[str, Any]],
+        secondary_html: str,
+        secondary_render_hash: str,
+        secondary_targets: Sequence[Mapping[str, Any]],
+        now: datetime | str | None = None,
+    ) -> bool:
+        at = _dt(now, "now", default=True)
+        if _HASH_RE.fullmatch(str(main_render_hash)) is None:
+            raise ValueError("main render hash is invalid")
+        if _HASH_RE.fullmatch(str(secondary_render_hash)) is None:
+            raise ValueError("secondary render hash is invalid")
+        with self._tx(True) as db:
+            rotation = db.execute(
+                """SELECT * FROM telegram_quick_link_rotations
+                   WHERE rotation_id=? AND status='running'
+                     AND phase='planned' AND lease_token=?""",
+                (int(rotation_id), str(lease_token)),
+            ).fetchone()
+            if rotation is None:
+                return False
+            main = db.execute(
+                """SELECT * FROM telegram_quick_link_posts
+                   WHERE quick_post_key=?""",
+                (CATALOG_QUICK_POST_KEY,),
+            ).fetchone()
+            secondary = db.execute(
+                """SELECT * FROM telegram_quick_link_posts
+                   WHERE quick_post_key=?""",
+                (rotation["secondary_quick_post_key"],),
+            ).fetchone()
+            if (
+                main is None or secondary is None
+                or int(main["message_id"]) != int(previous_main_message_id)
+                or int(secondary["message_id"])
+                != int(previous_secondary_message_id)
+            ):
+                raise ValueError("quick-link bindings changed before rotation")
+            cursor = db.execute(
+                """UPDATE telegram_quick_link_rotations
+                   SET phase='send_inflight',previous_main_message_id=?,
+                       previous_main_post_url=?,previous_secondary_message_id=?,
+                       previous_secondary_post_url=?,main_html=?,
+                       main_render_hash=?,main_targets_json=?,secondary_html=?,
+                       secondary_render_hash=?,secondary_targets_json=?,
+                       last_error=NULL,updated_at=?
+                   WHERE rotation_id=? AND status='running'
+                     AND phase='planned' AND lease_token=?""",
+                (
+                    int(previous_main_message_id),
+                    str(previous_main_post_url),
+                    int(previous_secondary_message_id),
+                    str(previous_secondary_post_url),
+                    str(main_html), str(main_render_hash),
+                    _dump([dict(item) for item in main_targets]),
+                    str(secondary_html), str(secondary_render_hash),
+                    _dump([dict(item) for item in secondary_targets]),
+                    _iso(at), int(rotation_id), str(lease_token),
+                ),
+            )
+            return cursor.rowcount == 1
+
+    def record_quick_link_rotation_main_sent(
+        self,
+        rotation_id: int,
+        lease_token: str,
+        *,
+        message_id: int,
+        post_url: str,
+        now: datetime | str | None = None,
+    ) -> bool:
+        at = _dt(now, "now", default=True)
+        if int(message_id) <= 0:
+            raise ValueError("new main message_id must be positive")
+        with self._tx(True) as db:
+            cursor = db.execute(
+                """UPDATE telegram_quick_link_rotations
+                   SET phase='main_sent',new_main_message_id=?,
+                       new_main_post_url=?,last_error=NULL,updated_at=?
+                   WHERE rotation_id=? AND status='running'
+                     AND phase='send_inflight' AND lease_token=?""",
+                (
+                    int(message_id), str(post_url), _iso(at),
+                    int(rotation_id), str(lease_token),
+                ),
+            )
+            return cursor.rowcount == 1
+
+    def mark_quick_link_rotation_phase(
+        self,
+        rotation_id: int,
+        lease_token: str,
+        *,
+        expected_phase: str,
+        phase: str,
+        now: datetime | str | None = None,
+    ) -> bool:
+        allowed = {
+            ("main_sent", "new_pinned"),
+            ("new_pinned", "secondary_edited"),
+            ("secondary_edited", "catalog_edited"),
+            ("swapped", "old_unpinned"),
+        }
+        if (expected_phase, phase) not in allowed:
+            raise ValueError("invalid quick-link rotation phase transition")
+        at = _dt(now, "now", default=True)
+        timestamp_column = (
+            "pinned_at" if phase == "new_pinned"
+            else "unpinned_at" if phase == "old_unpinned"
+            else None
+        )
+        assignments = "phase=?,updated_at=?"
+        params: list[Any] = [phase, _iso(at)]
+        if timestamp_column:
+            assignments += f",{timestamp_column}=?"
+            params.append(_iso(at))
+        params.extend((int(rotation_id), expected_phase, str(lease_token)))
+        with self._tx(True) as db:
+            cursor = db.execute(
+                f"""UPDATE telegram_quick_link_rotations SET {assignments}
+                    WHERE rotation_id=? AND status='running' AND phase=?
+                      AND lease_token=?""",
+                params,
+            )
+            return cursor.rowcount == 1
+
+    @staticmethod
+    def _replace_quick_link_applied_targets_tx(
+        db: sqlite3.Connection,
+        quick_post_key: str,
+        targets: Sequence[Mapping[str, Any]],
+        at: datetime,
+    ) -> None:
+        key = _key(quick_post_key)
+        expected = {
+            row["link_key"]
+            for row in db.execute(
+                """SELECT link_key FROM telegram_quick_link_targets
+                   WHERE quick_post_key=?
+                   UNION
+                   SELECT link_key FROM telegram_quick_link_post_targets
+                   WHERE quick_post_key=?""",
+                (key, key),
+            ).fetchall()
+        }
+        supplied = {str(item.get("link_key") or "") for item in targets}
+        if supplied != expected:
+            raise ValueError("rotation targets are incomplete")
+        db.execute(
+            """DELETE FROM telegram_quick_link_applied_targets
+               WHERE quick_post_key=?""",
+            (key,),
+        )
+        for item in targets:
+            target_url = str(item.get("target_url") or "").strip()
+            target_message_id = int(item.get("target_message_id") or 0)
+            if PriceRepository._telegram_message_id_from_url(
+                target_url
+            ) != target_message_id:
+                raise ValueError("rotation target URL does not match message ID")
+            db.execute(
+                """INSERT INTO telegram_quick_link_applied_targets(
+                     quick_post_key,link_key,target_channel_id,
+                     target_message_id,target_publication_id,target_url,
+                     updated_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (
+                    key, _key(item.get("link_key")),
+                    str(item.get("target_channel_id") or ""),
+                    target_message_id,
+                    str(item.get("target_publication_id") or ""),
+                    target_url, _iso(at),
+                ),
+            )
+
+    def commit_quick_link_rotation_swap(
+        self,
+        rotation_id: int,
+        lease_token: str,
+        *,
+        now: datetime | str | None = None,
+    ) -> bool:
+        """Atomically bind the new main and recycle the previous main."""
+        at = _dt(now, "now", default=True)
+        with self._tx(True) as db:
+            rotation = db.execute(
+                """SELECT * FROM telegram_quick_link_rotations
+                   WHERE rotation_id=? AND status='running'
+                     AND phase='catalog_edited' AND lease_token=?""",
+                (int(rotation_id), str(lease_token)),
+            ).fetchone()
+            if rotation is None:
+                return False
+            secondary_key = str(rotation["secondary_quick_post_key"])
+            main = db.execute(
+                """SELECT * FROM telegram_quick_link_posts
+                   WHERE quick_post_key=?""",
+                (CATALOG_QUICK_POST_KEY,),
+            ).fetchone()
+            secondary = db.execute(
+                """SELECT * FROM telegram_quick_link_posts
+                   WHERE quick_post_key=?""",
+                (secondary_key,),
+            ).fetchone()
+            if (
+                main is None or secondary is None
+                or int(main["message_id"])
+                != int(rotation["previous_main_message_id"])
+                or int(secondary["message_id"])
+                != int(rotation["previous_secondary_message_id"])
+            ):
+                raise ValueError("quick-link bindings changed during rotation")
+            new_main_id = int(rotation["new_main_message_id"] or 0)
+            if new_main_id <= 0:
+                raise ValueError("rotation has no new main message")
+            main_url = str(rotation["new_main_post_url"] or "").strip()
+            if self._telegram_message_id_from_url(main_url) != new_main_id:
+                raise ValueError("new main URL does not match message ID")
+            old_main_id = int(rotation["previous_main_message_id"])
+            old_main_url = str(rotation["previous_main_post_url"] or "")
+            old_secondary_id = int(rotation["previous_secondary_message_id"])
+            old_secondary_url = str(
+                rotation["previous_secondary_post_url"] or ""
+            )
+
+            # Free the old main binding first to satisfy UNIQUE(channel_id,message_id).
+            db.execute(
+                """UPDATE telegram_quick_link_posts
+                   SET message_id=?,post_url=?,last_rendered_html=?,
+                       last_render_hash=?,status='active',last_error=NULL,
+                       last_edited_at=?,updated_at=?
+                   WHERE quick_post_key=?""",
+                (
+                    new_main_id, main_url, rotation["main_html"],
+                    rotation["main_render_hash"], _iso(at), _iso(at),
+                    CATALOG_QUICK_POST_KEY,
+                ),
+            )
+            db.execute(
+                """UPDATE telegram_quick_link_posts
+                   SET message_id=?,post_url=?,last_rendered_html=?,
+                       last_render_hash=?,status='active',last_error=NULL,
+                       last_edited_at=?,updated_at=?
+                   WHERE quick_post_key=?""",
+                (
+                    old_main_id, old_main_url, rotation["secondary_html"],
+                    rotation["secondary_render_hash"], _iso(at), _iso(at),
+                    secondary_key,
+                ),
+            )
+            display_date = date.fromisoformat(
+                str(rotation["local_date"])
+            ).strftime("%d.%m.%Y")
+            db.execute(
+                """INSERT INTO telegram_quick_link_context(
+                     quick_post_key,context_json,updated_at)
+                   VALUES(?,?,?)
+                   ON CONFLICT(quick_post_key) DO UPDATE SET
+                    context_json=excluded.context_json,
+                    updated_at=excluded.updated_at""",
+                (
+                    CATALOG_QUICK_POST_KEY,
+                    _dump({"catalog_date": display_date}),
+                    _iso(at),
+                ),
+            )
+            self._replace_quick_link_applied_targets_tx(
+                db,
+                CATALOG_QUICK_POST_KEY,
+                _load(rotation["main_targets_json"], []),
+                at,
+            )
+            self._replace_quick_link_applied_targets_tx(
+                db,
+                secondary_key,
+                _load(rotation["secondary_targets_json"], []),
+                at,
+            )
+            for quick_post_key in (
+                CATALOG_QUICK_POST_KEY,
+                secondary_key,
+            ):
+                queued = db.execute(
+                    """SELECT status,desired_revision,applied_revision
+                       FROM telegram_quick_link_queue
+                       WHERE quick_post_key=?""",
+                    (quick_post_key,),
+                ).fetchone()
+                if queued is not None and (
+                    str(queued["status"]) != "done"
+                    or int(queued["applied_revision"])
+                    < int(queued["desired_revision"])
+                ):
+                    self._queue_quick_link_post_tx(
+                        db,
+                        quick_post_key,
+                        at,
+                    )
+
+            retired_record_key = (
+                f"quick-link:{secondary_key}:{old_secondary_id}"
+            )
+            db.execute(
+                """INSERT INTO telegram_quick_link_retired_posts(
+                     record_key,quick_post_key,title,channel_id,
+                     channel_username,message_id,post_url,status,
+                     retired_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,'pending_delete',?,?)
+                   ON CONFLICT(record_key) DO NOTHING""",
+                (
+                    retired_record_key, secondary_key, secondary["title"],
+                    secondary["channel_id"], secondary["channel_username"],
+                    old_secondary_id, old_secondary_url,
+                    _iso(at), _iso(at),
+                ),
+            )
+            db.execute(
+                """INSERT INTO telegram_deletion_queue(
+                     record_key,section_key,channel_id,message_id,status,
+                     attempts,max_attempts,created_at,updated_at)
+                   VALUES(?,?,?,?,'pending',0,12,?,?)
+                   ON CONFLICT(record_key) DO NOTHING""",
+                (
+                    retired_record_key, secondary_key,
+                    secondary["channel_id"], old_secondary_id,
+                    _iso(at), _iso(at),
+                ),
+            )
+            db.execute(
+                """UPDATE telegram_quick_link_rotations
+                   SET phase='swapped',last_error=NULL,updated_at=?
+                   WHERE rotation_id=? AND status='running'
+                     AND phase='catalog_edited' AND lease_token=?""",
+                (_iso(at), int(rotation_id), str(lease_token)),
+            )
+            self._audit(
+                db,
+                "quick_link_rotation_swapped",
+                "quick_link_rotation",
+                rotation_id,
+                {
+                    "new_main_message_id": new_main_id,
+                    "recycled_message_id": old_main_id,
+                    "retired_message_id": old_secondary_id,
+                    "secondary_quick_post_key": secondary_key,
+                },
+                at,
+            )
+            return True
+
+    def complete_quick_link_rotation(
+        self,
+        rotation_id: int,
+        lease_token: str,
+        *,
+        now: datetime | str | None = None,
+    ) -> bool:
+        at = _dt(now, "now", default=True)
+        with self._tx(True) as db:
+            cursor = db.execute(
+                """UPDATE telegram_quick_link_rotations
+                   SET status='done',phase='completed',attempts=0,
+                       next_attempt_at=NULL,lease_token=NULL,
+                       lease_expires_at=NULL,last_error=NULL,updated_at=?,
+                       completed_at=?
+                   WHERE rotation_id=? AND status='running'
+                     AND phase='old_unpinned' AND lease_token=?""",
+                (
+                    _iso(at), _iso(at), int(rotation_id), str(lease_token),
+                ),
+            )
+            if cursor.rowcount != 1:
+                return False
+            self._audit(
+                db,
+                "quick_link_rotation_completed",
+                "quick_link_rotation",
+                rotation_id,
+                {},
+                at,
+            )
+            return True
+
+    def retry_quick_link_rotation(
+        self,
+        rotation_id: int,
+        lease_token: str,
+        now_utc: datetime | str,
+        error: Any,
+        *,
+        retry_after_seconds: float | int | None = None,
+        permanent: bool = False,
+        ambiguous: bool = False,
+    ) -> bool:
+        at = _dt(now_utc, "now_utc")
+        safe_error = str(error or "quick-link rotation failed").replace(
+            "\n", " "
+        )[:1000]
+        with self._tx(True) as db:
+            row = db.execute(
+                """SELECT * FROM telegram_quick_link_rotations
+                   WHERE rotation_id=? AND status='running'
+                     AND lease_token=?""",
+                (int(rotation_id), str(lease_token)),
+            ).fetchone()
+            if row is None:
+                return False
+            exhausted = int(row["attempts"]) >= int(row["max_attempts"])
+            if ambiguous:
+                status = "needs_review"
+            elif permanent or exhausted:
+                status = "failed"
+            else:
+                status = "pending"
+            delay = (
+                2 ** min(int(row["attempts"]), 11)
+                if retry_after_seconds is None
+                else float(retry_after_seconds)
+            )
+            next_attempt = (
+                _iso(at + timedelta(seconds=min(86400, max(0, delay))))
+                if status == "pending" else None
+            )
+            phase = (
+                "planned"
+                if row["phase"] == "send_inflight" and not ambiguous
+                else row["phase"]
+            )
+            db.execute(
+                """UPDATE telegram_quick_link_rotations
+                   SET status=?,phase=?,next_attempt_at=?,lease_token=NULL,
+                       lease_expires_at=NULL,last_error=?,updated_at=?,
+                       completed_at=?
+                   WHERE rotation_id=? AND status='running'
+                     AND lease_token=?""",
+                (
+                    status, phase, next_attempt, safe_error, _iso(at),
+                    _iso(at) if status in {"failed", "needs_review"} else None,
+                    int(rotation_id), str(lease_token),
+                ),
+            )
+            return True
+
+    def reconcile_quick_link_rotation_main_message(
+        self,
+        rotation_id: int,
+        message_id: int,
+        *,
+        now: datetime | str | None = None,
+    ) -> bool:
+        """Resume a send-ambiguous rotation after an administrator supplies ID."""
+        at = _dt(now, "now", default=True)
+        if int(message_id) <= 0:
+            raise ValueError("message_id must be positive")
+        username = (
+            self.settings.telegram_channel_username
+            if self.settings is not None else ""
+        )
+        if not username:
+            raise ValueError("Telegram channel username is required")
+        post_url = f"https://t.me/{username}/{int(message_id)}"
+        with self._tx(True) as db:
+            rotation = db.execute(
+                """SELECT * FROM telegram_quick_link_rotations
+                   WHERE rotation_id=? AND status='needs_review'
+                     AND phase='send_inflight'""",
+                (int(rotation_id),),
+            ).fetchone()
+            if rotation is None:
+                return False
+            previous_main_id = int(
+                rotation["previous_main_message_id"] or 0
+            )
+            if int(message_id) <= previous_main_id:
+                raise ValueError(
+                    "new main message_id must be newer than the previous main"
+                )
+            main_binding = db.execute(
+                """SELECT channel_id FROM telegram_quick_link_posts
+                   WHERE quick_post_key=?""",
+                (CATALOG_QUICK_POST_KEY,),
+            ).fetchone()
+            if main_binding is None:
+                raise ValueError("main quick-link post is not configured")
+            active = db.execute(
+                """SELECT 'quick_link' AS kind
+                   FROM telegram_quick_link_posts
+                   WHERE channel_id=? AND message_id=? AND status!='disabled'
+                   UNION ALL
+                   SELECT 'price_post' AS kind FROM telegram_posts
+                   WHERE channel_id=? AND message_id=?
+                   LIMIT 1""",
+                (
+                    main_binding["channel_id"], int(message_id),
+                    main_binding["channel_id"], int(message_id),
+                ),
+            ).fetchone()
+            if active is not None:
+                raise ValueError(
+                    "new main message_id is already registered for another post"
+                )
+            cursor = db.execute(
+                """UPDATE telegram_quick_link_rotations
+                   SET status='pending',phase='main_sent',
+                       new_main_message_id=?,new_main_post_url=?,attempts=0,
+                       next_attempt_at=?,last_error=NULL,updated_at=?,
+                       completed_at=NULL
+                   WHERE rotation_id=? AND status='needs_review'
+                     AND phase='send_inflight'""",
+                (
+                    int(message_id), post_url, _iso(at), _iso(at),
+                    int(rotation_id),
+                ),
+            )
+            return cursor.rowcount == 1
+
+    def confirm_quick_link_rotation_not_sent(
+        self,
+        rotation_id: int,
+        *,
+        now: datetime | str | None = None,
+    ) -> bool:
+        """Retry sendMessage only after an administrator verified no post exists."""
+        at = _dt(now, "now", default=True)
+        with self._tx(True) as db:
+            cursor = db.execute(
+                """UPDATE telegram_quick_link_rotations
+                   SET status='pending',phase='planned',attempts=0,
+                       next_attempt_at=?,lease_token=NULL,lease_expires_at=NULL,
+                       previous_main_message_id=NULL,
+                       previous_main_post_url='',
+                       previous_secondary_message_id=NULL,
+                       previous_secondary_post_url='',
+                       new_main_message_id=NULL,new_main_post_url='',
+                       main_html='',main_render_hash='',main_targets_json='[]',
+                       secondary_html='',secondary_render_hash='',
+                       secondary_targets_json='[]',last_error=NULL,
+                       updated_at=?,completed_at=NULL
+                   WHERE rotation_id=? AND status='needs_review'
+                     AND phase='send_inflight'""",
+                (_iso(at), _iso(at), int(rotation_id)),
+            )
+            if cursor.rowcount != 1:
+                return False
+            self._audit(
+                db,
+                "quick_link_rotation_send_confirmed_absent",
+                "quick_link_rotation",
+                rotation_id,
+                {},
+                at,
+            )
+            return True
+
+    def retry_failed_quick_link_rotation(
+        self,
+        rotation_id: int,
+        *,
+        now: datetime | str | None = None,
+    ) -> bool:
+        """Resume a failed rotation from its last persisted idempotent phase."""
+        at = _dt(now, "now", default=True)
+        with self._tx(True) as db:
+            cursor = db.execute(
+                """UPDATE telegram_quick_link_rotations
+                   SET status='pending',attempts=0,next_attempt_at=?,
+                       lease_token=NULL,lease_expires_at=NULL,last_error=NULL,
+                       updated_at=?,completed_at=NULL
+                   WHERE rotation_id=? AND status='failed'""",
+                (_iso(at), _iso(at), int(rotation_id)),
+            )
+            if cursor.rowcount != 1:
+                return False
+            self._audit(
+                db,
+                "quick_link_rotation_retry_requested",
+                "quick_link_rotation",
+                rotation_id,
+                {},
+                at,
+            )
+            return True
 
     def enqueue_job(
         self,
@@ -2625,7 +3852,7 @@ class PriceRepository:
                     time(9, 30),
                     tzinfo=zone,
                 ).astimezone(timezone.utc)
-                if execute <= now or execute > horizon:
+                if execute > horizon:
                     continue
                 plan_days: list[int] = []
                 if 1 <= target_date.day <= 30:

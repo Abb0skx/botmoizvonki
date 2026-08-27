@@ -60,19 +60,46 @@ CALENDAR_HEADERS = (
 
 QUICK_LINK_HEADERS = (
     "quick_post_key",
+    "role",
+    "rotation_position",
     "title",
     "channel_id",
     "channel_username",
     "message_id",
     "post_url",
     "linked_section_keys",
+    "linked_quick_post_keys",
     "target_message_ids",
     "target_post_urls",
+    "context",
     "desired_revision",
     "applied_revision",
     "status",
     "last_render_hash",
     "last_edited_at",
+    "updated_at",
+    "last_sync_at",
+    "last_error",
+)
+
+QUICK_LINK_ROTATION_HEADERS = (
+    "rotation_id",
+    "scheduled_for",
+    "local_date",
+    "rotation_index",
+    "secondary_quick_post_key",
+    "secondary_title",
+    "previous_main_message_id",
+    "previous_main_post_url",
+    "previous_secondary_message_id",
+    "previous_secondary_post_url",
+    "new_main_message_id",
+    "new_main_post_url",
+    "phase",
+    "status",
+    "pinned_at",
+    "unpinned_at",
+    "completed_at",
     "updated_at",
     "last_sync_at",
     "last_error",
@@ -491,6 +518,9 @@ class ProductSortQuickLinkRegistry:
         missing = [name for name in QUICK_LINK_HEADERS if name not in headers]
         if missing:
             headers.extend(missing)
+        grid_width = int(getattr(worksheet, "col_count", 0) or 0)
+        if grid_width and grid_width < len(headers):
+            worksheet.resize(cols=len(headers))
         normalized_rows = [
             list(row) + [""] * max(0, len(headers) - len(row))
             for row in existing[1:]
@@ -510,6 +540,121 @@ class ProductSortQuickLinkRegistry:
             if not key:
                 raise ValueError("Quick-link registry row has no key")
             payload["quick_post_key"] = key
+            payload["last_sync_at"] = now
+            row_number = row_by_key.get(key)
+            if row_number is None:
+                row_number = next_row
+                next_row += 1
+                row_by_key[key] = row_number
+            updates[row_number] = [
+                _cell(payload.get(name)) for name in headers
+            ]
+        last_column = _column_letter(len(headers))
+        current_headers = [
+            str(value).strip() for value in (existing[0] if existing else [])
+        ]
+        requests = []
+        if not existing or headers != current_headers:
+            requests.append({
+                "range": f"A1:{last_column}1",
+                "values": [headers],
+            })
+        for row_number, values in sorted(updates.items()):
+            requests.append({
+                "range": f"A{row_number}:{last_column}{row_number}",
+                "values": [values],
+            })
+        worksheet.batch_update(requests, value_input_option="RAW")
+        return len(records)
+
+
+@dataclass
+class ProductSortQuickLinkRotationRegistry:
+    """Append/update mirror of durable catalogue rotation runs."""
+
+    settings: PriceSettings
+    client: Any | None = None
+
+    def _worksheet(self):
+        import gspread
+
+        client = self.client or _google_client()
+        book = client.open_by_key(self.settings.product_sort_sheet_id)
+        try:
+            worksheet = book.worksheet(
+                self.settings.quick_link_rotations_sheet_name
+            )
+        except gspread.WorksheetNotFound:
+            worksheet = book.add_worksheet(
+                title=self.settings.quick_link_rotations_sheet_name,
+                rows=1000,
+                cols=len(QUICK_LINK_ROTATION_HEADERS),
+            )
+            worksheet.update(
+                range_name=(
+                    f"A1:{_column_letter(len(QUICK_LINK_ROTATION_HEADERS))}1"
+                ),
+                values=[list(QUICK_LINK_ROTATION_HEADERS)],
+                value_input_option="RAW",
+            )
+            worksheet.freeze(rows=1)
+            worksheet.format(
+                f"A1:{_column_letter(len(QUICK_LINK_ROTATION_HEADERS))}1",
+                {
+                    "backgroundColor": {
+                        "red": 0.20,
+                        "green": 0.28,
+                        "blue": 0.52,
+                    },
+                    "textFormat": {
+                        "bold": True,
+                        "foregroundColor": {
+                            "red": 1,
+                            "green": 1,
+                            "blue": 1,
+                        },
+                    },
+                },
+            )
+        return worksheet
+
+    def upsert(self, records: Iterable[Mapping[str, Any]]) -> int:
+        records = list(records)
+        if not records:
+            return 0
+        worksheet = self._worksheet()
+        existing = worksheet.get_all_values()
+        headers = (
+            [str(value).strip() for value in existing[0]]
+            if existing else []
+        )
+        if not headers:
+            headers = list(QUICK_LINK_ROTATION_HEADERS)
+        missing = [
+            name for name in QUICK_LINK_ROTATION_HEADERS
+            if name not in headers
+        ]
+        if missing:
+            headers.extend(missing)
+        normalized_rows = [
+            list(row) + [""] * max(0, len(headers) - len(row))
+            for row in existing[1:]
+        ]
+        key_index = headers.index("rotation_id")
+        row_by_key = {
+            row[key_index]: row_number
+            for row_number, row in enumerate(normalized_rows, start=2)
+            if key_index < len(row) and row[key_index]
+        }
+        now = datetime.now(timezone.utc).isoformat()
+        next_row = max(2, len(existing) + 1)
+        updates: dict[int, list[Any]] = {}
+        for source in records:
+            payload = dict(source)
+            key = str(payload.get("rotation_id") or "").strip()
+            if not key:
+                raise ValueError("Quick-link rotation row has no ID")
+            payload["rotation_id"] = key
             payload["last_sync_at"] = now
             row_number = row_by_key.get(key)
             if row_number is None:

@@ -8,6 +8,7 @@ import importlib
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from price_server.config import PriceSettings
 from price_server.contracts import (
@@ -16,14 +17,25 @@ from price_server.contracts import (
     validate_sync_payload,
 )
 from price_server.repository import PriceRepository, StaleSnapshotError
-from price_server.quick_links import QUICK_LINK_POST_SPECS
+from price_server.quick_links import (
+    CATALOG_QUICK_POST_KEY,
+    QUICK_LINK_POST_SPECS,
+    QUICK_LINK_ROTATION_ORDER,
+)
 from price_server.scheduler import PriceScheduler
 from price_server.service import PricePublicationService
 from price_server.sheets_registry import (
     QUICK_LINK_HEADERS,
+    QUICK_LINK_ROTATION_HEADERS,
     ProductSortQuickLinkRegistry,
+    ProductSortQuickLinkRotationRegistry,
 )
-from price_server.telegram_api import TelegramMessage, telegram_text_units
+from price_server.telegram_api import (
+    TelegramAPIError,
+    TelegramClient,
+    TelegramMessage,
+    telegram_text_units,
+)
 from fastapi import HTTPException
 from starlette.requests import Request
 
@@ -37,17 +49,27 @@ class FakeTelegramRetryableError(RuntimeError):
     retry_after = 0
 
 
+class FakeTelegramAmbiguousError(RuntimeError):
+    retryable = False
+    ambiguous = True
+
+
 class FakeTelegram:
     def __init__(self):
         self.next_id = 100
         self.sent: list[tuple[str, str, dict]] = []
         self.edited: list[tuple[str, int, str]] = []
         self.deleted: list[tuple[str, int]] = []
+        self.pinned: list[tuple[str, int, bool]] = []
+        self.unpinned: list[tuple[str, int]] = []
         self.updates: list[dict] = []
         self.callback_answers: list[tuple[str, str, bool]] = []
         self.member_status = "administrator"
         self.delete_failures: dict[tuple[str, int], Exception] = {}
         self.edit_failures: dict[tuple[str, int], Exception] = {}
+        self.pin_failures: dict[tuple[str, int], Exception] = {}
+        self.unpin_failures: dict[tuple[str, int], Exception] = {}
+        self.send_failure: Exception | None = None
 
     @staticmethod
     def _message(chat_id: str, message_id: int, html_text: str) -> TelegramMessage:
@@ -62,6 +84,8 @@ class FakeTelegram:
         )
 
     def send_message(self, chat_id, html_text, **kwargs):
+        if self.send_failure is not None:
+            raise self.send_failure
         self.next_id += 1
         self.sent.append((str(chat_id), html_text, kwargs))
         return self._message(str(chat_id), self.next_id, html_text)
@@ -79,6 +103,22 @@ class FakeTelegram:
         if error is not None:
             raise error
         self.deleted.append(key)
+        return True
+
+    def pin_message(self, chat_id, message_id, *, disable_notification=True):
+        key = (str(chat_id), int(message_id))
+        error = self.pin_failures.get(key)
+        if error is not None:
+            raise error
+        self.pinned.append((*key, bool(disable_notification)))
+        return True
+
+    def unpin_message(self, chat_id, message_id):
+        key = (str(chat_id), int(message_id))
+        error = self.unpin_failures.get(key)
+        if error is not None:
+            raise error
+        self.unpinned.append(key)
         return True
 
     def get_updates(self, **_kwargs):
@@ -188,6 +228,32 @@ class PriceRepositoryTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def rotation_fixture(self, db_name="rotation.db"):
+        settings = PriceSettings(
+            enabled=True,
+            db_path=Path(self.temp.name) / db_name,
+            legacy_html_path=Path(self.temp.name) / "legacy.html",
+            admin_username="admin",
+            admin_password="secret",
+            sync_api_key="sync",
+            telegram_bot_token="fake-token",
+            telegram_channel_id="-1001463992448",
+            telegram_channel_username="testchannel",
+            product_sort_sheet_id="sheet",
+            posts_sheet_name="Telegram Posts",
+            timezone="Asia/Tashkent",
+            scheduler_poll_seconds=1,
+            sync_max_bytes=2_000_000,
+            telegram_preview_channel_id="-1003922029862",
+        )
+        repo = PriceRepository(settings)
+        fake = FakeTelegram()
+        service = PricePublicationService(settings, repo, telegram=fake)
+        self.assertEqual(service.ensure_quick_link_registry(), 9)
+        self.assertEqual(service.refresh_quick_link_posts(), 9)
+        fake.edited.clear()
+        return settings, repo, fake, service
 
     def test_snapshot_is_atomic_idempotent_and_rejects_stale(self):
         first = self.repo.ingest_snapshot(snapshot(self.now))
@@ -618,9 +684,15 @@ class PriceRepositoryTests(unittest.TestCase):
             self.assertNotIn("<tg-emoji", rendered)
             self.assertLessEqual(telegram_text_units(rendered), 4096)
 
-        self.assertEqual(service.refresh_quick_link_posts(), 1)
-        self.assertEqual(len(fake.edited), 1)
-        self.assertEqual(fake.edited[0][1], 4882)
+        self.assertEqual(service.refresh_quick_link_posts(), 9)
+        self.assertEqual(len(fake.edited), 9)
+        self.assertEqual(
+            {item[1] for item in fake.edited},
+            {
+                spec["message_id"]
+                for spec in QUICK_LINK_POST_SPECS
+            },
+        )
         self.assertTrue(all(
             row["status"] == "done"
             for row in self.repo.list_quick_link_updates()
@@ -730,11 +802,15 @@ class PriceRepositoryTests(unittest.TestCase):
             spec for spec in QUICK_LINK_POST_SPECS
             if spec["quick_post_key"] == "quick-index-catalog"
         )
-        for message_id in (4942, 4978, 4905, 4882, 4878, 4869, 5033, 5016):
+        for quick_post_key in QUICK_LINK_ROTATION_ORDER:
             self.assertIn(
-                f'https://t.me/texnikach/{message_id}',
+                f'{{{{quick_post_url:{quick_post_key}}}}}',
                 master["template_html"],
             )
+        self.assertIn("{{context:catalog_date}}", master["template_html"])
+        self.assertIn("▸ ", master["template_html"])
+        self.assertIn("• ", master["template_html"])
+        self.assertNotIn("<tg-emoji", master["template_html"])
 
     def test_quick_link_sheet_upserts_nine_stable_rows(self):
         settings = PriceSettings(
@@ -795,6 +871,44 @@ class PriceRepositoryTests(unittest.TestCase):
         self.assertNotIn(
             "A11:Q11",
             {request["range"] for request in worksheet.requests},
+        )
+
+    def test_quick_link_sheet_expands_legacy_column_grid(self):
+        settings, repo, _fake, _service = self.rotation_fixture()
+        records = repo.build_quick_link_registry_records()
+        legacy_headers = [
+            "quick_post_key", "title", "channel_id", "channel_username",
+            "message_id", "post_url", "linked_section_keys",
+            "target_message_ids", "target_post_urls", "desired_revision",
+            "applied_revision", "status", "last_render_hash",
+            "last_edited_at", "updated_at", "last_sync_at", "last_error",
+        ]
+
+        class LegacyWorksheet:
+            def __init__(self):
+                self.values = [legacy_headers]
+                self.col_count = len(legacy_headers)
+                self.resized_to = None
+
+            def get_all_values(self):
+                return self.values
+
+            def resize(self, *, cols):
+                self.resized_to = cols
+                self.col_count = cols
+
+            def batch_update(self, requests, *, value_input_option):
+                self.requests = list(requests)
+                self.value_input_option = value_input_option
+
+        worksheet = LegacyWorksheet()
+        registry = ProductSortQuickLinkRegistry(settings)
+        registry._worksheet = lambda: worksheet
+        self.assertEqual(registry.upsert(records), 9)
+        self.assertEqual(worksheet.resized_to, len(QUICK_LINK_HEADERS))
+        self.assertEqual(
+            len(worksheet.requests[0]["values"][0]),
+            len(QUICK_LINK_HEADERS),
         )
 
     def test_combined_quick_link_uses_first_available_section(self):
@@ -1499,6 +1613,879 @@ class PriceRepositoryTests(unittest.TestCase):
             },
             {1, 30},
         )
+
+
+    def test_rotation_schedule_and_exact_eight_post_cycle(self):
+        _settings, repo, _fake, _service = self.rotation_fixture()
+        friday = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+        self.assertEqual(
+            repo.materialize_due_quick_link_rotations(
+                friday,
+                horizon_days=20,
+            ),
+            9,
+        )
+        self.assertEqual(
+            repo.materialize_due_quick_link_rotations(
+                friday,
+                horizon_days=20,
+            ),
+            0,
+        )
+        rotations = list(reversed(repo.list_quick_link_rotations(limit=20)))
+        self.assertEqual(
+            [row["secondary_quick_post_key"] for row in rotations[:9]],
+            [*QUICK_LINK_ROTATION_ORDER, QUICK_LINK_ROTATION_ORDER[0]],
+        )
+        for row in rotations:
+            scheduled = datetime.fromisoformat(row["scheduled_for"])
+            local = scheduled.astimezone(ZoneInfo("Asia/Tashkent"))
+            self.assertIn(local.isoweekday(), {2, 4, 6})
+            self.assertEqual((local.hour, local.minute), (11, 0))
+        self.assertIsNone(
+            repo.claim_due_quick_link_rotation(
+                datetime(2026, 8, 29, 5, 59, tzinfo=timezone.utc)
+            )
+        )
+
+    def test_same_day_calendar_jobs_materialize_after_0930_restart(self):
+        _settings, repo, _fake, _service = self.rotation_fixture()
+        plan = [
+            row for row in repo.list_calendar_plan()
+            if row["day_of_month"] == 29
+        ]
+        self.assertEqual(len(plan), 3)
+        now = datetime(2026, 8, 29, 5, 30, tzinfo=timezone.utc)
+        repo.ingest_snapshot(snapshot_with_sections(
+            now,
+            [row["section_key"] for row in plan],
+        ))
+        self.assertEqual(
+            repo.materialize_due_schedules(now, horizon_days=0),
+            3,
+        )
+        self.assertEqual(
+            {
+                datetime.fromisoformat(job["execute_at"])
+                for job in repo.list_jobs(limit=20)
+            },
+            {datetime(2026, 8, 29, 4, 30, tzinfo=timezone.utc)},
+        )
+
+    def test_stale_planned_rotations_are_skipped_without_catchup_burst(self):
+        _settings, repo, _fake, _service = self.rotation_fixture()
+        friday = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+        repo.materialize_due_quick_link_rotations(friday, horizon_days=20)
+        recovery = datetime(2026, 9, 4, 7, 0, tzinfo=timezone.utc)
+        repo.materialize_due_quick_link_rotations(recovery, horizon_days=0)
+        rotations = list(reversed(repo.list_quick_link_rotations(limit=30)))
+        stale = [
+            row for row in rotations
+            if row["local_date"] in {"2026-08-29", "2026-09-01", "2026-09-03"}
+        ]
+        self.assertEqual({row["status"] for row in stale}, {"skipped"})
+        next_run = next(
+            row for row in rotations if row["local_date"] == "2026-09-05"
+        )
+        self.assertEqual(next_run["status"], "pending")
+        self.assertEqual(
+            next_run["secondary_quick_post_key"],
+            QUICK_LINK_ROTATION_ORDER[0],
+        )
+        self.assertIsNone(repo.claim_due_quick_link_rotation(recovery))
+        due = repo.claim_due_quick_link_rotation(
+            datetime(2026, 9, 5, 6, 0, tzinfo=timezone.utc)
+        )
+        self.assertIsNotNone(due)
+        self.assertEqual(
+            due["secondary_quick_post_key"],
+            QUICK_LINK_ROTATION_ORDER[0],
+        )
+
+    def test_rotation_recycles_main_updates_ids_and_preserves_runtime_binding(self):
+        settings, repo, fake, service = self.rotation_fixture()
+        friday = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+        execute = datetime(2026, 8, 29, 6, 0, tzinfo=timezone.utc)
+        self.assertEqual(
+            repo.materialize_due_quick_link_rotations(
+                friday,
+                horizon_days=2,
+            ),
+            1,
+        )
+        self.assertEqual(service.process_quick_link_rotations(execute), 1)
+
+        master = repo.get_quick_link_post(CATALOG_QUICK_POST_KEY)
+        smartphones = repo.get_quick_link_post(
+            "quick-index-smartphones"
+        )
+        self.assertEqual(master["message_id"], 101)
+        self.assertEqual(smartphones["message_id"], 5050)
+        self.assertEqual(fake.pinned, [(
+            settings.telegram_channel_id,
+            101,
+            True,
+        )])
+        self.assertEqual(fake.unpinned, [(
+            settings.telegram_channel_id,
+            5050,
+        )])
+        self.assertEqual(
+            [(item[1], item[2]) for item in fake.edited],
+            [
+                (5050, smartphones["last_rendered_html"]),
+                (101, master["last_rendered_html"]),
+            ],
+        )
+        self.assertIn("<b>Смартфоны</b>", fake.edited[0][2])
+        self.assertTrue(all(
+            line.startswith("• ")
+            for line in fake.edited[0][2].splitlines()[2::2]
+        ))
+        sent_main = fake.sent[0][1]
+        self.assertIn("Каталог товаров | 29.08.2026", sent_main)
+        self.assertIn(
+            'href="https://t.me/testchannel/4942">Телефоны</a>',
+            sent_main,
+        )
+        self.assertIn(
+            'href="https://t.me/testchannel/5050">Телефоны</a>',
+            fake.edited[1][2],
+        )
+        self.assertNotIn("<tg-emoji", sent_main)
+
+        retired = repo.list_quick_link_retired_posts()
+        self.assertEqual(len(retired), 1)
+        self.assertEqual(retired[0]["message_id"], 4942)
+        self.assertEqual(retired[0]["title"], "Смартфоны")
+        self.assertEqual(service.ensure_quick_link_registry(), 0)
+        self.assertEqual(
+            repo.get_quick_link_post(CATALOG_QUICK_POST_KEY)["message_id"],
+            101,
+        )
+        self.assertEqual(
+            repo.get_quick_link_post("quick-index-smartphones")["message_id"],
+            5050,
+        )
+
+        records = {
+            row["quick_post_key"]: row
+            for row in repo.build_quick_link_registry_records()
+        }
+        self.assertEqual(records[CATALOG_QUICK_POST_KEY]["message_id"], 101)
+        self.assertEqual(
+            records["quick-index-smartphones"]["message_id"],
+            5050,
+        )
+        self.assertEqual(
+            records[CATALOG_QUICK_POST_KEY]["target_message_ids"][
+                "quick-index-smartphones"
+            ],
+            5050,
+        )
+
+    def test_nine_real_rotations_keep_unique_ids_and_wrap_to_smartphones(self):
+        _settings, repo, fake, service = self.rotation_fixture()
+        friday = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+        self.assertEqual(
+            repo.materialize_due_quick_link_rotations(
+                friday,
+                horizon_days=20,
+            ),
+            9,
+        )
+        rotations = list(reversed(repo.list_quick_link_rotations(limit=20)))
+        for rotation in rotations:
+            execute = datetime.fromisoformat(rotation["scheduled_for"])
+            self.assertEqual(service.process_quick_link_rotations(execute), 1)
+            bindings = repo.list_quick_link_posts()
+            self.assertEqual(len(bindings), 9)
+            self.assertEqual(
+                len({row["message_id"] for row in bindings}),
+                9,
+            )
+
+        self.assertEqual(len(fake.sent), 9)
+        self.assertEqual(len(fake.pinned), 9)
+        self.assertEqual(len(fake.unpinned), 9)
+        final_main = repo.get_quick_link_post(CATALOG_QUICK_POST_KEY)
+        final_smartphones = repo.get_quick_link_post(
+            "quick-index-smartphones"
+        )
+        self.assertEqual(final_main["message_id"], 109)
+        self.assertEqual(final_smartphones["message_id"], 108)
+        final_rotation = repo.list_quick_link_rotations(limit=1)[0]
+        self.assertEqual(
+            final_rotation["secondary_quick_post_key"],
+            QUICK_LINK_ROTATION_ORDER[0],
+        )
+
+    def test_price_refresh_edits_recycled_secondary_message(self):
+        settings, repo, fake, service = self.rotation_fixture()
+        before = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+        execute = datetime(2026, 8, 29, 6, 0, tzinfo=timezone.utc)
+        repo.materialize_due_quick_link_rotations(before, horizon_days=2)
+        self.assertEqual(service.process_quick_link_rotations(execute), 1)
+        fake.edited.clear()
+
+        repo.ingest_snapshot(
+            snapshot_with_sections(before, ["smartphones-xiaomi-poco"])
+        )
+        service.execute_job({
+            "action": "send",
+            "section_key": "smartphones-xiaomi-poco",
+            "channel_id": settings.telegram_channel_id,
+            "snapshot_policy": "latest",
+        })
+        self.assertEqual(service.refresh_quick_link_posts(), 1)
+        self.assertEqual(fake.edited[-1][1], 5050)
+        self.assertIn("https://t.me/testchannel/102", fake.edited[-1][2])
+
+    def test_rotation_pin_retry_does_not_resend_catalogue(self):
+        settings, repo, fake, service = self.rotation_fixture()
+        now = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+        execute = datetime(2026, 8, 29, 6, 0, tzinfo=timezone.utc)
+        repo.materialize_due_quick_link_rotations(now, horizon_days=2)
+        fake.pin_failures[(settings.telegram_channel_id, 101)] = (
+            FakeTelegramRetryableError("temporary pin failure")
+        )
+        self.assertEqual(service.process_quick_link_rotations(execute), 0)
+        rotation = repo.list_quick_link_rotations(limit=1)[0]
+        self.assertEqual(rotation["status"], "pending")
+        self.assertEqual(rotation["phase"], "main_sent")
+        self.assertEqual(len(fake.sent), 1)
+        self.assertEqual(fake.edited, [])
+
+        del fake.pin_failures[(settings.telegram_channel_id, 101)]
+        self.assertEqual(
+            service.process_quick_link_rotations(
+                execute + timedelta(seconds=1)
+            ),
+            1,
+        )
+        self.assertEqual(len(fake.sent), 1)
+        self.assertEqual(len(fake.edited), 2)
+        self.assertEqual(fake.edited[0][1], 5050)
+        self.assertEqual(fake.edited[1][1], 101)
+
+    def test_due_planned_rotation_allows_link_queue_to_drain_first(self):
+        import hashlib
+
+        settings, repo, _fake, service = self.rotation_fixture()
+        before = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+        execute = datetime(2026, 8, 29, 6, 0, tzinfo=timezone.utc)
+        repo.materialize_due_quick_link_rotations(before, horizon_days=2)
+        repo.ingest_snapshot(
+            snapshot_with_sections(before, ["smartphones-xiaomi-poco"])
+        )
+        service.execute_job({
+            "action": "send",
+            "section_key": "smartphones-xiaomi-poco",
+            "channel_id": settings.telegram_channel_id,
+            "snapshot_policy": "latest",
+        })
+        claimed = repo.claim_quick_link_updates(execute, limit=20)
+        self.assertEqual(
+            [row["quick_post_key"] for row in claimed],
+            ["quick-index-smartphones"],
+        )
+        task = claimed[0]
+        post = repo.resolve_quick_link_post(task["quick_post_key"])
+        rendered, targets = service._render_quick_link(post)
+        self.assertTrue(repo.complete_quick_link_update(
+            task["quick_post_key"],
+            task["lease_token"],
+            execute,
+            rendered_html=rendered,
+            render_hash=hashlib.sha256(rendered.encode()).hexdigest(),
+            resolved_targets=targets,
+        ))
+        rotation = repo.claim_due_quick_link_rotation(execute)
+        self.assertIsNotNone(rotation)
+        self.assertEqual(rotation["phase"], "planned")
+
+    def test_ambiguous_rotation_send_requires_review_without_duplicate(self):
+        _settings, repo, fake, service = self.rotation_fixture()
+        now = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+        execute = datetime(2026, 8, 29, 6, 0, tzinfo=timezone.utc)
+        repo.materialize_due_quick_link_rotations(now, horizon_days=2)
+        fake.send_failure = FakeTelegramAmbiguousError("timeout")
+        self.assertEqual(service.process_quick_link_rotations(execute), 0)
+        rotation = repo.list_quick_link_rotations(limit=1)[0]
+        self.assertEqual(rotation["status"], "needs_review")
+        self.assertEqual(rotation["phase"], "send_inflight")
+        self.assertEqual(
+            repo.get_quick_link_post(CATALOG_QUICK_POST_KEY)["message_id"],
+            5050,
+        )
+        self.assertEqual(
+            repo.get_quick_link_post("quick-index-smartphones")["message_id"],
+            4942,
+        )
+        fake.send_failure = None
+        self.assertEqual(
+            service.process_quick_link_rotations(
+                execute + timedelta(hours=1)
+            ),
+            0,
+        )
+        self.assertEqual(fake.pinned, [])
+        self.assertEqual(fake.edited, [])
+
+    def test_ambiguous_rotation_blocks_link_refresh_until_reconciled(self):
+        settings, repo, fake, service = self.rotation_fixture()
+        before = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+        execute = datetime(2026, 8, 29, 6, 0, tzinfo=timezone.utc)
+        repo.materialize_due_quick_link_rotations(before, horizon_days=2)
+        fake.send_failure = FakeTelegramAmbiguousError("timeout")
+        self.assertEqual(service.process_quick_link_rotations(execute), 0)
+        fake.send_failure = None
+
+        repo.ingest_snapshot(
+            snapshot_with_sections(before, ["smartphones-xiaomi-poco"])
+        )
+        service.execute_job({
+            "action": "send",
+            "section_key": "smartphones-xiaomi-poco",
+            "channel_id": settings.telegram_channel_id,
+            "snapshot_policy": "latest",
+        })
+        fake.edited.clear()
+        self.assertEqual(
+            repo.claim_quick_link_updates(
+                execute + timedelta(minutes=1),
+                limit=20,
+            ),
+            [],
+        )
+        update = next(
+            row for row in repo.list_quick_link_updates()
+            if row["quick_post_key"] == "quick-index-smartphones"
+        )
+        self.assertEqual(update["status"], "pending")
+
+    def test_ambiguous_rotation_can_be_confirmed_absent_and_retried(self):
+        _settings, repo, fake, service = self.rotation_fixture()
+        before = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+        execute = datetime(2026, 8, 29, 6, 0, tzinfo=timezone.utc)
+        repo.materialize_due_quick_link_rotations(before, horizon_days=2)
+        fake.send_failure = FakeTelegramAmbiguousError("timeout")
+        self.assertEqual(service.process_quick_link_rotations(execute), 0)
+        fake.send_failure = None
+        rotation = repo.list_quick_link_rotations(limit=1)[0]
+        self.assertTrue(repo.confirm_quick_link_rotation_not_sent(
+            rotation["rotation_id"],
+            now=execute + timedelta(minutes=1),
+        ))
+        self.assertEqual(
+            service.process_quick_link_rotations(
+                execute + timedelta(minutes=1)
+            ),
+            1,
+        )
+        self.assertEqual(len(fake.sent), 1)
+
+    def test_reconciled_rotation_rejects_active_quick_post_id(self):
+        _settings, repo, fake, service = self.rotation_fixture()
+        before = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+        execute = datetime(2026, 8, 29, 6, 0, tzinfo=timezone.utc)
+        repo.materialize_due_quick_link_rotations(before, horizon_days=2)
+        fake.send_failure = FakeTelegramAmbiguousError("timeout")
+        service.process_quick_link_rotations(execute)
+        fake.send_failure = None
+        rotation = repo.list_quick_link_rotations(limit=1)[0]
+        with self.assertRaises(ValueError):
+            repo.reconcile_quick_link_rotation_main_message(
+                rotation["rotation_id"],
+                5050,
+            )
+        self.assertTrue(repo.reconcile_quick_link_rotation_main_message(
+            rotation["rotation_id"],
+            6000,
+        ))
+        self.assertEqual(
+            service.process_quick_link_rotations(
+                execute + timedelta(minutes=1)
+            ),
+            1,
+        )
+        self.assertEqual(fake.pinned[-1][1], 6000)
+
+    def test_failed_post_send_phase_can_be_retried_without_resend(self):
+        settings, repo, fake, service = self.rotation_fixture()
+        before = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+        execute = datetime(2026, 8, 29, 6, 0, tzinfo=timezone.utc)
+        repo.materialize_due_quick_link_rotations(before, horizon_days=2)
+        fake.pin_failures[(settings.telegram_channel_id, 101)] = (
+            FakeTelegramDeleteError("not enough rights")
+        )
+        self.assertEqual(service.process_quick_link_rotations(execute), 0)
+        rotation = repo.list_quick_link_rotations(limit=1)[0]
+        self.assertEqual((rotation["status"], rotation["phase"]), (
+            "failed", "main_sent",
+        ))
+        del fake.pin_failures[(settings.telegram_channel_id, 101)]
+        self.assertTrue(repo.retry_failed_quick_link_rotation(
+            rotation["rotation_id"],
+            now=execute + timedelta(minutes=1),
+        ))
+        self.assertEqual(
+            service.process_quick_link_rotations(
+                execute + timedelta(minutes=1)
+            ),
+            1,
+        )
+        self.assertEqual(len(fake.sent), 1)
+
+    def test_secondary_edit_failure_leaves_new_catalogue_link_functional(self):
+        settings, repo, fake, service = self.rotation_fixture()
+        before = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+        execute = datetime(2026, 8, 29, 6, 0, tzinfo=timezone.utc)
+        repo.materialize_due_quick_link_rotations(before, horizon_days=2)
+        fake.edit_failures[(settings.telegram_channel_id, 5050)] = (
+            FakeTelegramDeleteError("not enough rights")
+        )
+        self.assertEqual(service.process_quick_link_rotations(execute), 0)
+        rotation = repo.list_quick_link_rotations(limit=1)[0]
+        self.assertEqual((rotation["status"], rotation["phase"]), (
+            "failed", "new_pinned",
+        ))
+        self.assertIn(
+            'href="https://t.me/testchannel/4942">Телефоны</a>',
+            fake.sent[0][1],
+        )
+        self.assertEqual(
+            repo.get_quick_link_post(CATALOG_QUICK_POST_KEY)["message_id"],
+            5050,
+        )
+        self.assertEqual(
+            repo.get_quick_link_post("quick-index-smartphones")["message_id"],
+            4942,
+        )
+
+    def test_rotation_resumes_after_restart_from_every_persisted_phase(self):
+        phases = (
+            "planned", "send_inflight", "main_sent", "new_pinned",
+            "secondary_edited", "catalog_edited", "swapped",
+            "old_unpinned",
+        )
+        before = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+        execute = datetime(2026, 8, 29, 6, 0, tzinfo=timezone.utc)
+        restart_at = execute + timedelta(minutes=4)
+
+        for target_phase in phases:
+            with self.subTest(phase=target_phase):
+                settings, repo, fake, service = self.rotation_fixture(
+                    db_name=f"restart-{target_phase}.db"
+                )
+                fake.next_id = 6000
+                repo.materialize_due_quick_link_rotations(
+                    before,
+                    horizon_days=2,
+                )
+                sent = None
+                if target_phase != "planned":
+                    rotation = repo.claim_due_quick_link_rotation(execute)
+                    rotation_id = rotation["rotation_id"]
+                    token = rotation["lease_token"]
+                    plan = service._rotation_render_plan(rotation)
+                    self.assertTrue(repo.mark_quick_link_rotation_send_inflight(
+                        rotation_id,
+                        token,
+                        previous_main_message_id=plan[
+                            "previous_main_message_id"
+                        ],
+                        previous_main_post_url=plan[
+                            "previous_main_post_url"
+                        ],
+                        previous_secondary_message_id=plan[
+                            "previous_secondary_message_id"
+                        ],
+                        previous_secondary_post_url=plan[
+                            "previous_secondary_post_url"
+                        ],
+                        main_html=plan["main_html"],
+                        main_render_hash=plan["main_render_hash"],
+                        main_targets=plan["main_targets"],
+                        secondary_html=plan["secondary_html"],
+                        secondary_render_hash=plan[
+                            "secondary_render_hash"
+                        ],
+                        secondary_targets=plan["secondary_targets"],
+                        now=execute,
+                    ))
+                    sent = fake.send_message(
+                        plan["channel_id"],
+                        plan["send_main_html"],
+                    )
+                    if target_phase != "send_inflight":
+                        self.assertTrue(
+                            repo.record_quick_link_rotation_main_sent(
+                                rotation_id,
+                                token,
+                                message_id=sent.message_id,
+                                post_url=sent.post_url,
+                                now=execute,
+                            )
+                        )
+                    if target_phase in {
+                        "new_pinned", "secondary_edited", "catalog_edited",
+                        "swapped", "old_unpinned",
+                    }:
+                        fake.pin_message(
+                            settings.telegram_channel_id,
+                            sent.message_id,
+                        )
+                        self.assertTrue(repo.mark_quick_link_rotation_phase(
+                            rotation_id,
+                            token,
+                            expected_phase="main_sent",
+                            phase="new_pinned",
+                            now=execute,
+                        ))
+                    if target_phase in {
+                        "secondary_edited", "catalog_edited", "swapped",
+                        "old_unpinned",
+                    }:
+                        fake.edit_message(
+                            settings.telegram_channel_id,
+                            plan["previous_main_message_id"],
+                            plan["secondary_html"],
+                        )
+                        self.assertTrue(repo.mark_quick_link_rotation_phase(
+                            rotation_id,
+                            token,
+                            expected_phase="new_pinned",
+                            phase="secondary_edited",
+                            now=execute,
+                        ))
+                    if target_phase in {
+                        "catalog_edited", "swapped", "old_unpinned",
+                    }:
+                        fake.edit_message(
+                            settings.telegram_channel_id,
+                            sent.message_id,
+                            plan["main_html"],
+                        )
+                        self.assertTrue(repo.mark_quick_link_rotation_phase(
+                            rotation_id,
+                            token,
+                            expected_phase="secondary_edited",
+                            phase="catalog_edited",
+                            now=execute,
+                        ))
+                    if target_phase in {"swapped", "old_unpinned"}:
+                        self.assertTrue(repo.commit_quick_link_rotation_swap(
+                            rotation_id,
+                            token,
+                            now=execute,
+                        ))
+                    if target_phase == "old_unpinned":
+                        fake.unpin_message(
+                            settings.telegram_channel_id,
+                            plan["previous_main_message_id"],
+                        )
+                        self.assertTrue(repo.mark_quick_link_rotation_phase(
+                            rotation_id,
+                            token,
+                            expected_phase="swapped",
+                            phase="old_unpinned",
+                            now=execute,
+                        ))
+
+                reopened = PriceRepository(settings)
+                resumed = PricePublicationService(
+                    settings,
+                    reopened,
+                    telegram=fake,
+                )
+                if target_phase == "send_inflight":
+                    self.assertEqual(
+                        reopened.recover_stale_quick_link_rotations(restart_at),
+                        1,
+                    )
+                    row = reopened.list_quick_link_rotations(limit=1)[0]
+                    self.assertEqual((row["status"], row["phase"]), (
+                        "needs_review", "send_inflight",
+                    ))
+                    self.assertTrue(
+                        reopened.reconcile_quick_link_rotation_main_message(
+                            row["rotation_id"],
+                            sent.message_id,
+                            now=restart_at,
+                        )
+                    )
+                self.assertEqual(
+                    resumed.process_quick_link_rotations(restart_at),
+                    1,
+                )
+                row = reopened.list_quick_link_rotations(limit=1)[0]
+                self.assertEqual((row["status"], row["phase"]), (
+                    "done", "completed",
+                ))
+                self.assertEqual(len(fake.sent), 1)
+                expected_main_id = 6001
+                self.assertEqual(
+                    reopened.get_quick_link_post(
+                        CATALOG_QUICK_POST_KEY
+                    )["message_id"],
+                    expected_main_id,
+                )
+                self.assertEqual(
+                    reopened.get_quick_link_post(
+                        "quick-index-smartphones"
+                    )["message_id"],
+                    5050,
+                )
+
+    def test_rotated_secondary_manual_cleanup_has_human_title_and_url(self):
+        settings, repo, fake, service = self.rotation_fixture()
+        now = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+        execute = datetime(2026, 8, 29, 6, 0, tzinfo=timezone.utc)
+        repo.materialize_due_quick_link_rotations(now, horizon_days=2)
+        self.assertEqual(service.process_quick_link_rotations(execute), 1)
+        target = (settings.telegram_channel_id, 4942)
+        fake.delete_failures[target] = FakeTelegramDeleteError(
+            "message can't be deleted"
+        )
+        self.assertEqual(service.cleanup_superseded_posts(), 0)
+        self.assertEqual(service.ensure_manual_deletion_requests(), 1)
+        helper = fake.sent[-1][1]
+        self.assertIn("Раздел: Смартфоны", helper)
+        self.assertIn("https://t.me/testchannel/4942", helper)
+
+    def test_catalogue_date_survives_later_direct_price_link_refresh(self):
+        settings, repo, fake, service = self.rotation_fixture()
+        now = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+        execute = datetime(2026, 8, 29, 6, 0, tzinfo=timezone.utc)
+        repo.materialize_due_quick_link_rotations(now, horizon_days=2)
+        self.assertEqual(service.process_quick_link_rotations(execute), 1)
+        fake.edited.clear()
+
+        repo.ingest_snapshot(
+            snapshot_with_sections(now, ["apple-computers-all"])
+        )
+        service.execute_job({
+            "action": "send",
+            "section_key": "apple-computers-all",
+            "channel_id": settings.telegram_channel_id,
+            "snapshot_policy": "latest",
+        })
+        self.assertEqual(service.refresh_quick_link_posts(), 1)
+        self.assertEqual(fake.edited[-1][1], 101)
+        self.assertIn(
+            "Каталог товаров | 29.08.2026",
+            fake.edited[-1][2],
+        )
+
+    def test_quick_link_rotation_sheet_upserts_stable_history_rows(self):
+        settings, repo, _fake, _service = self.rotation_fixture()
+        now = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+        repo.materialize_due_quick_link_rotations(now, horizon_days=7)
+        records = repo.list_quick_link_rotations(limit=20)
+
+        class FakeWorksheet:
+            def __init__(self):
+                self.values = []
+                self.requests = []
+
+            def get_all_values(self):
+                return self.values
+
+            def batch_update(self, requests, *, value_input_option):
+                self.requests = list(requests)
+                self.value_input_option = value_input_option
+
+        worksheet = FakeWorksheet()
+        registry = ProductSortQuickLinkRotationRegistry(settings)
+        registry._worksheet = lambda: worksheet
+        self.assertEqual(registry.upsert(records), len(records))
+        self.assertEqual(
+            worksheet.requests[0]["values"],
+            [list(QUICK_LINK_ROTATION_HEADERS)],
+        )
+        worksheet.values = [list(QUICK_LINK_ROTATION_HEADERS)] + [
+            request["values"][0]
+            for request in worksheet.requests[1:]
+        ]
+        self.assertEqual(registry.upsert(records), len(records))
+        self.assertEqual(len(worksheet.requests), len(records))
+
+    def test_main_channel_pin_service_message_is_deleted(self):
+        settings, _repo, fake, service = self.rotation_fixture()
+        fake.updates.append({
+            "update_id": 12,
+            "channel_post": {
+                "message_id": 778,
+                "chat": {"id": int(settings.telegram_channel_id)},
+                "pinned_message": {"message_id": 101},
+            },
+        })
+        self.assertEqual(service.poll_preview_updates(), 1)
+        self.assertIn((settings.telegram_channel_id, 778), fake.deleted)
+
+    def test_telegram_client_uses_exact_pin_and_unpin_payloads(self):
+        class Response:
+            ok = True
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {"ok": True, "result": True}
+
+        class Session:
+            def __init__(self):
+                self.calls = []
+
+            def post(self, url, *, json, timeout):
+                self.calls.append((url, json, timeout))
+                return Response()
+
+        session = Session()
+        client = TelegramClient("test-token", session=session)
+        self.assertTrue(client.pin_message("-100123", 456))
+        self.assertTrue(client.unpin_message("-100123", 456))
+        self.assertTrue(session.calls[0][0].endswith("/pinChatMessage"))
+        self.assertEqual(session.calls[0][1], {
+            "chat_id": "-100123",
+            "message_id": 456,
+            "disable_notification": True,
+        })
+        self.assertTrue(session.calls[1][0].endswith("/unpinChatMessage"))
+        self.assertEqual(session.calls[1][1], {
+            "chat_id": "-100123",
+            "message_id": 456,
+        })
+
+    def test_send_message_invalid_success_json_is_ambiguous(self):
+        class Response:
+            ok = True
+            status_code = 200
+
+            @staticmethod
+            def json():
+                raise ValueError("truncated")
+
+        class Session:
+            @staticmethod
+            def post(_url, *, json, timeout):
+                return Response()
+
+        client = TelegramClient("test-token", session=Session())
+        with self.assertRaises(TelegramAPIError) as raised:
+            client.send_message("-100123", "test")
+        self.assertTrue(raised.exception.ambiguous)
+        self.assertFalse(raised.exception.retryable)
+
+    def test_pin_and_unpin_are_idempotent_and_preserve_retry_after(self):
+        class Response:
+            ok = False
+            status_code = 400
+
+            def __init__(self, body):
+                self.body = body
+
+            def json(self):
+                return self.body
+
+        class Session:
+            def __init__(self):
+                self.responses = [
+                    Response({
+                        "ok": False,
+                        "error_code": 400,
+                        "description": "Bad Request: message is already pinned",
+                    }),
+                    Response({
+                        "ok": False,
+                        "error_code": 400,
+                        "description": "Bad Request: message to unpin not found",
+                    }),
+                    Response({
+                        "ok": False,
+                        "error_code": 429,
+                        "description": "Too Many Requests",
+                        "parameters": {"retry_after": 7},
+                    }),
+                ]
+
+            def post(self, _url, *, json, timeout):
+                return self.responses.pop(0)
+
+        client = TelegramClient("test-token", session=Session())
+        self.assertTrue(client.pin_message("-100123", 456))
+        self.assertTrue(client.unpin_message("-100123", 456))
+        with self.assertRaises(TelegramAPIError) as raised:
+            client.pin_message("-100123", 456)
+        self.assertTrue(raised.exception.retryable)
+        self.assertEqual(raised.exception.retry_after, 7)
+
+    def test_scheduler_publishes_due_price_before_1100_catalogue(self):
+        settings, repo, fake, service = self.rotation_fixture()
+        before = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+        execute = datetime(2026, 8, 29, 6, 0, tzinfo=timezone.utc)
+        repo.ingest_snapshot(
+            snapshot_with_sections(before, ["apple-computers-all"])
+        )
+        repo.enqueue_job(
+            "apple-computers-all",
+            "send",
+            execute,
+            channel_id=settings.telegram_channel_id,
+            payload={
+                "source": "price_calendar",
+                "calendar_date": "2026-08-29",
+            },
+            now=before,
+        )
+        repo.materialize_due_quick_link_rotations(before, horizon_days=2)
+        service.sync_sheets_outbox = lambda **_kwargs: 0
+        scheduler = PriceScheduler(
+            settings,
+            repo,
+            service,
+            clock=lambda: execute,
+        )
+        self.assertEqual(asyncio.run(scheduler.run_once()), 2)
+        self.assertEqual(len(fake.sent), 2)
+        self.assertIn("apple-computers-all", fake.sent[0][1])
+        self.assertIn("Каталог товаров | 29.08.2026", fake.sent[1][1])
+
+    def test_rotation_waits_while_same_day_calendar_post_is_retrying(self):
+        settings, repo, fake, service = self.rotation_fixture()
+        before = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+        execute = datetime(2026, 8, 29, 6, 0, tzinfo=timezone.utc)
+        repo.ingest_snapshot(
+            snapshot_with_sections(before, ["apple-computers-all"])
+        )
+        repo.enqueue_job(
+            "apple-computers-all",
+            "send",
+            execute,
+            channel_id=settings.telegram_channel_id,
+            payload={
+                "source": "price_calendar",
+                "calendar_date": "2026-08-29",
+            },
+            now=before,
+        )
+        repo.materialize_due_quick_link_rotations(before, horizon_days=2)
+        failure = FakeTelegramRetryableError("temporary outage")
+        failure.retry_after = 3600
+        fake.send_failure = failure
+        service.sync_sheets_outbox = lambda **_kwargs: 0
+        scheduler = PriceScheduler(
+            settings,
+            repo,
+            service,
+            clock=lambda: execute,
+        )
+        self.assertEqual(asyncio.run(scheduler.run_once()), 1)
+        rotation = repo.list_quick_link_rotations(limit=1)[0]
+        self.assertEqual((rotation["status"], rotation["phase"]), (
+            "pending", "planned",
+        ))
+        self.assertEqual(fake.pinned, [])
 
 
 class PricePageAuthTests(unittest.TestCase):

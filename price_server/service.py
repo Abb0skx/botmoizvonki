@@ -6,16 +6,21 @@ import hashlib
 import logging
 import uuid
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from .config import PriceSettings
-from .quick_links import QUICK_LINK_POST_SPECS
+from .quick_links import (
+    CATALOG_QUICK_POST_KEY,
+    QUICK_LINK_POST_SPECS,
+)
 from .sheets_registry import (
     ProductSortCalendarRegistry,
     ProductSortPostIndex,
     ProductSortPostRegistry,
     ProductSortQuickLinkRegistry,
+    ProductSortQuickLinkRotationRegistry,
 )
 from .telegram_api import (
     TelegramClient,
@@ -86,6 +91,10 @@ class PricePublicationService:
         self._last_calendar_hash = ""
         self._quick_link_registry: ProductSortQuickLinkRegistry | None = None
         self._last_quick_link_hash = ""
+        self._quick_link_rotation_registry: (
+            ProductSortQuickLinkRotationRegistry | None
+        ) = None
+        self._last_quick_link_rotation_hash = ""
         self._quick_links_ready = False
 
     def _section_for_job(self, job: Any):
@@ -548,7 +557,12 @@ class PricePublicationService:
         return changed
 
     @staticmethod
-    def _render_quick_link(post: Mapping[str, Any]) -> tuple[str, list[dict]]:
+    def _render_quick_link(
+        post: Mapping[str, Any],
+        *,
+        quick_post_overrides: Mapping[str, Mapping[str, Any]] | None = None,
+        context_override: Mapping[str, Any] | None = None,
+    ) -> tuple[str, list[dict]]:
         rendered = str(post.get("template_html") or "")
         resolved = [
             dict(item) for item in post.get("resolved_targets", [])
@@ -556,12 +570,48 @@ class PricePublicationService:
         ]
         for target in resolved:
             link_key = str(target.get("link_key") or "")
-            marker = "{{post_url:" + link_key + "}}"
+            target_kind = str(
+                target.get("target_kind") or "price_section"
+            )
+            if target_kind == "quick_post":
+                target_key = str(
+                    target.get("target_quick_post_key") or link_key
+                )
+                override = dict(
+                    (quick_post_overrides or {}).get(target_key) or {}
+                )
+                if override:
+                    target.update({
+                        "target_channel_id": str(
+                            override.get("target_channel_id")
+                            or target.get("target_channel_id") or ""
+                        ),
+                        "target_message_id": int(
+                            override.get("target_message_id")
+                            or target.get("target_message_id") or 0
+                        ),
+                        "target_url": str(
+                            override.get("target_url")
+                            or target.get("target_url") or ""
+                        ),
+                    })
+                marker = "{{quick_post_url:" + link_key + "}}"
+            else:
+                marker = "{{post_url:" + link_key + "}}"
             rendered = rendered.replace(
                 marker,
                 html.escape(str(target.get("target_url") or ""), quote=True),
             )
-        if "{{post_url:" in rendered:
+        context = dict(post.get("context") or {})
+        context.update(dict(context_override or {}))
+        for key, value in context.items():
+            rendered = rendered.replace(
+                "{{context:" + str(key) + "}}",
+                html.escape(str(value)),
+            )
+        if any(marker in rendered for marker in (
+            "{{post_url:", "{{quick_post_url:", "{{context:",
+        )):
             raise PublicationError("Quick-link template has unresolved targets")
         return rendered, resolved
 
@@ -612,6 +662,252 @@ class PricePublicationService:
                     key,
                     type(exc).__name__,
                 )
+        return completed
+
+    def _rotation_render_plan(
+        self,
+        rotation: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        main = self.repository.resolve_quick_link_post(
+            CATALOG_QUICK_POST_KEY
+        )
+        secondary_key = str(rotation["secondary_quick_post_key"])
+        secondary = self.repository.resolve_quick_link_post(secondary_key)
+        previous_main_id = int(main["message_id"])
+        previous_secondary_id = int(secondary["message_id"])
+        display_date = date.fromisoformat(
+            str(rotation["local_date"])
+        ).strftime("%d.%m.%Y")
+        send_main_html, _send_main_targets = self._render_quick_link(
+            main,
+            context_override={"catalog_date": display_date},
+        )
+        main_html, main_targets = self._render_quick_link(
+            main,
+            quick_post_overrides={
+                secondary_key: {
+                    "target_channel_id": str(main["channel_id"]),
+                    "target_message_id": previous_main_id,
+                    "target_url": str(main["post_url"]),
+                }
+            },
+            context_override={"catalog_date": display_date},
+        )
+        secondary_html, secondary_targets = self._render_quick_link(
+            secondary
+        )
+        return {
+            "channel_id": str(main["channel_id"]),
+            "channel_username": str(main["channel_username"]),
+            "previous_main_message_id": previous_main_id,
+            "previous_main_post_url": str(main["post_url"]),
+            "previous_secondary_message_id": previous_secondary_id,
+            "previous_secondary_post_url": str(secondary["post_url"]),
+            "send_main_html": send_main_html,
+            "main_html": main_html,
+            "main_render_hash": hashlib.sha256(
+                main_html.encode("utf-8")
+            ).hexdigest(),
+            "main_targets": main_targets,
+            "secondary_html": secondary_html,
+            "secondary_render_hash": hashlib.sha256(
+                secondary_html.encode("utf-8")
+            ).hexdigest(),
+            "secondary_targets": secondary_targets,
+        }
+
+    def process_quick_link_rotations(
+        self,
+        now: datetime,
+        *,
+        limit: int = 1,
+    ) -> int:
+        """Advance durable catalogue rotations without repeating sendMessage."""
+        completed = 0
+        for _ in range(max(1, min(10, int(limit)))):
+            rotation = self.repository.claim_due_quick_link_rotation(now)
+            if rotation is None:
+                break
+            rotation_id = int(rotation["rotation_id"])
+            lease_token = str(rotation["lease_token"])
+            try:
+                while True:
+                    phase = str(rotation["phase"])
+                    if phase == "planned":
+                        plan = self._rotation_render_plan(rotation)
+                        marked = (
+                            self.repository.mark_quick_link_rotation_send_inflight(
+                                rotation_id,
+                                lease_token,
+                                previous_main_message_id=plan[
+                                    "previous_main_message_id"
+                                ],
+                                previous_main_post_url=plan[
+                                    "previous_main_post_url"
+                                ],
+                                previous_secondary_message_id=plan[
+                                    "previous_secondary_message_id"
+                                ],
+                                previous_secondary_post_url=plan[
+                                    "previous_secondary_post_url"
+                                ],
+                                main_html=plan["main_html"],
+                                main_render_hash=plan["main_render_hash"],
+                                main_targets=plan["main_targets"],
+                                secondary_html=plan["secondary_html"],
+                                secondary_render_hash=plan[
+                                    "secondary_render_hash"
+                                ],
+                                secondary_targets=plan["secondary_targets"],
+                                now=now,
+                            )
+                        )
+                        if not marked:
+                            raise PublicationError(
+                                "Quick-link rotation lease was lost"
+                            )
+                        sent = self.telegram.send_message(
+                            plan["channel_id"],
+                            plan["send_main_html"],
+                            channel_username=plan["channel_username"],
+                        )
+                        try:
+                            saved = (
+                                self.repository.record_quick_link_rotation_main_sent(
+                                    rotation_id,
+                                    lease_token,
+                                    message_id=sent.message_id,
+                                    post_url=sent.post_url,
+                                    now=datetime.now(timezone.utc),
+                                )
+                            )
+                        except Exception as exc:
+                            raise PartialPublicationError(
+                                "New catalogue was sent but its ID was not saved"
+                            ) from exc
+                        if not saved:
+                            raise PartialPublicationError(
+                                "New catalogue was sent after the lease was lost"
+                            )
+                    elif phase == "send_inflight":
+                        raise PartialPublicationError(
+                            "Catalogue send outcome requires manual review"
+                        )
+                    elif phase == "main_sent":
+                        self.telegram.pin_message(
+                            rotation["channel_id"]
+                            if rotation.get("channel_id")
+                            else self.settings.telegram_channel_id,
+                            int(rotation["new_main_message_id"]),
+                        )
+                        if not self.repository.mark_quick_link_rotation_phase(
+                            rotation_id,
+                            lease_token,
+                            expected_phase="main_sent",
+                            phase="new_pinned",
+                        ):
+                            raise PublicationError(
+                                "Quick-link pin state was not saved"
+                            )
+                    elif phase == "new_pinned":
+                        self.telegram.edit_message(
+                            self.settings.telegram_channel_id,
+                            int(rotation["previous_main_message_id"]),
+                            str(rotation["secondary_html"]),
+                            channel_username=(
+                                self.settings.telegram_channel_username
+                            ),
+                        )
+                        if not self.repository.mark_quick_link_rotation_phase(
+                            rotation_id,
+                            lease_token,
+                            expected_phase="new_pinned",
+                            phase="secondary_edited",
+                        ):
+                            raise PublicationError(
+                                "Recycled secondary edit was not saved"
+                            )
+                    elif phase == "secondary_edited":
+                        self.telegram.edit_message(
+                            self.settings.telegram_channel_id,
+                            int(rotation["new_main_message_id"]),
+                            str(rotation["main_html"]),
+                            channel_username=(
+                                self.settings.telegram_channel_username
+                            ),
+                        )
+                        if not self.repository.mark_quick_link_rotation_phase(
+                            rotation_id,
+                            lease_token,
+                            expected_phase="secondary_edited",
+                            phase="catalog_edited",
+                        ):
+                            raise PublicationError(
+                                "New catalogue link edit was not saved"
+                            )
+                    elif phase == "catalog_edited":
+                        if not self.repository.commit_quick_link_rotation_swap(
+                            rotation_id,
+                            lease_token,
+                        ):
+                            raise PublicationError(
+                                "Quick-link rotation swap was not saved"
+                            )
+                    elif phase == "swapped":
+                        self.telegram.unpin_message(
+                            self.settings.telegram_channel_id,
+                            int(rotation["previous_main_message_id"]),
+                        )
+                        if not self.repository.mark_quick_link_rotation_phase(
+                            rotation_id,
+                            lease_token,
+                            expected_phase="swapped",
+                            phase="old_unpinned",
+                        ):
+                            raise PublicationError(
+                                "Previous catalogue unpin was not saved"
+                            )
+                    elif phase == "old_unpinned":
+                        if not self.repository.complete_quick_link_rotation(
+                            rotation_id,
+                            lease_token,
+                        ):
+                            raise PublicationError(
+                                "Quick-link rotation completion was not saved"
+                            )
+                        completed += 1
+                        break
+                    else:
+                        raise PublicationError(
+                            f"Unsupported quick-link rotation phase: {phase}"
+                        )
+                    refreshed = self.repository.get_quick_link_rotation(
+                        rotation_id
+                    )
+                    if refreshed is None:
+                        raise PublicationError(
+                            "Quick-link rotation disappeared"
+                        )
+                    rotation = refreshed
+            except Exception as exc:
+                self.repository.retry_quick_link_rotation(
+                    rotation_id,
+                    lease_token,
+                    datetime.now(timezone.utc),
+                    exc,
+                    retry_after_seconds=getattr(exc, "retry_after", None),
+                    permanent=(
+                        not bool(getattr(exc, "retryable", True))
+                        and not bool(getattr(exc, "ambiguous", False))
+                    ),
+                    ambiguous=bool(getattr(exc, "ambiguous", False)),
+                )
+                LOG.warning(
+                    "price_quick_link_rotation_failed rotation_id=%s type=%s",
+                    rotation_id,
+                    type(exc).__name__,
+                )
+                break
         return completed
 
     @staticmethod
@@ -879,8 +1175,16 @@ class PricePublicationService:
         )
 
     def poll_preview_updates(self) -> int:
-        if not self.settings.preview_configured:
+        if not self.settings.telegram_configured:
             return 0
+        service_channels = {
+            str(channel_id)
+            for channel_id in (
+                self.settings.telegram_channel_id,
+                self.settings.telegram_preview_channel_id,
+            )
+            if str(channel_id).strip()
+        }
         raw_offset = self.repository.get_runtime_state(
             "telegram_update_offset", "0"
         )
@@ -906,9 +1210,7 @@ class PricePublicationService:
                 chat = message.get("chat")
                 if (
                     isinstance(chat, Mapping)
-                    and str(chat.get("id")) == str(
-                        self.settings.telegram_preview_channel_id
-                    )
+                    and str(chat.get("id")) in service_channels
                     and self._is_service_channel_post(message)
                     and message.get("message_id")
                 ):
@@ -1047,4 +1349,28 @@ class PricePublicationService:
             self._quick_link_registry.upsert(quick_link_records)
             self._last_quick_link_hash = quick_link_hash
             completed += len(quick_link_records)
+
+        rotation_records = self.repository.list_quick_link_rotations(
+            limit=1000
+        )
+        rotation_stable = json.dumps(
+            rotation_records,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        rotation_hash = hashlib.sha256(
+            rotation_stable.encode("utf-8")
+        ).hexdigest()
+        if (
+            rotation_records
+            and rotation_hash != self._last_quick_link_rotation_hash
+        ):
+            if self._quick_link_rotation_registry is None:
+                self._quick_link_rotation_registry = (
+                    ProductSortQuickLinkRotationRegistry(self.settings)
+                )
+            self._quick_link_rotation_registry.upsert(rotation_records)
+            self._last_quick_link_rotation_hash = rotation_hash
+            completed += len(rotation_records)
         return completed

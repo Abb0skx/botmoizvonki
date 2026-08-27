@@ -249,13 +249,18 @@ class TelegramClient:
         try:
             body = response.json()
         except ValueError as exc:
+            ambiguous = bool(
+                ambiguous_on_transport_error
+                and (
+                    response.status_code >= 500
+                    or 200 <= response.status_code < 300
+                )
+            )
             raise TelegramAPIError(
                 f"Telegram {method} returned invalid JSON (HTTP {response.status_code})",
                 error_code=response.status_code,
-                retryable=response.status_code >= 500,
-                ambiguous=(
-                    ambiguous_on_transport_error and response.status_code >= 500
-                ),
+                retryable=response.status_code >= 500 and not ambiguous,
+                ambiguous=ambiguous,
             ) from exc
 
         if response.ok and isinstance(body, Mapping) and body.get("ok"):
@@ -285,6 +290,16 @@ class TelegramClient:
             retry_after = None
 
         if method == "editMessageText" and "message is not modified" in description.casefold():
+            return True
+        if (
+            method == "pinChatMessage"
+            and "already pinned" in description.casefold()
+        ):
+            return True
+        if method == "unpinChatMessage" and any(
+            phrase in description.casefold()
+            for phrase in ("not pinned", "message to unpin not found")
+        ):
             return True
         if method == "deleteMessage" and "message to delete not found" in description.casefold():
             # Deletion is idempotent for a leased edit job. Telegram may have
@@ -411,6 +426,34 @@ class TelegramClient:
     def delete_message(self, chat_id: str | int, message_id: int) -> bool:
         result = self._request(
             "deleteMessage",
+            {"chat_id": chat_id, "message_id": int(message_id)},
+        )
+        return bool(result)
+
+    def pin_message(
+        self,
+        chat_id: str | int,
+        message_id: int,
+        *,
+        disable_notification: bool = True,
+    ) -> bool:
+        result = self._request(
+            "pinChatMessage",
+            {
+                "chat_id": chat_id,
+                "message_id": int(message_id),
+                "disable_notification": bool(disable_notification),
+            },
+        )
+        return bool(result)
+
+    def unpin_message(
+        self,
+        chat_id: str | int,
+        message_id: int,
+    ) -> bool:
+        result = self._request(
+            "unpinChatMessage",
             {"chat_id": chat_id, "message_id": int(message_id)},
         )
         return bool(result)
