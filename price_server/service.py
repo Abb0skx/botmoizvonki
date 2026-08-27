@@ -138,12 +138,16 @@ class PricePublicationService:
         sent_at: str,
         publication_id: str,
         last_error: str = "",
+        record_key: str = "",
     ) -> dict[str, Any]:
         now = datetime.now(timezone.utc).isoformat()
         section_key = str(_value(section, "section_key"))
         channel_id = str(message.chat_id)
         return {
-            "record_key": f"{channel_id}:{message.message_id}",
+            "record_key": (
+                str(record_key).strip()
+                or f"{channel_id}:{message.message_id}"
+            ),
             "publication_id": publication_id,
             "section_key": section_key,
             "section_name": str(_value(section, "title", section_key)),
@@ -310,8 +314,10 @@ class PricePublicationService:
 
         try:
             for index, chunk in enumerate(chunks):
+                record_key = ""
                 if index < len(posts):
                     post = posts[index]
+                    record_key = str(_value(post, "record_key", ""))
                     message = self.telegram.edit_message(
                         channel_id,
                         int(_value(post, "message_id")),
@@ -332,6 +338,7 @@ class PricePublicationService:
                         status="published",
                         sent_at=sent_at,
                         publication_id=publication_id,
+                        record_key=record_key,
                     )
                 )
 
@@ -341,6 +348,11 @@ class PricePublicationService:
                     int(_value(stale, "message_id")),
                 )
                 self._supersede(stale, status="deleted")
+            self.repository.retire_shared_telegram_post_aliases(
+                section_key,
+                channel_id,
+                [int(_value(post, "message_id")) for post in posts],
+            )
         except Exception as exc:
             if sent_new_part:
                 raise PartialPublicationError(

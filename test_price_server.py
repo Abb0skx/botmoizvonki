@@ -345,6 +345,113 @@ class PriceRepositoryTests(unittest.TestCase):
         )
         self.assertEqual(fake.callback_answers[-1][1], "Публикация отменена")
 
+    def test_shared_legacy_post_aliases_are_retired_safely(self):
+        self.repo.ingest_snapshot(
+            snapshot_with_sections(self.now, ["group-one", "group-two"])
+        )
+        settings = PriceSettings(
+            enabled=True,
+            db_path=Path(self.temp.name) / "price.db",
+            legacy_html_path=Path(self.temp.name) / "legacy.html",
+            admin_username="admin",
+            admin_password="secret",
+            sync_api_key="sync",
+            telegram_bot_token="fake-token",
+            telegram_channel_id="-1001234567890",
+            telegram_channel_username="testchannel",
+            product_sort_sheet_id="sheet",
+            posts_sheet_name="Telegram Posts",
+            timezone="Asia/Tashkent",
+            scheduler_poll_seconds=1,
+            sync_max_bytes=2_000_000,
+        )
+        shared_id = 777
+        for section_key in ("group-one", "group-two"):
+            self.repo.upsert_telegram_post({
+                "record_key": f"legacy:{section_key}:{shared_id}",
+                "section_key": section_key,
+                "section_name": section_key,
+                "channel_id": settings.telegram_channel_id,
+                "channel_username": settings.telegram_channel_username,
+                "message_id": shared_id,
+                "post_url": f"https://t.me/testchannel/{shared_id}",
+                "publication_mode": "legacy_import",
+                "sent_at": self.now.isoformat(),
+                "status": "published",
+                "is_current": True,
+            })
+
+        fake = FakeTelegram()
+        service = PricePublicationService(settings, self.repo, telegram=fake)
+        service.execute_job({
+            "action": "edit",
+            "section_key": "group-one",
+            "channel_id": settings.telegram_channel_id,
+            "snapshot_policy": "latest",
+        })
+
+        current_one = self.repo.list_telegram_posts(
+            section_key="group-one", current_only=True
+        )
+        current_two = self.repo.list_telegram_posts(
+            section_key="group-two", current_only=True
+        )
+        self.assertEqual([post["message_id"] for post in current_one], [shared_id])
+        self.assertEqual(
+            current_one[0]["record_key"], f"legacy:group-one:{shared_id}"
+        )
+        self.assertEqual(current_two, [])
+        self.assertEqual(self.repo.list_telegram_deletions(), [])
+        index = {
+            row["section_key"]: row
+            for row in self.repo.build_post_index_records(
+                settings.telegram_channel_id
+            )
+        }
+        self.assertEqual(index["group-one"]["main_message_ids"], [shared_id])
+        self.assertEqual(index["group-two"]["main_message_ids"], [])
+
+        self.repo.upsert_telegram_post({
+            "record_key": f"legacy:group-two:{shared_id}",
+            "section_key": "group-two",
+            "section_name": "group-two",
+            "channel_id": settings.telegram_channel_id,
+            "channel_username": settings.telegram_channel_username,
+            "message_id": shared_id,
+            "post_url": f"https://t.me/testchannel/{shared_id}",
+            "publication_mode": "legacy_import",
+            "sent_at": self.now.isoformat(),
+            "status": "published",
+            "is_current": True,
+        })
+        service.execute_job({
+            "action": "send",
+            "section_key": "group-one",
+            "channel_id": settings.telegram_channel_id,
+            "snapshot_policy": "latest",
+        })
+
+        self.assertEqual(
+            self.repo.list_telegram_posts(
+                section_key="group-two", current_only=True
+            ),
+            [],
+        )
+        deletions = self.repo.list_telegram_deletions()
+        self.assertEqual(len(deletions), 1)
+        self.assertEqual(deletions[0]["message_id"], shared_id)
+        self.assertEqual(service.cleanup_superseded_posts(), 1)
+        self.assertEqual(
+            fake.deleted,
+            [(settings.telegram_channel_id, shared_id)],
+        )
+        aliases = [
+            post for post in self.repo.list_telegram_posts(limit=100)
+            if post["message_id"] == shared_id
+        ]
+        self.assertEqual(len(aliases), 2)
+        self.assertTrue(all(post["status"] == "deleted" for post in aliases))
+
     def test_preview_channel_service_message_is_deleted(self):
         self.repo.ingest_snapshot(snapshot(self.now))
         fake = FakeTelegram()

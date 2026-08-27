@@ -764,6 +764,87 @@ class PriceRepository:
 
     upsert_post = upsert_telegram_post
 
+    def _retire_shared_post_aliases_tx(
+        self,
+        db: sqlite3.Connection,
+        section_key: str,
+        channel_id: str,
+        message_ids: Sequence[int],
+        at: datetime,
+        *,
+        enqueue_sheet_sync: bool,
+    ) -> int:
+        """Retire other current rows that point at the same Telegram post."""
+        ids = sorted({int(message_id) for message_id in message_ids})
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        rows = db.execute(
+            f"""SELECT * FROM telegram_posts
+                WHERE channel_id=? AND section_key!=? AND is_current=1
+                  AND message_id IN ({placeholders})""",
+            (str(channel_id), _key(section_key), *ids),
+        ).fetchall()
+        for row in rows:
+            db.execute(
+                """UPDATE telegram_posts SET is_current=0,
+                   status='superseded',updated_at=? WHERE record_key=?""",
+                (_iso(at), row["record_key"]),
+            )
+            if enqueue_sheet_sync:
+                payload = dict(row)
+                payload["is_current"] = 0
+                payload["status"] = "superseded"
+                payload["updated_at"] = _iso(at)
+                self._queue_outbox_tx(
+                    db,
+                    "telegram_post",
+                    row["record_key"],
+                    "upsert",
+                    payload,
+                    f"telegram_post:{row['record_key']}:shared_archived:{_iso(at)}",
+                    at,
+                    at,
+                    12,
+                )
+        return len(rows)
+
+    def retire_shared_telegram_post_aliases(
+        self,
+        section_key: str,
+        channel_id: str,
+        message_ids: Sequence[int],
+        *,
+        enqueue_sheet_sync: bool = True,
+        now: datetime | str | None = None,
+    ) -> int:
+        """Invalidate sibling section mappings after a shared post changes."""
+        key = _key(section_key)
+        channel = str(channel_id).strip()
+        if not channel:
+            raise ValueError("channel_id is required")
+        at = _dt(now, "now", default=True)
+        with self._tx(True) as db:
+            retired = self._retire_shared_post_aliases_tx(
+                db,
+                key,
+                channel,
+                message_ids,
+                at,
+                enqueue_sheet_sync=enqueue_sheet_sync,
+            )
+            if retired:
+                self._audit(
+                    db,
+                    "telegram_shared_post_aliases_retired",
+                    "telegram_section",
+                    f"{channel}:{key}",
+                    {"message_ids": sorted({int(item) for item in message_ids}),
+                     "retired": retired},
+                    at,
+                )
+            return retired
+
     def replace_current_telegram_posts(
         self,
         section_key: str,
@@ -816,6 +897,10 @@ class PriceRepository:
                         at, at, 12,
                     )
             new_keys = {item["record_key"] for item in results}
+            new_messages = {
+                (str(item["channel_id"]), int(item["message_id"]))
+                for item in results
+            }
             for old in old_rows:
                 if old["record_key"] in new_keys:
                     continue
@@ -824,18 +909,27 @@ class PriceRepository:
                        updated_at=? WHERE record_key=?""",
                     (_iso(at), old["record_key"]),
                 )
-                db.execute(
-                    """INSERT INTO telegram_deletion_queue(
-                         record_key,section_key,channel_id,message_id,status,
-                         attempts,max_attempts,created_at,updated_at)
-                         VALUES(?,?,?,?,'pending',0,12,?,?)
-                         ON CONFLICT(record_key) DO NOTHING""",
-                    (
-                        old["record_key"], old["section_key"],
-                        old["channel_id"], old["message_id"],
-                        _iso(at), _iso(at),
-                    ),
-                )
+                if (
+                    str(old["channel_id"]), int(old["message_id"])
+                ) not in new_messages:
+                    queued = db.execute(
+                        """SELECT 1 FROM telegram_deletion_queue
+                           WHERE channel_id=? AND message_id=? LIMIT 1""",
+                        (old["channel_id"], old["message_id"]),
+                    ).fetchone()
+                    if queued is None:
+                        db.execute(
+                            """INSERT INTO telegram_deletion_queue(
+                                 record_key,section_key,channel_id,message_id,
+                                 status,attempts,max_attempts,created_at,updated_at)
+                                 VALUES(?,?,?,?,'pending',0,12,?,?)
+                                 ON CONFLICT(record_key) DO NOTHING""",
+                            (
+                                old["record_key"], old["section_key"],
+                                old["channel_id"], old["message_id"],
+                                _iso(at), _iso(at),
+                            ),
+                        )
                 if enqueue_sheet_sync:
                     old_payload = dict(old)
                     old_payload["is_current"] = 0
@@ -846,6 +940,14 @@ class PriceRepository:
                         f"telegram_post:{old['record_key']}:archived:{_iso(at)}",
                         at, at, 12,
                     )
+            self._retire_shared_post_aliases_tx(
+                db,
+                key,
+                channel,
+                [int(old["message_id"]) for old in old_rows],
+                at,
+                enqueue_sheet_sync=enqueue_sheet_sync,
+            )
             self._audit(db, "telegram_post_set_replaced", "telegram_section",
                         f"{channel}:{key}", {"parts": len(results)}, at)
             return results
@@ -968,24 +1070,27 @@ class PriceRepository:
             )
             db.execute(
                 """UPDATE telegram_posts SET status='deleted',is_current=0,
-                   last_error=NULL,updated_at=? WHERE record_key=?""",
-                (_iso(at), row["record_key"]),
+                   last_error=NULL,updated_at=?
+                   WHERE channel_id=? AND message_id=?""",
+                (_iso(at), row["channel_id"], row["message_id"]),
             )
-            post = db.execute(
-                "SELECT * FROM telegram_posts WHERE record_key=?",
-                (row["record_key"],),
-            ).fetchone()
-            if post is not None:
+            posts = db.execute(
+                """SELECT * FROM telegram_posts
+                   WHERE channel_id=? AND message_id=?""",
+                (row["channel_id"], row["message_id"]),
+            ).fetchall()
+            for post in posts:
                 payload = dict(post)
                 digest = hashlib.sha256(_dump(payload).encode()).hexdigest()
                 self._queue_outbox_tx(
-                    db, "telegram_post", row["record_key"], "upsert", payload,
-                    f"telegram_post:{row['record_key']}:deleted:{digest}",
+                    db, "telegram_post", post["record_key"], "upsert", payload,
+                    f"telegram_post:{post['record_key']}:deleted:{digest}",
                     at, at, 12,
                 )
             self._audit(
                 db, "telegram_post_deleted", "telegram_post",
-                row["record_key"], {"message_id": row["message_id"]}, at,
+                f"{row['channel_id']}:{row['message_id']}",
+                {"message_id": row["message_id"], "aliases": len(posts)}, at,
             )
             return True
 
@@ -1024,21 +1129,25 @@ class PriceRepository:
             db.execute(
                 """UPDATE telegram_posts SET status=CASE WHEN ?='failed'
                    THEN 'delete_failed' ELSE status END,last_error=?,updated_at=?
-                   WHERE record_key=?""",
-                (status, safe_error, _iso(at), row["record_key"]),
+                   WHERE channel_id=? AND message_id=?""",
+                (
+                    status, safe_error, _iso(at),
+                    row["channel_id"], row["message_id"],
+                ),
             )
             if status == "failed":
-                post = db.execute(
-                    "SELECT * FROM telegram_posts WHERE record_key=?",
-                    (row["record_key"],),
-                ).fetchone()
-                if post is not None:
+                posts = db.execute(
+                    """SELECT * FROM telegram_posts
+                       WHERE channel_id=? AND message_id=?""",
+                    (row["channel_id"], row["message_id"]),
+                ).fetchall()
+                for post in posts:
                     payload = dict(post)
                     digest = hashlib.sha256(_dump(payload).encode()).hexdigest()
                     self._queue_outbox_tx(
-                        db, "telegram_post", row["record_key"], "upsert",
+                        db, "telegram_post", post["record_key"], "upsert",
                         payload,
-                        f"telegram_post:{row['record_key']}:delete_failed:{digest}",
+                        f"telegram_post:{post['record_key']}:delete_failed:{digest}",
                         at, at, 12,
                     )
             return True
