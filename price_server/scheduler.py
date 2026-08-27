@@ -269,6 +269,11 @@ class PriceScheduler:
                 (),
                 "price_superseded_post_cleanup_failed",
             ),
+            (
+                "ensure_manual_deletion_requests",
+                (),
+                "price_manual_deletion_request_failed",
+            ),
             ("ensure_scheduled_previews", (now,), "price_preview_creation_failed"),
         ):
             try:
@@ -285,6 +290,10 @@ class PriceScheduler:
                 await self._service_call("cleanup_superseded_posts")
             except Exception:
                 LOG.exception("price_superseded_post_cleanup_failed")
+            try:
+                await self._service_call("ensure_manual_deletion_requests")
+            except Exception:
+                LOG.exception("price_manual_deletion_request_failed")
         await self._sync_sheets_outbox()
         return processed
 

@@ -17,6 +17,12 @@ service notices such as pin notifications. `PRICE_POST_INDEX_SHEET_NAME`
 contains one row for every current price section, including blank IDs for
 sections that have never been published.
 
+If Telegram refuses to delete a superseded post (for example, because it is
+older than the Bot API deletion window), the bot sends one manual-cleanup link
+to the preview channel. An administrator deletes the target post and presses
+`Пост удалён`; the bot verifies the target is gone, removes the cleanup link,
+and mirrors the final status to Product Sort.
+
 The monthly plan covers days 1 through 30. If the preceding month ends on day
 28, the day-29 and day-30 entries are folded into the next month's day 1; if it
 ends on day 29, day 30 is folded into day 1. Day 31 has no separate plan. The

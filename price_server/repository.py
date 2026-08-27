@@ -117,6 +117,25 @@ CREATE TABLE IF NOT EXISTS telegram_deletion_queue (
 CREATE INDEX IF NOT EXISTS idx_telegram_deletions_due
  ON telegram_deletion_queue(status,next_attempt_at,deletion_id);
 
+CREATE TABLE IF NOT EXISTS manual_deletion_requests (
+ deletion_id INTEGER PRIMARY KEY,
+ section_key TEXT NOT NULL,
+ target_channel_id TEXT NOT NULL,
+ target_message_id INTEGER NOT NULL CHECK(target_message_id>0),
+ target_post_url TEXT NOT NULL DEFAULT '',
+ request_channel_id TEXT NOT NULL,
+ request_message_id INTEGER NOT NULL CHECK(request_message_id>0),
+ status TEXT NOT NULL DEFAULT 'active',
+ last_error TEXT,
+ created_at TEXT NOT NULL,
+ updated_at TEXT NOT NULL,
+ completed_at TEXT,
+ UNIQUE(request_channel_id,request_message_id),
+ FOREIGN KEY(deletion_id) REFERENCES telegram_deletion_queue(deletion_id)
+   ON DELETE CASCADE);
+CREATE INDEX IF NOT EXISTS idx_manual_deletion_requests_status
+ ON manual_deletion_requests(status,deletion_id);
+
 CREATE TABLE IF NOT EXISTS publication_jobs (
  job_id INTEGER PRIMARY KEY AUTOINCREMENT,
  dedupe_key TEXT NOT NULL UNIQUE,
@@ -1160,6 +1179,150 @@ class PriceRepository:
                 (min(5000, max(1, int(limit))),),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def list_unreported_manual_deletions(
+        self,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return permanent Telegram failures not yet sent for manual cleanup."""
+        with self._read() as db:
+            rows = db.execute(
+                """SELECT q.*,
+                          COALESCE(MAX(p.section_name),q.section_key) AS section_name,
+                          COALESCE(MAX(p.post_url),'') AS post_url
+                   FROM telegram_deletion_queue AS q
+                   LEFT JOIN manual_deletion_requests AS r
+                     ON r.deletion_id=q.deletion_id
+                   LEFT JOIN telegram_posts AS p
+                     ON p.channel_id=q.channel_id
+                    AND p.message_id=q.message_id
+                   WHERE q.status='failed' AND r.deletion_id IS NULL
+                   GROUP BY q.deletion_id
+                   ORDER BY q.deletion_id
+                   LIMIT ?""",
+                (min(500, max(1, int(limit))),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_manual_deletion_request(
+        self,
+        deletion_id: int,
+        *,
+        request_channel_id: str,
+        request_message_id: int,
+        target_post_url: str = "",
+        now: datetime | str | None = None,
+    ) -> dict[str, Any]:
+        at = _dt(now, "now", default=True)
+        with self._tx(True) as db:
+            deletion = db.execute(
+                """SELECT * FROM telegram_deletion_queue
+                   WHERE deletion_id=? AND status='failed'""",
+                (int(deletion_id),),
+            ).fetchone()
+            if deletion is None:
+                raise ValueError("failed Telegram deletion does not exist")
+            db.execute(
+                """INSERT INTO manual_deletion_requests(
+                     deletion_id,section_key,target_channel_id,target_message_id,
+                     target_post_url,request_channel_id,request_message_id,status,
+                     created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,'active',?,?)
+                   ON CONFLICT(deletion_id) DO NOTHING""",
+                (
+                    int(deletion_id), deletion["section_key"],
+                    deletion["channel_id"], deletion["message_id"],
+                    str(target_post_url or ""), str(request_channel_id),
+                    int(request_message_id), _iso(at), _iso(at),
+                ),
+            )
+            row = db.execute(
+                "SELECT * FROM manual_deletion_requests WHERE deletion_id=?",
+                (int(deletion_id),),
+            ).fetchone()
+            assert row is not None
+            self._audit(
+                db, "manual_deletion_requested", "telegram_deletion",
+                deletion_id,
+                {
+                    "target_message_id": deletion["message_id"],
+                    "request_message_id": int(request_message_id),
+                },
+                at,
+            )
+            return dict(row)
+
+    def get_manual_deletion_request(
+        self,
+        deletion_id: int,
+    ) -> dict[str, Any] | None:
+        with self._read() as db:
+            row = db.execute(
+                "SELECT * FROM manual_deletion_requests WHERE deletion_id=?",
+                (int(deletion_id),),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def complete_manual_deletion(
+        self,
+        deletion_id: int,
+        now_utc: datetime | str,
+    ) -> bool:
+        """Record an administrator-confirmed deletion and sync post aliases."""
+        at = _dt(now_utc, "now_utc")
+        with self._tx(True) as db:
+            request = db.execute(
+                """SELECT * FROM manual_deletion_requests
+                   WHERE deletion_id=? AND status='active'""",
+                (int(deletion_id),),
+            ).fetchone()
+            if request is None:
+                return False
+            db.execute(
+                """UPDATE manual_deletion_requests SET status='completed',
+                   last_error=NULL,updated_at=?,completed_at=?
+                   WHERE deletion_id=? AND status='active'""",
+                (_iso(at), _iso(at), int(deletion_id)),
+            )
+            db.execute(
+                """UPDATE telegram_deletion_queue SET status='manual_done',
+                   last_error=NULL,next_attempt_at=NULL,updated_at=?,completed_at=?
+                   WHERE deletion_id=?""",
+                (_iso(at), _iso(at), int(deletion_id)),
+            )
+            db.execute(
+                """UPDATE telegram_posts SET status='deleted',is_current=0,
+                   last_error=NULL,updated_at=?
+                   WHERE channel_id=? AND message_id=?""",
+                (
+                    _iso(at), request["target_channel_id"],
+                    request["target_message_id"],
+                ),
+            )
+            posts = db.execute(
+                """SELECT * FROM telegram_posts
+                   WHERE channel_id=? AND message_id=?""",
+                (request["target_channel_id"], request["target_message_id"]),
+            ).fetchall()
+            for post in posts:
+                payload = dict(post)
+                digest = hashlib.sha256(_dump(payload).encode()).hexdigest()
+                self._queue_outbox_tx(
+                    db, "telegram_post", post["record_key"], "upsert", payload,
+                    f"telegram_post:{post['record_key']}:manual_deleted:{digest}",
+                    at, at, 12,
+                )
+            self._audit(
+                db, "manual_deletion_completed", "telegram_deletion",
+                deletion_id,
+                {
+                    "target_message_id": request["target_message_id"],
+                    "aliases": len(posts),
+                },
+                at,
+            )
+            return True
 
     def enqueue_job(
         self,

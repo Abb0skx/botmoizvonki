@@ -23,6 +23,10 @@ from fastapi import HTTPException
 from starlette.requests import Request
 
 
+class FakeTelegramDeleteError(RuntimeError):
+    retryable = False
+
+
 class FakeTelegram:
     def __init__(self):
         self.next_id = 100
@@ -32,6 +36,7 @@ class FakeTelegram:
         self.updates: list[dict] = []
         self.callback_answers: list[tuple[str, str, bool]] = []
         self.member_status = "administrator"
+        self.delete_failures: dict[tuple[str, int], Exception] = {}
 
     @staticmethod
     def _message(chat_id: str, message_id: int, html_text: str) -> TelegramMessage:
@@ -55,7 +60,11 @@ class FakeTelegram:
         return self._message(str(chat_id), int(message_id), html_text)
 
     def delete_message(self, chat_id, message_id):
-        self.deleted.append((str(chat_id), int(message_id)))
+        key = (str(chat_id), int(message_id))
+        error = self.delete_failures.get(key)
+        if error is not None:
+            raise error
+        self.deleted.append(key)
         return True
 
     def get_updates(self, **_kwargs):
@@ -344,6 +353,104 @@ class PriceRepositoryTests(unittest.TestCase):
             "cancelled",
         )
         self.assertEqual(fake.callback_answers[-1][1], "Публикация отменена")
+
+    def test_permanent_delete_failure_requests_manual_cleanup(self):
+        self.repo.ingest_snapshot(snapshot(self.now))
+        fake = FakeTelegram()
+        settings = PriceSettings(
+            enabled=True,
+            db_path=Path(self.temp.name) / "price.db",
+            legacy_html_path=Path(self.temp.name) / "legacy.html",
+            admin_username="admin",
+            admin_password="secret",
+            sync_api_key="sync",
+            telegram_bot_token="fake-token",
+            telegram_channel_id="-1001234567890",
+            telegram_channel_username="testchannel",
+            product_sort_sheet_id="sheet",
+            posts_sheet_name="Telegram Posts",
+            timezone="Asia/Tashkent",
+            scheduler_poll_seconds=1,
+            sync_max_bytes=2_000_000,
+            telegram_preview_channel_id="-1003922029862",
+        )
+        service = PricePublicationService(settings, self.repo, telegram=fake)
+        for _ in range(2):
+            service.execute_job({
+                "action": "send",
+                "section_key": "phones-test",
+                "channel_id": settings.telegram_channel_id,
+                "snapshot_policy": "latest",
+            })
+
+        target = (settings.telegram_channel_id, 101)
+        fake.delete_failures[target] = FakeTelegramDeleteError(
+            "message can't be deleted"
+        )
+        self.assertEqual(service.cleanup_superseded_posts(), 0)
+        deletion = self.repo.list_telegram_deletions()[0]
+        self.assertEqual(deletion["status"], "failed")
+
+        self.assertEqual(service.ensure_manual_deletion_requests(), 1)
+        request_message_id = fake.next_id
+        request = self.repo.get_manual_deletion_request(
+            deletion["deletion_id"]
+        )
+        self.assertIsNotNone(request)
+        self.assertEqual(request["request_message_id"], request_message_id)
+        self.assertEqual(fake.sent[-1][0], settings.telegram_preview_channel_id)
+        self.assertIn("https://t.me/testchannel/101", fake.sent[-1][1])
+        button = fake.sent[-1][2]["reply_markup"]["inline_keyboard"][0][0]
+        self.assertEqual(
+            button["callback_data"],
+            f"price_deleted:{deletion['deletion_id']}",
+        )
+        self.assertEqual(service.ensure_manual_deletion_requests(), 0)
+
+        callback = {
+            "callback_query": {
+                "id": "manual-delete-1",
+                "data": f"price_deleted:{deletion['deletion_id']}",
+                "from": {"id": 55},
+                "message": {
+                    "message_id": request_message_id,
+                    "chat": {"id": int(settings.telegram_preview_channel_id)},
+                },
+            },
+        }
+        fake.updates.append({"update_id": 20, **callback})
+        self.assertEqual(service.poll_preview_updates(), 1)
+        self.assertEqual(
+            self.repo.get_manual_deletion_request(deletion["deletion_id"])[
+                "status"
+            ],
+            "active",
+        )
+        self.assertIn("Сначала удалите", fake.callback_answers[-1][1])
+
+        del fake.delete_failures[target]
+        callback["callback_query"]["id"] = "manual-delete-2"
+        fake.updates.append({"update_id": 21, **callback})
+        self.assertEqual(service.poll_preview_updates(), 1)
+        self.assertIn(target, fake.deleted)
+        self.assertIn(
+            (settings.telegram_preview_channel_id, request_message_id),
+            fake.deleted,
+        )
+        self.assertEqual(
+            self.repo.get_manual_deletion_request(deletion["deletion_id"])[
+                "status"
+            ],
+            "completed",
+        )
+        self.assertEqual(
+            self.repo.list_telegram_deletions()[0]["status"], "manual_done"
+        )
+        old_post = next(
+            post for post in self.repo.list_telegram_posts(limit=20)
+            if post["message_id"] == 101
+        )
+        self.assertEqual(old_post["status"], "deleted")
 
     def test_shared_legacy_post_aliases_are_retired_safely(self):
         self.repo.ingest_snapshot(

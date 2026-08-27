@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import json
 import hashlib
 import logging
@@ -529,6 +530,71 @@ class PricePublicationService:
         return completed
 
     @staticmethod
+    def _manual_deletion_markup(deletion_id: int) -> dict[str, Any]:
+        return {
+            "inline_keyboard": [[{
+                "text": "✅ Пост удалён",
+                "callback_data": f"price_deleted:{int(deletion_id)}",
+            }]]
+        }
+
+    def ensure_manual_deletion_requests(self, *, limit: int = 50) -> int:
+        """Send one durable manual-cleanup link for each permanent failure."""
+        channel_id = self.settings.telegram_preview_channel_id
+        if not channel_id:
+            return 0
+        created = 0
+        for item in self.repository.list_unreported_manual_deletions(limit=limit):
+            deletion_id = int(item["deletion_id"])
+            message_id = int(item["message_id"])
+            post_url = str(item.get("post_url") or "").strip()
+            if not post_url and self.settings.telegram_channel_username:
+                post_url = (
+                    f"https://t.me/{self.settings.telegram_channel_username}/"
+                    f"{message_id}"
+                )
+            section_name = html.escape(
+                str(item.get("section_name") or item["section_key"])
+            )
+            link = (
+                f'<a href="{html.escape(post_url, quote=True)}">'
+                f"Открыть старый пост #{message_id}</a>"
+                if post_url else f"Старый post ID: <code>{message_id}</code>"
+            )
+            text = (
+                "<b>🗑 Требуется ручное удаление</b>\n"
+                f"Раздел: {section_name}\n"
+                f"{link}\n\n"
+                "Удалите старый пост, затем нажмите кнопку ниже."
+            )
+            request_message = self.telegram.send_message(
+                channel_id,
+                text,
+                reply_markup=self._manual_deletion_markup(deletion_id),
+                channel_username="",
+            )
+            try:
+                self.repository.record_manual_deletion_request(
+                    deletion_id,
+                    request_channel_id=channel_id,
+                    request_message_id=request_message.message_id,
+                    target_post_url=post_url,
+                )
+            except Exception:
+                try:
+                    self.telegram.delete_message(
+                        channel_id, request_message.message_id
+                    )
+                except Exception:
+                    LOG.exception(
+                        "price_manual_deletion_orphan_cleanup_failed deletion_id=%s",
+                        deletion_id,
+                    )
+                raise
+            created += 1
+        return created
+
+    @staticmethod
     def _is_service_channel_post(message: Mapping[str, Any]) -> bool:
         service_fields = {
             "pinned_message", "new_chat_title", "new_chat_photo",
@@ -585,6 +651,87 @@ class PricePublicationService:
             show_alert=not cancelled,
         )
 
+    def _handle_manual_deleted_callback(
+        self,
+        callback: Mapping[str, Any],
+    ) -> None:
+        callback_id = str(callback.get("id") or "")
+        data = str(callback.get("data") or "")
+        message = callback.get("message")
+        sender = callback.get("from")
+        if not (
+            callback_id and data.startswith("price_deleted:")
+            and isinstance(message, Mapping)
+            and isinstance(sender, Mapping)
+        ):
+            return
+        chat = message.get("chat")
+        if not isinstance(chat, Mapping) or str(chat.get("id")) != str(
+            self.settings.telegram_preview_channel_id
+        ):
+            self.telegram.answer_callback_query(
+                callback_id, text="Недоступно", show_alert=True
+            )
+            return
+        try:
+            deletion_id = int(data.split(":", 1)[1])
+            user_id = int(sender.get("id"))
+            request_message_id = int(message.get("message_id"))
+        except (TypeError, ValueError):
+            self.telegram.answer_callback_query(
+                callback_id, text="Некорректная команда", show_alert=True
+            )
+            return
+        member = self.telegram.get_chat_member(chat["id"], user_id)
+        if str(member.get("status") or "") not in {"administrator", "creator"}:
+            self.telegram.answer_callback_query(
+                callback_id,
+                text="Подтверждение доступно только администраторам",
+                show_alert=True,
+            )
+            return
+        request = self.repository.get_manual_deletion_request(deletion_id)
+        if not request or str(request.get("status")) != "active" or (
+            str(request.get("request_channel_id")) != str(chat["id"])
+            or int(request.get("request_message_id") or 0) != request_message_id
+        ):
+            self.telegram.answer_callback_query(
+                callback_id, text="Запрос уже обработан", show_alert=True
+            )
+            return
+        try:
+            # This also acts as verification: an already manually deleted post
+            # is treated as success by TelegramClient, while an old post that
+            # still exists returns "message can't be deleted".
+            self.telegram.delete_message(
+                request["target_channel_id"],
+                int(request["target_message_id"]),
+            )
+        except Exception:
+            self.telegram.answer_callback_query(
+                callback_id,
+                text="Сначала удалите старый пост, затем нажмите ещё раз",
+                show_alert=True,
+            )
+            return
+        try:
+            self.telegram.delete_message(chat["id"], request_message_id)
+        except Exception:
+            self.telegram.answer_callback_query(
+                callback_id,
+                text="Не удалось удалить ссылку, попробуйте ещё раз",
+                show_alert=True,
+            )
+            return
+        completed = self.repository.complete_manual_deletion(
+            deletion_id, datetime.now(timezone.utc)
+        )
+        self.telegram.answer_callback_query(
+            callback_id,
+            text=("Удаление отмечено" if completed else "Запрос уже обработан"),
+            show_alert=not completed,
+        )
+
     def poll_preview_updates(self) -> int:
         if not self.settings.preview_configured:
             return 0
@@ -605,6 +752,7 @@ class PricePublicationService:
             callback = update.get("callback_query")
             if isinstance(callback, Mapping):
                 self._handle_cancel_callback(callback)
+                self._handle_manual_deleted_callback(callback)
             for field in ("channel_post", "edited_channel_post"):
                 message = update.get(field)
                 if not isinstance(message, Mapping):
