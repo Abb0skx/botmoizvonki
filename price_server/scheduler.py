@@ -290,6 +290,14 @@ class PriceScheduler:
                 quick_links_ready = True
             except Exception:
                 LOG.exception("price_quick_link_registry_failed")
+        if quick_links_ready:
+            try:
+                await self._repository_call(
+                    "ensure_quick_link_catalog_date",
+                    now,
+                )
+            except Exception:
+                LOG.exception("price_quick_link_catalog_date_failed")
         await self._materialize_schedules(now)
         if quick_links_ready:
             await self._materialize_quick_link_rotations(now)
@@ -348,6 +356,8 @@ class PriceScheduler:
                         await self._service_call(method_name, self.clock())
                         or 0
                     )
+                elif method_name == "refresh_quick_link_posts":
+                    await self._service_call(method_name, self.clock())
                 else:
                     await self._service_call(method_name)
             except Exception:

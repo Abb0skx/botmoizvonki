@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo
 from .config import PriceSettings
 from .calendar_plan import CALENDAR_PLAN_ENTRIES
 from .quick_links import (
+    CATALOG_DATE_UPDATE_TIME,
     CATALOG_QUICK_POST_KEY,
     QUICK_LINK_ROTATION_ORDER,
     QUICK_LINK_ROTATION_TIME,
@@ -52,6 +53,14 @@ class SnapshotValidationError(ValueError):
 
 class StaleSnapshotError(SnapshotValidationError):
     """Raised when an older snapshot attempts to replace the current one."""
+
+
+class CurrentSnapshotUnavailableError(ValueError):
+    """Raised when an operation requires a current price snapshot."""
+
+
+class IdempotencyConflictError(ValueError):
+    """Raised when an idempotency key belongs to another operation scope."""
 
 
 SCHEMA = """
@@ -310,6 +319,21 @@ CREATE INDEX IF NOT EXISTS idx_publication_jobs_due
  ON publication_jobs(status,execute_at,next_attempt_at,job_id);
 CREATE INDEX IF NOT EXISTS idx_publication_jobs_section
  ON publication_jobs(section_key,created_at DESC);
+
+CREATE TABLE IF NOT EXISTS publication_edit_batches (
+ batch_id TEXT PRIMARY KEY,
+ channel_id TEXT NOT NULL,
+ channel_key TEXT NOT NULL DEFAULT '',
+ snapshot_id INTEGER NOT NULL,
+ job_ids_json TEXT NOT NULL DEFAULT '[]',
+ job_count INTEGER NOT NULL DEFAULT 0 CHECK(job_count>=0),
+ section_count INTEGER NOT NULL DEFAULT 0 CHECK(section_count>=0),
+ skipped_json TEXT NOT NULL DEFAULT '{}',
+ created_at TEXT NOT NULL,
+ updated_at TEXT NOT NULL,
+ FOREIGN KEY(snapshot_id) REFERENCES price_snapshots(snapshot_id));
+CREATE INDEX IF NOT EXISTS idx_publication_edit_batches_created
+ ON publication_edit_batches(created_at DESC,batch_id);
 
 CREATE TABLE IF NOT EXISTS scheduled_preview_posts (
  job_id INTEGER NOT NULL,
@@ -940,6 +964,66 @@ class PriceRepository:
             return result
 
     upsert_post = upsert_telegram_post
+
+    def upsert_telegram_posts_atomic(
+        self,
+        posts: Sequence[Mapping[str, Any]],
+        *,
+        enqueue_sheet_sync: bool = True,
+        now: datetime | str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Persist multiple aliases as one indivisible registry mutation."""
+
+        if not isinstance(posts, Sequence) or isinstance(
+            posts,
+            (str, bytes, bytearray),
+        ) or not posts:
+            raise ValueError("posts must be a non-empty sequence")
+        at = _dt(now, "now", default=True)
+        values = [self._normalize_post(dict(post), at) for post in posts]
+        record_keys = [item["record_key"] for item in values]
+        if len(set(record_keys)) != len(record_keys):
+            raise ValueError("post record_key values must be unique")
+        results: list[dict[str, Any]] = []
+        with self._tx(True) as db:
+            for item in values:
+                row = self._upsert_post_tx(db, item)
+                result = self._post(row)
+                assert result is not None
+                results.append(result)
+                if enqueue_sheet_sync:
+                    registry_hash = hashlib.sha256(
+                        _dump(result).encode("utf-8")
+                    ).hexdigest()
+                    self._queue_outbox_tx(
+                        db,
+                        "telegram_post",
+                        item["record_key"],
+                        "upsert",
+                        result,
+                        (
+                            f"telegram_post:{item['record_key']}:"
+                            f"{registry_hash}"
+                        ),
+                        at,
+                        at,
+                        12,
+                    )
+                self._audit(
+                    db,
+                    "telegram_post_upserted",
+                    "telegram_post",
+                    item["record_key"],
+                    {
+                        "section_key": item["section_key"],
+                        "channel_id": item["channel_id"],
+                        "part_no": item["part_no"],
+                        "message_id": item["message_id"],
+                        "atomic_batch": True,
+                    },
+                    at,
+                )
+        return results
 
     def _retire_shared_post_aliases_tx(
         self,
@@ -2129,6 +2213,107 @@ class PriceRepository:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def ensure_quick_link_catalog_date(
+        self,
+        now_utc: datetime | str,
+    ) -> int:
+        """Queue one daily catalogue edit after 00:01 in local time."""
+
+        now = _dt(now_utc, "now_utc")
+        zone = ZoneInfo(self.timezone)
+        local_now = now.astimezone(zone)
+        hour, minute = (
+            int(part) for part in CATALOG_DATE_UPDATE_TIME.split(":", 1)
+        )
+        if local_now.time().replace(tzinfo=None) < time(hour, minute):
+            return 0
+        display_date = local_now.strftime("%d.%m.%Y")
+        with self._tx(True) as db:
+            post = db.execute(
+                """SELECT 1 FROM telegram_quick_link_posts
+                   WHERE quick_post_key=? AND status!='disabled'""",
+                (CATALOG_QUICK_POST_KEY,),
+            ).fetchone()
+            if post is None:
+                return 0
+            row = db.execute(
+                """SELECT context_json FROM telegram_quick_link_context
+                   WHERE quick_post_key=?""",
+                (CATALOG_QUICK_POST_KEY,),
+            ).fetchone()
+            context = _load(
+                row["context_json"] if row is not None else None,
+                {},
+            )
+            if str(context.get("catalog_date") or "") == display_date:
+                queue = db.execute(
+                    """SELECT status,desired_revision,applied_revision,
+                              updated_at
+                       FROM telegram_quick_link_queue
+                       WHERE quick_post_key=?""",
+                    (CATALOG_QUICK_POST_KEY,),
+                ).fetchone()
+                if (
+                    queue is not None
+                    and str(queue["status"]) == "failed"
+                    and int(queue["applied_revision"])
+                        < int(queue["desired_revision"])
+                    and now >= (
+                        _dt(queue["updated_at"], "updated_at")
+                        + timedelta(hours=1)
+                    )
+                ):
+                    db.execute(
+                        """UPDATE telegram_quick_link_queue SET
+                             status='pending',attempts=0,next_attempt_at=?,
+                             lease_token=NULL,lease_expires_at=NULL,
+                             last_error=NULL,updated_at=?,completed_at=NULL
+                           WHERE quick_post_key=? AND status='failed'""",
+                        (
+                            _iso(now),
+                            _iso(now),
+                            CATALOG_QUICK_POST_KEY,
+                        ),
+                    )
+                    self._audit(
+                        db,
+                        "quick_link_catalog_date_retry_queued",
+                        "quick_link_post",
+                        CATALOG_QUICK_POST_KEY,
+                        {"catalog_date": display_date},
+                        now,
+                    )
+                    return 1
+                return 0
+            context["catalog_date"] = display_date
+            db.execute(
+                """INSERT INTO telegram_quick_link_context(
+                     quick_post_key,context_json,updated_at)
+                   VALUES(?,?,?)
+                   ON CONFLICT(quick_post_key) DO UPDATE SET
+                    context_json=excluded.context_json,
+                    updated_at=excluded.updated_at""",
+                (
+                    CATALOG_QUICK_POST_KEY,
+                    _dump(context),
+                    _iso(now),
+                ),
+            )
+            self._queue_quick_link_post_tx(
+                db,
+                CATALOG_QUICK_POST_KEY,
+                now,
+            )
+            self._audit(
+                db,
+                "quick_link_catalog_date_updated",
+                "quick_link_post",
+                CATALOG_QUICK_POST_KEY,
+                {"catalog_date": display_date},
+                now,
+            )
+            return 1
+
     def get_quick_link_post(self, quick_post_key: str) -> dict[str, Any] | None:
         with self._read() as db:
             row = db.execute(
@@ -3138,6 +3323,34 @@ class PriceRepository:
             display_date = date.fromisoformat(
                 str(rotation["local_date"])
             ).strftime("%d.%m.%Y")
+            context_row = db.execute(
+                """SELECT context_json FROM telegram_quick_link_context
+                   WHERE quick_post_key=?""",
+                (CATALOG_QUICK_POST_KEY,),
+            ).fetchone()
+            context = _load(
+                context_row["context_json"]
+                if context_row is not None else None,
+                {},
+            )
+            existing_display_date = str(
+                context.get("catalog_date") or ""
+            )
+            try:
+                existing_date = datetime.strptime(
+                    existing_display_date,
+                    "%d.%m.%Y",
+                ).date()
+            except ValueError:
+                existing_date = None
+            rotation_date = date.fromisoformat(str(rotation["local_date"]))
+            catalog_date_requires_refresh = bool(
+                existing_date is not None
+                and existing_date > rotation_date
+                and existing_display_date not in str(rotation["main_html"])
+            )
+            if existing_date is None or existing_date < rotation_date:
+                context["catalog_date"] = display_date
             db.execute(
                 """INSERT INTO telegram_quick_link_context(
                      quick_post_key,context_json,updated_at)
@@ -3147,7 +3360,7 @@ class PriceRepository:
                     updated_at=excluded.updated_at""",
                 (
                     CATALOG_QUICK_POST_KEY,
-                    _dump({"catalog_date": display_date}),
+                    _dump(context),
                     _iso(at),
                 ),
             )
@@ -3173,11 +3386,17 @@ class PriceRepository:
                        WHERE quick_post_key=?""",
                     (quick_post_key,),
                 ).fetchone()
-                if queued is not None and (
+                needs_refresh = bool(queued is not None and (
                     str(queued["status"]) != "done"
                     or int(queued["applied_revision"])
                     < int(queued["desired_revision"])
+                ))
+                if (
+                    quick_post_key == CATALOG_QUICK_POST_KEY
+                    and catalog_date_requires_refresh
                 ):
+                    needs_refresh = True
+                if needs_refresh:
                     self._queue_quick_link_post_tx(
                         db,
                         quick_post_key,
@@ -3554,6 +3773,303 @@ class PriceRepository:
             return result
 
     enqueue_publication_job = enqueue_job
+
+    def enqueue_current_post_edit_batch(
+        self,
+        *,
+        channel_id: str,
+        channel_key: str = "",
+        idempotency_key: str,
+        now: datetime | str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically enqueue one fenced edit job per physical current post."""
+
+        channel = str(channel_id or "").strip()
+        if not channel or len(channel) > 100:
+            raise ValueError("channel_id is invalid")
+        batch_id = str(idempotency_key or "").strip()
+        if not batch_id or len(batch_id) > 100:
+            raise ValueError("idempotency_key is invalid")
+        at = _dt(now, "now", default=True)
+        with self._tx(True) as db:
+            existing_batch = db.execute(
+                """SELECT * FROM publication_edit_batches
+                   WHERE batch_id=?""",
+                (batch_id,),
+            ).fetchone()
+            if existing_batch is not None:
+                if str(existing_batch["channel_id"]) != channel:
+                    raise IdempotencyConflictError(
+                        "idempotency_key belongs to another channel"
+                    )
+                raw_job_ids = _load(existing_batch["job_ids_json"], [])
+                job_ids = [
+                    int(job_id)
+                    for job_id in raw_job_ids
+                    if int(job_id) > 0
+                ]
+                jobs: list[dict[str, Any]] = []
+                for job_id in job_ids:
+                    job = self._job(db.execute(
+                        "SELECT * FROM publication_jobs WHERE job_id=?",
+                        (job_id,),
+                    ).fetchone())
+                    if job is None:
+                        raise RuntimeError(
+                            "publication edit batch has a missing child job"
+                        )
+                    jobs.append(job)
+                return {
+                    "batch_id": batch_id,
+                    "snapshot_id": int(existing_batch["snapshot_id"]),
+                    "jobs": jobs,
+                    "job_count": int(existing_batch["job_count"]),
+                    "section_count": int(existing_batch["section_count"]),
+                    "duplicate": True,
+                    "skipped": _load(existing_batch["skipped_json"], {}),
+                }
+
+            snapshot = db.execute(
+                """SELECT snapshot_id FROM price_snapshots
+                   WHERE is_current=1 LIMIT 1"""
+            ).fetchone()
+            if snapshot is None:
+                raise CurrentSnapshotUnavailableError(
+                    "current snapshot is not available"
+                )
+            snapshot_id = int(snapshot["snapshot_id"])
+            rows = db.execute(
+                """SELECT post.*,section.position AS section_position
+                   FROM telegram_posts AS post
+                   LEFT JOIN price_sections AS section
+                     ON section.snapshot_id=?
+                    AND section.section_key=post.section_key
+                   WHERE post.channel_id=? AND post.is_current=1
+                     AND post.message_id>0
+                   ORDER BY section.position IS NULL,section.position,
+                            post.section_key,post.part_no""",
+                (snapshot_id, channel),
+            ).fetchall()
+
+            by_section: dict[str, list[sqlite3.Row]] = {}
+            positions: dict[str, int] = {}
+            missing_snapshot_sections: set[str] = set()
+            for row in rows:
+                key = str(row["section_key"])
+                by_section.setdefault(key, []).append(row)
+                if row["section_position"] is None:
+                    missing_snapshot_sections.add(key)
+                else:
+                    positions[key] = int(row["section_position"])
+
+            active_sections: set[str] = set()
+            for row in db.execute(
+                """SELECT section_key,payload_json FROM publication_jobs
+                   WHERE channel_id=? AND action='edit'
+                     AND status IN ('pending','running','needs_review')""",
+                (channel,),
+            ).fetchall():
+                payload = _load(row["payload_json"], {})
+                raw_keys = payload.get("section_keys")
+                if isinstance(raw_keys, Sequence) and not isinstance(
+                    raw_keys, (str, bytes)
+                ):
+                    active_sections.update(str(item) for item in raw_keys)
+                else:
+                    active_sections.add(str(row["section_key"]))
+
+            quick_message_ids = {
+                int(row["message_id"])
+                for row in db.execute(
+                    """SELECT message_id FROM telegram_quick_link_posts
+                       WHERE channel_id=? AND status!='disabled'""",
+                    (channel,),
+                ).fetchall()
+            }
+            binding_groups: dict[tuple[int, ...], list[str]] = {}
+            invalid_sections: set[str] = set()
+            for section_key, posts in by_section.items():
+                parts = tuple(int(row["part_no"]) for row in posts)
+                declared_counts = {
+                    int(row["part_count"]) for row in posts
+                }
+                message_ids = tuple(int(row["message_id"]) for row in posts)
+                if (
+                    section_key in missing_snapshot_sections
+                    or parts != tuple(range(1, len(posts) + 1))
+                    or declared_counts != {len(posts)}
+                    or len(set(message_ids)) != len(message_ids)
+                    or len(message_ids) != 1
+                ):
+                    invalid_sections.add(section_key)
+                    continue
+                binding_groups.setdefault(message_ids, []).append(section_key)
+
+            unsafe_message_ids = {
+                int(post["message_id"])
+                for section_key in invalid_sections
+                for post in by_section[section_key]
+            }
+            for binding, section_keys in list(binding_groups.items()):
+                if any(message_id in unsafe_message_ids for message_id in binding):
+                    invalid_sections.update(section_keys)
+                    del binding_groups[binding]
+
+            message_bindings: dict[int, set[tuple[int, ...]]] = {}
+            for binding in binding_groups:
+                for message_id in binding:
+                    message_bindings.setdefault(message_id, set()).add(binding)
+            overlapping = {
+                binding
+                for bindings in message_bindings.values()
+                if len(bindings) > 1
+                for binding in bindings
+            }
+
+            skipped: dict[str, list[str]] = {
+                "active_job": [],
+                "invalid_binding": sorted(invalid_sections),
+                "quick_link_collision": [],
+            }
+            jobs: list[dict[str, Any]] = []
+            ordered_groups = sorted(
+                binding_groups.items(),
+                key=lambda item: (
+                    min(positions[key] for key in item[1]),
+                    item[1][0],
+                ),
+            )
+            for message_ids, raw_section_keys in ordered_groups:
+                section_keys = sorted(
+                    raw_section_keys,
+                    key=lambda key: (positions[key], key),
+                )
+                if message_ids in overlapping:
+                    skipped["invalid_binding"].extend(section_keys)
+                    continue
+                if any(key in active_sections for key in section_keys):
+                    skipped["active_job"].extend(section_keys)
+                    continue
+                if any(item in quick_message_ids for item in message_ids):
+                    skipped["quick_link_collision"].extend(section_keys)
+                    continue
+                position = len(jobs) + 1
+                primary = section_keys[0]
+                payload = {
+                    "source": "price_admin_edit_all",
+                    "batch_id": batch_id,
+                    "batch_position": position,
+                    "section_keys": section_keys,
+                    "expected_message_ids": list(message_ids),
+                    "expected_part_count": len(message_ids),
+                    "expected_bindings": {
+                        section_key: [
+                            {
+                                "record_key": str(post["record_key"]),
+                                "message_id": int(post["message_id"]),
+                                "part_no": int(post["part_no"]),
+                                "publication_id": str(
+                                    post["publication_id"] or ""
+                                ),
+                                "content_hash": str(
+                                    post["content_hash"] or ""
+                                ),
+                                "snapshot_id": str(
+                                    post["snapshot_id"] or ""
+                                ),
+                                "updated_at": str(post["updated_at"]),
+                            }
+                            for post in by_section[section_key]
+                        ]
+                        for section_key in section_keys
+                    },
+                }
+                cursor = db.execute(
+                    """INSERT INTO publication_jobs(
+                         dedupe_key,action,section_key,channel_id,channel_key,
+                         snapshot_policy,snapshot_id,execute_at,schedule_type,
+                         schedule_json,status,attempts,max_attempts,payload_json,
+                         created_at,updated_at)
+                       VALUES(?, 'edit', ?, ?, ?, 'pinned', ?, ?, 'once',
+                              '{}', 'pending', 0, 8, ?, ?, ?)""",
+                    (
+                        f"price-admin-edit-all:{batch_id}:{position}:{primary}",
+                        primary, channel, str(channel_key or "")[:100],
+                        snapshot_id, _iso(at), _dump(payload),
+                        _iso(at), _iso(at),
+                    ),
+                )
+                job_id = int(cursor.lastrowid)
+                job = self._job(db.execute(
+                    "SELECT * FROM publication_jobs WHERE job_id=?",
+                    (job_id,),
+                ).fetchone())
+                assert job is not None
+                jobs.append(job)
+                self._audit(
+                    db,
+                    "publication_job_enqueued",
+                    "publication_job",
+                    job_id,
+                    {
+                        "action": "edit",
+                        "source": "price_admin_edit_all",
+                        "batch_id": batch_id,
+                        "section_keys": section_keys,
+                        "message_ids": list(message_ids),
+                    },
+                    at,
+                )
+            skipped = {
+                key: sorted(set(value))
+                for key, value in skipped.items()
+                if value
+            }
+            section_count = sum(
+                len(job["payload"]["section_keys"]) for job in jobs
+            )
+            job_ids = [int(job["job_id"]) for job in jobs]
+            db.execute(
+                """INSERT INTO publication_edit_batches(
+                     batch_id,channel_id,channel_key,snapshot_id,
+                     job_ids_json,job_count,section_count,skipped_json,
+                     created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    batch_id,
+                    channel,
+                    str(channel_key or "")[:100],
+                    snapshot_id,
+                    _dump(job_ids),
+                    len(jobs),
+                    section_count,
+                    _dump(skipped),
+                    _iso(at),
+                    _iso(at),
+                ),
+            )
+            self._audit(
+                db,
+                "publication_edit_all_enqueued",
+                "publication_batch",
+                batch_id,
+                {
+                    "snapshot_id": snapshot_id,
+                    "job_count": len(jobs),
+                    "section_count": section_count,
+                    "skipped": skipped,
+                },
+                at,
+            )
+            return {
+                "batch_id": batch_id,
+                "snapshot_id": snapshot_id,
+                "jobs": jobs,
+                "job_count": len(jobs),
+                "section_count": section_count,
+                "duplicate": False,
+                "skipped": skipped,
+            }
 
     def list_jobs_for_preview(
         self,
@@ -3985,6 +4501,75 @@ class PriceRepository:
             ).fetchall()
         return [item for row in rows if (item := self._job(row)) is not None]
 
+    def list_publication_edit_batches(
+        self,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """List durable bulk-edit envelopes, including zero-job batches."""
+
+        bounded = min(500, max(1, int(limit)))
+        with self._read() as db:
+            rows = db.execute(
+                """SELECT * FROM publication_edit_batches
+                   ORDER BY created_at DESC,batch_id DESC LIMIT ?""",
+                (bounded,),
+            ).fetchall()
+            batch_ids = [str(row["batch_id"]) for row in rows]
+            job_rows: list[sqlite3.Row] = []
+            if batch_ids:
+                marks = ",".join("?" for _ in batch_ids)
+                job_rows = db.execute(
+                    f"""SELECT job_id,status,result_json,payload_json
+                        FROM publication_jobs
+                        WHERE json_extract(payload_json,'$.source')
+                                ='price_admin_edit_all'
+                          AND json_extract(payload_json,'$.batch_id')
+                                IN ({marks})
+                        ORDER BY job_id""",
+                    batch_ids,
+                ).fetchall()
+        jobs_by_batch: dict[str, list[sqlite3.Row]] = {}
+        for job in job_rows:
+            payload = _load(job["payload_json"], {})
+            jobs_by_batch.setdefault(
+                str(payload.get("batch_id") or ""),
+                [],
+            ).append(job)
+
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            batch_id = str(row["batch_id"])
+            children = jobs_by_batch.get(batch_id, [])
+            status_counts: dict[str, int] = {}
+            skipped_job_count = 0
+            for child in children:
+                status = str(child["status"])
+                status_counts[status] = status_counts.get(status, 0) + 1
+                child_result = _load(child["result_json"], {})
+                if (
+                    isinstance(child_result, Mapping)
+                    and child_result.get("status") == "skipped"
+                ):
+                    skipped_job_count += 1
+            result.append({
+                "batch_id": batch_id,
+                "channel_id": str(row["channel_id"]),
+                "snapshot_id": int(row["snapshot_id"]),
+                "job_ids": [
+                    int(job_id)
+                    for job_id in _load(row["job_ids_json"], [])
+                ],
+                "job_count": int(row["job_count"]),
+                "section_count": int(row["section_count"]),
+                "skipped": _load(row["skipped_json"], {}),
+                "job_status_counts": status_counts,
+                "skipped_job_count": skipped_job_count,
+                "created_at": str(row["created_at"]),
+                "updated_at": str(row["updated_at"]),
+            })
+        return result
+
     @staticmethod
     def _recover_jobs_tx(db: sqlite3.Connection, now: datetime) -> int:
         cursor = db.execute(
@@ -4010,19 +4595,79 @@ class PriceRepository:
         claimed: list[int] = []
         with self._tx(True) as db:
             self._recover_jobs_tx(db, now)
-            rows = db.execute(
-                """SELECT pending.job_id FROM publication_jobs AS pending
-                   WHERE pending.status='pending' AND pending.execute_at<=?
-                   AND (pending.next_attempt_at IS NULL OR pending.next_attempt_at<=?)
-                   AND NOT EXISTS (
-                     SELECT 1 FROM publication_jobs AS running
-                     WHERE running.status='running'
-                       AND running.section_key=pending.section_key
-                       AND running.channel_id=pending.channel_id)
-                   ORDER BY pending.execute_at,pending.job_id LIMIT ?""",
-                (_iso(now), _iso(now), bounded),
-            ).fetchall()
-            for row in rows:
+            for _index in range(bounded):
+                row = db.execute(
+                    """SELECT pending.job_id
+                       FROM publication_jobs AS pending
+                       WHERE pending.status='pending'
+                         AND pending.execute_at<=?
+                         AND (
+                           pending.next_attempt_at IS NULL
+                           OR pending.next_attempt_at<=?
+                         )
+                         AND NOT EXISTS (
+                           SELECT 1 FROM publication_jobs AS running
+                           WHERE running.status='running'
+                             AND running.channel_id=pending.channel_id
+                             AND (
+                               running.section_key=pending.section_key
+                               OR EXISTS (
+                                 SELECT 1
+                                 FROM json_each(
+                                   running.payload_json,'$.section_keys'
+                                 ) AS running_key
+                                 WHERE running_key.value=pending.section_key
+                               )
+                               OR EXISTS (
+                                 SELECT 1
+                                 FROM json_each(
+                                   pending.payload_json,'$.section_keys'
+                                 ) AS pending_key
+                                 WHERE pending_key.value=running.section_key
+                               )
+                               OR EXISTS (
+                                 SELECT 1
+                                 FROM json_each(
+                                   pending.payload_json,'$.section_keys'
+                                 ) AS pending_key
+                                 JOIN json_each(
+                                   running.payload_json,'$.section_keys'
+                                 ) AS running_key
+                                   ON running_key.value=pending_key.value
+                               )
+                             )
+                         )
+                         AND (
+                           COALESCE(
+                             json_extract(
+                               pending.payload_json,'$.source'
+                             ),''
+                           )!='price_admin_edit_all'
+                           OR NOT EXISTS (
+                             SELECT 1 FROM publication_jobs AS earlier
+                             WHERE json_extract(
+                                     earlier.payload_json,'$.source'
+                                   )='price_admin_edit_all'
+                               AND json_extract(
+                                     earlier.payload_json,'$.batch_id'
+                                   )=json_extract(
+                                     pending.payload_json,'$.batch_id'
+                                   )
+                               AND CAST(json_extract(
+                                     earlier.payload_json,'$.batch_position'
+                                   ) AS INTEGER)
+                                   < CAST(json_extract(
+                                     pending.payload_json,'$.batch_position'
+                                   ) AS INTEGER)
+                               AND earlier.status IN ('pending','running')
+                           )
+                         )
+                       ORDER BY pending.execute_at,pending.job_id
+                       LIMIT 1""",
+                    (_iso(now), _iso(now)),
+                ).fetchone()
+                if row is None:
+                    break
                 token = secrets.token_urlsafe(24)
                 cursor = db.execute(
                     """UPDATE publication_jobs SET status='running',attempts=attempts+1,
@@ -4046,6 +4691,49 @@ class PriceRepository:
         """Singular convenience wrapper used by thin schedulers."""
         jobs = self.claim_due_jobs(now_utc, limit=1, lease_seconds=lease_seconds)
         return jobs[0] if jobs else None
+
+    @staticmethod
+    def _delay_next_bulk_job_tx(
+        db: sqlite3.Connection,
+        row: sqlite3.Row,
+        now: datetime,
+    ) -> None:
+        payload = _load(row["payload_json"], {})
+        if payload.get("source") != "price_admin_edit_all":
+            return
+        batch_id = str(payload.get("batch_id") or "")
+        try:
+            position = int(payload.get("batch_position"))
+        except (TypeError, ValueError):
+            return
+        if not batch_id or position < 1:
+            return
+        next_row = db.execute(
+            """SELECT job_id FROM publication_jobs
+               WHERE status='pending'
+                 AND json_extract(payload_json,'$.source')
+                       ='price_admin_edit_all'
+                 AND json_extract(payload_json,'$.batch_id')=?
+                 AND CAST(json_extract(
+                       payload_json,'$.batch_position'
+                     ) AS INTEGER)>?
+               ORDER BY CAST(json_extract(
+                   payload_json,'$.batch_position'
+               ) AS INTEGER),job_id LIMIT 1""",
+            (batch_id, position),
+        ).fetchone()
+        if next_row is None:
+            return
+        available = _iso(now + timedelta(seconds=2))
+        db.execute(
+            """UPDATE publication_jobs SET
+                 next_attempt_at=CASE
+                   WHEN next_attempt_at IS NULL OR next_attempt_at<? THEN ?
+                   ELSE next_attempt_at END,
+                 updated_at=?
+               WHERE job_id=? AND status='pending'""",
+            (available, available, _iso(now), int(next_row["job_id"])),
+        )
 
     def complete_job(self, job_id: int, lease_token: str,
                      now_utc: datetime | str,
@@ -4080,6 +4768,7 @@ class PriceRepository:
                 return False
             self._audit(db, "publication_job_completed", "publication_job", job_id,
                         dict(result or {}), now)
+            self._delay_next_bulk_job_tx(db, row, now)
             return True
 
     def retry_job(self, job_id: int, lease_token: str,
@@ -4120,6 +4809,8 @@ class PriceRepository:
             self._audit(db, "publication_job_retry" if status == "pending" else
                         "publication_job_failed", "publication_job", job_id,
                         {"status": status, "error": safe_error}, now)
+            if status != "pending":
+                self._delay_next_bulk_job_tx(db, row, now)
             return True
 
     def fail_job(self, job_id: int, lease_token: str,
@@ -4138,6 +4829,13 @@ class PriceRepository:
         """Cancel a job that has not reached a terminal state."""
         at = _dt(now, "now", default=True)
         with self._tx(True) as db:
+            row = db.execute(
+                """SELECT * FROM publication_jobs
+                   WHERE job_id=? AND status='pending'""",
+                (int(job_id),),
+            ).fetchone()
+            if row is None:
+                return False
             cursor = db.execute(
                 """UPDATE publication_jobs SET status='cancelled',lease_token=NULL,
                    lease_expires_at=NULL,next_attempt_at=NULL,updated_at=?,completed_at=?
@@ -4148,6 +4846,7 @@ class PriceRepository:
                 return False
             self._audit(db, "publication_job_cancelled", "publication_job",
                         job_id, {}, at)
+            self._delay_next_bulk_job_tx(db, row, at)
             return True
 
     @staticmethod
@@ -4382,6 +5081,8 @@ class PriceRepository:
 
 
 __all__ = [
+    "CurrentSnapshotUnavailableError",
+    "IdempotencyConflictError",
     "PriceRepository",
     "SnapshotValidationError",
     "StaleSnapshotError",

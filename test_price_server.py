@@ -16,11 +16,21 @@ from price_server.contracts import (
     section_content_hash,
     validate_sync_payload,
 )
-from price_server.repository import PriceRepository, StaleSnapshotError
+from price_server.repository import (
+    IdempotencyConflictError,
+    PriceRepository,
+    StaleSnapshotError,
+)
 from price_server.quick_links import (
+    CATALOG_DATE_UPDATE_TIME,
     CATALOG_QUICK_POST_KEY,
     QUICK_LINK_POST_SPECS,
     QUICK_LINK_ROTATION_ORDER,
+)
+from price_server.post_formatting import (
+    PRICE_INFO_RU_HTML,
+    PRICE_INFO_UZ_HTML,
+    format_price_sections,
 )
 from price_server.scheduler import PriceScheduler
 from price_server.service import PricePublicationService
@@ -35,6 +45,7 @@ from price_server.telegram_api import (
     TelegramClient,
     TelegramMessage,
     telegram_text_units,
+    telegram_visible_text,
 )
 from fastapi import HTTPException
 from starlette.requests import Request
@@ -386,6 +397,588 @@ class PriceRepositoryTests(unittest.TestCase):
             self.repo.get_job(cancellable["job_id"])["status"],
             "cancelled",
         )
+
+    def test_price_post_format_is_canonical_and_idempotent(self):
+        raw = (
+            '📌 <a href="https://t.me/Texnikach_info">Do‘kon</a> | '
+            '📞 <a href="https://t.me/Texnikach_info">Aloqa</a> | '
+            '📦 <a href="https://t.me/Texnikach_info">Yetkazish</a>\n\n'
+            '<b>【 Телефоны Infinix 】</b>\n'
+            '<a href="https://t.me/catalog/3/64gb">Infinix Smart 10</a>\n'
+            '• 3/64Gb Black, Silver: 130\n'
+            '• 4/128Gb : 205 🔺\n'
+            '• Black: 120 🔻\n'
+            'Product aloqa special yetkazish edition: 100\n'
+            '【Limited】 Edition: 100\n\n'
+            '📌 <a href="https://t.me/Texnikach_info">Магазин</a> │ '
+            '📞 <a href="https://t.me/Texnikach_info">Связь</a> │ '
+            '📦 <a href="https://t.me/Texnikach_info">Доставка</a>'
+        )
+        rendered = format_price_sections([
+            ("smartphones-infinix", "Телефоны Infinix", [raw])
+        ])
+        self.assertEqual(len(rendered), 1)
+        message = rendered[0]
+        self.assertTrue(message.startswith(PRICE_INFO_UZ_HTML + "\n\n"))
+        self.assertTrue(message.endswith("\n\n" + PRICE_INFO_RU_HTML))
+        self.assertEqual(message.count("https://texnikach.uz/go"), 2)
+        self.assertIn("<b>━━ ТЕЛЕФОНЫ · INFINIX ━━</b>", message)
+        self.assertIn("• 3/64 GB · Black, Silver — 130", message)
+        self.assertIn("• 4/128 GB — 205 ↑", message)
+        self.assertIn("• Black — 120 ↓", message)
+        self.assertIn('href="https://t.me/catalog/3/64gb"', message)
+        self.assertIn(
+            "Product aloqa special yetkazish edition — 100",
+            message,
+        )
+        self.assertIn("【Limited】 Edition — 100", message)
+        self.assertNotIn("Texnikach_info", message)
+        self.assertNotIn("🔺", message)
+        self.assertNotIn("🔻", message)
+        self.assertLessEqual(telegram_text_units(message), 4096)
+        self.assertEqual(
+            format_price_sections([
+                ("smartphones-infinix", "Телефоны Infinix", [message])
+            ]),
+            rendered,
+        )
+        self.assertEqual(
+            format_price_sections([
+                ("smartphones-infinix", "Телефоны · Infinix", [message])
+            ]),
+            rendered,
+        )
+        self.assertNotIn("· ·", message)
+
+    def test_price_post_format_splits_one_oversized_html_block_safely(self):
+        long_text = "x" * 4050
+        raw = (
+            "<b>【 Long 】</b>\n"
+            f'<a href="https://example.test/long">{long_text}</a>'
+        )
+        rendered = format_price_sections([("long", "Long", [raw])])
+        self.assertGreater(len(rendered), 1)
+        self.assertEqual(
+            sum(telegram_visible_text(item).count("x") for item in rendered),
+            len(long_text),
+        )
+        self.assertTrue(all(
+            telegram_text_units(item) <= 4096 for item in rendered
+        ))
+        self.assertTrue(all(
+            item.count('<a href="https://example.test/long">') == 1
+            for item in rendered
+        ))
+        self.assertTrue(all(item.count("</a>") >= 3 for item in rendered))
+        self.assertTrue(all(
+            item.startswith(PRICE_INFO_UZ_HTML + "\n\n")
+            and item.endswith("\n\n" + PRICE_INFO_RU_HTML)
+            for item in rendered
+        ))
+
+    def test_edit_all_groups_shared_posts_and_runs_sequentially(self):
+        self.repo.ingest_snapshot(snapshot_with_sections(
+            self.now,
+            ["group-one", "group-two", "solo"],
+        ))
+        settings = PriceSettings(
+            enabled=True,
+            db_path=Path(self.temp.name) / "price.db",
+            legacy_html_path=Path(self.temp.name) / "legacy.html",
+            admin_username="admin",
+            admin_password="secret",
+            sync_api_key="sync",
+            telegram_bot_token="fake-token",
+            telegram_channel_id="-1001234567890",
+            telegram_channel_username="testchannel",
+            product_sort_sheet_id="sheet",
+            posts_sheet_name="Telegram Posts",
+            timezone="Asia/Tashkent",
+            scheduler_poll_seconds=1,
+            sync_max_bytes=2_000_000,
+        )
+        for section_key, message_id in (
+            ("group-one", 777),
+            ("group-two", 777),
+            ("solo", 778),
+        ):
+            self.repo.upsert_telegram_post({
+                "record_key": f"legacy:{section_key}:{message_id}",
+                "publication_id": f"publication:{section_key}",
+                "section_key": section_key,
+                "section_name": section_key,
+                "channel_id": settings.telegram_channel_id,
+                "channel_username": settings.telegram_channel_username,
+                "message_id": message_id,
+                "post_url": f"https://t.me/testchannel/{message_id}",
+                "publication_mode": "legacy_import",
+                "sent_at": self.now.isoformat(),
+                "status": "published",
+                "is_current": True,
+            })
+
+        batch_id = "01234567-89ab-4cde-8fab-0123456789ab"
+        batch = self.repo.enqueue_current_post_edit_batch(
+            channel_id=settings.telegram_channel_id,
+            channel_key=settings.telegram_channel_username,
+            idempotency_key=batch_id,
+            now=self.now,
+        )
+        self.assertEqual(batch["job_count"], 2)
+        self.assertEqual(batch["section_count"], 3)
+        self.assertEqual(
+            batch["jobs"][0]["payload"]["section_keys"],
+            ["group-one", "group-two"],
+        )
+        self.assertEqual(
+            batch["jobs"][0]["payload"]["expected_message_ids"],
+            [777],
+        )
+        self.assertEqual(
+            {job["snapshot_policy"] for job in batch["jobs"]},
+            {"pinned"},
+        )
+        replay = self.repo.enqueue_current_post_edit_batch(
+            channel_id=settings.telegram_channel_id,
+            channel_key=settings.telegram_channel_username,
+            idempotency_key=batch_id,
+            now=self.now,
+        )
+        self.assertTrue(replay["duplicate"])
+        self.assertEqual(
+            [job["job_id"] for job in replay["jobs"]],
+            [job["job_id"] for job in batch["jobs"]],
+        )
+
+        fake = FakeTelegram()
+        service = PricePublicationService(settings, self.repo, telegram=fake)
+        first = self.repo.claim_due_jobs(self.now, limit=20)
+        self.assertEqual(len(first), 1)
+        self.assertEqual(
+            first[0]["payload"]["batch_position"],
+            1,
+        )
+        result = service.execute_job(first[0])
+        self.assertEqual(result["status"], "updated")
+        self.assertEqual(fake.edited[0][1], 777)
+        self.assertIn("GROUP-ONE", fake.edited[0][2])
+        self.assertIn("GROUP-TWO", fake.edited[0][2])
+        self.assertTrue(self.repo.complete_job(
+            first[0]["job_id"],
+            first[0]["lease_token"],
+            self.now,
+            result,
+        ))
+        self.assertEqual(self.repo.claim_due_jobs(self.now, limit=20), [])
+
+        second_at = self.now + timedelta(seconds=2)
+        second = self.repo.claim_due_jobs(second_at, limit=20)
+        self.assertEqual(len(second), 1)
+        self.assertEqual(second[0]["payload"]["batch_position"], 2)
+        result = service.execute_job(second[0])
+        self.assertEqual(result["status"], "updated")
+        self.assertTrue(self.repo.complete_job(
+            second[0]["job_id"],
+            second[0]["lease_token"],
+            second_at,
+            result,
+        ))
+        self.assertEqual([item[1] for item in fake.edited], [777, 778])
+        self.assertEqual(fake.sent, [])
+        self.assertEqual(fake.deleted, [])
+        for section_key in ("group-one", "group-two"):
+            current = self.repo.list_telegram_posts(
+                section_key=section_key,
+                current_only=True,
+            )
+            self.assertEqual([item["message_id"] for item in current], [777])
+
+    def test_edit_all_skips_when_current_binding_changes(self):
+        self.repo.ingest_snapshot(
+            snapshot_with_sections(self.now, ["group-one"])
+        )
+        settings = PriceSettings(
+            enabled=True,
+            db_path=Path(self.temp.name) / "price.db",
+            legacy_html_path=Path(self.temp.name) / "legacy.html",
+            admin_username="admin",
+            admin_password="secret",
+            sync_api_key="sync",
+            telegram_bot_token="fake-token",
+            telegram_channel_id="-1001234567890",
+            telegram_channel_username="testchannel",
+            product_sort_sheet_id="sheet",
+            posts_sheet_name="Telegram Posts",
+            timezone="Asia/Tashkent",
+            scheduler_poll_seconds=1,
+            sync_max_bytes=2_000_000,
+        )
+        old = {
+            "record_key": "legacy:group-one:701",
+            "publication_id": "publication-old",
+            "section_key": "group-one",
+            "section_name": "group-one",
+            "channel_id": settings.telegram_channel_id,
+            "channel_username": settings.telegram_channel_username,
+            "message_id": 701,
+            "post_url": "https://t.me/testchannel/701",
+            "publication_mode": "legacy_import",
+            "sent_at": self.now.isoformat(),
+            "status": "published",
+            "is_current": True,
+        }
+        self.repo.upsert_telegram_post(old)
+        batch = self.repo.enqueue_current_post_edit_batch(
+            channel_id=settings.telegram_channel_id,
+            channel_key=settings.telegram_channel_username,
+            idempotency_key="fedcba98-7654-4cba-8765-fedcba987654",
+            now=self.now,
+        )
+        old["is_current"] = False
+        old["status"] = "superseded"
+        self.repo.upsert_telegram_post(old)
+        self.repo.upsert_telegram_post({
+            **old,
+            "record_key": "legacy:group-one:702",
+            "publication_id": "publication-new",
+            "message_id": 702,
+            "post_url": "https://t.me/testchannel/702",
+            "status": "published",
+            "is_current": True,
+        })
+
+        fake = FakeTelegram()
+        service = PricePublicationService(settings, self.repo, telegram=fake)
+        result = service.execute_job(batch["jobs"][0])
+        self.assertEqual(result["status"], "skipped")
+        self.assertEqual(result["reason"], "current_binding_changed")
+        self.assertEqual(fake.edited, [])
+        self.assertEqual(fake.sent, [])
+
+    def test_edit_all_zero_job_replay_preserves_original_decision(self):
+        self.repo.ingest_snapshot(
+            snapshot_with_sections(self.now, ["group-one"])
+        )
+        settings = PriceSettings(
+            enabled=True,
+            db_path=Path(self.temp.name) / "price.db",
+            legacy_html_path=Path(self.temp.name) / "legacy.html",
+            admin_username="admin",
+            admin_password="secret",
+            sync_api_key="sync",
+            telegram_bot_token="fake-token",
+            telegram_channel_id="-1001234567890",
+            telegram_channel_username="testchannel",
+            product_sort_sheet_id="sheet",
+            posts_sheet_name="Telegram Posts",
+            timezone="Asia/Tashkent",
+            scheduler_poll_seconds=1,
+            sync_max_bytes=2_000_000,
+        )
+        self.repo.upsert_telegram_post({
+            "record_key": "legacy:group-one:701",
+            "section_key": "group-one",
+            "section_name": "group-one",
+            "channel_id": settings.telegram_channel_id,
+            "channel_username": settings.telegram_channel_username,
+            "message_id": 701,
+            "post_url": "https://t.me/testchannel/701",
+            "sent_at": self.now.isoformat(),
+            "status": "published",
+            "is_current": True,
+        })
+        active = self.repo.enqueue_job(
+            "group-one",
+            "edit",
+            self.now,
+            channel_id=settings.telegram_channel_id,
+            now=self.now,
+        )
+        batch_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        first = self.repo.enqueue_current_post_edit_batch(
+            channel_id=settings.telegram_channel_id,
+            channel_key=settings.telegram_channel_username,
+            idempotency_key=batch_id,
+            now=self.now,
+        )
+        self.assertEqual(first["job_count"], 0)
+        self.assertEqual(first["section_count"], 0)
+        self.assertEqual(first["skipped"], {
+            "active_job": ["group-one"],
+        })
+
+        self.assertTrue(self.repo.cancel_job(active["job_id"], now=self.now))
+        replay = self.repo.enqueue_current_post_edit_batch(
+            channel_id=settings.telegram_channel_id,
+            channel_key=settings.telegram_channel_username,
+            idempotency_key=batch_id,
+            now=self.now + timedelta(seconds=1),
+        )
+        self.assertTrue(replay["duplicate"])
+        self.assertEqual(replay["job_count"], 0)
+        self.assertEqual(replay["section_count"], 0)
+        self.assertEqual(replay["skipped"], first["skipped"])
+        self.assertEqual(replay["jobs"], [])
+        history = self.repo.list_publication_edit_batches()
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["batch_id"], batch_id)
+        self.assertEqual(history[0]["job_count"], 0)
+        self.assertEqual(history[0]["skipped"], first["skipped"])
+        with self.assertRaises(IdempotencyConflictError):
+            self.repo.enqueue_current_post_edit_batch(
+                channel_id="-1009999999999",
+                channel_key="otherchannel",
+                idempotency_key=batch_id,
+                now=self.now + timedelta(seconds=2),
+            )
+
+    def test_claim_due_jobs_locks_all_bulk_section_aliases(self):
+        self.repo.ingest_snapshot(
+            snapshot_with_sections(self.now, ["group-one", "group-two"])
+        )
+        channel_id = "-1001234567890"
+        for section_key in ("group-one", "group-two"):
+            self.repo.upsert_telegram_post({
+                "record_key": f"legacy:{section_key}:777",
+                "section_key": section_key,
+                "section_name": section_key,
+                "channel_id": channel_id,
+                "channel_username": "testchannel",
+                "message_id": 777,
+                "post_url": "https://t.me/testchannel/777",
+                "sent_at": self.now.isoformat(),
+                "status": "published",
+                "is_current": True,
+            })
+        batch = self.repo.enqueue_current_post_edit_batch(
+            channel_id=channel_id,
+            channel_key="testchannel",
+            idempotency_key="11111111-2222-4333-8444-555555555555",
+            now=self.now,
+        )
+        competing = self.repo.enqueue_job(
+            "group-two",
+            "edit",
+            self.now,
+            channel_id=channel_id,
+            now=self.now,
+        )
+
+        claimed = self.repo.claim_due_jobs(self.now, limit=20)
+        self.assertEqual(
+            [job["job_id"] for job in claimed],
+            [batch["jobs"][0]["job_id"]],
+        )
+        self.assertEqual(
+            self.repo.get_job(competing["job_id"])["status"],
+            "pending",
+        )
+
+    def test_edit_all_fence_rejects_newer_content_on_same_message_id(self):
+        self.repo.ingest_snapshot(
+            snapshot_with_sections(self.now, ["group-one"])
+        )
+        settings = PriceSettings(
+            enabled=True,
+            db_path=Path(self.temp.name) / "price.db",
+            legacy_html_path=Path(self.temp.name) / "legacy.html",
+            admin_username="admin",
+            admin_password="secret",
+            sync_api_key="sync",
+            telegram_bot_token="fake-token",
+            telegram_channel_id="-1001234567890",
+            telegram_channel_username="testchannel",
+            product_sort_sheet_id="sheet",
+            posts_sheet_name="Telegram Posts",
+            timezone="Asia/Tashkent",
+            scheduler_poll_seconds=1,
+            sync_max_bytes=2_000_000,
+        )
+        self.repo.upsert_telegram_post({
+            "record_key": "legacy:group-one:701",
+            "publication_id": "publication-one",
+            "section_key": "group-one",
+            "section_name": "group-one",
+            "channel_id": settings.telegram_channel_id,
+            "channel_username": settings.telegram_channel_username,
+            "message_id": 701,
+            "post_url": "https://t.me/testchannel/701",
+            "content_hash": "old-content",
+            "snapshot_id": "1",
+            "sent_at": self.now.isoformat(),
+            "status": "published",
+            "is_current": True,
+        })
+        batch = self.repo.enqueue_current_post_edit_batch(
+            channel_id=settings.telegram_channel_id,
+            channel_key=settings.telegram_channel_username,
+            idempotency_key="99999999-8888-4777-8666-555555555555",
+            now=self.now,
+        )
+        fake = FakeTelegram()
+        service = PricePublicationService(settings, self.repo, telegram=fake)
+        service.execute_job({
+            "action": "edit",
+            "section_key": "group-one",
+            "channel_id": settings.telegram_channel_id,
+            "snapshot_policy": "latest",
+        })
+        self.assertEqual([item[1] for item in fake.edited], [701])
+        fake.edited.clear()
+
+        result = service.execute_job(batch["jobs"][0])
+        self.assertEqual(result["status"], "skipped")
+        self.assertEqual(result["reason"], "current_binding_changed")
+        self.assertEqual(fake.edited, [])
+
+    def test_atomic_alias_upsert_rolls_back_every_alias_on_failure(self):
+        channel_id = "-1001234567890"
+        for section_key in ("group-one", "group-two"):
+            self.repo.upsert_telegram_post({
+                "record_key": f"legacy:{section_key}:777",
+                "section_key": section_key,
+                "section_name": section_key,
+                "channel_id": channel_id,
+                "channel_username": "testchannel",
+                "message_id": 777,
+                "post_url": "https://t.me/testchannel/777",
+                "content_hash": "old-content",
+                "snapshot_id": "old-snapshot",
+                "sent_at": self.now.isoformat(),
+                "status": "published",
+                "is_current": True,
+            })
+        updates = []
+        for post in self.repo.list_telegram_posts(current_only=True):
+            updates.append({
+                **post,
+                "content_hash": "new-content",
+                "snapshot_id": "new-snapshot",
+            })
+
+        original = self.repo._upsert_post_tx
+        calls = 0
+
+        def fail_second(db, values):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("simulated second-alias failure")
+            return original(db, values)
+
+        self.repo._upsert_post_tx = fail_second
+        try:
+            with self.assertRaises(RuntimeError):
+                self.repo.upsert_telegram_posts_atomic(updates)
+        finally:
+            self.repo._upsert_post_tx = original
+
+        current = self.repo.list_telegram_posts(current_only=True)
+        self.assertEqual(len(current), 2)
+        self.assertEqual(
+            {post["content_hash"] for post in current},
+            {"old-content"},
+        )
+        self.assertEqual(
+            {post["snapshot_id"] for post in current},
+            {"old-snapshot"},
+        )
+
+    def test_edit_all_skips_multipart_and_quick_link_message_ids(self):
+        self.repo.ingest_snapshot(snapshot_with_sections(
+            self.now,
+            ["multi", "truncated", "collision"],
+        ))
+        channel_id = "-1001234567890"
+        for part_no, message_id in ((1, 701), (2, 702)):
+            self.repo.upsert_telegram_post({
+                "record_key": f"legacy:multi:{message_id}",
+                "section_key": "multi",
+                "section_name": "multi",
+                "channel_id": channel_id,
+                "channel_username": "testchannel",
+                "part_no": part_no,
+                "part_count": 2,
+                "message_id": message_id,
+                "post_url": f"https://t.me/testchannel/{message_id}",
+                "sent_at": self.now.isoformat(),
+                "status": "published",
+                "is_current": True,
+            })
+        self.repo.upsert_telegram_post({
+            "record_key": "legacy:truncated:703",
+            "section_key": "truncated",
+            "section_name": "truncated",
+            "channel_id": channel_id,
+            "channel_username": "testchannel",
+            "part_no": 1,
+            "part_count": 2,
+            "message_id": 703,
+            "post_url": "https://t.me/testchannel/703",
+            "sent_at": self.now.isoformat(),
+            "status": "published",
+            "is_current": True,
+        })
+        self.repo.upsert_telegram_post({
+            "record_key": "legacy:collision:900",
+            "section_key": "collision",
+            "section_name": "collision",
+            "channel_id": channel_id,
+            "channel_username": "testchannel",
+            "message_id": 900,
+            "post_url": "https://t.me/testchannel/900",
+            "sent_at": self.now.isoformat(),
+            "status": "published",
+            "is_current": True,
+        })
+        self.repo.ensure_quick_link_posts(
+            [quick_link_spec(["collision"], message_id=900)],
+            channel_id=channel_id,
+            channel_username="testchannel",
+        )
+
+        batch = self.repo.enqueue_current_post_edit_batch(
+            channel_id=channel_id,
+            channel_key="testchannel",
+            idempotency_key="12345678-1234-4123-8123-123456789abc",
+            now=self.now,
+        )
+        self.assertEqual(batch["job_count"], 0)
+        self.assertEqual(batch["section_count"], 0)
+        self.assertEqual(batch["skipped"], {
+            "invalid_binding": ["multi", "truncated"],
+            "quick_link_collision": ["collision"],
+        })
+
+    def test_edit_all_skips_every_alias_when_one_is_missing_from_snapshot(self):
+        self.repo.ingest_snapshot(
+            snapshot_with_sections(self.now, ["group-one"])
+        )
+        channel_id = "-1001234567890"
+        for section_key in ("group-one", "removed-section"):
+            self.repo.upsert_telegram_post({
+                "record_key": f"legacy:{section_key}:777",
+                "section_key": section_key,
+                "section_name": section_key,
+                "channel_id": channel_id,
+                "channel_username": "testchannel",
+                "message_id": 777,
+                "post_url": "https://t.me/testchannel/777",
+                "sent_at": self.now.isoformat(),
+                "status": "published",
+                "is_current": True,
+            })
+
+        batch = self.repo.enqueue_current_post_edit_batch(
+            channel_id=channel_id,
+            channel_key="testchannel",
+            idempotency_key="abcdefab-cdef-4abc-8def-abcdefabcdef",
+            now=self.now,
+        )
+        self.assertEqual(batch["job_count"], 0)
+        self.assertEqual(batch["skipped"], {
+            "invalid_binding": ["group-one", "removed-section"],
+        })
 
     def test_delayed_preview_window_cancel_button_and_post_index(self):
         self.repo.ingest_snapshot(snapshot(self.now))
@@ -1080,7 +1673,7 @@ class PriceRepositoryTests(unittest.TestCase):
             settings,
             self.repo,
             service,
-            clock=lambda: self.now,
+            clock=lambda: self.now + timedelta(seconds=1),
         )
         self.assertEqual(asyncio.run(scheduler.run_once()), 1)
         self.assertEqual(self.repo.get_job(job["job_id"])["status"], "done")
@@ -1655,6 +2248,135 @@ class PriceRepositoryTests(unittest.TestCase):
                 datetime(2026, 8, 29, 5, 59, tzinfo=timezone.utc)
             )
         )
+
+    def test_catalogue_date_updates_once_daily_after_0001(self):
+        _settings, repo, fake, service = self.rotation_fixture()
+        self.assertEqual(CATALOG_DATE_UPDATE_TIME, "00:01")
+        before = datetime(2026, 8, 28, 19, 0, 59, tzinfo=timezone.utc)
+        due = datetime(2026, 8, 28, 19, 1, 0, tzinfo=timezone.utc)
+
+        self.assertEqual(repo.ensure_quick_link_catalog_date(before), 0)
+        self.assertEqual(repo.ensure_quick_link_catalog_date(due), 1)
+        self.assertEqual(repo.ensure_quick_link_catalog_date(due), 0)
+        self.assertEqual(
+            repo.resolve_quick_link_post(CATALOG_QUICK_POST_KEY)["context"][
+                "catalog_date"
+            ],
+            "29.08.2026",
+        )
+        self.assertEqual(service.refresh_quick_link_posts(due), 1)
+        self.assertEqual(fake.edited[-1][1], 5050)
+        self.assertIn("Каталог товаров | 29.08.2026", fake.edited[-1][2])
+        self.assertEqual(service.refresh_quick_link_posts(due), 0)
+
+    def test_catalogue_date_catches_up_once_after_restart(self):
+        settings, repo, _fake, _service = self.rotation_fixture()
+        before = next(
+            item for item in repo.list_quick_link_updates()
+            if item["quick_post_key"] == CATALOG_QUICK_POST_KEY
+        )["desired_revision"]
+        reopened = PriceRepository(settings)
+        recovery = datetime(2026, 9, 2, 19, 1, tzinfo=timezone.utc)
+
+        self.assertEqual(reopened.ensure_quick_link_catalog_date(recovery), 1)
+        self.assertEqual(reopened.ensure_quick_link_catalog_date(recovery), 0)
+        self.assertEqual(
+            reopened.resolve_quick_link_post(CATALOG_QUICK_POST_KEY)["context"][
+                "catalog_date"
+            ],
+            "03.09.2026",
+        )
+        after = next(
+            item for item in reopened.list_quick_link_updates()
+            if item["quick_post_key"] == CATALOG_QUICK_POST_KEY
+        )["desired_revision"]
+        self.assertEqual(after, before + 1)
+
+    def test_failed_catalogue_date_edit_is_retried_after_one_hour(self):
+        settings, repo, fake, service = self.rotation_fixture()
+        due = datetime(2026, 8, 28, 19, 1, tzinfo=timezone.utc)
+        target = (settings.telegram_channel_id, 5050)
+        fake.edit_failures[target] = FakeTelegramDeleteError(
+            "temporary permissions failure"
+        )
+
+        self.assertEqual(repo.ensure_quick_link_catalog_date(due), 1)
+        self.assertEqual(service.refresh_quick_link_posts(due), 0)
+        failed = next(
+            item for item in repo.list_quick_link_updates()
+            if item["quick_post_key"] == CATALOG_QUICK_POST_KEY
+        )
+        self.assertEqual(failed["status"], "failed")
+        desired_revision = failed["desired_revision"]
+        self.assertEqual(
+            repo.ensure_quick_link_catalog_date(
+                due + timedelta(minutes=59)
+            ),
+            0,
+        )
+
+        del fake.edit_failures[target]
+        retry_at = due + timedelta(hours=1)
+        self.assertEqual(repo.ensure_quick_link_catalog_date(retry_at), 1)
+        pending = next(
+            item for item in repo.list_quick_link_updates()
+            if item["quick_post_key"] == CATALOG_QUICK_POST_KEY
+        )
+        self.assertEqual(pending["status"], "pending")
+        self.assertEqual(pending["desired_revision"], desired_revision)
+        self.assertEqual(service.refresh_quick_link_posts(retry_at), 1)
+        self.assertIn("Каталог товаров | 29.08.2026", fake.edited[-1][2])
+
+    def test_scheduler_edits_catalogue_date_at_0001_on_non_rotation_day(self):
+        settings, repo, fake, service = self.rotation_fixture()
+        clock = [
+            datetime(2026, 8, 30, 19, 0, 59, tzinfo=timezone.utc)
+        ]
+        service.sync_sheets_outbox = lambda **_kwargs: 0
+        scheduler = PriceScheduler(
+            settings,
+            repo,
+            service,
+            clock=lambda: clock[0],
+        )
+
+        asyncio.run(scheduler.run_once())
+        self.assertEqual(fake.edited, [])
+        clock[0] = datetime(2026, 8, 30, 19, 1, tzinfo=timezone.utc)
+        asyncio.run(scheduler.run_once())
+        self.assertEqual(len(fake.edited), 1)
+        self.assertEqual(fake.edited[0][1], 5050)
+        self.assertIn("Каталог товаров | 31.08.2026", fake.edited[0][2])
+
+    def test_delayed_rotation_does_not_regress_newer_catalogue_date(self):
+        _settings, repo, fake, service = self.rotation_fixture()
+        friday = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+        delayed = datetime(2026, 8, 29, 19, 5, tzinfo=timezone.utc)
+        repo.materialize_due_quick_link_rotations(friday, horizon_days=2)
+
+        self.assertEqual(
+            repo.ensure_quick_link_catalog_date(
+                datetime(2026, 8, 29, 19, 1, tzinfo=timezone.utc)
+            ),
+            1,
+        )
+        self.assertEqual(service.refresh_quick_link_posts(delayed), 1)
+        self.assertIn("Каталог товаров | 30.08.2026", fake.edited[-1][2])
+        fake.edited.clear()
+
+        self.assertEqual(service.process_quick_link_rotations(delayed), 1)
+        self.assertIn("Каталог товаров | 30.08.2026", fake.sent[-1][1])
+        self.assertNotIn("Каталог товаров | 29.08.2026", fake.sent[-1][1])
+        self.assertEqual(
+            repo.resolve_quick_link_post(CATALOG_QUICK_POST_KEY)["context"][
+                "catalog_date"
+            ],
+            "30.08.2026",
+        )
+        self.assertEqual(service.refresh_quick_link_posts(delayed), 0)
+        new_main = repo.get_quick_link_post(CATALOG_QUICK_POST_KEY)
+        self.assertEqual(fake.edited[-1][1], new_main["message_id"])
+        self.assertIn("Каталог товаров | 30.08.2026", fake.edited[-1][2])
 
     def test_same_day_calendar_jobs_materialize_after_0930_restart(self):
         _settings, repo, _fake, _service = self.rotation_fixture()
@@ -2456,7 +3178,7 @@ class PriceRepositoryTests(unittest.TestCase):
         )
         self.assertEqual(asyncio.run(scheduler.run_once()), 2)
         self.assertEqual(len(fake.sent), 2)
-        self.assertIn("apple-computers-all", fake.sent[0][1])
+        self.assertIn("APPLE-COMPUTERS-ALL", fake.sent[0][1])
         self.assertIn("Каталог товаров | 29.08.2026", fake.sent[1][1])
 
     def test_rotation_waits_while_same_day_calendar_post_is_retrying(self):
@@ -2552,6 +3274,253 @@ class PricePageAuthTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 200)
                 self.assertIn(b"/price/assets/admin.js", response.body)
                 self.assertEqual(response.headers["x-robots-tag"], "noindex, nofollow, noarchive")
+            finally:
+                (
+                    module.settings,
+                    module._repository,
+                    module._service,
+                    module._startup_error,
+                ) = old
+
+    def test_update_all_endpoint_requires_auth_csrf_and_is_idempotent(self):
+        module = importlib.import_module("price_server.router")
+        with tempfile.TemporaryDirectory() as folder:
+            configured = PriceSettings(
+                enabled=True,
+                db_path=Path(folder) / "price.db",
+                legacy_html_path=Path(folder) / "index.html",
+                admin_username="admin",
+                admin_password="secret",
+                sync_api_key="sync",
+                telegram_bot_token="fake-token",
+                telegram_channel_id="-1001234567890",
+                telegram_channel_username="testchannel",
+                product_sort_sheet_id="sheet",
+                posts_sheet_name="Telegram Posts",
+                timezone="Asia/Tashkent",
+                scheduler_poll_seconds=1,
+                sync_max_bytes=2_000_000,
+            )
+            repo = PriceRepository(configured)
+            now = datetime.now(timezone.utc).replace(microsecond=0)
+            repo.ingest_snapshot(snapshot_with_sections(now, ["group-one"]))
+            repo.upsert_telegram_post({
+                "record_key": "legacy:group-one:701",
+                "section_key": "group-one",
+                "section_name": "group-one",
+                "channel_id": configured.telegram_channel_id,
+                "channel_username": configured.telegram_channel_username,
+                "message_id": 701,
+                "post_url": "https://t.me/testchannel/701",
+                "sent_at": now.isoformat(),
+                "status": "published",
+                "is_current": True,
+            })
+            old = (
+                module.settings,
+                module._repository,
+                module._service,
+                module._startup_error,
+            )
+            module.settings = configured
+            module._repository = repo
+            module._service = object()
+            module._startup_error = ""
+            token = base64.b64encode(b"admin:secret").decode()
+            body = json.dumps({
+                "confirm": True,
+                "channel_id": "-1000000000000",
+                "section_keys": ["attacker-selected"],
+                "action": "send",
+            }).encode()
+            body_reads = 0
+
+            async def receive():
+                nonlocal body_reads
+                body_reads += 1
+                return {
+                    "type": "http.request",
+                    "body": body,
+                    "more_body": False,
+                }
+
+            def request(headers):
+                return Request(
+                    {
+                        "type": "http",
+                        "method": "POST",
+                        "path": "/price/api/v1/posts/update-all",
+                        "headers": headers,
+                    },
+                    receive,
+                )
+
+            try:
+                with self.assertRaises(HTTPException) as anonymous:
+                    asyncio.run(module.update_all_current_posts(request([])))
+                self.assertEqual(anonymous.exception.status_code, 401)
+                self.assertEqual(body_reads, 0)
+
+                auth = (b"authorization", f"Basic {token}".encode())
+                with self.assertRaises(HTTPException) as no_csrf:
+                    asyncio.run(module.update_all_current_posts(request([auth])))
+                self.assertEqual(no_csrf.exception.status_code, 403)
+                self.assertEqual(body_reads, 0)
+
+                batch_id = "01234567-89ab-4cde-8fab-0123456789ab"
+                headers = [
+                    auth,
+                    (b"x-requested-with", b"TexnikachPriceAdmin"),
+                    (b"idempotency-key", batch_id.encode()),
+                    (b"content-type", b"application/json"),
+                ]
+                first = asyncio.run(
+                    module.update_all_current_posts(request(headers))
+                )
+                second = asyncio.run(
+                    module.update_all_current_posts(request(headers))
+                )
+                self.assertEqual(first["job_count"], 1)
+                self.assertEqual(first["section_count"], 1)
+                self.assertFalse(first["duplicate"])
+                self.assertTrue(second["duplicate"])
+                self.assertEqual(second["job_ids"], first["job_ids"])
+                job = repo.get_job(first["job_ids"][0])
+                self.assertEqual(job["action"], "edit")
+                self.assertEqual(job["channel_id"], configured.telegram_channel_id)
+                self.assertEqual(job["payload"]["section_keys"], ["group-one"])
+                self.assertNotIn("lease_token", first)
+                history = asyncio.run(module.price_jobs(Request({
+                    "type": "http",
+                    "method": "GET",
+                    "path": "/price/api/v1/jobs",
+                    "headers": [auth],
+                })))
+                self.assertEqual(
+                    history["edit_batches"][0]["batch_id"],
+                    first["batch_id"],
+                )
+
+                module.settings = PriceSettings(**{
+                    **configured.__dict__,
+                    "telegram_channel_id": "-1009999999999",
+                })
+                with self.assertRaises(HTTPException) as conflict:
+                    asyncio.run(
+                        module.update_all_current_posts(request(headers))
+                    )
+                self.assertEqual(conflict.exception.status_code, 409)
+                self.assertEqual(
+                    conflict.exception.detail,
+                    "idempotency_key_conflict",
+                )
+                self.assertEqual(len(repo.list_jobs()), 1)
+            finally:
+                (
+                    module.settings,
+                    module._repository,
+                    module._service,
+                    module._startup_error,
+                ) = old
+
+    def test_update_all_endpoint_validates_confirmation_and_snapshot(self):
+        module = importlib.import_module("price_server.router")
+        with tempfile.TemporaryDirectory() as folder:
+            configured = PriceSettings(
+                enabled=True,
+                db_path=Path(folder) / "price.db",
+                legacy_html_path=Path(folder) / "index.html",
+                admin_username="admin",
+                admin_password="secret",
+                sync_api_key="sync",
+                telegram_bot_token="fake-token",
+                telegram_channel_id="-1001234567890",
+                telegram_channel_username="testchannel",
+                product_sort_sheet_id="sheet",
+                posts_sheet_name="Telegram Posts",
+                timezone="Asia/Tashkent",
+                scheduler_poll_seconds=1,
+                sync_max_bytes=2_000_000,
+            )
+            old = (
+                module.settings,
+                module._repository,
+                module._service,
+                module._startup_error,
+            )
+            module.settings = configured
+            module._repository = PriceRepository(configured)
+            module._service = object()
+            module._startup_error = ""
+            token = base64.b64encode(b"admin:secret").decode()
+            base_headers = [
+                (b"authorization", f"Basic {token}".encode()),
+                (b"x-requested-with", b"TexnikachPriceAdmin"),
+                (b"content-type", b"application/json"),
+            ]
+
+            def request(raw_body: bytes, idempotency_key: str):
+                delivered = False
+
+                async def receive():
+                    nonlocal delivered
+                    if delivered:
+                        return {
+                            "type": "http.request",
+                            "body": b"",
+                            "more_body": False,
+                        }
+                    delivered = True
+                    return {
+                        "type": "http.request",
+                        "body": raw_body,
+                        "more_body": False,
+                    }
+
+                return Request(
+                    {
+                        "type": "http",
+                        "method": "POST",
+                        "path": "/price/api/v1/posts/update-all",
+                        "headers": [
+                            *base_headers,
+                            (b"idempotency-key", idempotency_key.encode()),
+                        ],
+                    },
+                    receive,
+                )
+
+            try:
+                with self.assertRaises(HTTPException) as confirm:
+                    asyncio.run(module.update_all_current_posts(
+                        request(b'{"confirm": false}', "not-a-uuid")
+                    ))
+                self.assertEqual(confirm.exception.status_code, 422)
+                self.assertEqual(
+                    confirm.exception.detail,
+                    "explicit_confirmation_required",
+                )
+
+                with self.assertRaises(HTTPException) as key_error:
+                    asyncio.run(module.update_all_current_posts(
+                        request(b'{"confirm": true}', "not-a-uuid")
+                    ))
+                self.assertEqual(key_error.exception.status_code, 422)
+                self.assertEqual(
+                    key_error.exception.detail,
+                    "valid_idempotency_key_required",
+                )
+
+                with self.assertRaises(HTTPException) as missing:
+                    asyncio.run(module.update_all_current_posts(request(
+                        b'{"confirm": true}',
+                        "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                    )))
+                self.assertEqual(missing.exception.status_code, 409)
+                self.assertEqual(
+                    missing.exception.detail,
+                    "current_snapshot_not_available",
+                )
             finally:
                 (
                     module.settings,

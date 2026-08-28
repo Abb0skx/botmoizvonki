@@ -15,6 +15,7 @@ from .quick_links import (
     CATALOG_QUICK_POST_KEY,
     QUICK_LINK_POST_SPECS,
 )
+from .post_formatting import format_price_sections
 from .sheets_registry import (
     ProductSortCalendarRegistry,
     ProductSortPostIndex,
@@ -25,7 +26,6 @@ from .sheets_registry import (
 from .telegram_api import (
     TelegramClient,
     TelegramMessage,
-    split_telegram_blocks,
 )
 
 
@@ -97,8 +97,10 @@ class PricePublicationService:
         self._last_quick_link_rotation_hash = ""
         self._quick_links_ready = False
 
-    def _section_for_job(self, job: Any):
-        section_key = str(_value(job, "section_key", "")).strip()
+    def _section_for_job(self, job: Any, section_key: str | None = None):
+        section_key = str(
+            section_key or _value(job, "section_key", "")
+        ).strip()
         snapshot_policy = str(
             _value(job, "snapshot_policy", "latest")
         ).strip()
@@ -118,7 +120,7 @@ class PricePublicationService:
         return section
 
     @staticmethod
-    def _section_blocks(section: Any) -> list[str]:
+    def _raw_section_blocks(section: Any) -> list[str]:
         raw = _value(section, "telegram_blocks")
         if raw is None:
             raw = _value(section, "telegram_blocks_json")
@@ -126,7 +128,15 @@ class PricePublicationService:
             payload = _value(section, "payload", {})
             if isinstance(payload, Mapping):
                 raw = payload.get("telegram_blocks")
-        return split_telegram_blocks(_json_list(raw))
+        return _json_list(raw)
+
+    @classmethod
+    def _section_blocks(cls, section: Any) -> list[str]:
+        section_key = str(_value(section, "section_key", "")).strip()
+        title = str(_value(section, "title", section_key)).strip()
+        return format_price_sections([
+            (section_key, title, cls._raw_section_blocks(section))
+        ])
 
     def _current_posts(self, section_key: str, channel_id: str) -> list[Any]:
         posts = self.repository.list_telegram_posts(
@@ -139,6 +149,175 @@ class PricePublicationService:
             posts,
             key=lambda item: int(_value(item, "part_no", 0)),
         )
+
+    @staticmethod
+    def _bulk_section_keys(job: Any) -> list[str]:
+        payload = _value(job, "payload", {})
+        if not isinstance(payload, Mapping):
+            return []
+        raw = payload.get("section_keys")
+        if not isinstance(raw, Sequence) or isinstance(
+            raw, (str, bytes, bytearray)
+        ):
+            return []
+        result = list(dict.fromkeys(
+            str(item).strip() for item in raw if str(item).strip()
+        ))
+        return result[:100]
+
+    def _edit_current_bulk(
+        self,
+        job: Any,
+        channel_id: str,
+    ) -> dict[str, Any]:
+        payload = _value(job, "payload", {})
+        if not isinstance(payload, Mapping):
+            raise PublicationError("Bulk edit payload is invalid")
+        section_keys = self._bulk_section_keys(job)
+        if not section_keys:
+            raise PublicationError("Bulk edit has no price sections")
+        raw_expected = payload.get("expected_message_ids")
+        if not isinstance(raw_expected, Sequence) or isinstance(
+            raw_expected, (str, bytes, bytearray)
+        ):
+            raise PublicationError("Bulk edit has no expected message IDs")
+        try:
+            expected_ids = [int(item) for item in raw_expected]
+        except (TypeError, ValueError) as exc:
+            raise PublicationError("Bulk edit message IDs are invalid") from exc
+        if (
+            not expected_ids
+            or any(item <= 0 for item in expected_ids)
+            or len(set(expected_ids)) != len(expected_ids)
+        ):
+            raise PublicationError("Bulk edit message IDs are invalid")
+        if len(expected_ids) != 1:
+            return {
+                "status": "skipped",
+                "reason": "multi_part_binding_not_supported",
+                "section_keys": section_keys,
+                "message_ids": expected_ids,
+            }
+
+        sections = [
+            self._section_for_job(job, section_key)
+            for section_key in section_keys
+        ]
+        current_by_section = {
+            section_key: self._current_posts(section_key, channel_id)
+            for section_key in section_keys
+        }
+        raw_binding_fences = payload.get("expected_bindings")
+        if not isinstance(raw_binding_fences, Mapping):
+            return {
+                "status": "skipped",
+                "reason": "binding_fence_missing",
+                "section_keys": section_keys,
+                "message_ids": expected_ids,
+            }
+
+        fence_fields = (
+            "record_key",
+            "message_id",
+            "part_no",
+            "publication_id",
+            "content_hash",
+            "snapshot_id",
+            "updated_at",
+        )
+
+        def binding_fence(item: Any) -> tuple[str, ...]:
+            return tuple(str(_value(item, field, "")) for field in fence_fields)
+
+        for section_key, current_posts in current_by_section.items():
+            expected_posts = raw_binding_fences.get(section_key)
+            if not isinstance(expected_posts, Sequence) or isinstance(
+                expected_posts,
+                (str, bytes, bytearray),
+            ):
+                return {
+                    "status": "skipped",
+                    "reason": "binding_fence_missing",
+                    "section_keys": section_keys,
+                    "message_ids": expected_ids,
+                }
+            if (
+                [binding_fence(post) for post in current_posts]
+                != [binding_fence(post) for post in expected_posts]
+            ):
+                return {
+                    "status": "skipped",
+                    "reason": "current_binding_changed",
+                    "section_keys": section_keys,
+                    "message_ids": expected_ids,
+                }
+        expected_tuple = tuple(expected_ids)
+        if any(
+            tuple(int(_value(post, "message_id")) for post in posts)
+            != expected_tuple
+            for posts in current_by_section.values()
+        ):
+            return {
+                "status": "skipped",
+                "reason": "current_binding_changed",
+                "section_keys": section_keys,
+                "message_ids": expected_ids,
+            }
+
+        chunks = format_price_sections([
+            (
+                str(_value(section, "section_key", "")),
+                str(_value(section, "title", "")),
+                self._raw_section_blocks(section),
+            )
+            for section in sections
+        ])
+        if len(chunks) != len(expected_ids):
+            return {
+                "status": "skipped",
+                "reason": "message_shape_changed",
+                "section_keys": section_keys,
+                "message_ids": expected_ids,
+                "expected_parts": len(expected_ids),
+                "rendered_parts": len(chunks),
+            }
+
+        messages = [
+            self.telegram.edit_message(channel_id, message_id, chunk)
+            for message_id, chunk in zip(expected_ids, chunks, strict=True)
+        ]
+        registry_payloads: list[dict[str, Any]] = []
+        for section in sections:
+            section_key = str(_value(section, "section_key"))
+            posts = current_by_section[section_key]
+            for index, (post, message) in enumerate(
+                zip(posts, messages, strict=True),
+                start=1,
+            ):
+                registry_payloads.append(self._post_payload(
+                    section=section,
+                    message=message,
+                    part_no=index,
+                    part_count=len(messages),
+                    publication_mode="edit",
+                    is_current=True,
+                    status="published",
+                    sent_at=str(
+                        _value(post, "sent_at", "")
+                        or datetime.now(timezone.utc).isoformat()
+                    ),
+                    publication_id=str(
+                        _value(post, "publication_id", "")
+                        or uuid.uuid4().hex
+                    ),
+                    record_key=str(_value(post, "record_key", "")),
+                ))
+        self.repository.upsert_telegram_posts_atomic(registry_payloads)
+        return {
+            "status": "updated",
+            "section_keys": section_keys,
+            "message_ids": expected_ids,
+        }
 
     def _post_payload(
         self,
@@ -615,9 +794,14 @@ class PricePublicationService:
             raise PublicationError("Quick-link template has unresolved targets")
         return rendered, resolved
 
-    def refresh_quick_link_posts(self, *, limit: int = 20) -> int:
+    def refresh_quick_link_posts(
+        self,
+        now_utc: datetime | str | None = None,
+        *,
+        limit: int = 20,
+    ) -> int:
         """Edit quick-link indexes independently from price publication jobs."""
-        now = datetime.now(timezone.utc)
+        now = now_utc if now_utc is not None else datetime.now(timezone.utc)
         claimed = self.repository.claim_quick_link_updates(
             now,
             limit=limit,
@@ -642,7 +826,7 @@ class PricePublicationService:
                 if self.repository.complete_quick_link_update(
                     key,
                     token,
-                    datetime.now(timezone.utc),
+                    now,
                     rendered_html=rendered,
                     render_hash=render_hash,
                     resolved_targets=resolved,
@@ -652,7 +836,7 @@ class PricePublicationService:
                 self.repository.retry_quick_link_update(
                     key,
                     token,
-                    datetime.now(timezone.utc),
+                    now,
                     exc,
                     retry_after_seconds=getattr(exc, "retry_after", None),
                     permanent=not bool(getattr(exc, "retryable", True)),
@@ -675,8 +859,22 @@ class PricePublicationService:
         secondary = self.repository.resolve_quick_link_post(secondary_key)
         previous_main_id = int(main["message_id"])
         previous_secondary_id = int(secondary["message_id"])
-        display_date = date.fromisoformat(
-            str(rotation["local_date"])
+        rotation_date = date.fromisoformat(str(rotation["local_date"]))
+        context = main.get("context")
+        try:
+            context_date = datetime.strptime(
+                str(
+                    context.get("catalog_date")
+                    if isinstance(context, Mapping)
+                    else ""
+                ),
+                "%d.%m.%Y",
+            ).date()
+        except ValueError:
+            context_date = None
+        display_date = max(
+            rotation_date,
+            context_date or rotation_date,
         ).strftime("%d.%m.%Y")
         send_main_html, _send_main_targets = self._render_quick_link(
             main,
@@ -1225,7 +1423,6 @@ class PricePublicationService:
         return processed
 
     def execute_job(self, job: Any) -> dict[str, Any]:
-        section = self._section_for_job(job)
         channel_id = str(
             _value(job, "channel_id", "")
             or self.settings.telegram_channel_id
@@ -1233,6 +1430,14 @@ class PricePublicationService:
         if not channel_id:
             raise PublicationError("Telegram channel is not configured")
         action = str(_value(job, "action", "")).strip().casefold()
+        payload = _value(job, "payload", {})
+        if (
+            action in {"edit", "edit_current"}
+            and isinstance(payload, Mapping)
+            and payload.get("source") == "price_admin_edit_all"
+        ):
+            return self._edit_current_bulk(job, channel_id)
+        section = self._section_for_job(job)
         if action in {"send", "publish_new"}:
             return self._send_new(section, channel_id)
         if action in {"edit", "edit_current"}:

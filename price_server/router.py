@@ -15,7 +15,13 @@ from fastapi.responses import HTMLResponse, Response
 from .auth import require_admin, require_admin_action, require_sync_key
 from .config import PriceSettings
 from .contracts import ContractError, SECTION_KEY_RE, validate_sync_payload
-from .repository import PriceRepository, SnapshotValidationError, StaleSnapshotError
+from .repository import (
+    CurrentSnapshotUnavailableError,
+    IdempotencyConflictError,
+    PriceRepository,
+    SnapshotValidationError,
+    StaleSnapshotError,
+)
 from .scheduler import PriceScheduler
 from .service import PricePublicationService
 
@@ -318,6 +324,9 @@ async def price_jobs(request: Request) -> dict[str, Any]:
     _admin(request)
     return {
         "jobs": get_repository().list_jobs(limit=500),
+        "edit_batches": (
+            get_repository().list_publication_edit_batches(limit=100)
+        ),
         "quick_link_rotations": (
             get_repository().list_quick_link_rotations(limit=100)
         ),
@@ -465,6 +474,58 @@ async def send_section_now(section_key: str, request: Request) -> dict[str, Any]
 async def edit_section_current(section_key: str, request: Request) -> dict[str, Any]:
     _admin(request, action=True)
     return _enqueue(section_key, "edit", datetime.now(timezone.utc))
+
+
+@router.post("/price/api/v1/posts/update-all", status_code=202)
+async def update_all_current_posts(request: Request) -> dict[str, Any]:
+    """Queue fenced edits for every physical current price post."""
+
+    _admin(request, action=True)
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="invalid_json")
+    if not isinstance(body, dict) or body.get("confirm") is not True:
+        raise HTTPException(
+            status_code=422,
+            detail="explicit_confirmation_required",
+        )
+    raw_key = str(request.headers.get("Idempotency-Key") or "").strip()
+    try:
+        batch_id = str(uuid.UUID(raw_key))
+    except (ValueError, AttributeError):
+        raise HTTPException(
+            status_code=422,
+            detail="valid_idempotency_key_required",
+        )
+    get_service()
+    try:
+        batch = get_repository().enqueue_current_post_edit_batch(
+            channel_id=settings.telegram_channel_id,
+            channel_key=settings.telegram_channel_username,
+            idempotency_key=batch_id,
+            now=datetime.now(timezone.utc),
+        )
+    except CurrentSnapshotUnavailableError:
+        raise HTTPException(
+            status_code=409,
+            detail="current_snapshot_not_available",
+        )
+    except IdempotencyConflictError:
+        raise HTTPException(
+            status_code=409,
+            detail="idempotency_key_conflict",
+        )
+    return {
+        "status": "queued",
+        "batch_id": batch["batch_id"],
+        "snapshot_id": batch["snapshot_id"],
+        "job_count": batch["job_count"],
+        "section_count": batch["section_count"],
+        "job_ids": [job["job_id"] for job in batch["jobs"]],
+        "duplicate": bool(batch["duplicate"]),
+        "skipped": batch["skipped"],
+    }
 
 
 def _parse_schedule(value: Any) -> datetime:

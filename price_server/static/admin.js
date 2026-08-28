@@ -84,12 +84,13 @@
         window.setTimeout(() => element.remove(), error ? 9000 : 5000);
     };
 
-    const request = async (path, payload = {}) => {
+    const request = async (path, payload = {}, extraHeaders = {}) => {
         const response = await fetch(path, {
             method: "POST",
             credentials: "same-origin",
             headers: {
                 ...actionHeader,
+                ...extraHeaders,
                 "Content-Type": "application/json",
             },
             body: JSON.stringify(payload),
@@ -97,7 +98,10 @@
         let body = {};
         try { body = await response.json(); } catch (_) { /* no-op */ }
         if (!response.ok) {
-            throw new Error(body.detail || `Ошибка сервера: ${response.status}`);
+            const error = new Error(body.detail || `Ошибка сервера: ${response.status}`);
+            error.status = response.status;
+            error.detail = body.detail || "";
+            throw error;
         }
         return body;
     };
@@ -137,10 +141,18 @@
     jobHeading.className = "price-server-job-heading";
     const jobTitle = document.createElement("h2");
     jobTitle.textContent = "Расписание Telegram";
-    const refresh = makeButton("Обновить", "Обновить список заданий");
+    const refreshAll = makeButton(
+        "Обновить все посты",
+        "Поставить в очередь обновление всех текущих прайс-постов",
+        "primary"
+    );
+    const refresh = makeButton("Обновить список", "Обновить список заданий");
+    const headingActions = document.createElement("div");
+    headingActions.className = "price-server-actions";
+    headingActions.append(refreshAll, refresh);
     const jobList = document.createElement("div");
     jobList.className = "price-server-job-list";
-    jobHeading.append(jobTitle, refresh);
+    jobHeading.append(jobTitle, headingActions);
     jobPanel.append(jobHeading, jobList);
 
     const pageMain = document.querySelector("main") || document.body;
@@ -175,6 +187,9 @@
             if (!response.ok) throw new Error(`Ошибка расписания: ${response.status}`);
             const body = await response.json();
             const jobs = Array.isArray(body.jobs) ? body.jobs : [];
+            const editBatches = Array.isArray(body.edit_batches)
+                ? body.edit_batches
+                : [];
             const rotations = Array.isArray(body.quick_link_rotations)
                 ? body.quick_link_rotations
                 : [];
@@ -186,9 +201,36 @@
                 const comparison = String(left.execute_at).localeCompare(String(right.execute_at));
                 return leftActive ? comparison : -comparison;
             });
+            const bulkJobsByBatch = new Map();
+            const regularJobs = [];
+            jobs.forEach((job) => {
+                const payload = job && typeof job.payload === "object"
+                    ? job.payload
+                    : {};
+                if (payload.source !== "price_admin_edit_all" || !payload.batch_id) {
+                    regularJobs.push(job);
+                    return;
+                }
+                const key = String(payload.batch_id);
+                if (!bulkJobsByBatch.has(key)) bulkJobsByBatch.set(key, []);
+                bulkJobsByBatch.get(key).push(job);
+            });
+            const batchRows = editBatches.length
+                ? editBatches
+                : [...bulkJobsByBatch.entries()].map(([batchId, batchJobs]) => ({
+                    batch_id: batchId,
+                    created_at: batchJobs[0] ? batchJobs[0].execute_at : "",
+                    job_count: batchJobs.length,
+                    section_count: batchJobs.reduce((total, job) => {
+                        const keys = job.payload && Array.isArray(job.payload.section_keys)
+                            ? job.payload.section_keys : [];
+                        return total + keys.length;
+                    }, 0),
+                    skipped: {},
+                }));
             jobList.replaceChildren();
 
-            if (!jobs.length && !rotations.length) {
+            if (!regularJobs.length && !batchRows.length && !rotations.length) {
                 const empty = document.createElement("p");
                 empty.className = "price-server-empty";
                 empty.textContent = "Запланированных и выполненных заданий пока нет.";
@@ -196,7 +238,58 @@
                 return;
             }
 
-            jobs.slice(0, 100).forEach((job) => {
+            batchRows.slice(0, 20).forEach((batch) => {
+                const batchId = String(batch.batch_id || "");
+                const batchJobs = bulkJobsByBatch.get(batchId) || [];
+                const row = document.createElement("div");
+                row.className = "price-server-job-row";
+                const date = document.createElement("time");
+                const timestamp = String(
+                    batch.created_at
+                    || (batchJobs[0] ? batchJobs[0].execute_at : "")
+                    || ""
+                );
+                date.dateTime = timestamp;
+                const parsed = new Date(timestamp);
+                date.textContent = Number.isNaN(parsed.getTime())
+                    ? (timestamp || "—")
+                    : tashkentDate.format(parsed);
+                const sectionCount = Number(batch.section_count || 0);
+                const jobCount = Number(batch.job_count || batchJobs.length || 0);
+                const name = document.createElement("span");
+                name.textContent = `Все посты · ${jobCount} сообщений / ${sectionCount} разделов`;
+                const statusCounts = batch && typeof batch.job_status_counts === "object"
+                    ? batch.job_status_counts : {};
+                const done = Number(
+                    statusCounts.done
+                    ?? batchJobs.filter((job) => job.status === "done").length
+                );
+                const skippedJobs = Number(
+                    batch.skipped_job_count
+                    ?? batchJobs.filter(
+                        (job) => job.result && job.result.status === "skipped"
+                    ).length
+                );
+                const preflightSkipped = Object.values(batch.skipped || {}).reduce(
+                    (total, items) => total + (Array.isArray(items) ? items.length : 0),
+                    0
+                );
+                const errors = Number(statusCounts.failed || 0)
+                    + Number(statusCounts.needs_review || 0)
+                    || batchJobs.filter(
+                        (job) => ["failed", "needs_review"].includes(job.status)
+                    ).length;
+                const state = document.createElement("span");
+                state.className = "price-server-job-status";
+                state.textContent = `Пакет ${batchId.slice(0, 8)}: готово ${done}/${jobCount}`
+                    + (skippedJobs ? ` · пропущено заданий ${skippedJobs}` : "")
+                    + (preflightSkipped ? ` · пропущено разделов ${preflightSkipped}` : "")
+                    + (errors ? ` · ошибок ${errors}` : "");
+                row.append(date, name, state);
+                jobList.appendChild(row);
+            });
+
+            regularJobs.slice(0, 100).forEach((job) => {
                 const row = document.createElement("div");
                 row.className = "price-server-job-row";
                 const date = document.createElement("time");
@@ -327,6 +420,75 @@
             refresh.disabled = false;
         }
     }
+
+    const bulkStorageKey = "price-server-update-all-idempotency";
+    const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    const createIdempotencyKey = () => {
+        if (window.crypto && typeof window.crypto.randomUUID === "function") {
+            return window.crypto.randomUUID();
+        }
+        return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (char) => {
+            const value = Math.floor(Math.random() * 16);
+            const normalized = char === "x" ? value : ((value & 0x3) | 0x8);
+            return normalized.toString(16);
+        });
+    };
+
+    refreshAll.addEventListener("click", async () => {
+        if (!window.confirm(
+            "Обновить все текущие прайс-посты из последнего snapshot? Новые сообщения создаваться не будут."
+        )) return;
+        let idempotencyKey = window.sessionStorage.getItem(bulkStorageKey);
+        if (idempotencyKey && !uuidPattern.test(idempotencyKey)) {
+            window.sessionStorage.removeItem(bulkStorageKey);
+            idempotencyKey = null;
+        }
+        if (!idempotencyKey) {
+            idempotencyKey = createIdempotencyKey();
+            window.sessionStorage.setItem(bulkStorageKey, idempotencyKey);
+        }
+        refreshAll.disabled = true;
+        try {
+            const result = await request(
+                "/price/api/v1/posts/update-all",
+                {confirm: true},
+                {"Idempotency-Key": idempotencyKey}
+            );
+            window.sessionStorage.removeItem(bulkStorageKey);
+            const skipped = Object.values(result.skipped || {}).reduce(
+                (total, items) => total + (Array.isArray(items) ? items.length : 0),
+                0
+            );
+            toast(
+                `В очередь поставлено ${result.job_count} постов`
+                + ` (${result.section_count} разделов)`
+                + (skipped ? `; пропущено разделов: ${skipped}.` : ".")
+            );
+            await refreshJobs();
+        } catch (error) {
+            if (
+                error instanceof Error
+                && (
+                    (
+                        error.status === 422
+                        && error.detail === "valid_idempotency_key_required"
+                    )
+                    || (
+                        error.status === 409
+                        && error.detail === "idempotency_key_conflict"
+                    )
+                )
+            ) {
+                window.sessionStorage.removeItem(bulkStorageKey);
+            }
+            toast(
+                error instanceof Error ? error.message : "Ошибка массового обновления",
+                true
+            );
+        } finally {
+            refreshAll.disabled = false;
+        }
+    });
 
     refresh.addEventListener("click", refreshJobs);
 

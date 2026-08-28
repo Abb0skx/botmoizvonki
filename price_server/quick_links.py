@@ -13,6 +13,7 @@ from typing import Any, Sequence
 CATALOG_QUICK_POST_KEY = "quick-index-catalog"
 QUICK_LINK_ROTATION_WEEKDAYS = (2, 4, 6)  # ISO: Tue, Thu, Sat.
 QUICK_LINK_ROTATION_TIME = "11:00"
+CATALOG_DATE_UPDATE_TIME = "00:01"
 QUICK_LINK_ROTATION_ORDER = (
     "quick-index-smartphones",
     "quick-index-tablets",

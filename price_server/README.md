@@ -9,6 +9,7 @@ with the `botmoizvonki` FastAPI application and owns:
 - a 24-hour delayed-post preview channel with administrator-only cancellation;
 - an authoritative day-of-month publication plan at 09:30 Asia/Tashkent;
 - automatic updates of links inside the existing Telegram catalogue posts;
+- a fenced, durable admin action for updating every current price post;
 - a durable Tue/Thu/Sat 11:00 rotation of the pinned catalogue post;
 - `chat_id` / `message_id` registry and its `Product Sort` mirror.
 
@@ -43,6 +44,22 @@ Templates use minimalist Unicode markers (`▸` for a second level and `•` for
 direct link) because Telegram restricts custom-emoji entities for ordinary bots
 editing channel posts.
 
+Immediately before a price post is sent or edited, the server applies the
+canonical Telegram presentation: both information links point to
+`https://texnikach.uz/go`, the section title is visually separated, memory and
+price rows use consistent spacing, and the old triangle markers become `↑` and
+`↓`. This affects Telegram HTML only; the source snapshot and `/price` page are
+not rewritten.
+
+The admin action `Обновить все посты` pins the current snapshot and queues one
+sequential edit for each eligible physical Telegram message. Sections that
+share one legacy message ID are rendered and persisted together. Every job is
+fenced by the exact SQLite binding captured at enqueue time, so it cannot
+overwrite a post updated in the meantime. The action never sends or deletes
+messages; changed, multipart, or quick-link bindings are skipped and reported.
+A durable batch envelope makes the UUID idempotency key effective even when a
+request creates zero jobs.
+
 The main catalogue is published every Tuesday, Thursday and Saturday at 11:00
 Asia/Tashkent, after the 09:30 price publications. The new catalogue is pinned
 and the previous catalogue is recycled into one of eight second-level posts in
@@ -64,7 +81,10 @@ either the verified new message ID or an explicit confirmation that no post was
 created. Failed idempotent phases can be retried from the same point. Missed,
 never-started dates are marked `skipped` instead of being posted in a burst
 after downtime. The main post date is stored as publication context, so later
-price-link edits do not change it.
+price-link edits do not change it. At 00:01 Asia/Tashkent the scheduler advances
+that context to the current local date and queues an idempotent edit of the
+active main catalogue. After downtime it catches up once to today's date; a
+delayed rotation cannot restore an older date.
 
 The local generator remains in the other project:
 `Price2024DB/Cod/Price.py`. It reads local/Google data, builds the price and
