@@ -402,9 +402,10 @@ def test_night_business_message_exact_search_creates_request_and_keyboard(
     product = harness.api.sent[-1]
     assert request is not None
     assert request["exact_model"] == "iPhone 16 Pro Max"
-    assert request["wizard_state"] == "memory"
+    assert request["wizard_state"] == "price_result"
     assert product["reply_markup"]["inline_keyboard"]
-    assert callback_data(product["reply_markup"], "256 GB")
+    assert callback_data(product["reply_markup"], "Заказать")
+    assert callback_data(product["reply_markup"], "Найти модель")
     assert selection_fields(request)["wizard_message_id"] == product["message_id"]
     assert all(
         not button.get("callback_data")
@@ -412,6 +413,173 @@ def test_night_business_message_exact_search_creates_request_and_keyboard(
         for row in product["reply_markup"]["inline_keyboard"]
         for button in row
     )
+
+
+def test_text_order_intent_after_price_result_enters_order_selection(
+    harness: Harness,
+):
+    chat_id = 3011
+    session = harness.incoming("iPhone 16 Pro Max", chat_id=chat_id)
+    harness.run_debounce()
+
+    harness.clock.value += timedelta(seconds=10)
+    harness.incoming("беру", chat_id=chat_id)
+    harness.run_debounce()
+
+    request = harness.service.repo.active_business_request(
+        str(chat_id), session["session_id"]
+    )
+    assert selection_fields(request)["flow"] == "order"
+    assert request["exact_model"] == "iPhone 16 Pro Max"
+    assert request["wizard_state"] == "memory"
+
+
+def test_order_from_filtered_price_retains_memory_and_color(harness: Harness):
+    chat_id = 3012
+    session = harness.incoming(
+        "iPhone 16 Pro Max 256 GB Black",
+        chat_id=chat_id,
+    )
+    harness.run_debounce()
+    visible = harness.api.sent[-1]
+
+    harness.callback(
+        callback_data(visible["reply_markup"], "Заказать"),
+        chat_id=chat_id,
+        message_id=visible["message_id"],
+        callback_id="filtered-price-order",
+    )
+
+    request = harness.service.repo.active_business_request(
+        str(chat_id), session["session_id"]
+    )
+    assert selection_fields(request)["flow"] == "order"
+    assert request["option_kind"] == "memory"
+    assert request["option_value"] == "256 GB"
+    assert request["color"] == "Black"
+    assert request["wizard_state"] == "item_ready"
+
+
+def test_failed_text_order_promotion_keeps_existing_price_buttons(harness: Harness):
+    chat_id = 3013
+    session = harness.incoming("iPhone 16 Pro Max", chat_id=chat_id)
+    harness.run_debounce()
+    price_message = harness.api.sent[-1]
+    before = harness.service.repo.active_business_request(
+        str(chat_id), session["session_id"]
+    )
+    before_revision = before["revision"]
+
+    harness.service.products.by_model.pop("iPhone 16 Pro Max")
+    harness.clock.value += timedelta(seconds=10)
+    harness.incoming("беру", chat_id=chat_id)
+    harness.run_debounce()
+
+    after = harness.service.repo.active_business_request(
+        str(chat_id), session["session_id"]
+    )
+    assert after["revision"] == before_revision
+    assert selection_fields(after)["flow"] == "price"
+    assert after["wizard_state"] == "price_result"
+
+    harness.callback(
+        callback_data(price_message["reply_markup"], "Найти модель"),
+        chat_id=chat_id,
+        message_id=price_message["message_id"],
+        callback_id="retry-after-missing-model",
+    )
+    current = harness.service.repo.active_business_request(
+        str(chat_id), session["session_id"]
+    )
+    assert current["wizard_state"] == "model"
+
+
+def test_first_night_message_has_price_and_request_buttons(harness: Harness):
+    session = harness.incoming("Здравствуйте", chat_id=300)
+    harness.run_debounce()
+
+    request = harness.service.repo.active_business_request(
+        "300", session["session_id"]
+    )
+    markup = harness.api.sent[-1]["reply_markup"]
+    buttons = [button for row in markup["inline_keyboard"] for button in row]
+
+    assert request["wizard_state"] == "start"
+    assert len(buttons) == 2
+    assert callback_data(markup, "Найти модель")
+    assert callback_data(markup, "Оставить заявку")
+
+
+def test_two_models_are_collected_in_one_request(harness: Harness):
+    chat_id = 3001
+    session = harness.incoming("iPhone 16 Pro Max", chat_id=chat_id)
+    harness.run_debounce()
+    message_id = harness.api.sent[-1]["message_id"]
+    markup = harness.api.sent[-1]["reply_markup"]
+
+    steps = (
+        ("Заказать", "multi-order"),
+        ("256 GB", "multi-memory"),
+        ("Black", "multi-color"),
+        ("Добавить в заявку", "multi-add-first"),
+        ("Добавить модель", "multi-more"),
+    )
+    for label, callback_id in steps:
+        harness.callback(
+            callback_data(markup, label),
+            chat_id=chat_id,
+            message_id=message_id,
+            callback_id=callback_id,
+        )
+        markup = harness.api.edits[-1]["reply_markup"]
+
+    harness.clock.value += timedelta(seconds=10)
+    harness.incoming("Apple Adapter 20W", chat_id=chat_id)
+    harness.run_debounce()
+    message_id = harness.api.sent[-1]["message_id"]
+    markup = harness.api.sent[-1]["reply_markup"]
+    harness.callback(
+        callback_data(markup, "Добавить в заявку"),
+        chat_id=chat_id,
+        message_id=message_id,
+        callback_id="multi-add-second",
+    )
+    request = harness.service.repo.active_business_request(
+        str(chat_id), session["session_id"]
+    )
+    items = selection_fields(request)["items"]
+
+    assert [item["model"] for item in items] == [
+        "iPhone 16 Pro Max",
+        "Apple Adapter 20W",
+    ]
+    assert request["wizard_state"] == "cart"
+    assert "1. iPhone 16 Pro Max" in harness.api.edits[-1]["text"]
+    assert "2. Apple Adapter 20W" in harness.api.edits[-1]["text"]
+
+
+def test_find_model_button_allows_explicit_repeat_search(harness: Harness):
+    chat_id = 3002
+    session = harness.incoming("Apple Adapter 20W", chat_id=chat_id)
+    harness.run_debounce()
+    first = harness.api.sent[-1]
+    sent_count = len(harness.api.sent)
+
+    harness.callback(
+        callback_data(first["reply_markup"], "Найти модель"),
+        chat_id=chat_id,
+        message_id=first["message_id"],
+        callback_id="repeat-find",
+    )
+    harness.clock.value += timedelta(seconds=10)
+    harness.incoming("Apple Adapter 20W", chat_id=chat_id)
+    harness.run_debounce()
+
+    request = harness.service.repo.active_business_request(
+        str(chat_id), session["session_id"]
+    )
+    assert len(harness.api.sent) == sent_count + 1
+    assert request["wizard_state"] == "price_result"
 
 
 def test_night_ambiguous_search_creates_model_callback_buttons(harness: Harness):
@@ -430,7 +598,7 @@ def test_night_ambiguous_search_creates_model_callback_buttons(harness: Harness)
     assert all(len(row) == 1 for row in sent["reply_markup"]["inline_keyboard"])
 
 
-def test_exact_product_without_attributes_starts_at_fulfillment(harness: Harness):
+def test_exact_product_without_attributes_stays_in_price_mode(harness: Harness):
     session = harness.incoming("Apple Adapter 20W", chat_id=303)
     harness.run_debounce()
 
@@ -439,11 +607,11 @@ def test_exact_product_without_attributes_starts_at_fulfillment(harness: Harness
     )
     sent = harness.api.sent[-1]
     assert request["exact_model"] == "Apple Adapter 20W"
-    assert request["wizard_state"] == "fulfillment"
+    assert request["wizard_state"] == "price_result"
     assert request["option_kind"] is None
     assert request["color"] is None
-    assert callback_data(sent["reply_markup"], "Доставка")
-    assert callback_data(sent["reply_markup"], "Самовывоз")
+    assert callback_data(sent["reply_markup"], "Заказать")
+    assert callback_data(sent["reply_markup"], "Найти модель")
 
 
 def test_process_update_callbacks_exact_to_pickup_telegram_and_submit(
@@ -454,6 +622,14 @@ def test_process_update_callbacks_exact_to_pickup_telegram_and_submit(
     harness.run_debounce()
     visible_message_id = harness.api.sent[-1]["message_id"]
     markup = harness.api.sent[-1]["reply_markup"]
+
+    harness.callback(
+        callback_data(markup, "Заказать"),
+        chat_id=chat_id,
+        message_id=visible_message_id,
+        callback_id="service-start-order",
+    )
+    markup = harness.api.edits[-1]["reply_markup"]
 
     harness.callback(
         callback_data(markup, "256 GB"),
@@ -467,6 +643,20 @@ def test_process_update_callbacks_exact_to_pickup_telegram_and_submit(
         chat_id=chat_id,
         message_id=visible_message_id,
         callback_id="service-color",
+    )
+    markup = harness.api.edits[-1]["reply_markup"]
+    harness.callback(
+        callback_data(markup, "Добавить в заявку"),
+        chat_id=chat_id,
+        message_id=visible_message_id,
+        callback_id="service-add-item",
+    )
+    markup = harness.api.edits[-1]["reply_markup"]
+    harness.callback(
+        callback_data(markup, "Продолжить"),
+        chat_id=chat_id,
+        message_id=visible_message_id,
+        callback_id="service-continue",
     )
     markup = harness.api.edits[-1]["reply_markup"]
     harness.callback(
@@ -528,7 +718,7 @@ def test_location_or_phone_sent_before_model_persists_after_exact_search(
     initial = harness.service.repo.active_business_request(
         str(chat_id), session["session_id"]
     )
-    assert initial["wizard_state"] == "model"
+    assert initial["wizard_state"] == "start"
     assert initial[field] == expected
 
     harness.clock.value += timedelta(seconds=10)
@@ -579,7 +769,7 @@ def test_duplicate_exact_search_keeps_visible_callback_valid(harness: Harness):
     session = harness.incoming("iPhone 16 Pro Max", chat_id=chat_id)
     harness.run_debounce()
     visible = harness.api.sent[-1]
-    token = callback_data(visible["reply_markup"], "256 GB")
+    token = callback_data(visible["reply_markup"], "Заказать")
     request = harness.service.repo.active_business_request(
         str(chat_id), session["session_id"]
     )
@@ -617,8 +807,8 @@ def test_duplicate_exact_search_keeps_visible_callback_valid(harness: Harness):
     transitioned = harness.service.repo.active_business_request(
         str(chat_id), session["session_id"]
     )
-    assert transitioned["wizard_state"] == "color"
-    assert transitioned["option_value"] == "256 GB"
+    assert transitioned["wizard_state"] == "memory"
+    assert transitioned["option_value"] is None
     assert harness.api.answers[-1] == ("visible-token-after-duplicate", None)
 
 
@@ -637,9 +827,9 @@ def test_mm_query_is_extracted_as_watch_size_and_removed_from_model_query(
         None,
     )
     assert request["exact_model"] == "Apple Watch Series 10"
-    assert request["option_kind"] == "size"
-    assert request["option_value"] == "45mm"
-    assert request["wizard_state"] == "color"
+    assert request["option_kind"] is None
+    assert request["option_value"] is None
+    assert request["wizard_state"] == "price_result"
 
 
 def test_phone_embedded_alongside_model_is_removed_from_query_and_persisted(
@@ -668,7 +858,7 @@ def test_callback_updates_are_processed_through_durable_service_rows(
     harness.run_debounce()
     visible = harness.api.sent[-1]
     harness.callback(
-        callback_data(visible["reply_markup"], "Самовывоз"),
+        callback_data(visible["reply_markup"], "Заказать"),
         chat_id=chat_id,
         message_id=visible["message_id"],
         callback_id="durable-service-callback",

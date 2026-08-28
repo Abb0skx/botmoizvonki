@@ -19,12 +19,22 @@ from .product_wizard import (
     build_edit_menu,
     build_fulfillment_step,
     build_grouped_model_step,
+    build_cart_step,
+    build_item_ready_step,
     build_model_step,
     build_pickup_contact_step,
+    build_price_actions_step,
     build_review_step,
+    build_start_step,
     variants_for_choice,
 )
-from .products import ProductMatch, ProductVariant, normalize_model, safe_product_url
+from .products import (
+    ProductMatch,
+    ProductVariant,
+    format_result,
+    normalize_model,
+    safe_product_url,
+)
 from .request_inputs import (
     format_price,
     location_from_message,
@@ -55,6 +65,10 @@ def _localized(language: str, ru: str, uz: str) -> str:
     if language == "uz":
         return uz
     return f"{ru}\n\n———\n\n{uz}"
+
+
+def _button_label(language: str, ru: str, uz: str) -> str:
+    return ru if language == "ru" else uz if language == "uz" else f"{ru} / {uz}"
 
 
 def _choice(step: WizardStep, raw_value: str | None):
@@ -181,6 +195,39 @@ class NightRequestCoordinator:
         return WizardStep("model", text, (), keyboard)
 
     @staticmethod
+    def _start_step(language: str) -> WizardStep:
+        return build_start_step(language)
+
+    @staticmethod
+    def _items(request: Any) -> list[dict[str, Any]]:
+        raw = selection_fields(request).get("items", [])
+        return [dict(item) for item in raw if isinstance(item, dict)][:10]
+
+    def _price_step(
+        self, request: Any, match: ProductMatch, language: str, now: datetime,
+    ) -> WizardStep:
+        renderer = getattr(self.service, "_product_result_message", None)
+        text = (
+            renderer(match, language, now)
+            if renderer
+            else format_result(match, language)
+        ) or ""
+        return build_price_actions_step(text, language)
+
+    def _item_ready_step(self, request: Any, language: str) -> WizardStep:
+        return build_item_ready_step(
+            str(_value(request, "exact_model", "")),
+            language,
+            attribute_kind=_value(request, "option_kind"),
+            attribute_value=_value(request, "option_value"),
+            color=_value(request, "color"),
+            any_color=bool(_value(request, "color_any", 0)),
+        )
+
+    def _cart_step(self, request: Any, language: str) -> WizardStep:
+        return build_cart_step(self._items(request), language)
+
+    @staticmethod
     def _pickup_phone_step(language: str) -> WizardStep:
         base = build_delivery_phone_step(language)
         text = _localized(
@@ -198,6 +245,43 @@ class NightRequestCoordinator:
         )
 
     def _review_step(self, request: Any, language: str) -> WizardStep:
+        items = self._items(request)
+        if items:
+            cart_ru = build_cart_step(items, "ru").text
+            cart_uz = build_cart_step(items, "uz").text
+            fulfillment = str(_value(request, "fulfillment_method", ""))
+            method_ru = "Доставка" if fulfillment == "delivery" else "Самовывоз"
+            method_uz = "Yetkazib berish" if fulfillment == "delivery" else "Do‘kondan olib ketish"
+            extra_ru = [f"Получение: {method_ru}"]
+            extra_uz = [f"Olish usuli: {method_uz}"]
+            if _value(request, "phone"):
+                masked = masked_phone(_value(request, "phone"))
+                extra_ru.append(f"Телефон: {masked}")
+                extra_uz.append(f"Telefon: {masked}")
+            elif fulfillment == "pickup":
+                extra_ru.append("Связь: этот Telegram-чат")
+                extra_uz.append("Aloqa: shu Telegram chati")
+            if fulfillment == "delivery":
+                location = _value(request, "address") or _value(request, "location_url")
+                if location:
+                    extra_ru.append(f"Локация: {html.escape(str(location)[:400])}")
+                    extra_uz.append(f"Lokatsiya: {html.escape(str(location)[:400])}")
+            text = _localized(
+                language,
+                cart_ru + "\n\n" + "\n".join(extra_ru) + "\n\nЗаказ не оформлен. Подтвердит менеджер.",
+                cart_uz + "\n\n" + "\n".join(extra_uz) + "\n\nBuyurtma rasmiylashtirilmagan. Menejer tasdiqlaydi.",
+            )
+            return WizardStep(
+                "review",
+                text,
+                (),
+                (
+                    (ButtonSpec(_button_label(language, "Передать менеджеру", "Menejerga yuborish"), action="submit"),),
+                    (ButtonSpec(_button_label(language, "➕ Добавить модель", "➕ Model qo‘shish"), action="add_more"),),
+                    (ButtonSpec(_button_label(language, "Изменить получение", "Olish usulini o‘zgartirish"), action="edit_fulfillment"),),
+                    (ButtonSpec(_button_label(language, "Отменить", "Bekor qilish"), action="cancel"),),
+                ),
+            )
         fulfillment = str(_value(request, "fulfillment_method", ""))
         data = WizardReviewData(
             model=str(_value(request, "exact_model", "")),
@@ -269,8 +353,15 @@ class NightRequestCoordinator:
 
     def _product_screen_for_request(self, request: Any, language: str) -> WizardStep:
         state = str(_value(request, "wizard_state", "model"))
+        if state == "start":
+            return self._start_step(language)
         if state == "model":
             return self._enter_model_step(language)
+        if state == "price_result":
+            match = self._full_match(str(_value(request, "exact_model", "")))
+            clock = getattr(self.service, "clock", None)
+            rendered_at = clock() if clock else datetime.now().astimezone()
+            return self._price_step(request, match, language, rendered_at)
         if state in {"memory", "size"}:
             variants = self._full_match(str(_value(request, "exact_model", ""))).variants
             return build_attribute_step(
@@ -285,6 +376,10 @@ class NightRequestCoordinator:
                 language,
                 model_name=str(_value(request, "exact_model", "")),
             ) or build_fulfillment_step(language)
+        if state == "item_ready":
+            return self._item_ready_step(request, language)
+        if state == "cart":
+            return self._cart_step(request, language)
         if state == "fulfillment":
             return build_fulfillment_step(language)
         if state == "delivery_phone":
@@ -324,6 +419,58 @@ class NightRequestCoordinator:
             return None
         model = match.models[0]
         variants = tuple(match.all_variants or match.variants)
+        fields = selection_fields(request)
+        flow = str(fields.get("flow") or "price")
+        if flow == "price":
+            selections: dict[str, Any] = {
+                "model_query": model,
+                "flow": "price",
+                "price_requested_memory": requested_memory or "",
+                "price_requested_color": requested_color or "",
+            }
+            if wizard_message_id:
+                selections["wizard_message_id"] = int(wizard_message_id)
+            updated = self.repo.update_business_request(
+                str(_value(request, "request_id")),
+                int(_value(request, "revision")),
+                now,
+                state="price_result",
+                status="collecting",
+                language=language,
+                exact_model=model,
+                model_key=normalize_model(model),
+                model_url=match.url_for(model),
+                option_kind=None,
+                option_value=None,
+                color=None,
+                color_any=0,
+                database_price=_minimum_price(variants),
+                source_updated_at=now.isoformat(),
+                phone=early_phone or _value(request, "phone"),
+                contact_method=early_phone_source or _value(request, "contact_method"),
+                location_url=(
+                    early_location.url
+                    if early_location is not None
+                    else _value(request, "location_url")
+                ),
+                address=(
+                    early_location.address
+                    if early_location is not None
+                    else _value(request, "address")
+                ),
+                selections=selections,
+                clear_selections=("force_search",),
+                event_type="price_viewed",
+                event_key=event_key,
+                telegram_update_id=update_id,
+                telegram_message_id=message_id,
+                client_at=event_at,
+            )
+            if not updated:
+                return None
+            self._schedule_expiry(updated, connection_id, event_at, now)
+            step = self._price_step(updated, match, language, now)
+            return PreparedRequestScreen(updated, step, self.markup(updated, step, now))
         attribute_step = build_attribute_step(
             variants, language, model_name=model,
         )
@@ -358,12 +505,13 @@ class NightRequestCoordinator:
         elif color_step and selected_color is None:
             state, step = "color", color_step
         else:
-            state, step = "fulfillment", build_fulfillment_step(language)
+            state, step = "item_ready", None
 
         selections: dict[str, Any] = {
             "model_query": model,
             "attribute_required": bool(attribute_step),
             "color_required": bool(color_step),
+            "flow": "order",
         }
         if early_location is not None:
             selections["outside_tashkent"] = bool(
@@ -402,7 +550,12 @@ class NightRequestCoordinator:
                 else _value(request, "address")
             ),
             selections=selections,
-            clear_selections=("outside_tashkent",),
+            clear_selections=(
+                "outside_tashkent",
+                "force_search",
+                "price_requested_memory",
+                "price_requested_color",
+            ),
             event_type="product_selected",
             event_key=event_key,
             telegram_update_id=update_id,
@@ -412,6 +565,8 @@ class NightRequestCoordinator:
         if not updated:
             return None
         self._schedule_expiry(updated, connection_id, event_at, now)
+        if step is None:
+            step = self._item_ready_step(updated, language)
         return PreparedRequestScreen(updated, step, self.markup(updated, step, now))
 
     def prepare_match(
@@ -431,7 +586,14 @@ class NightRequestCoordinator:
         requested_color: str | None = None,
         rows: Sequence[Any] = (),
         text: str = "",
+        flow: str | None = None,
     ) -> PreparedRequestScreen | None:
+        # Do not advance or revoke a currently visible wizard when the
+        # catalogue cannot reproduce the model that was shown earlier.
+        if match.status not in {"found", "ambiguous"}:
+            return None
+        if match.status == "found" and (not match.models or not match.variants):
+            return None
         raw_message = self._raw_message_for_rows(rows)
         early_phone, early_phone_source = phone_from_message(raw_message, text)
         early_location = location_from_message(
@@ -449,6 +611,20 @@ class NightRequestCoordinator:
         )
         if _value(request, "status") == "submitted":
             return None
+        if flow in {"price", "order"} and selection_fields(request).get("flow") != flow:
+            changed = self.repo.update_business_request(
+                str(_value(request, "request_id")),
+                int(_value(request, "revision")),
+                now,
+                selections={"flow": flow},
+                event_type="flow_selected",
+                event_key=f"message:{message_id}:flow:{flow}",
+                telegram_update_id=update_id,
+                telegram_message_id=message_id,
+                client_at=event_at,
+            )
+            if changed:
+                request = changed
         event_key = f"message:{message_id}:update:{update_id or 0}:product"
         grouped_model_step = (
             build_grouped_model_step(match, language)
@@ -461,6 +637,9 @@ class NightRequestCoordinator:
                 return None
             ambiguous_selections: dict[str, Any] = {
                 "model_query": model_query,
+                "flow": str(selection_fields(request).get("flow") or "price"),
+                "price_requested_memory": requested_memory or "",
+                "price_requested_color": requested_color or "",
             }
             if early_location is not None:
                 ambiguous_selections["outside_tashkent"] = bool(
@@ -484,6 +663,7 @@ class NightRequestCoordinator:
                 selections=ambiguous_selections,
                 clear_selections=(
                     "attribute_required", "color_required", "outside_tashkent",
+                    "force_search",
                 ),
                 event_type="model_candidates",
                 event_key=event_key,
@@ -571,7 +751,7 @@ class NightRequestCoordinator:
         phone, phone_source = phone_from_message(raw_message, text)
         parsed_location = location_from_message(raw_message, text, expected=False)
         changes: dict[str, Any] = {
-            "state": "model",
+            "state": "start",
             "status": "collecting",
             "language": language,
         }
@@ -599,7 +779,7 @@ class NightRequestCoordinator:
         if not updated:
             return None
         self._schedule_expiry(updated, connection_id, event_at, now)
-        step = self._enter_model_step(language)
+        step = self._start_step(language)
         return PreparedRequestScreen(updated, step, self.markup(updated, step, now))
 
     def _answer_callback(self, callback_id: str, text: str | None = None) -> None:
@@ -722,6 +902,88 @@ class NightRequestCoordinator:
         now: datetime,
         language: str,
     ) -> tuple[Any, WizardStep | None, str | None]:
+        if action in {"browse_prices", "start_order", "find_model"}:
+            flow = "order" if action == "start_order" else "price"
+            new_selections: dict[str, Any] = {"flow": flow}
+            if action == "find_model":
+                new_selections["force_search"] = True
+            updated = self._update_state(
+                request,
+                now,
+                callback_id,
+                message_id,
+                "model",
+                status="collecting",
+                exact_model=None,
+                model_key=None,
+                model_url=None,
+                option_kind=None,
+                option_value=None,
+                color=None,
+                color_any=0,
+                database_price=None,
+                selections=new_selections,
+                clear_selections=(
+                    "attribute_required",
+                    "color_required",
+                    "price_requested_memory",
+                    "price_requested_color",
+                ),
+            )
+            return updated, self._enter_model_step(language), None
+
+        if action == "start_item_order":
+            model = str(_value(request, "exact_model", "") or "")
+            if not model:
+                return request, self._enter_model_step(language), None
+            fields = selection_fields(request)
+            try:
+                match = self._full_match(model)
+            except Exception as exc:
+                self.service._record_error(
+                    "request_order_catalogue", now,
+                    str(_value(request, "chat_id")),
+                    str(_value(request, "session_id", "")), exc,
+                )
+                return request, None, self._terminal_text(
+                    "product_source_unavailable", request, language, now,
+                )
+            if match.status != "found" or not match.models or not match.variants:
+                return request, None, self._terminal_text(
+                    "product_source_unavailable", request, language, now,
+                )
+            updated = self.repo.update_business_request(
+                str(_value(request, "request_id")),
+                int(_value(request, "revision")),
+                now,
+                selections={"flow": "order", "wizard_message_id": int(message_id)},
+                event_type="order_flow_started",
+                event_key=f"callback:{callback_id}:flow",
+            )
+            if not updated:
+                return request, None, None
+            prepared = self._transition_found(
+                updated,
+                match,
+                connection_id,
+                now,
+                now,
+                language=language,
+                event_key=f"callback:{callback_id}:product",
+                requested_memory=str(
+                    fields.get("price_requested_memory") or ""
+                ) or None,
+                requested_color=str(
+                    fields.get("price_requested_color") or ""
+                ) or None,
+                wizard_message_id=message_id,
+            )
+            return (
+                (prepared.request, prepared.step, None)
+                if prepared
+                else (request, None, None)
+            )
+
         if action == "select_model":
             model = str(payload.get("value") or "")
             try:
@@ -732,8 +994,13 @@ class NightRequestCoordinator:
                     str(_value(request, "chat_id")),
                     str(_value(request, "session_id", "")), exc,
                 )
+                fallback_state = (
+                    "item_ready"
+                    if selection_fields(request).get("flow") == "order"
+                    else "price_result"
+                )
                 updated = self._update_state(
-                    request, now, callback_id, message_id, "fulfillment",
+                    request, now, callback_id, message_id, fallback_state,
                     exact_model=model,
                     model_key=normalize_model(model),
                     model_url=None,
@@ -744,7 +1011,9 @@ class NightRequestCoordinator:
                     database_price=None,
                     selections={"attribute_required": False, "color_required": False},
                 )
-                return updated, build_fulfillment_step(language), None
+                if fallback_state == "item_ready":
+                    return updated, self._item_ready_step(updated, language), None
+                return updated, build_price_actions_step(model, language), None
             prepared = self._transition_found(
                 request,
                 match,
@@ -753,6 +1022,12 @@ class NightRequestCoordinator:
                 now,
                 language=language,
                 event_key=f"callback:{callback_id}",
+                requested_memory=str(
+                    selection_fields(request).get("price_requested_memory") or ""
+                ) or None,
+                requested_color=str(
+                    selection_fields(request).get("price_requested_color") or ""
+                ) or None,
                 wizard_message_id=message_id,
             )
             return (
@@ -780,7 +1055,7 @@ class NightRequestCoordinator:
                 language,
                 model_name=str(_value(request, "exact_model", "")),
             )
-            state = "color" if color_step else "fulfillment"
+            state = "color" if color_step else "item_ready"
             updated = self._update_state(
                 request,
                 now,
@@ -794,7 +1069,7 @@ class NightRequestCoordinator:
                 database_price=_minimum_price(selected),
                 selections={"attribute_required": True, "color_required": bool(color_step)},
             )
-            return updated, color_step or build_fulfillment_step(language), None
+            return updated, color_step or self._item_ready_step(updated, language), None
 
         if action in {"select_color", "any_color"}:
             variants = self._variants_for_request(request, include_color=False)
@@ -818,11 +1093,90 @@ class NightRequestCoordinator:
                 now,
                 callback_id,
                 message_id,
-                "fulfillment",
+                "item_ready",
                 color=color,
                 color_any=int(action == "any_color"),
                 database_price=_minimum_price(selected),
                 selections={"color_required": bool(step)},
+            )
+            return updated, self._item_ready_step(updated, language), None
+
+        if action == "add_item":
+            fields = selection_fields(request)
+            items = self._items(request)
+            if len(items) >= 10:
+                return request, self._cart_step(request, language), None
+            item = {
+                "model": str(_value(request, "exact_model", "") or ""),
+                "model_url": str(_value(request, "model_url", "") or ""),
+                "option_kind": str(_value(request, "option_kind", "") or ""),
+                "option_value": str(_value(request, "option_value", "") or ""),
+                "color": str(_value(request, "color", "") or ""),
+                "color_any": bool(_value(request, "color_any", 0)),
+                "price": str(_value(request, "database_price", "") or ""),
+            }
+            if not item["model"]:
+                return request, self._enter_model_step(language), None
+            items.append(item)
+            updated = self._update_state(
+                request,
+                now,
+                callback_id,
+                message_id,
+                "cart",
+                selections={"items": items, "flow": "order"},
+            )
+            return updated, self._cart_step(updated, language), None
+
+        if action == "add_more":
+            updated = self._update_state(
+                request,
+                now,
+                callback_id,
+                message_id,
+                "model",
+                status="collecting",
+                exact_model=None,
+                model_key=None,
+                model_url=None,
+                option_kind=None,
+                option_value=None,
+                color=None,
+                color_any=0,
+                database_price=None,
+                selections={"flow": "order"},
+                clear_selections=(
+                    "attribute_required",
+                    "color_required",
+                    "price_requested_memory",
+                    "price_requested_color",
+                ),
+            )
+            return updated, self._enter_model_step(language), None
+
+        if action == "remove_last_item":
+            items = self._items(request)
+            if items:
+                items.pop()
+            updated = self._update_state(
+                request,
+                now,
+                callback_id,
+                message_id,
+                "cart" if items else "model",
+                selections={"items": items, "flow": "order"},
+            )
+            return (
+                updated,
+                self._cart_step(updated, language) if items else self._enter_model_step(language),
+                None,
+            )
+
+        if action == "continue_order":
+            if not self._items(request):
+                return request, self._enter_model_step(language), None
+            updated = self._update_state(
+                request, now, callback_id, message_id, "fulfillment",
             )
             return updated, build_fulfillment_step(language), None
 
@@ -983,7 +1337,20 @@ class NightRequestCoordinator:
             target = "pickup_contact"
             changes.update(status="collecting")
         elif action == "back":
-            if state == "color" and fields.get("attribute_required"):
+            if state == "price_result":
+                target = "model"
+            elif state == "item_ready":
+                if fields.get("color_required"):
+                    target = "color"
+                    changes.update(color=None, color_any=0)
+                elif fields.get("attribute_required"):
+                    target = str(_value(request, "option_kind") or "memory")
+                    changes.update(option_value=None)
+                else:
+                    target = "model"
+            elif state == "cart":
+                target = "item_ready" if _value(request, "exact_model") else "model"
+            elif state == "color" and fields.get("attribute_required"):
                 target = str(_value(request, "option_kind") or "memory")
                 changes.update(option_value=None, color=None, color_any=0)
             elif state in {"memory", "size"}:
@@ -994,7 +1361,9 @@ class NightRequestCoordinator:
                 )
                 clear = ("attribute_required", "color_required")
             elif state == "fulfillment":
-                if fields.get("color_required"):
+                if self._items(request):
+                    target = "cart"
+                elif fields.get("color_required"):
                     target = "color"
                     changes.update(color=None, color_any=0)
                 elif fields.get("attribute_required"):
@@ -1011,7 +1380,7 @@ class NightRequestCoordinator:
             elif state == "edit":
                 target = "review"
             elif state == "review":
-                target = "edit"
+                target = "fulfillment" if self._items(request) else "edit"
 
         selections = {"wizard_message_id": int(message_id)}
         updated = self.repo.update_business_request(

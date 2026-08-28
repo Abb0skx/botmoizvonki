@@ -70,9 +70,32 @@ def test_notification_contains_collected_order_and_is_not_duplicated(tmp_path: P
     assert len(service.api.messages) == 1
     destination, text = service.api.messages[0]
     assert destination == "-1004307725887"
-    assert "Модель: iPhone 16 Pro Max" in text
-    assert "Память: 256 GB" in text
-    assert "Цена в базе: 14 500 000 so'm" in text
+    assert "1. iPhone 16 Pro Max, 256 GB, Black, 14 500 000 so'm" in text
     assert "Получение: доставка" in text
     assert "Телефон: +998901234567" in text
     assert "Локация: https://maps.google.com/?q=41.3,69.2" in text
+
+
+def test_notification_lists_multiple_items():
+    request = request_row()
+    request["selection_fields"] = {
+        "items": [
+            {
+                "model": "iPhone 16 Pro Max",
+                "option_value": "256 GB",
+                "color": "Black",
+                "price": "14500000",
+            },
+            {
+                "model": "Apple Adapter 20W",
+                "option_value": "",
+                "color": "",
+                "price": "250000",
+            },
+        ]
+    }
+
+    text = BusinessService._order_notification_text(request, {})
+
+    assert "1. iPhone 16 Pro Max, 256 GB, Black, 14 500 000 so'm" in text
+    assert "2. Apple Adapter 20W, 250 000 so'm" in text

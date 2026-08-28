@@ -40,8 +40,8 @@ TEMPLATES: dict[str, dict[str, str]] = {
         "uz": "Assalomu alaykum! Men TEXNIKACH avto-yordamchisiman. Menejer {manager_time_phrase_uz} javob beradi.",
     },
     "greeting_no_model": {
-        "ru": "Здравствуйте! Я авто-помощник TEXNIKACH. Менеджер ответит {manager_time_phrase_ru}. Напишите модель — покажу цену.",
-        "uz": "Assalomu alaykum! Men TEXNIKACH avto-yordamchisiman. Menejer {manager_time_phrase_uz} javob beradi. Modelni yozing — narxini ko‘rsataman.",
+        "ru": "Здравствуйте! Я авто-помощник TEXNIKACH. Ночью могу показать цены или собрать заявку. Цену и наличие подтвердит менеджер {manager_time_phrase_ru}.",
+        "uz": "Assalomu alaykum! Men TEXNIKACH avto-yordamchisiman. Kechasi narxlarni ko‘rsataman yoki so‘rov yig‘aman. Narx va mavjudlikni menejer {manager_time_phrase_uz} tasdiqlaydi.",
     },
     "credit": {
         "ru": "Я автоматический помощник TEXNIKACH. К сожалению, у нас нет кредита и рассрочки. Оплата производится полностью после проверки товара.\n\nАктуальные модели и цены: {catalog_url}",

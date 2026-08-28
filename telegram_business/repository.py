@@ -2345,6 +2345,7 @@ class BusinessRepository:
             "source_updated_at": row["source_updated_at"] or "",
             "price_source_updated_at": row["source_updated_at"] or "",
             "expected_input": row["wizard_state"],
+            "items": selection_fields.get("items", []),
             "location_received": bool(row["location_url"] or row["address"]),
             "needs_manager_reply": bool(row["needs_manager_reply"]),
             "created_at_utc": self._as_utc(row["created_at"]),
@@ -2755,7 +2756,16 @@ class BusinessRepository:
                     raise ValueError("phone_required_for_complete_delivery")
                 if not ((row["location_url"] or "").strip() or (row["address"] or "").strip()):
                     raise ValueError("location_required_for_complete_delivery")
-            if not (row["exact_model"] or "").strip():
+            try:
+                request_fields = json.loads(row["selection_fields"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                request_fields = {}
+            items = (
+                [item for item in request_fields.get("items", []) if isinstance(item, dict)]
+                if isinstance(request_fields, dict)
+                else []
+            )
+            if not items and not (row["exact_model"] or "").strip():
                 raise ValueError("model_required_for_completion")
             new_revision = int(row["revision"]) + 1
             db.execute(
@@ -2789,9 +2799,13 @@ class BusinessRepository:
                        needs_manager_reply=1,status='waiting_manager',updated_at=?
                        WHERE session_id=?""",
                     (
-                        row["exact_model"],
-                        row["option_value"],
-                        selected_color,
+                        (items[0].get("model") if items else row["exact_model"]),
+                        (items[0].get("option_value") if items else row["option_value"]),
+                        (
+                            items[0].get("color")
+                            or ("any" if items[0].get("color_any") else None)
+                            if items else selected_color
+                        ),
                         int(bool(row["location_url"] or row["address"])),
                         row["location_url"],
                         iso(now),

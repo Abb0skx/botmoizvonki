@@ -38,6 +38,7 @@ from .products import (
 )
 from .repository import BusinessRepository
 from .request_coordinator import NightRequestCoordinator
+from .request_inputs import selection_fields
 from .sheets import BusinessSheets
 from .telegram_api import TelegramAPIError, TelegramBusinessAPI
 from .templates import TEMPLATES, normalize_template_code, render
@@ -62,6 +63,14 @@ PRODUCT_HINTS = {
     "tecno", "infinix", "oppo", "vivo", "realme", "nothing", "oneplus",
     "nokia", "motorola", "asus", "lenovo", "acer", "dell", "msi", "sony", "jbl",
 }
+
+
+def _localized_text(language: str, ru: str, uz: str) -> str:
+    if language == "ru":
+        return ru
+    if language == "uz":
+        return uz
+    return f"{ru}\n{uz}"
 
 _TELEGRAM_HTML_TAGS = {
     "a", "b", "strong", "i", "em", "u", "ins", "s", "strike", "del",
@@ -323,23 +332,34 @@ class BusinessService:
         if username:
             lines.append(f"Telegram: @{username}")
         lines.append(f"ID: {str(_value(request, 'chat_id', '') or '—')}")
-        lines.append(f"Модель: {str(_value(request, 'exact_model', '') or '—')}")
-        option_kind = str(_value(request, "option_kind", "") or "")
-        option_value = str(_value(request, "option_value", "") or "").strip()
-        if option_value:
-            label = "Размер" if option_kind == "size" else "Память"
-            lines.append(f"{label}: {option_value}")
-        color = str(_value(request, "color", "") or "").strip()
-        lines.append(
-            f"Цвет: {color or ('не важен' if _value(request, 'color_any', 0) else '—')}"
-        )
-        price = str(_value(request, "database_price", "") or "").strip()
-        if price:
-            try:
-                price = f"{int(float(price)):,}".replace(",", " ")
-            except (TypeError, ValueError, OverflowError):
-                pass
-            lines.append(f"Цена в базе: {price} so'm")
+        fields = selection_fields(request)
+        items = [item for item in fields.get("items", []) if isinstance(item, dict)]
+        if not items:
+            items = [{
+                "model": _value(request, "exact_model", ""),
+                "option_kind": _value(request, "option_kind", ""),
+                "option_value": _value(request, "option_value", ""),
+                "color": _value(request, "color", ""),
+                "color_any": bool(_value(request, "color_any", 0)),
+                "price": _value(request, "database_price", ""),
+            }]
+        lines.append("Товары:")
+        for index, item in enumerate(items[:10], 1):
+            parts = [str(item.get("model") or "—")[:180]]
+            if item.get("option_value"):
+                parts.append(str(item["option_value"]))
+            if item.get("color_any"):
+                parts.append("цвет не важен")
+            elif item.get("color"):
+                parts.append(str(item["color"]))
+            price = str(item.get("price") or "").strip()
+            if price:
+                try:
+                    price = f"{int(float(price)):,}".replace(",", " ")
+                except (TypeError, ValueError, OverflowError):
+                    pass
+                parts.append(f"{price} so'm")
+            lines.append(f"{index}. {', '.join(parts)}")
         lines.append(
             "Получение: доставка" if fulfillment == "delivery" else "Получение: самовывоз"
         )
@@ -355,15 +375,18 @@ class BusinessService:
             or ""
         ).strip()
         if location:
-            lines.append(f"Локация: {location}")
+            lines.append(f"Локация: {location[:500]}")
         preferred_time = str(_value(request, "preferred_time", "") or "").strip()
         if preferred_time:
             lines.append(f"Удобное время: {preferred_time}")
-        return "\n".join(lines)
+        return "\n".join(lines)[:4000]
 
     def _send_order_notification(self, request_id: str, destination: str, now: datetime) -> None:
         request = self.repo.business_request(request_id)
-        if not request or _value(request, "status") != "submitted":
+        if not request or not (
+            _value(request, "status") == "submitted"
+            or _value(request, "submitted_at")
+        ):
             return
         text = self._order_notification_text(
             request, self.repo.client(str(_value(request, "chat_id", "")))
@@ -1821,6 +1844,80 @@ class BusinessService:
                 delivery_key=event_delivery_key,
             )
 
+            # A customer may type "беру" / "olaman" after viewing a price
+            # instead of pressing the inline order button. Continue from the
+            # already selected catalogue model and preserve any memory/colour
+            # filters that were included in the original price query.
+            if (
+                collecting_request
+                and _value(active_request, "wizard_state") == "price_result"
+                and str(_value(active_request, "exact_model", "") or "").strip()
+            ):
+                request_fields = selection_fields(active_request)
+                exact_model = str(_value(active_request, "exact_model", ""))
+                try:
+                    current_match = self.products.search(exact_model)
+                    promoted = self.requests.prepare_match(
+                        current_match,
+                        connection_id=connection_id,
+                        chat_id=chat_id,
+                        session_id=session_id,
+                        language=language,
+                        now=now,
+                        event_at=event_at,
+                        message_id=int(rows[-1]["message_id"]),
+                        update_id=payload.get("update_id"),
+                        model_query=exact_model,
+                        requested_memory=str(
+                            request_fields.get("price_requested_memory") or ""
+                        ) or None,
+                        requested_color=str(
+                            request_fields.get("price_requested_color") or ""
+                        ) or None,
+                        rows=rows,
+                        text=text,
+                        flow="order",
+                    )
+                except Exception as exc:
+                    self._record_error(
+                        "request_order_promotion", now, chat_id, session_id, exc,
+                    )
+                    promoted = None
+                if promoted:
+                    wizard_message_id = selection_fields(promoted.request).get(
+                        "wizard_message_id"
+                    )
+                    try:
+                        wizard_message_id = (
+                            int(wizard_message_id) if wizard_message_id else None
+                        )
+                    except (TypeError, ValueError):
+                        wizard_message_id = None
+                    if wizard_message_id:
+                        self.requests._edit_screen(
+                            promoted.request,
+                            promoted.step,
+                            connection_id,
+                            chat_id,
+                            wizard_message_id,
+                            now,
+                        )
+                    else:
+                        sent_result = self.send(
+                            connection_id,
+                            chat_id,
+                            session_id,
+                            promoted.step.text,
+                            "request_prompt",
+                            now,
+                            parse_mode=promoted.step.parse_mode,
+                            reply_markup=promoted.reply_markup,
+                            delivery_key=f"{event_delivery_key}:order-flow",
+                            return_message_id=True,
+                        )
+                        bind_request_screen(promoted, sent_result)
+                    return
+
         if collecting_request and hasattr(
             self.repo, "active_business_request"
         ):
@@ -2026,10 +2123,17 @@ class BusinessService:
         if match.status == "found" and match.variants:
             self.repo.replace_model_choices(session_id, (), now)
             fingerprint = self._product_fingerprint(match)
+            force_search = bool(
+                active_request
+                and selection_fields(active_request).get("force_search")
+            )
             recent_search = getattr(self.repo, "search_was_recent", None)
             duplicate = bool(
-                (recent_search and recent_search(session_id, fingerprint, now, 10))
-                or self._recent(chat_id, "product_result", fingerprint, now, 600)
+                not force_search
+                and (
+                    (recent_search and recent_search(session_id, fingerprint, now, 10))
+                    or self._recent(chat_id, "product_result", fingerprint, now, 600)
+                )
             )
             if duplicate:
                 return
@@ -2049,16 +2153,29 @@ class BusinessService:
                     requested_color=color,
                     rows=rows,
                     text=text,
+                    flow="order" if order_request else None,
                 )
                 if hasattr(self.repo, "get_or_create_business_request")
                 else None
             )
             product_message = self._product_result_message(match, language, now)
             if request_screen:
-                product_message = self._product_wizard_message(
-                    product_message,
-                    request_screen.step.text,
-                )
+                if request_screen.step.code == "price_result":
+                    product_message = request_screen.step.text
+                elif request_screen.step.code == "item_ready":
+                    product_message = self._product_wizard_message(
+                        product_message,
+                        _localized_text(
+                            language,
+                            "Добавить в заявку?",
+                            "So‘rovga qo‘shilsinmi?",
+                        ),
+                    )
+                else:
+                    product_message = self._product_wizard_message(
+                        product_message,
+                        request_screen.step.text,
+                    )
             sent_result = self.send(
                 connection_id, chat_id, session_id,
                 product_message,
@@ -2086,10 +2203,17 @@ class BusinessService:
                 )
         elif match.status == "ambiguous":
             fingerprint = self._product_fingerprint(match)
+            force_search = bool(
+                active_request
+                and selection_fields(active_request).get("force_search")
+            )
             recent_search = getattr(self.repo, "search_was_recent", None)
             duplicate = (
-                bool(recent_search and recent_search(session_id, fingerprint, now, 10))
-                or self._recent(chat_id, "ambiguous", fingerprint, now, 600)
+                not force_search
+                and (
+                    bool(recent_search and recent_search(session_id, fingerprint, now, 10))
+                    or self._recent(chat_id, "ambiguous", fingerprint, now, 600)
+                )
             )
             if duplicate:
                 return
@@ -2109,6 +2233,7 @@ class BusinessService:
                     requested_color=color,
                     rows=rows,
                     text=text,
+                    flow="order" if order_request else None,
                 )
                 if hasattr(self.repo, "get_or_create_business_request")
                 else None

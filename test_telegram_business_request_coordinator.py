@@ -293,6 +293,7 @@ def prepare(
         message_id=1,
         update_id=100,
         model_query=model_query,
+        flow="order",
     )
     assert screen is not None
     return screen
@@ -448,6 +449,19 @@ def test_exact_model_memory_color_delivery_phone_location_and_submit(
         chat_id=chat_id,
         callback_id="delivery-color",
     )
+    assert edited is not None and "Добавить в заявку" in str(edited["reply_markup"])
+    edited = click(
+        harness,
+        callback_data(edited["reply_markup"], "Добавить в заявку"),
+        chat_id=chat_id,
+        callback_id="delivery-add-item",
+    )
+    edited = click(
+        harness,
+        callback_data(edited["reply_markup"], "Продолжить"),
+        chat_id=chat_id,
+        callback_id="delivery-continue",
+    )
     assert edited is not None and "доставка или самовывоз" in edited["text"].casefold()
     edited = click(
         harness,
@@ -537,8 +551,8 @@ def test_product_without_memory_or_color_skips_both_steps(harness: Harness):
     )
 
     request = harness.repo.active_business_request(chat_id, session_id)
-    assert screen.step.code == "fulfillment"
-    assert request["wizard_state"] == "fulfillment"
+    assert screen.step.code == "item_ready"
+    assert request["wizard_state"] == "item_ready"
     assert request["option_kind"] is None
     assert request["option_value"] is None
     assert request["color"] is None
@@ -578,6 +592,19 @@ def test_color_any_and_pickup_submit_without_phone_or_location(harness: Harness)
     request = harness.repo.active_business_request(chat_id, session_id)
     assert request["color"] is None
     assert request["color_any"] == 1
+
+    edited = click(
+        harness,
+        callback_data(edited["reply_markup"], "Добавить в заявку"),
+        chat_id=chat_id,
+        callback_id="pickup-add-item",
+    )
+    edited = click(
+        harness,
+        callback_data(edited["reply_markup"], "Продолжить"),
+        chat_id=chat_id,
+        callback_id="pickup-continue",
+    )
 
     edited = click(
         harness,
@@ -626,7 +653,7 @@ def test_callback_survives_restart_then_request_expires_and_buttons_go_stale(
         harness.products.search("Apple Adapter 20W"),
         model_query="Apple Adapter 20W",
     )
-    delivery = callback_data(screen.reply_markup, "Доставка")
+    delivery = callback_data(screen.reply_markup, "Добавить в заявку")
 
     restarted = harness.restart()
     edited = click(
@@ -639,7 +666,7 @@ def test_callback_survives_restart_then_request_expires_and_buttons_go_stale(
     assert edited is not None
     assert restarted.repo.active_business_request(chat_id, session_id)[
         "wizard_state"
-    ] == "delivery_phone"
+    ] == "cart"
     back = callback_data(edited["reply_markup"], "Назад")
 
     request = restarted.repo.active_business_request(chat_id, session_id)
@@ -676,7 +703,7 @@ def test_manager_closure_revokes_pending_wizard_callbacks(harness: Harness):
         harness.products.search("Apple Adapter 20W"),
         model_query="Apple Adapter 20W",
     )
-    pickup = callback_data(screen.reply_markup, "Самовывоз")
+    pickup = callback_data(screen.reply_markup, "Добавить в заявку")
     manager_at = harness.now + timedelta(minutes=1)
 
     harness.repo.manager_answer(

@@ -37,6 +37,7 @@ SHEETS = {
         "option_value", "color", "color_any", "fulfillment_method",
         "contact_method", "phone_masked", "location_received", "location_url",
         "address", "preferred_time", "database_price", "source_updated_at",
+        "items",
         "needs_manager_reply", "created_at_utc", "updated_at_utc",
     ],
 }

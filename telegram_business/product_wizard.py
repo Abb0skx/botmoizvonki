@@ -11,10 +11,14 @@ from .products import ProductMatch, ProductVariant, normalize_model, safe_produc
 
 Language = Literal["ru", "uz", "bi"]
 StepCode = Literal[
+    "start",
     "model",
+    "price_result",
     "memory",
     "size",
     "color",
+    "item_ready",
+    "cart",
     "fulfillment",
     "delivery_phone",
     "pickup_contact",
@@ -212,6 +216,142 @@ def _navigation_row(language: str) -> tuple[ButtonSpec, ...]:
             text=_button_text(language, "Отменить", "Bekor qilish"),
             action="cancel",
         ),
+    )
+
+
+def build_start_step(language: str = "bi") -> WizardStep:
+    ru = (
+        "Я авто-помощник TEXNIKACH. Ночью могу показать цены или собрать "
+        "заявку для менеджера. Цена и наличие подтверждаются менеджером."
+    )
+    uz = (
+        "Men TEXNIKACH avto-yordamchisiman. Kechasi narxlarni ko‘rsataman "
+        "yoki menejer uchun so‘rov yig‘aman. Narx va mavjudlikni menejer tasdiqlaydi."
+    )
+    return WizardStep(
+        "start",
+        _localized(language, ru, uz),
+        (),
+        (
+            (
+                ButtonSpec(
+                    _button_text(language, "🔎 Найти модель", "🔎 Model topish"),
+                    action="browse_prices",
+                ),
+            ),
+            (
+                ButtonSpec(
+                    _button_text(language, "🛒 Оставить заявку", "🛒 So‘rov qoldirish"),
+                    action="start_order",
+                ),
+            ),
+        ),
+    )
+
+
+def build_price_actions_step(text: str, language: str = "bi") -> WizardStep:
+    return WizardStep(
+        "price_result",
+        text,
+        (),
+        (
+            (
+                ButtonSpec(
+                    _button_text(language, "🛒 Заказать", "🛒 Buyurtma berish"),
+                    action="start_item_order",
+                ),
+            ),
+            (
+                ButtonSpec(
+                    _button_text(language, "🔎 Найти модель", "🔎 Model topish"),
+                    action="find_model",
+                ),
+            ),
+        ),
+    )
+
+
+def build_item_ready_step(
+    model: str,
+    language: str = "bi",
+    *,
+    attribute_kind: str | None = None,
+    attribute_value: str | None = None,
+    color: str | None = None,
+    any_color: bool = False,
+) -> WizardStep:
+    safe_model = _escaped_value(model, 240)
+    ru_lines = [f"<b>{safe_model}</b>"]
+    uz_lines = [f"<b>{safe_model}</b>"]
+    if attribute_value:
+        ru_label = "Размер" if attribute_kind == "size" else "Память"
+        uz_label = "O‘lcham" if attribute_kind == "size" else "Xotira"
+        safe_value = _escaped_value(attribute_value, 100)
+        ru_lines.append(f"{ru_label}: {safe_value}")
+        uz_lines.append(f"{uz_label}: {safe_value}")
+    if color or any_color:
+        ru_lines.append(f"Цвет: {_escaped_value(color, 100) if color else 'не важен'}")
+        uz_lines.append(f"Rang: {_escaped_value(color, 100) if color else 'farqi yo‘q'}")
+    return WizardStep(
+        "item_ready",
+        _localized(language, "\n".join(ru_lines), "\n".join(uz_lines)),
+        (),
+        (
+            (
+                ButtonSpec(
+                    _button_text(language, "➕ Добавить в заявку", "➕ So‘rovga qo‘shish"),
+                    action="add_item",
+                ),
+            ),
+            _navigation_row(language),
+        ),
+    )
+
+
+def build_cart_step(items: Sequence[dict], language: str = "bi") -> WizardStep:
+    def lines(selected: str) -> str:
+        result = []
+        for index, item in enumerate(items, 1):
+            parts = [str(item.get("model") or "")]
+            if item.get("option_value"):
+                parts.append(str(item["option_value"]))
+            if item.get("color_any"):
+                parts.append("цвет не важен" if selected == "ru" else "rang farqi yo‘q")
+            elif item.get("color"):
+                parts.append(str(item["color"]))
+            result.append(f"{index}. {_escaped_value(', '.join(parts), 350)}")
+        title = "В заявке:" if selected == "ru" else "So‘rovda:"
+        return title + "\n\n" + "\n".join(result)
+
+    rows: list[tuple[ButtonSpec, ...]] = [
+        (
+            ButtonSpec(
+                _button_text(language, "➕ Добавить модель", "➕ Model qo‘shish"),
+                action="add_more",
+            ),
+        ),
+        (
+            ButtonSpec(
+                _button_text(language, "Продолжить", "Davom etish"),
+                action="continue_order",
+            ),
+        ),
+    ]
+    if items:
+        rows.append(
+            (
+                ButtonSpec(
+                    _button_text(language, "Удалить последнюю", "Oxirgisini o‘chirish"),
+                    action="remove_last_item",
+                ),
+            )
+        )
+    rows.append(_navigation_row(language))
+    return WizardStep(
+        "cart",
+        _localized(language, lines("ru"), lines("uz")),
+        (),
+        tuple(rows),
     )
 
 

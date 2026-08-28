@@ -187,11 +187,12 @@ def format_price(value: Any, language: str) -> str:
 def missing_request_fields(request: Mapping[str, Any] | Any) -> tuple[str, ...]:
     fields = selection_fields(request)
     missing: list[str] = []
-    if not str(_value(request, "exact_model", "")).strip():
+    items = [item for item in fields.get("items", []) if isinstance(item, dict)]
+    if not items and not str(_value(request, "exact_model", "")).strip():
         missing.append("model")
-    if fields.get("attribute_required") and not str(_value(request, "option_value", "")).strip():
+    if not items and fields.get("attribute_required") and not str(_value(request, "option_value", "")).strip():
         missing.append(str(_value(request, "option_kind", "attribute") or "attribute"))
-    if fields.get("color_required") and not (
+    if not items and fields.get("color_required") and not (
         str(_value(request, "color", "")).strip()
         or bool(_value(request, "color_any", 0))
     ):
