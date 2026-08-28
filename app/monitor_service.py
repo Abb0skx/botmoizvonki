@@ -252,7 +252,7 @@ def _courier_route(
     path: list[list[float]] = [[WAREHOUSE["latitude"], WAREHOUSE["longitude"]]]
     for order in completed:
         picked_up = local_datetime(order.picked_up_at)
-        if last_completed_at and picked_up and picked_up > last_completed_at:
+        if last_completed_at and (picked_up is None or picked_up > last_completed_at):
             path.append([WAREHOUSE["latitude"], WAREHOUSE["longitude"]])
             if len(path) > 1:
                 dark_paths.append(path)
@@ -283,7 +283,11 @@ def _courier_route(
     )
     if current:
         current_pickup = local_datetime(current.picked_up_at)
-        if not last_completed_at or (current_pickup and current_pickup > last_completed_at):
+        if (
+            not last_completed_at
+            or current_pickup is None
+            or current_pickup > last_completed_at
+        ):
             current_origin = [WAREHOUSE["latitude"], WAREHOUSE["longitude"]]
             if dark_paths and dark_paths[-1][-1] != current_origin:
                 dark_paths[-1].append(current_origin)

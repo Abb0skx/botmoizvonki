@@ -101,7 +101,7 @@ class CourierWorkflowKeyboardTests(unittest.TestCase):
 
         self.assertEqual(
             self._callbacks(courier_keyboard(pending)),
-            ["group_pickup:7", "cancel:7"],
+            ["group_pickup:7", "onway:7", "cancel:7"],
         )
         self.assertEqual(
             self._callbacks(courier_keyboard(picked)),
@@ -111,6 +111,10 @@ class CourierWorkflowKeyboardTests(unittest.TestCase):
             self._callbacks(on_way_keyboard(picked)),
             ["undo_onway:8", "complete:8", "cancel:8"],
         )
+
+        pending.assigned_courier_id = None
+        pending.assigned_courier_name = None
+        self.assertEqual(self._callbacks(courier_keyboard(pending)), ["cancel:7"])
 
     def test_courier_selection_is_filtered_by_environment_allowlist(self):
         order = Order(

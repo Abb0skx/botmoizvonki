@@ -203,6 +203,17 @@ class DeliveryRepositorySafetyTests(unittest.TestCase):
         self.assertEqual(current.updated_at, reassigned.updated_at)
         self.assertEqual(current.status, "pending")
         self.assertEqual(current.assigned_courier_id, 11)
+        stale_start = self.repo.transition(
+            order.id,
+            {"pending"},
+            status="on_way",
+            courier_id=10,
+            courier_name="Courier A",
+            guard_courier_id=10,
+            require_assigned_to_courier=True,
+            require_no_other_on_way_for_courier=True,
+        )
+        self.assertIsNone(stale_start)
         with self.assertRaisesRegex(ValueError, "must match"):
             self.repo.transition(
                 order.id,
@@ -211,6 +222,24 @@ class DeliveryRepositorySafetyTests(unittest.TestCase):
                 require_no_other_on_way_for_courier=True,
                 status="on_way",
             )
+
+    def test_unassigned_order_cannot_be_started_by_courier(self) -> None:
+        order = self.create_order()
+        order = self.repo.transition(order.id, {"draft"}, status="pending")
+
+        started = self.repo.transition(
+            order.id,
+            {"pending"},
+            status="on_way",
+            courier_id=10,
+            courier_name="Courier A",
+            guard_courier_id=10,
+            require_assigned_to_courier=True,
+            require_no_other_on_way_for_courier=True,
+        )
+
+        self.assertIsNone(started)
+        self.assertEqual(self.repo.get(order.id).status, "pending")
 
     def test_cleanup_retry_is_due_only_after_backoff_and_eventually_terminal(self) -> None:
         base = datetime(2026, 8, 24, tzinfo=timezone.utc)

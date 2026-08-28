@@ -115,7 +115,10 @@ class CourierReadWorkflowTests(unittest.IsolatedAsyncioTestCase):
             for button in row
             if button.callback_data
         ]
-        self.assertEqual(callbacks, [f"group_pickup:{order.id}", f"cancel:{order.id}"])
+        self.assertEqual(
+            callbacks,
+            [f"group_pickup:{order.id}", f"onway:{order.id}", f"cancel:{order.id}"],
+        )
 
         order = self.repo.update(
             order.id,
@@ -129,7 +132,10 @@ class CourierReadWorkflowTests(unittest.IsolatedAsyncioTestCase):
             for button in row
             if button.callback_data
         ]
-        self.assertEqual(callbacks, [f"group_pickup:{order.id}", f"cancel:{order.id}"])
+        self.assertEqual(
+            callbacks,
+            [f"group_pickup:{order.id}", f"onway:{order.id}", f"cancel:{order.id}"],
+        )
         self.assertNotIn("Заказ прочитан", courier_card(order))
         self.assertNotIn("Едет на склад", courier_card(order))
         read_time = datetime.fromisoformat(order.courier_read_at).astimezone(TASHKENT).strftime("%H:%M")

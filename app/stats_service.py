@@ -651,8 +651,12 @@ def build_delivery_stats(
         last_completed: datetime | None = None
         last_point = warehouse_point
         for row in completed_rows:
-            pickup = local_datetime(row["picked_up_at"])
-            if last_completed and pickup and pickup > last_completed:
+            # Use the persisted business timestamp, not the day-scoped display
+            # value. A direct pending→on_way trip has no pickup timestamp and
+            # therefore begins a fresh warehouse leg instead of drawing an
+            # impossible customer→customer segment.
+            pickup = local_datetime(order_by_id[row["id"]].picked_up_at)
+            if last_completed and (pickup is None or pickup > last_completed):
                 if completed_path[-1] != warehouse_point:
                     completed_path.append(warehouse_point)
                 if len(completed_path) > 1:
@@ -672,9 +676,9 @@ def build_delivery_stats(
         current_row = current_rows[-1] if current_rows else None
         current_path: list[list[float]] = []
         if current_row:
-            pickup = local_datetime(current_row["picked_up_at"])
+            pickup = local_datetime(order_by_id[current_row["id"]].picked_up_at)
             current_origin = last_point
-            if not last_completed or (pickup and pickup > last_completed):
+            if not last_completed or pickup is None or pickup > last_completed:
                 current_origin = warehouse_point
                 if completed_paths and completed_paths[-1][-1] != warehouse_point:
                     completed_paths[-1].append(warehouse_point)

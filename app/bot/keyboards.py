@@ -364,6 +364,10 @@ def location_channel_keyboard(
 def courier_keyboard(order: Order) -> InlineKeyboardMarkup:
     rows = _location_rows(order) + _pickup_rows(order)
     if order.status == "pending":
+        if order.assigned_courier_id:
+            rows.append([
+                InlineKeyboardButton("🚗 Еду к заказу", callback_data=f"onway:{order.id}"),
+            ])
         rows.append([InlineKeyboardButton("❌ Отменён", callback_data=f"cancel:{order.id}")])
     elif order.status == "picked_up":
         rows += [

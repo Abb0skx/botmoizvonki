@@ -832,6 +832,7 @@ class OrderRepository:
         *,
         guard_courier_id: int | None = None,
         require_unassigned_or_same: bool = False,
+        require_assigned_to_courier: bool = False,
         require_no_other_on_way_for_courier: bool = False,
         expected_updated_at: str | None = None,
         actor_id: int | None = None,
@@ -850,8 +851,15 @@ class OrderRepository:
             raise ValueError(f"Unsupported fields: {invalid}")
         if not from_statuses:
             raise ValueError("from_statuses cannot be empty")
+        if require_unassigned_or_same and require_assigned_to_courier:
+            raise ValueError(
+                "require_unassigned_or_same and require_assigned_to_courier "
+                "are mutually exclusive"
+            )
         if (
-            require_unassigned_or_same or require_no_other_on_way_for_courier
+            require_unassigned_or_same
+            or require_assigned_to_courier
+            or require_no_other_on_way_for_courier
         ) and guard_courier_id is None:
             raise ValueError("guard_courier_id is required")
         cleanups = [
@@ -880,6 +888,16 @@ class OrderRepository:
                 " AND (courier_id IS NULL OR courier_id=?)"
             )
             params.extend((guard_courier_id, guard_courier_id))
+        elif require_assigned_to_courier:
+            # Starting a trip is allowed only for the courier who is still
+            # assigned at the instant of the UPDATE. Unlike the more general
+            # guard above, an unassigned row cannot be claimed from a stale
+            # courier-group button.
+            where += (
+                " AND assigned_courier_id=?"
+                " AND (courier_id IS NULL OR courier_id=?)"
+            )
+            params.extend((guard_courier_id, guard_courier_id))
         if require_no_other_on_way_for_courier:
             where += (
                 " AND NOT EXISTS ("
@@ -905,7 +923,7 @@ class OrderRepository:
             if expected_updated_at is not None and previous["updated_at"] != expected_updated_at:
                 return None
             self._validate_domain_fields(fields, current=previous)
-            if require_unassigned_or_same:
+            if require_unassigned_or_same or require_assigned_to_courier:
                 for courier_field in ("assigned_courier_id", "courier_id"):
                     # Validate only values this call is trying to write. An
                     # already-reassigned row is a normal stale-button race;

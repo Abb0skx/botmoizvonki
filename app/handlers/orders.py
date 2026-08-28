@@ -3292,6 +3292,8 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif action == "onway":
         if order.status == "on_way" and order.courier_id == query.from_user.id:
             await query.answer("Вы уже едете к этому заказу"); return
+        if not order.assigned_courier_id:
+            await query.answer("Сначала назначьте курьера", show_alert=True); return
         current = repo.get_on_way_for_courier(
             query.from_user.id,
             exclude_order_id=order.id,
@@ -3304,17 +3306,17 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
         timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
         order = repo.transition(
-            order.id, {"picked_up"}, status="on_way",
+            order.id, {"pending", "picked_up"}, status="on_way",
             time_started=timestamp,
             guard_courier_id=query.from_user.id,
-            require_unassigned_or_same=True,
+            require_assigned_to_courier=True,
             require_no_other_on_way_for_courier=True,
             **courier,
         )
         if not order:
             await query.answer(
-                "Сначала сотрудник склада должен отметить, что товар забран, "
-                "или завершите текущую доставку.",
+                "Не удалось начать поездку. Обновите карточку или завершите "
+                "текущую доставку.",
                 show_alert=True,
             )
             return
