@@ -32,7 +32,9 @@ _MEMORY_RE = re.compile(
     r"(?<![A-Za-z0-9])(?P<first>\d+)\s*/\s*(?P<second>\d+)\s*"
     r"(?P<unit>[GgTt][Bb])\b"
 )
-_PRICE_RE = re.compile(r"^\d[\d\s.,]*(?:\s*[↑↓])?$")
+_PRICE_RE = re.compile(
+    r"^(?P<amount>\d[\d\s.,]*?)(?:\s*(?P<trend>[↑↓]))?$"
+)
 _VARIANT_RE = re.compile(
     r"^(?P<bullet>\s*•\s*)(?P<memory>\d+/\d+\s+(?:GB|TB))"
     r"(?:\s+(?P<details>.*?))?\s*$"
@@ -71,6 +73,8 @@ _TITLE_PREFIXES = (
     "Техника",
     "Камеры",
 )
+
+_DECORATED_HEADING_MAX_CHARS = 20
 
 
 def _visible_line(value: str) -> str:
@@ -138,6 +142,23 @@ def _heading_text(section_key: str, title: str) -> str:
     return source.upper()
 
 
+def _heading_html(section_key: str, title: str) -> str:
+    visible = _heading_text(section_key, title)
+    escaped = html.escape(visible, quote=False)
+    if len(visible) <= _DECORATED_HEADING_MAX_CHARS:
+        return f"<b>━━ {escaped} ━━</b>"
+    return f"<b>▰ {escaped}</b>"
+
+
+def _price_html(value: str) -> str | None:
+    match = _PRICE_RE.fullmatch(str(value).strip())
+    if match is None:
+        return None
+    amount = match.group("amount").strip()
+    trend = str(match.group("trend") or "").strip()
+    return f"<b>{amount}</b>" + (f" {trend}" if trend else "")
+
+
 def _format_content_line(value: str) -> str:
     def normalize_memory(match: re.Match[str]) -> str:
         unit = match.group("unit").upper()
@@ -154,7 +175,8 @@ def _format_content_line(value: str) -> str:
         return line.rstrip()
     label, candidate = line.rsplit(":", 1)
     price = candidate.strip()
-    if not _PRICE_RE.fullmatch(price):
+    formatted_price = _price_html(price)
+    if formatted_price is None:
         return line.rstrip()
     variant = _VARIANT_RE.fullmatch(label)
     if variant is not None:
@@ -162,9 +184,9 @@ def _format_content_line(value: str) -> str:
         suffix = f" · {details}" if details else ""
         return (
             f"{variant.group('bullet')}{variant.group('memory')}"
-            f"{suffix} — {price}"
+            f"{suffix} — {formatted_price}"
         ).strip()
-    return f"{label.rstrip()} — {price}"
+    return f"{label.rstrip()} — {formatted_price}"
 
 
 def _clean_source_block(value: str, section_key: str, title: str) -> str:
@@ -311,11 +333,7 @@ def _section_body_blocks(
     *,
     max_body_units: int,
 ) -> list[str]:
-    heading = (
-        "<b>━━ "
-        + html.escape(_heading_text(section_key, title), quote=False)
-        + " ━━</b>"
-    )
+    heading = _heading_html(section_key, title)
     cleaned = [
         block
         for raw in raw_blocks

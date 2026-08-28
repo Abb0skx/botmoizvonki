@@ -424,15 +424,15 @@ class PriceRepositoryTests(unittest.TestCase):
         self.assertTrue(message.endswith("\n\n" + PRICE_INFO_RU_HTML))
         self.assertEqual(message.count("https://texnikach.uz/go"), 2)
         self.assertIn("<b>━━ ТЕЛЕФОНЫ · INFINIX ━━</b>", message)
-        self.assertIn("• 3/64 GB · Black, Silver — 130", message)
-        self.assertIn("• 4/128 GB — 205 ↑", message)
-        self.assertIn("• Black — 120 ↓", message)
+        self.assertIn("• 3/64 GB · Black, Silver — <b>130</b>", message)
+        self.assertIn("• 4/128 GB — <b>205</b> ↑", message)
+        self.assertIn("• Black — <b>120</b> ↓", message)
         self.assertIn('href="https://t.me/catalog/3/64gb"', message)
         self.assertIn(
-            "Product aloqa special yetkazish edition — 100",
+            "Product aloqa special yetkazish edition — <b>100</b>",
             message,
         )
-        self.assertIn("【Limited】 Edition — 100", message)
+        self.assertIn("【Limited】 Edition — <b>100</b>", message)
         self.assertNotIn("Texnikach_info", message)
         self.assertNotIn("🔺", message)
         self.assertNotIn("🔻", message)
@@ -450,6 +450,61 @@ class PriceRepositoryTests(unittest.TestCase):
             rendered,
         )
         self.assertNotIn("· ·", message)
+
+    def test_price_post_format_compacts_long_heading_and_bolds_prices(self):
+        raw = (
+            "<b>【 Dyson — фены и стайлеры 】</b>\n"
+            "Dyson Supersonic Nural HD16\n"
+            "• Prussian Blue/Rich Copper: 330\n"
+            "• Ceramic Apricot/Topaz: 1 200,50 🔺"
+        )
+        rendered = format_price_sections([
+            ("dyson-hair", "Dyson — фены и стайлеры", [raw])
+        ])
+        self.assertEqual(len(rendered), 1)
+        message = rendered[0]
+        self.assertIn("<b>▰ DYSON — ФЕНЫ И СТАЙЛЕРЫ</b>", message)
+        self.assertNotIn("━━ DYSON", message)
+        self.assertIn("• Prussian Blue/Rich Copper — <b>330</b>", message)
+        self.assertIn(
+            "• Ceramic Apricot/Topaz — <b>1 200,50</b> ↑",
+            message,
+        )
+        self.assertEqual(
+            format_price_sections([
+                ("dyson-hair", "Dyson — фены и стайлеры", [message])
+            ]),
+            rendered,
+        )
+
+    def test_compact_transformed_heading_remains_idempotent(self):
+        raw = (
+            "<b>【 Телефоны Xiaomi, Redmi, Poco 】</b>\n"
+            "Poco Test\n"
+            "• 8/256Gb Black: 300"
+        )
+        rendered = format_price_sections([
+            (
+                "smartphones-xiaomi-poco",
+                "Телефоны Xiaomi, Redmi, Poco",
+                [raw],
+            )
+        ])
+        message = rendered[0]
+        self.assertIn(
+            "<b>▰ ТЕЛЕФОНЫ · XIAOMI, REDMI, POCO</b>",
+            message,
+        )
+        self.assertEqual(
+            format_price_sections([
+                (
+                    "smartphones-xiaomi-poco",
+                    "Телефоны Xiaomi, Redmi, Poco",
+                    [message],
+                )
+            ]),
+            rendered,
+        )
 
     def test_price_post_format_splits_one_oversized_html_block_safely(self):
         long_text = "x" * 4050

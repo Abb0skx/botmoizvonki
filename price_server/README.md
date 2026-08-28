@@ -57,8 +57,9 @@ editing channel posts.
 
 Immediately before a price post is sent or edited, the server applies the
 canonical Telegram presentation: both information links point to
-`https://texnikach.uz/go`, the section title is visually separated, memory and
-price rows use consistent spacing, and the old triangle markers become `↑` and
+`https://texnikach.uz/go`, short section titles keep the `━━ … ━━` frame while
+long titles use the compact `▰ …` marker, memory and price rows use consistent
+spacing, numeric prices are bold, and the old triangle markers become `↑` and
 `↓`. This affects Telegram HTML only; the source snapshot and `/price` page are
 not rewritten.
 
