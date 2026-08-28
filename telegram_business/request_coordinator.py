@@ -912,6 +912,11 @@ class NightRequestCoordinator:
             if not completed:
                 return request, None, None
             self.repo.cancel(f"request-expire:{_value(request, 'request_id')}")
+            schedule_notification = getattr(
+                self.service, "schedule_order_notification", None
+            )
+            if schedule_notification:
+                schedule_notification(completed, now)
             code = "request_saved_delivery" if fulfillment == "delivery" else "request_saved_pickup"
             return completed, None, self._terminal_text(code, completed, language, now)
 

@@ -72,6 +72,7 @@ class BusinessSettings:
     workdays: tuple[int, ...] = (0, 1, 2, 3, 4, 5, 6)
     bot_id: str = ""
     product_urls_path: Path = Path("/app/data/Bot_URLS.xlsx")
+    orders_chat_id: str = ""
 
     @classmethod
     def load(cls) -> "BusinessSettings":
@@ -117,6 +118,9 @@ class BusinessSettings:
             workdays=configured(_workdays, (0, 1, 2, 3, 4, 5, 6)),
             bot_id=explicit_bot_id or derived_bot_id,
             product_urls_path=Path(os.getenv("PRODUCT_URLS_PATH", "/app/data/Bot_URLS.xlsx")),
+            orders_chat_id=os.getenv(
+                "TELEGRAM_BUSINESS_ORDERS_CHAT_ID", "-1004307725887"
+            ).strip(),
         )
 
     def validate_enabled(self) -> None:

@@ -297,6 +297,114 @@ class BusinessService:
         self._recent_local: dict[tuple[str, str, str], datetime] = {}
         self.requests = NightRequestCoordinator(self)
 
+    def schedule_order_notification(self, request: Any, now: datetime) -> None:
+        destination = str(getattr(self.settings, "orders_chat_id", "") or "").strip()
+        request_id = str(_value(request, "request_id", "") or "").strip()
+        if not destination or not request_id:
+            return
+        self.repo.schedule(
+            f"request-notify:{request_id}",
+            str(_value(request, "chat_id", "")),
+            _value(request, "session_id"),
+            "request_notify",
+            now,
+            {"request_id": request_id},
+            now,
+        )
+
+    @staticmethod
+    def _order_notification_text(request: Any, client: Any) -> str:
+        fulfillment = str(_value(request, "fulfillment_method", "") or "")
+        lines = [
+            "🛒 Новая заявка",
+            f"Клиент: {str(_value(client, 'first_name', '') or '').strip() or '—'}",
+        ]
+        username = str(_value(client, "username", "") or "").strip().lstrip("@")
+        if username:
+            lines.append(f"Telegram: @{username}")
+        lines.append(f"ID: {str(_value(request, 'chat_id', '') or '—')}")
+        lines.append(f"Модель: {str(_value(request, 'exact_model', '') or '—')}")
+        option_kind = str(_value(request, "option_kind", "") or "")
+        option_value = str(_value(request, "option_value", "") or "").strip()
+        if option_value:
+            label = "Размер" if option_kind == "size" else "Память"
+            lines.append(f"{label}: {option_value}")
+        color = str(_value(request, "color", "") or "").strip()
+        lines.append(
+            f"Цвет: {color or ('не важен' if _value(request, 'color_any', 0) else '—')}"
+        )
+        price = str(_value(request, "database_price", "") or "").strip()
+        if price:
+            try:
+                price = f"{int(float(price)):,}".replace(",", " ")
+            except (TypeError, ValueError, OverflowError):
+                pass
+            lines.append(f"Цена в базе: {price} so'm")
+        lines.append(
+            "Получение: доставка" if fulfillment == "delivery" else "Получение: самовывоз"
+        )
+        phone = str(_value(request, "phone", "") or "").strip()
+        contact_method = str(_value(request, "contact_method", "") or "")
+        if phone:
+            lines.append(f"Телефон: {phone}")
+        elif contact_method == "telegram":
+            lines.append("Связь: Telegram")
+        location = str(
+            _value(request, "location_url", "")
+            or _value(request, "address", "")
+            or ""
+        ).strip()
+        if location:
+            lines.append(f"Локация: {location}")
+        preferred_time = str(_value(request, "preferred_time", "") or "").strip()
+        if preferred_time:
+            lines.append(f"Удобное время: {preferred_time}")
+        return "\n".join(lines)
+
+    def _send_order_notification(self, request_id: str, destination: str, now: datetime) -> None:
+        request = self.repo.business_request(request_id)
+        if not request or _value(request, "status") != "submitted":
+            return
+        text = self._order_notification_text(
+            request, self.repo.client(str(_value(request, "chat_id", "")))
+        )
+        delivery_key = f"request-notify:{request_id}"
+        decision = self.repo.begin_outbound_delivery(
+            delivery_key,
+            destination,
+            str(_value(request, "session_id", "") or ""),
+            "request_notify",
+            hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            now,
+        )
+        if decision != "send":
+            return
+        try:
+            result = self.api.send_chat_message(destination, text)
+        except Exception as exc:
+            status = getattr(exc, "status", None)
+            retryable = bool(getattr(exc, "retryable", True))
+            ambiguous = bool(getattr(exc, "ambiguous", False) or status is None)
+            self.repo.finish_outbound_delivery(
+                delivery_key,
+                now,
+                error=exc,
+                safe_to_retry=bool(status is not None and retryable and not ambiguous),
+                ambiguous=ambiguous,
+            )
+            raise
+        message = result.get("result", {}) if isinstance(result, dict) else {}
+        self.repo.finish_outbound_delivery(
+            delivery_key,
+            now,
+            telegram_message_id=message.get("message_id"),
+        )
+        LOG.info(
+            "business_request_notification_sent request_id=%s destination=%s",
+            request_id,
+            destination,
+        )
+
     def _runtime_policy(self, now: datetime) -> RuntimePolicy:
         try:
             cached = getattr(self.sheets, "settings_cached", None)
@@ -1236,6 +1344,18 @@ class BusinessService:
         policy = self._runtime_policy(now)
         payload = json.loads(action["payload"])
         chat_id, session_id = action["chat_id"], action["session_id"]
+        if action["action_type"] == "request_notify":
+            destination = str(
+                getattr(self.settings, "orders_chat_id", "") or ""
+            ).strip()
+            if not destination:
+                return
+            self._send_order_notification(
+                str(payload.get("request_id") or ""),
+                destination,
+                now,
+            )
+            return
         if action["action_type"] == "request_expire":
             # Expiry is a durable state transition and must still happen when
             # a manager lock or permanent pause prevents customer-facing edits.

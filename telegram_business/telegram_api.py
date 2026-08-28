@@ -298,6 +298,21 @@ class TelegramBusinessAPI:
         self._message_result(response, "sendMessage")
         return response
 
+    def send_chat_message(self, chat_id: str, text: str) -> dict:
+        """Send a regular bot message to an internal group or channel."""
+        if chat_id is None or isinstance(chat_id, bool) or not str(chat_id).strip():
+            raise ValueError("chat_id is required")
+        response = self._call(
+            "sendMessage",
+            {
+                "chat_id": str(chat_id),
+                "text": text,
+                "link_preview_options": {"is_disabled": True},
+            },
+        )
+        self._message_result(response, "sendMessage")
+        return response
+
     def edit_message_text(
         self,
         connection_id: str,
