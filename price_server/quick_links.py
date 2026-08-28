@@ -104,7 +104,8 @@ QUICK_LINK_POST_SPECS: tuple[dict[str, Any], ...] = (
             '<b>Адрес:</b> Малика, Б2 — <a href="https://t.me/texnikach_info">Локация</a>\n\n'
             "<b>Для заказа</b>\n\n"
             '<a href="https://t.me/Texnikach_Admin">@Texnikach_Admin</a>\n'
-            "+998 (99) 844-61-62"
+            '<a href="tel:+998998446162">+998 (99) 844-61-62</a>\n'
+            '<a href="tel:+998998334466">+998 (99) 833-44-66</a>'
         ),
         "targets": [
             _target("apple-computers-all", 4965),

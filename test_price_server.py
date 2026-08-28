@@ -810,6 +810,14 @@ class PriceRepositoryTests(unittest.TestCase):
         self.assertIn("{{context:catalog_date}}", master["template_html"])
         self.assertIn("▸ ", master["template_html"])
         self.assertIn("• ", master["template_html"])
+        self.assertIn(
+            '<a href="tel:+998998446162">+998 (99) 844-61-62</a>',
+            master["template_html"],
+        )
+        self.assertIn(
+            '<a href="tel:+998998334466">+998 (99) 833-44-66</a>',
+            master["template_html"],
+        )
         self.assertNotIn("<tg-emoji", master["template_html"])
 
     def test_quick_link_sheet_upserts_nine_stable_rows(self):
