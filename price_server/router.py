@@ -19,6 +19,8 @@ from .repository import (
     CurrentSnapshotUnavailableError,
     IdempotencyConflictError,
     PriceRepository,
+    QuickLinkRotationConflictError,
+    QuickLinkRotationUnavailableError,
     SnapshotValidationError,
     StaleSnapshotError,
 )
@@ -340,6 +342,66 @@ async def price_quick_link_rotations(request: Request) -> dict[str, Any]:
         "quick_link_rotations": (
             get_repository().list_quick_link_rotations(limit=500)
         )
+    }
+
+
+@router.post(
+    "/price/api/v1/quick-link-rotations/publish-now",
+    status_code=202,
+)
+async def publish_main_quick_link_post_now(
+    request: Request,
+) -> dict[str, Any]:
+    """Durably queue the existing rotation state machine for immediate use."""
+
+    _admin(request, action=True)
+    try:
+        body = await request.json()
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise HTTPException(status_code=400, detail="invalid_json")
+    if not isinstance(body, dict) or body.get("confirm") is not True:
+        raise HTTPException(
+            status_code=422,
+            detail="explicit_confirmation_required",
+        )
+    raw_key = str(request.headers.get("Idempotency-Key") or "").strip()
+    try:
+        request_id = str(uuid.UUID(raw_key))
+    except (ValueError, AttributeError):
+        raise HTTPException(
+            status_code=422,
+            detail="valid_idempotency_key_required",
+        )
+    get_service()
+    try:
+        rotation = get_repository().enqueue_manual_quick_link_rotation(
+            datetime.now(timezone.utc),
+            idempotency_key=request_id,
+        )
+    except QuickLinkRotationUnavailableError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except QuickLinkRotationConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    secondary = get_repository().get_quick_link_post(
+        str(rotation["secondary_quick_post_key"])
+    )
+    return {
+        "status": (
+            "existing" if bool(rotation.get("duplicate")) else "queued"
+        ),
+        "rotation_id": int(rotation["rotation_id"]),
+        "scheduled_for": rotation["scheduled_for"],
+        "local_date": rotation["local_date"],
+        "rotation_index": int(rotation["rotation_index"]),
+        "secondary_quick_post_key": rotation[
+            "secondary_quick_post_key"
+        ],
+        "secondary_title": (
+            str(secondary.get("title") or "") if secondary else ""
+        ),
+        "rotation_status": rotation["status"],
+        "phase": rotation["phase"],
+        "duplicate": bool(rotation.get("duplicate")),
     }
 
 

@@ -84,6 +84,7 @@ QUICK_LINK_HEADERS = (
 
 QUICK_LINK_ROTATION_HEADERS = (
     "rotation_id",
+    "trigger_source",
     "scheduled_for",
     "local_date",
     "rotation_index",

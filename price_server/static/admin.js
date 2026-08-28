@@ -141,6 +141,11 @@
     jobHeading.className = "price-server-job-heading";
     const jobTitle = document.createElement("h2");
     jobTitle.textContent = "Расписание Telegram";
+    const publishMain = makeButton(
+        "Опубликовать новый главный пост",
+        "Опубликовать и закрепить новый основной пост быстрых ссылок",
+        "primary"
+    );
     const refreshAll = makeButton(
         "Обновить все посты",
         "Поставить в очередь обновление всех текущих прайс-постов",
@@ -149,7 +154,7 @@
     const refresh = makeButton("Обновить список", "Обновить список заданий");
     const headingActions = document.createElement("div");
     headingActions.className = "price-server-actions";
-    headingActions.append(refreshAll, refresh);
+    headingActions.append(publishMain, refreshAll, refresh);
     const jobList = document.createElement("div");
     jobList.className = "price-server-job-list";
     jobHeading.append(jobTitle, headingActions);
@@ -335,7 +340,11 @@
                     ? String(rotation.scheduled_for || "—")
                     : tashkentDate.format(parsed);
                 const name = document.createElement("span");
-                name.textContent = `Главный каталог → ${rotation.secondary_title || rotation.secondary_quick_post_key || "раздел"}`;
+                const manual = rotation.trigger_source === "manual"
+                    || String(rotation.dedupe_key || "").startsWith(
+                        "quick-link-rotation:manual:"
+                    );
+                name.textContent = `Главный каталог${manual ? " (вручную)" : ""} → ${rotation.secondary_title || rotation.secondary_quick_post_key || "раздел"}`;
                 const state = document.createElement("span");
                 state.className = "price-server-job-status";
                 state.textContent = `Ротация: ${statusNames[rotation.status] || rotation.status} · ${rotation.phase || "—"}`;
@@ -422,6 +431,7 @@
     }
 
     const bulkStorageKey = "price-server-update-all-idempotency";
+    const manualRotationStorageKey = "price-server-publish-main-idempotency";
     const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
     const createIdempotencyKey = () => {
         if (window.crypto && typeof window.crypto.randomUUID === "function") {
@@ -433,6 +443,74 @@
             return normalized.toString(16);
         });
     };
+
+    publishMain.addEventListener("click", async () => {
+        if (!window.confirm(
+            "Опубликовать новый главный пост быстрых ссылок в основном канале прямо сейчас? Он будет закреплён, предыдущий главный пост станет очередным постом второго уровня, а прежнее закрепление будет снято."
+        )) return;
+        let idempotencyKey = window.sessionStorage.getItem(
+            manualRotationStorageKey
+        );
+        if (idempotencyKey && !uuidPattern.test(idempotencyKey)) {
+            window.sessionStorage.removeItem(manualRotationStorageKey);
+            idempotencyKey = null;
+        }
+        if (!idempotencyKey) {
+            idempotencyKey = createIdempotencyKey();
+            window.sessionStorage.setItem(
+                manualRotationStorageKey,
+                idempotencyKey
+            );
+        }
+        publishMain.disabled = true;
+        try {
+            const result = await request(
+                "/price/api/v1/quick-link-rotations/publish-now",
+                {confirm: true},
+                {"Idempotency-Key": idempotencyKey}
+            );
+            window.sessionStorage.removeItem(manualRotationStorageKey);
+            const nextTitle = String(
+                result.secondary_title
+                || result.secondary_quick_post_key
+                || "следующий раздел"
+            );
+            if (result.duplicate) {
+                const currentStatus = statusNames[result.rotation_status]
+                    || result.rotation_status
+                    || "зарегистрировано";
+                toast(
+                    `Запрос уже зарегистрирован: ротация #${result.rotation_id} · ${currentStatus}.`
+                );
+            } else {
+                toast(
+                    `Ротация #${result.rotation_id} поставлена в очередь. Предыдущий каталог станет постом «${nextTitle}».`
+                );
+            }
+            await refreshJobs();
+        } catch (error) {
+            if (
+                error instanceof Error
+                && (error.status === 409 || error.status === 422)
+            ) {
+                window.sessionStorage.removeItem(manualRotationStorageKey);
+            }
+            const knownErrors = {
+                quick_link_rotation_already_active:
+                    "Сначала завершите или проверьте уже активную ротацию.",
+                quick_link_rotation_already_exists_today:
+                    "Сегодня новый главный пост уже создавался.",
+                quick_link_rotation_registry_not_ready:
+                    "Реестр быстрых ссылок пока не готов к ротации.",
+            };
+            const message = error instanceof Error
+                ? (knownErrors[error.detail] || error.message)
+                : "Ошибка публикации главного поста";
+            toast(message, true);
+        } finally {
+            publishMain.disabled = false;
+        }
+    });
 
     refreshAll.addEventListener("click", async () => {
         if (!window.confirm(

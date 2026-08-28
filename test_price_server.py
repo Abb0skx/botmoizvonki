@@ -19,6 +19,7 @@ from price_server.contracts import (
 from price_server.repository import (
     IdempotencyConflictError,
     PriceRepository,
+    QuickLinkRotationConflictError,
     StaleSnapshotError,
 )
 from price_server.quick_links import (
@@ -2249,6 +2250,211 @@ class PriceRepositoryTests(unittest.TestCase):
             )
         )
 
+    def test_manual_rotation_off_schedule_is_idempotent_and_rebases_cycle(self):
+        settings, repo, _fake, _service = self.rotation_fixture()
+        now = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+        request_id = "01234567-89ab-4cde-8fab-0123456789ab"
+
+        queued = repo.enqueue_manual_quick_link_rotation(
+            now,
+            idempotency_key=request_id,
+        )
+        replay = PriceRepository(settings).enqueue_manual_quick_link_rotation(
+            now,
+            idempotency_key=request_id,
+        )
+
+        self.assertFalse(queued["duplicate"])
+        self.assertTrue(replay["duplicate"])
+        self.assertEqual(replay["rotation_id"], queued["rotation_id"])
+        self.assertEqual(queued["trigger_source"], "manual")
+        self.assertEqual(queued["local_date"], "2026-08-28")
+        rotations = sorted(
+            repo.list_quick_link_rotations(limit=20),
+            key=lambda row: (row["scheduled_for"], row["rotation_id"]),
+        )
+        self.assertEqual(len(rotations), 4)
+        self.assertEqual(
+            [row["secondary_quick_post_key"] for row in rotations],
+            list(QUICK_LINK_ROTATION_ORDER[:4]),
+        )
+        claimed = repo.claim_due_quick_link_rotation(now)
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed["rotation_id"], queued["rotation_id"])
+
+    def test_manual_rotation_accelerates_today_schedule_once(self):
+        _settings, repo, _fake, _service = self.rotation_fixture()
+        now = datetime(2026, 8, 29, 5, 0, tzinfo=timezone.utc)
+        repo.materialize_due_quick_link_rotations(now, horizon_days=7)
+        before = next(
+            row for row in repo.list_quick_link_rotations(limit=20)
+            if row["local_date"] == "2026-08-29"
+        )
+        before_count = len(repo.list_quick_link_rotations(limit=20))
+
+        queued = repo.enqueue_manual_quick_link_rotation(
+            now,
+            idempotency_key="11111111-2222-4333-8444-555555555555",
+        )
+
+        self.assertEqual(queued["rotation_id"], before["rotation_id"])
+        self.assertEqual(queued["trigger_source"], "manual")
+        self.assertEqual(
+            datetime.fromisoformat(queued["scheduled_for"]),
+            now,
+        )
+        self.assertEqual(
+            len(repo.list_quick_link_rotations(limit=20)),
+            before_count,
+        )
+        with self.assertRaises(QuickLinkRotationConflictError) as conflict:
+            repo.enqueue_manual_quick_link_rotation(
+                now,
+                idempotency_key=(
+                    "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+                ),
+            )
+        self.assertEqual(
+            str(conflict.exception),
+            "quick_link_rotation_already_active",
+        )
+
+    def test_manual_rotation_does_not_clear_scheduled_retry_backoff(self):
+        _settings, repo, _fake, _service = self.rotation_fixture()
+        now = datetime(2026, 8, 29, 5, 0, tzinfo=timezone.utc)
+        repo.materialize_due_quick_link_rotations(now, horizon_days=7)
+        scheduled = next(
+            row for row in repo.list_quick_link_rotations(limit=20)
+            if row["local_date"] == "2026-08-29"
+        )
+        retry_at = now + timedelta(minutes=30)
+        retry_text = retry_at.isoformat(timespec="microseconds")
+        with repo._tx(True) as db:
+            db.execute(
+                """UPDATE telegram_quick_link_rotations
+                   SET attempts=1,next_attempt_at=?,last_error=?
+                   WHERE rotation_id=?""",
+                (
+                    retry_text,
+                    "Telegram retry_after",
+                    scheduled["rotation_id"],
+                ),
+            )
+
+        with self.assertRaises(QuickLinkRotationConflictError) as conflict:
+            repo.enqueue_manual_quick_link_rotation(
+                now,
+                idempotency_key=(
+                    "cccccccc-dddd-4eee-8fff-000000000000"
+                ),
+            )
+
+        self.assertEqual(
+            str(conflict.exception),
+            "quick_link_rotation_already_active",
+        )
+        preserved = repo.get_quick_link_rotation(scheduled["rotation_id"])
+        self.assertEqual(preserved["attempts"], 1)
+        self.assertEqual(preserved["next_attempt_at"], retry_text)
+        self.assertEqual(
+            preserved["dedupe_key"],
+            "quick-link-rotation:2026-08-29",
+        )
+
+    def test_manual_rotation_uses_existing_restart_safe_state_machine(self):
+        _settings, repo, fake, service = self.rotation_fixture()
+        now = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+        queued = repo.enqueue_manual_quick_link_rotation(
+            now,
+            idempotency_key="22222222-3333-4444-8555-666666666666",
+        )
+
+        self.assertEqual(service.process_quick_link_rotations(now), 1)
+
+        finished = repo.get_quick_link_rotation(queued["rotation_id"])
+        self.assertEqual((finished["status"], finished["phase"]), (
+            "done", "completed",
+        ))
+        self.assertEqual(finished["trigger_source"], "manual")
+        self.assertEqual(len(fake.sent), 1)
+        new_main_id = fake.next_id
+        self.assertEqual(fake.pinned, [(
+            "-1001463992448", new_main_id, True,
+        )])
+        self.assertIn(("-1001463992448", 5050), fake.unpinned)
+        self.assertEqual(
+            [message_id for _channel, message_id, _html in fake.edited],
+            [5050, new_main_id],
+        )
+        with self.assertRaises(QuickLinkRotationConflictError) as conflict:
+            repo.enqueue_manual_quick_link_rotation(
+                now,
+                idempotency_key=(
+                    "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+                ),
+            )
+        self.assertEqual(
+            str(conflict.exception),
+            "quick_link_rotation_already_exists_today",
+        )
+
+    def test_stale_manual_rotation_does_not_double_publish_on_restart(self):
+        _settings, repo, fake, service = self.rotation_fixture()
+        requested = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+        queued = repo.enqueue_manual_quick_link_rotation(
+            requested,
+            idempotency_key="33333333-4444-4555-8666-777777777777",
+        )
+
+        recovery = datetime(2026, 8, 29, 7, 0, tzinfo=timezone.utc)
+        repo.materialize_due_quick_link_rotations(recovery, horizon_days=7)
+
+        restored = repo.get_quick_link_rotation(queued["rotation_id"])
+        self.assertEqual((restored["status"], restored["phase"]), (
+            "skipped", "skipped",
+        ))
+        today = next(
+            row for row in repo.list_quick_link_rotations(limit=20)
+            if row["local_date"] == "2026-08-29"
+        )
+        self.assertEqual(
+            today["secondary_quick_post_key"],
+            QUICK_LINK_ROTATION_ORDER[0],
+        )
+        self.assertEqual(service.process_quick_link_rotations(recovery), 1)
+        self.assertEqual(service.process_quick_link_rotations(recovery), 0)
+        self.assertEqual(len(fake.sent), 1)
+
+    def test_expired_stale_manual_lease_is_recovered_before_skip(self):
+        _settings, repo, fake, service = self.rotation_fixture()
+        requested = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+        queued = repo.enqueue_manual_quick_link_rotation(
+            requested,
+            idempotency_key="55555555-6666-4777-8888-999999999999",
+        )
+        with repo._tx(True) as db:
+            db.execute(
+                """UPDATE telegram_quick_link_rotations
+                   SET status='running',phase='planned',attempts=1,
+                       lease_token='expired',lease_expires_at=?
+                   WHERE rotation_id=?""",
+                (
+                    requested.isoformat(timespec="microseconds"),
+                    queued["rotation_id"],
+                ),
+            )
+
+        recovery = datetime(2026, 8, 29, 7, 0, tzinfo=timezone.utc)
+        repo.materialize_due_quick_link_rotations(recovery, horizon_days=7)
+
+        restored = repo.get_quick_link_rotation(queued["rotation_id"])
+        self.assertEqual((restored["status"], restored["phase"]), (
+            "skipped", "skipped",
+        ))
+        self.assertEqual(service.process_quick_link_rotations(recovery), 1)
+        self.assertEqual(service.process_quick_link_rotations(recovery), 0)
+        self.assertEqual(len(fake.sent), 1)
+
     def test_catalogue_date_updates_once_daily_after_0001(self):
         _settings, repo, fake, service = self.rotation_fixture()
         self.assertEqual(CATALOG_DATE_UPDATE_TIME, "00:01")
@@ -3219,6 +3425,23 @@ class PriceRepositoryTests(unittest.TestCase):
 
 
 class PricePageAuthTests(unittest.TestCase):
+    def test_admin_script_exposes_guarded_manual_catalogue_action(self):
+        script = (
+            Path(__file__).resolve().parent
+            / "price_server"
+            / "static"
+            / "admin.js"
+        ).read_text(encoding="utf-8")
+        self.assertIn("Опубликовать новый главный пост", script)
+        self.assertIn(
+            "/price/api/v1/quick-link-rotations/publish-now",
+            script,
+        )
+        self.assertIn("price-server-publish-main-idempotency", script)
+        self.assertIn('{"Idempotency-Key": idempotencyKey}', script)
+        self.assertIn("if (result.duplicate)", script)
+        self.assertIn("предыдущий главный пост станет", script)
+
     def test_enabled_price_page_is_password_protected(self):
         module = importlib.import_module("price_server.router")
         with tempfile.TemporaryDirectory() as folder:
@@ -3520,6 +3743,289 @@ class PricePageAuthTests(unittest.TestCase):
                 self.assertEqual(
                     missing.exception.detail,
                     "current_snapshot_not_available",
+                )
+            finally:
+                (
+                    module.settings,
+                    module._repository,
+                    module._service,
+                    module._startup_error,
+                ) = old
+
+    def test_publish_main_endpoint_is_guarded_idempotent_and_queue_only(self):
+        module = importlib.import_module("price_server.router")
+        with tempfile.TemporaryDirectory() as folder:
+            configured = PriceSettings(
+                enabled=True,
+                db_path=Path(folder) / "price.db",
+                legacy_html_path=Path(folder) / "index.html",
+                admin_username="admin",
+                admin_password="secret",
+                sync_api_key="sync",
+                telegram_bot_token="fake-token",
+                telegram_channel_id="-1001463992448",
+                telegram_channel_username="testchannel",
+                product_sort_sheet_id="sheet",
+                posts_sheet_name="Telegram Posts",
+                timezone="Asia/Tashkent",
+                scheduler_poll_seconds=1,
+                sync_max_bytes=2_000_000,
+                telegram_preview_channel_id="-1003922029862",
+            )
+            repo = PriceRepository(configured)
+            fake = FakeTelegram()
+            service = PricePublicationService(
+                configured,
+                repo,
+                telegram=fake,
+            )
+            self.assertEqual(service.ensure_quick_link_registry(), 9)
+            self.assertEqual(service.refresh_quick_link_posts(), 9)
+            fake.sent.clear()
+            fake.edited.clear()
+            fake.pinned.clear()
+            fake.unpinned.clear()
+            old = (
+                module.settings,
+                module._repository,
+                module._service,
+                module._startup_error,
+            )
+            module.settings = configured
+            module._repository = repo
+            module._service = service
+            module._startup_error = ""
+            token = base64.b64encode(b"admin:secret").decode()
+            auth = (b"authorization", f"Basic {token}".encode())
+            request_id = "44444444-5555-4666-8777-888888888888"
+            body_reads = 0
+
+            def request(headers, raw_body=b'{"confirm": true}'):
+                delivered = False
+
+                async def receive():
+                    nonlocal delivered, body_reads
+                    if delivered:
+                        return {
+                            "type": "http.request",
+                            "body": b"",
+                            "more_body": False,
+                        }
+                    delivered = True
+                    body_reads += 1
+                    return {
+                        "type": "http.request",
+                        "body": raw_body,
+                        "more_body": False,
+                    }
+
+                return Request(
+                    {
+                        "type": "http",
+                        "method": "POST",
+                        "path": (
+                            "/price/api/v1/quick-link-rotations/"
+                            "publish-now"
+                        ),
+                        "headers": headers,
+                    },
+                    receive,
+                )
+
+            try:
+                with self.assertRaises(HTTPException) as anonymous:
+                    asyncio.run(
+                        module.publish_main_quick_link_post_now(request([]))
+                    )
+                self.assertEqual(anonymous.exception.status_code, 401)
+                self.assertEqual(body_reads, 0)
+
+                with self.assertRaises(HTTPException) as no_csrf:
+                    asyncio.run(
+                        module.publish_main_quick_link_post_now(
+                            request([auth])
+                        )
+                    )
+                self.assertEqual(no_csrf.exception.status_code, 403)
+                self.assertEqual(body_reads, 0)
+
+                headers = [
+                    auth,
+                    (b"x-requested-with", b"TexnikachPriceAdmin"),
+                    (b"idempotency-key", request_id.encode()),
+                    (b"content-type", b"application/json"),
+                ]
+                first = asyncio.run(
+                    module.publish_main_quick_link_post_now(
+                        request(headers)
+                    )
+                )
+                replay = asyncio.run(
+                    module.publish_main_quick_link_post_now(
+                        request(headers)
+                    )
+                )
+                self.assertFalse(first["duplicate"])
+                self.assertTrue(replay["duplicate"])
+                self.assertEqual(first["status"], "queued")
+                self.assertEqual(replay["status"], "existing")
+                self.assertEqual(replay["rotation_id"], first["rotation_id"])
+                self.assertEqual(first["rotation_status"], "pending")
+                self.assertEqual(first["phase"], "planned")
+                self.assertTrue(first["secondary_title"])
+                self.assertEqual(fake.sent, [])
+                self.assertEqual(fake.edited, [])
+                self.assertEqual(fake.pinned, [])
+                self.assertEqual(fake.unpinned, [])
+                manual = [
+                    row for row in repo.list_quick_link_rotations(limit=20)
+                    if row["trigger_source"] == "manual"
+                ]
+                self.assertEqual(len(manual), 1)
+
+                conflict_headers = [
+                    *headers[:2],
+                    (
+                        b"idempotency-key",
+                        b"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                    ),
+                    headers[3],
+                ]
+                with self.assertRaises(HTTPException) as conflict:
+                    asyncio.run(
+                        module.publish_main_quick_link_post_now(
+                            request(conflict_headers)
+                        )
+                    )
+                self.assertEqual(conflict.exception.status_code, 409)
+                self.assertEqual(
+                    conflict.exception.detail,
+                    "quick_link_rotation_already_active",
+                )
+
+                with self.assertRaises(HTTPException) as confirmation:
+                    asyncio.run(
+                        module.publish_main_quick_link_post_now(
+                            request(headers, b'{"confirm": false}')
+                        )
+                    )
+                self.assertEqual(confirmation.exception.status_code, 422)
+                self.assertEqual(
+                    confirmation.exception.detail,
+                    "explicit_confirmation_required",
+                )
+
+                process_at = (
+                    datetime.fromisoformat(first["scheduled_for"])
+                    + timedelta(seconds=1)
+                )
+                self.assertEqual(
+                    service.process_quick_link_rotations(process_at),
+                    1,
+                )
+                sent_count = len(fake.sent)
+                completed_replay = asyncio.run(
+                    module.publish_main_quick_link_post_now(
+                        request(headers)
+                    )
+                )
+                self.assertTrue(completed_replay["duplicate"])
+                self.assertEqual(
+                    completed_replay["rotation_status"],
+                    "done",
+                )
+                self.assertEqual(
+                    completed_replay["phase"],
+                    "completed",
+                )
+                self.assertEqual(len(fake.sent), sent_count)
+            finally:
+                (
+                    module.settings,
+                    module._repository,
+                    module._service,
+                    module._startup_error,
+                ) = old
+
+    def test_publish_main_endpoint_rejects_invalid_idempotency_key(self):
+        module = importlib.import_module("price_server.router")
+        with tempfile.TemporaryDirectory() as folder:
+            configured = PriceSettings(
+                enabled=True,
+                db_path=Path(folder) / "price.db",
+                legacy_html_path=Path(folder) / "index.html",
+                admin_username="admin",
+                admin_password="secret",
+                sync_api_key="sync",
+                telegram_bot_token="fake-token",
+                telegram_channel_id="-1001463992448",
+                telegram_channel_username="testchannel",
+                product_sort_sheet_id="sheet",
+                posts_sheet_name="Telegram Posts",
+                timezone="Asia/Tashkent",
+                scheduler_poll_seconds=1,
+                sync_max_bytes=2_000_000,
+                telegram_preview_channel_id="-1003922029862",
+            )
+            old = (
+                module.settings,
+                module._repository,
+                module._service,
+                module._startup_error,
+            )
+            module.settings = configured
+            module._repository = PriceRepository(configured)
+            module._service = object()
+            module._startup_error = ""
+            token = base64.b64encode(b"admin:secret").decode()
+            delivered = False
+
+            async def receive():
+                nonlocal delivered
+                if delivered:
+                    return {
+                        "type": "http.request",
+                        "body": b"",
+                        "more_body": False,
+                    }
+                delivered = True
+                return {
+                    "type": "http.request",
+                    "body": b'{"confirm": true}',
+                    "more_body": False,
+                }
+
+            request = Request(
+                {
+                    "type": "http",
+                    "method": "POST",
+                    "path": (
+                        "/price/api/v1/quick-link-rotations/publish-now"
+                    ),
+                    "headers": [
+                        (
+                            b"authorization",
+                            f"Basic {token}".encode(),
+                        ),
+                        (
+                            b"x-requested-with",
+                            b"TexnikachPriceAdmin",
+                        ),
+                        (b"idempotency-key", b"not-a-uuid"),
+                        (b"content-type", b"application/json"),
+                    ],
+                },
+                receive,
+            )
+            try:
+                with self.assertRaises(HTTPException) as invalid:
+                    asyncio.run(
+                        module.publish_main_quick_link_post_now(request)
+                    )
+                self.assertEqual(invalid.exception.status_code, 422)
+                self.assertEqual(
+                    invalid.exception.detail,
+                    "valid_idempotency_key_required",
                 )
             finally:
                 (

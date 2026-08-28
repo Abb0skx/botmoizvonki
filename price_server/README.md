@@ -11,6 +11,7 @@ with the `botmoizvonki` FastAPI application and owns:
 - automatic updates of links inside the existing Telegram catalogue posts;
 - a fenced, durable admin action for updating every current price post;
 - a durable Tue/Thu/Sat 11:00 rotation of the pinned catalogue post;
+- an idempotent admin action for starting that rotation immediately;
 - `chat_id` / `message_id` registry and its `Product Sort` mirror.
 
 Delayed jobs enter the preview channel only when their execution time is no
@@ -70,6 +71,17 @@ manual-cleanup link is sent to the preview channel. Quick-post IDs remain
 authoritative in SQLite and are mirrored to `PRICE_QUICK_LINKS_SHEET_NAME`.
 Every rotation run, including old/new message IDs and pin state, is mirrored to
 `PRICE_QUICK_LINK_ROTATIONS_SHEET_NAME`.
+
+The admin action `Опубликовать новый главный пост` queues the same rotation state machine
+for immediate execution; the HTTP request itself never calls Telegram. Basic
+authentication, the admin action header, explicit confirmation and a UUID
+idempotency key are required. Only one catalogue rotation is allowed per
+Tashkent calendar day. On Tuesday, Thursday or Saturday a not-yet-started
+scheduled occurrence is accelerated instead of duplicated; on another day the
+next second-level position is consumed and future planned positions are
+rebased so the eight-post cycle remains exact. A manual occurrence that never
+started before the Tashkent date changed is marked `skipped`, preventing it
+from publishing back-to-back with the next day's scheduled catalogue.
 
 Rotation is a forward-only leased state machine. The new `sendMessage` result
 is persisted before pin/edit/swap operations continue. The new catalogue keeps

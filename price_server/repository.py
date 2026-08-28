@@ -63,6 +63,14 @@ class IdempotencyConflictError(ValueError):
     """Raised when an idempotency key belongs to another operation scope."""
 
 
+class QuickLinkRotationConflictError(ValueError):
+    """Raised when a manual catalogue rotation cannot be queued safely."""
+
+
+class QuickLinkRotationUnavailableError(ValueError):
+    """Raised when the quick-link registry is not ready for rotation."""
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS price_snapshots (
  snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -661,6 +669,13 @@ class PriceRepository:
         if row is None:
             return None
         result = dict(row)
+        result["trigger_source"] = (
+            "manual"
+            if str(result.get("dedupe_key") or "").startswith(
+                "quick-link-rotation:manual:"
+            )
+            else "schedule"
+        )
         result["main_targets"] = _load(
             result.pop("main_targets_json"), []
         )
@@ -2797,6 +2812,10 @@ class PriceRepository:
         )
         created = 0
         with self._tx(True) as db:
+            # Recover expired leases before deciding which never-started local
+            # dates are stale. Otherwise an expired running/planned row could
+            # become pending only during claim and publish beside today's run.
+            self._recover_quick_link_rotations_tx(db, now)
             required = (CATALOG_QUICK_POST_KEY, *QUICK_LINK_ROTATION_ORDER)
             placeholders = ",".join("?" for _ in required)
             installed = db.execute(
@@ -2825,7 +2844,7 @@ class PriceRepository:
                             lease_token=NULL,lease_expires_at=NULL
                         WHERE rotation_id IN ({placeholders})""",
                     (
-                        "scheduled occurrence passed while the service was offline",
+                        "rotation occurrence passed while the service was offline",
                         _iso(now), _iso(now), *stale_ids,
                     ),
                 )
@@ -2931,6 +2950,220 @@ class PriceRepository:
                 target_date += timedelta(days=1)
         return created
 
+    def enqueue_manual_quick_link_rotation(
+        self,
+        now_utc: datetime | str,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Queue one immediate catalogue rotation without Telegram I/O.
+
+        The local-date uniqueness constraint is an intentional safety fence:
+        only one new main catalogue may be created per Tashkent day.  On a
+        scheduled rotation day the existing pending occurrence is accelerated;
+        on any other day a manual occurrence consumes the next cycle position
+        and all pre-materialized future occurrences are rebased atomically.
+        """
+
+        now = _dt(now_utc, "now_utc")
+        try:
+            request_id = str(uuid.UUID(str(idempotency_key).strip()))
+        except (ValueError, AttributeError) as exc:
+            raise ValueError("idempotency_key must be a UUID") from exc
+        dedupe_key = f"quick-link-rotation:manual:{request_id}"
+
+        # Ensure that today's scheduled occurrence (when applicable) and the
+        # future cycle are present before the single enqueue transaction.
+        self.materialize_due_quick_link_rotations(now, horizon_days=7)
+
+        zone = ZoneInfo(self.timezone)
+        local_date = now.astimezone(zone).date().isoformat()
+        with self._tx(True) as db:
+            replay = db.execute(
+                """SELECT * FROM telegram_quick_link_rotations
+                   WHERE dedupe_key=?""",
+                (dedupe_key,),
+            ).fetchone()
+            if replay is not None:
+                result = self._rotation(replay)
+                assert result is not None
+                result["duplicate"] = True
+                return result
+
+            required = (CATALOG_QUICK_POST_KEY, *QUICK_LINK_ROTATION_ORDER)
+            placeholders = ",".join("?" for _ in required)
+            installed = db.execute(
+                f"""SELECT COUNT(*) AS count
+                    FROM telegram_quick_link_posts
+                    WHERE quick_post_key IN ({placeholders})
+                      AND status!='disabled'""",
+                required,
+            ).fetchone()
+            if installed is None or int(installed["count"]) != len(required):
+                raise QuickLinkRotationUnavailableError(
+                    "quick_link_rotation_registry_not_ready"
+                )
+
+            blocker = db.execute(
+                """SELECT rotation_id FROM telegram_quick_link_rotations
+                   WHERE status IN ('running','needs_review','failed')
+                      OR (status='pending' AND phase!='planned')
+                      OR (status='pending' AND phase='planned'
+                          AND (
+                            attempts>0 OR next_attempt_at IS NOT NULL
+                            OR last_error IS NOT NULL
+                          ))
+                      OR (status='pending' AND phase='planned'
+                          AND dedupe_key LIKE
+                              'quick-link-rotation:manual:%')
+                   ORDER BY scheduled_for,rotation_id LIMIT 1"""
+            ).fetchone()
+            if blocker is not None:
+                raise QuickLinkRotationConflictError(
+                    "quick_link_rotation_already_active"
+                )
+
+            today = db.execute(
+                """SELECT * FROM telegram_quick_link_rotations
+                   WHERE local_date=?""",
+                (local_date,),
+            ).fetchone()
+            accelerated = False
+            old_scheduled_for = ""
+            if today is not None:
+                automatic_key = f"quick-link-rotation:{local_date}"
+                if not (
+                    str(today["status"]) == "pending"
+                    and str(today["phase"]) == "planned"
+                    and str(today["dedupe_key"]) == automatic_key
+                    and int(today["attempts"]) == 0
+                    and today["next_attempt_at"] is None
+                    and today["last_error"] is None
+                ):
+                    raise QuickLinkRotationConflictError(
+                        "quick_link_rotation_already_exists_today"
+                    )
+                old_scheduled_for = str(today["scheduled_for"])
+                cursor = db.execute(
+                    """UPDATE telegram_quick_link_rotations
+                       SET dedupe_key=?,scheduled_for=?,next_attempt_at=NULL,
+                           updated_at=?
+                       WHERE rotation_id=? AND dedupe_key=?
+                         AND status='pending' AND phase='planned'
+                         AND attempts=0 AND next_attempt_at IS NULL
+                         AND last_error IS NULL""",
+                    (
+                        dedupe_key,
+                        _iso(now),
+                        _iso(now),
+                        int(today["rotation_id"]),
+                        automatic_key,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise QuickLinkRotationConflictError(
+                        "quick_link_rotation_already_active"
+                    )
+                rotation_id = int(today["rotation_id"])
+                accelerated = True
+            else:
+                next_planned = db.execute(
+                    """SELECT rotation_index
+                       FROM telegram_quick_link_rotations
+                       WHERE status='pending' AND phase='planned'
+                         AND scheduled_for>?
+                       ORDER BY scheduled_for,rotation_id LIMIT 1""",
+                    (_iso(now),),
+                ).fetchone()
+                if next_planned is not None:
+                    next_index = int(next_planned["rotation_index"])
+                else:
+                    last = db.execute(
+                        """SELECT rotation_index
+                           FROM telegram_quick_link_rotations
+                           WHERE status!='skipped'
+                           ORDER BY scheduled_for DESC,rotation_id DESC
+                           LIMIT 1"""
+                    ).fetchone()
+                    next_index = (
+                        (int(last["rotation_index"]) + 1)
+                        % len(QUICK_LINK_ROTATION_ORDER)
+                        if last is not None else 0
+                    )
+                secondary_key = QUICK_LINK_ROTATION_ORDER[next_index]
+                cursor = db.execute(
+                    """INSERT INTO telegram_quick_link_rotations(
+                         dedupe_key,scheduled_for,local_date,rotation_index,
+                         secondary_quick_post_key,status,phase,attempts,
+                         max_attempts,created_at,updated_at)
+                       VALUES(?,?,?,?,?,'pending','planned',0,12,?,?)""",
+                    (
+                        dedupe_key,
+                        _iso(now),
+                        local_date,
+                        next_index,
+                        secondary_key,
+                        _iso(now),
+                        _iso(now),
+                    ),
+                )
+                rotation_id = int(cursor.lastrowid)
+
+                future = db.execute(
+                    """SELECT rotation_id
+                       FROM telegram_quick_link_rotations
+                       WHERE rotation_id!=? AND status='pending'
+                         AND phase='planned' AND scheduled_for>?
+                       ORDER BY scheduled_for,rotation_id""",
+                    (rotation_id, _iso(now)),
+                ).fetchall()
+                rebased_index = (
+                    next_index + 1
+                ) % len(QUICK_LINK_ROTATION_ORDER)
+                for row in future:
+                    db.execute(
+                        """UPDATE telegram_quick_link_rotations
+                           SET rotation_index=?,secondary_quick_post_key=?,
+                               updated_at=? WHERE rotation_id=?""",
+                        (
+                            rebased_index,
+                            QUICK_LINK_ROTATION_ORDER[rebased_index],
+                            _iso(now),
+                            int(row["rotation_id"]),
+                        ),
+                    )
+                    rebased_index = (
+                        rebased_index + 1
+                    ) % len(QUICK_LINK_ROTATION_ORDER)
+
+            queued = db.execute(
+                """SELECT * FROM telegram_quick_link_rotations
+                   WHERE rotation_id=?""",
+                (rotation_id,),
+            ).fetchone()
+            assert queued is not None
+            self._audit(
+                db,
+                "quick_link_rotation_manual_requested",
+                "quick_link_rotation",
+                rotation_id,
+                {
+                    "request_id": request_id,
+                    "accelerated_scheduled_rotation": accelerated,
+                    "old_scheduled_for": old_scheduled_for,
+                    "scheduled_for": _iso(now),
+                    "rotation_index": int(queued["rotation_index"]),
+                    "secondary_quick_post_key": str(
+                        queued["secondary_quick_post_key"]
+                    ),
+                },
+                now,
+            )
+            result = self._rotation(queued)
+            assert result is not None
+            result["duplicate"] = False
+            return result
+
     @staticmethod
     def _recover_quick_link_rotations_tx(
         db: sqlite3.Connection,
@@ -2987,8 +3220,14 @@ class PriceRepository:
                           OR rotation.next_attempt_at<=?)
                      AND NOT EXISTS(
                        SELECT 1 FROM telegram_quick_link_rotations AS earlier
-                       WHERE earlier.rotation_id<rotation.rotation_id
-                         AND earlier.status NOT IN ('done','skipped')
+                       WHERE earlier.status NOT IN ('done','skipped')
+                         AND (
+                           earlier.scheduled_for<rotation.scheduled_for
+                           OR (
+                             earlier.scheduled_for=rotation.scheduled_for
+                             AND earlier.rotation_id<rotation.rotation_id
+                           )
+                         )
                      )
                      AND NOT EXISTS(
                        SELECT 1 FROM publication_jobs AS job
