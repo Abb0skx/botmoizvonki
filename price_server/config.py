@@ -47,6 +47,10 @@ class PriceSettings:
     calendar_sheet_name: str = "Price Auto Schedule"
     quick_links_sheet_name: str = "Price Quick Links"
     quick_link_rotations_sheet_name: str = "Price Quick Link Rotations"
+    bot_settings_sheet_id: str = (
+        "1TrS6C4oHe6nzQTPTa_4se_upXBFF6rmbfnE7RqznR8U"
+    )
+    bot_settings_sheet_name: str = "bot_settings"
 
     @classmethod
     def load(cls) -> "PriceSettings":
@@ -128,6 +132,19 @@ class PriceSettings:
                 ).strip()
                 or "Price Quick Link Rotations"
             ),
+            bot_settings_sheet_id=(
+                os.getenv(
+                    "PRICE_BOT_SETTINGS_SHEET_ID",
+                    "1TrS6C4oHe6nzQTPTa_4se_upXBFF6rmbfnE7RqznR8U",
+                ).strip()
+                or "1TrS6C4oHe6nzQTPTa_4se_upXBFF6rmbfnE7RqznR8U"
+            ),
+            bot_settings_sheet_name=(
+                os.getenv(
+                    "PRICE_BOT_SETTINGS_SHEET_NAME", "bot_settings"
+                ).strip()
+                or "bot_settings"
+            ),
         )
 
     def validate_runtime(self) -> None:
@@ -175,6 +192,18 @@ class PriceSettings:
         if len(self.quick_link_rotations_sheet_name) > 100:
             raise RuntimeError(
                 "PRICE_QUICK_LINK_ROTATIONS_SHEET_NAME must be at most 100 characters"
+            )
+        if not self.bot_settings_sheet_id:
+            raise RuntimeError(
+                "PRICE_BOT_SETTINGS_SHEET_ID is not configured"
+            )
+        if not self.bot_settings_sheet_name:
+            raise RuntimeError(
+                "PRICE_BOT_SETTINGS_SHEET_NAME is not configured"
+            )
+        if len(self.bot_settings_sheet_name) > 100:
+            raise RuntimeError(
+                "PRICE_BOT_SETTINGS_SHEET_NAME must be at most 100 characters"
             )
 
     @property

@@ -21,6 +21,16 @@ service notices such as pin notifications. `PRICE_POST_INDEX_SHEET_NAME`
 contains one row for every current price section, including blank IDs for
 sections that have never been published.
 
+A new plain numeric post such as `11900` in the preview channel is treated as
+an exchange-rate command. The command is persisted before the Telegram update
+offset advances. The server first edits the active main catalogue to show
+`11 900`, then updates the unique `kurs` row in the existing
+`PRICE_BOT_SETTINGS_SHEET_NAME` tab of `PRICE_BOT_SETTINGS_SHEET_ID`. Only
+after both writes succeed does it publish a confirmation and delete the
+numeric command. The workflow is leased and restart-safe; an uncertain
+confirmation send is left for review instead of being sent twice. Commands
+are processed in order, while SQLite remains the authoritative workflow state.
+
 If Telegram refuses to delete a superseded post (for example, because it is
 older than the Bot API deletion window), the bot sends one manual-cleanup link
 to the preview channel. An administrator deletes the target post and presses

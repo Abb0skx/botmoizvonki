@@ -5,6 +5,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
+from zoneinfo import ZoneInfo
 
 from .config import PriceSettings
 
@@ -106,9 +107,26 @@ QUICK_LINK_ROTATION_HEADERS = (
     "last_error",
 )
 
+BOT_SETTINGS_HEADERS = (
+    "setting",
+    "value",
+    "updated_at",
+)
+BOT_SETTINGS_READ_RANGE = "A1:C100"
+
 
 class RegistryNotConfigured(RuntimeError):
     """Google Sheets credentials are not available in this process."""
+
+
+class BotSettingsRegistryError(RuntimeError):
+    """A bot_settings read, write, or verification failed."""
+
+
+class BotSettingsSchemaError(BotSettingsRegistryError):
+    """The existing bot_settings sheet does not match its strict contract."""
+
+    retryable = False
 
 
 def _google_client():
@@ -165,6 +183,73 @@ def _cell(value: Any) -> Any:
     if isinstance(value, (dict, list, tuple)):
         return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     return str(value)
+
+
+def _google_datetime_serial(
+    value: datetime,
+    timezone_name: str,
+) -> tuple[float, datetime]:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("updated_at must be timezone-aware")
+    local_value = value.astimezone(ZoneInfo(timezone_name)).replace(
+        microsecond=0
+    )
+    local_naive = local_value.replace(tzinfo=None)
+    epoch = datetime(1899, 12, 30)
+    serial = (local_naive - epoch).total_seconds() / 86_400
+    if serial < 0:
+        raise ValueError("updated_at is earlier than the Google Sheets epoch")
+    return serial, local_value
+
+
+def _unformatted_values(worksheet: Any, range_name: str) -> list[list[Any]]:
+    values = worksheet.get(
+        range_name,
+        value_render_option="UNFORMATTED_VALUE",
+        date_time_render_option="SERIAL_NUMBER",
+    )
+    return [list(row) for row in values]
+
+
+def _bot_settings_layout(
+    values: list[list[Any]],
+) -> tuple[dict[str, int], int]:
+    if not values:
+        raise BotSettingsSchemaError("bot_settings is empty")
+    headers = list(values[0][:3])
+    headers.extend([""] * (3 - len(headers)))
+    if any(not isinstance(header, str) for header in headers):
+        raise BotSettingsSchemaError(
+            "bot_settings headers must be text"
+        )
+    if len(set(headers)) != len(BOT_SETTINGS_HEADERS) or set(headers) != set(
+        BOT_SETTINGS_HEADERS
+    ):
+        raise BotSettingsSchemaError(
+            "bot_settings headers must be exactly: setting, value, updated_at"
+        )
+    columns = {header: index for index, header in enumerate(headers)}
+    setting_index = columns["setting"]
+    matching_rows = []
+    for row_number, source in enumerate(values[1:], start=2):
+        row = list(source[:3])
+        row.extend([""] * (3 - len(row)))
+        if row[setting_index] == "kurs":
+            matching_rows.append(row_number)
+    if len(matching_rows) != 1:
+        raise BotSettingsSchemaError(
+            "bot_settings must contain exactly one kurs row"
+        )
+    return columns, matching_rows[0]
+
+
+def _numeric_equal(actual: Any, expected: float) -> bool:
+    if isinstance(actual, bool):
+        return False
+    try:
+        return abs(float(actual) - float(expected)) <= 1e-9
+    except (TypeError, ValueError):
+        return False
 
 
 @dataclass
@@ -682,3 +767,84 @@ class ProductSortQuickLinkRotationRegistry:
             })
         worksheet.batch_update(requests, value_input_option="RAW")
         return len(records)
+
+
+@dataclass
+class BotSettingsRegistry:
+    """Strict writer for the existing Product Prices bot_settings tab."""
+
+    settings: PriceSettings
+    client: Any | None = None
+
+    def _worksheet(self):
+        import gspread
+
+        client = self.client or _google_client()
+        book = client.open_by_key(self.settings.bot_settings_sheet_id)
+        try:
+            return book.worksheet(self.settings.bot_settings_sheet_name)
+        except gspread.WorksheetNotFound as exc:
+            raise BotSettingsSchemaError(
+                "bot_settings worksheet does not exist"
+            ) from exc
+
+    def update_exchange_rate(
+        self,
+        rate: int,
+        updated_at: datetime,
+    ) -> dict[str, Any]:
+        if (
+            isinstance(rate, bool)
+            or not isinstance(rate, int)
+            or not 5000 <= rate <= 50000
+        ):
+            raise ValueError("rate must be between 5000 and 50000")
+        serial, local_updated_at = _google_datetime_serial(
+            updated_at,
+            self.settings.timezone,
+        )
+        worksheet = self._worksheet()
+        values = _unformatted_values(worksheet, BOT_SETTINGS_READ_RANGE)
+        columns, row_number = _bot_settings_layout(values)
+        value_column = _column_letter(columns["value"] + 1)
+        updated_at_column = _column_letter(columns["updated_at"] + 1)
+        worksheet.batch_update(
+            [
+                {
+                    "range": f"{value_column}{row_number}",
+                    "values": [[rate]],
+                },
+                {
+                    "range": f"{updated_at_column}{row_number}",
+                    "values": [[serial]],
+                },
+            ],
+            value_input_option="RAW",
+        )
+
+        verified = _unformatted_values(worksheet, BOT_SETTINGS_READ_RANGE)
+        verified_columns, verified_row_number = _bot_settings_layout(verified)
+        if verified_row_number != row_number:
+            raise BotSettingsRegistryError(
+                "kurs row moved while bot_settings was being updated"
+            )
+        verified_row = list(verified[row_number - 1][:3])
+        verified_row.extend([""] * (3 - len(verified_row)))
+        if not _numeric_equal(
+            verified_row[verified_columns["value"]], rate
+        ):
+            raise BotSettingsRegistryError(
+                "bot_settings exchange-rate verification failed"
+            )
+        if not _numeric_equal(
+            verified_row[verified_columns["updated_at"]], serial
+        ):
+            raise BotSettingsRegistryError(
+                "bot_settings updated_at verification failed"
+            )
+        return {
+            "setting": "kurs",
+            "value": rate,
+            "updated_at": local_updated_at.isoformat(timespec="seconds"),
+            "row_number": row_number,
+        }

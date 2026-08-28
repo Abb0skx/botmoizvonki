@@ -310,7 +310,19 @@ class PriceScheduler:
                 await self._service_call(method_name, *args)
             except Exception:
                 LOG.exception(log_name)
-        processed = await self._process_due_jobs()
+        exchange_rate_progress = 0
+        if quick_links_ready:
+            try:
+                exchange_rate_progress = int(
+                    await self._service_call(
+                        "process_exchange_rate_updates",
+                        self.clock(),
+                    )
+                    or 0
+                )
+            except Exception:
+                LOG.exception("price_exchange_rate_update_failed")
+        processed = await self._process_due_jobs() + exchange_rate_progress
         if processed:
             try:
                 await self._service_call("cleanup_terminal_previews")
@@ -331,6 +343,10 @@ class PriceScheduler:
         # due publications, then permit deletion of the now-unreferenced posts.
         for method_name, log_name in (
             ("refresh_quick_link_posts", "price_quick_link_update_failed"),
+            (
+                "process_exchange_rate_updates",
+                "price_exchange_rate_update_failed",
+            ),
             (
                 "process_quick_link_rotations",
                 "price_quick_link_rotation_failed",
@@ -358,6 +374,11 @@ class PriceScheduler:
                     )
                 elif method_name == "refresh_quick_link_posts":
                     await self._service_call(method_name, self.clock())
+                elif method_name == "process_exchange_rate_updates":
+                    processed += int(
+                        await self._service_call(method_name, self.clock())
+                        or 0
+                    )
                 else:
                     await self._service_call(method_name)
             except Exception:

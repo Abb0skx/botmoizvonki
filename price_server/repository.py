@@ -243,6 +243,31 @@ CREATE TABLE IF NOT EXISTS telegram_quick_link_queue (
 CREATE INDEX IF NOT EXISTS idx_quick_link_queue_due
  ON telegram_quick_link_queue(status,next_attempt_at,quick_post_key);
 
+CREATE TABLE IF NOT EXISTS exchange_rate_change_requests (
+ request_id INTEGER PRIMARY KEY AUTOINCREMENT,
+ source_update_id INTEGER NOT NULL CHECK(source_update_id>=0),
+ source_channel_id TEXT NOT NULL,
+ source_message_id INTEGER NOT NULL CHECK(source_message_id>0),
+ rate INTEGER NOT NULL CHECK(rate BETWEEN 5000 AND 50000),
+ formatted_rate TEXT NOT NULL,
+ requested_at TEXT NOT NULL,
+ target_quick_revision INTEGER,
+ status TEXT NOT NULL DEFAULT 'pending',
+ phase TEXT NOT NULL DEFAULT 'planned',
+ attempts INTEGER NOT NULL DEFAULT 0,
+ max_attempts INTEGER NOT NULL DEFAULT 100,
+ next_attempt_at TEXT,
+ lease_token TEXT,
+ lease_expires_at TEXT,
+ confirmation_message_id INTEGER,
+ last_error TEXT,
+ created_at TEXT NOT NULL,
+ updated_at TEXT NOT NULL,
+ completed_at TEXT,
+ UNIQUE(source_channel_id,source_message_id));
+CREATE INDEX IF NOT EXISTS idx_exchange_rate_requests_due
+ ON exchange_rate_change_requests(status,next_attempt_at,request_id);
+
 CREATE TABLE IF NOT EXISTS telegram_quick_link_rotations (
  rotation_id INTEGER PRIMARY KEY AUTOINCREMENT,
  dedupe_key TEXT NOT NULL UNIQUE,
@@ -2077,6 +2102,24 @@ class PriceRepository:
                     if existing is not None and spec["rotating"]
                     else int(spec["message_id"])
                 )
+                context_row = db.execute(
+                    """SELECT context_json FROM telegram_quick_link_context
+                       WHERE quick_post_key=?""",
+                    (key,),
+                ).fetchone()
+                stored_context = _load(
+                    context_row["context_json"]
+                    if context_row is not None else None,
+                    {},
+                )
+                merged_context = dict(stored_context)
+                for context_key, context_value in spec[
+                    "initial_context"
+                ].items():
+                    merged_context.setdefault(context_key, context_value)
+                context_changed = (
+                    context_row is None or merged_context != stored_context
+                )
                 changed = existing is None or any((
                     str(existing["title"]) != spec["title"],
                     str(existing["channel_id"]) != channel,
@@ -2087,16 +2130,9 @@ class PriceRepository:
                     ),
                     str(existing["template_hash"]) != spec["template_hash"],
                     str(existing["status"]) == "disabled",
+                    context_changed,
                 ))
                 post_url = f"https://t.me/{username}/{effective_message_id}"
-                if existing is not None:
-                    db.execute(
-                        """INSERT INTO telegram_quick_link_context(
-                             quick_post_key,context_json,updated_at)
-                           VALUES(?,?,?)
-                           ON CONFLICT(quick_post_key) DO NOTHING""",
-                        (key, _dump(spec["initial_context"]), _iso(at)),
-                    )
                 if not changed:
                     continue
                 db.execute(
@@ -2124,8 +2160,10 @@ class PriceRepository:
                     """INSERT INTO telegram_quick_link_context(
                          quick_post_key,context_json,updated_at)
                        VALUES(?,?,?)
-                       ON CONFLICT(quick_post_key) DO NOTHING""",
-                    (key, _dump(spec["initial_context"]), _iso(at)),
+                       ON CONFLICT(quick_post_key) DO UPDATE SET
+                        context_json=excluded.context_json,
+                        updated_at=excluded.updated_at""",
+                    (key, _dump(merged_context), _iso(at)),
                 )
                 db.execute(
                     "DELETE FROM telegram_quick_link_targets WHERE quick_post_key=?",
@@ -2328,6 +2366,512 @@ class PriceRepository:
                 now,
             )
             return 1
+
+    def record_exchange_rate_request(
+        self,
+        *,
+        source_update_id: int,
+        source_channel_id: str,
+        source_message_id: int,
+        rate: int,
+        now: datetime | str | None = None,
+    ) -> dict[str, Any]:
+        """Persist one preview-channel rate command before advancing updates."""
+
+        if isinstance(rate, bool):
+            raise ValueError("exchange rate must be an integer")
+        try:
+            update_id = int(source_update_id)
+            message_id = int(source_message_id)
+            normalized_rate = int(rate)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("exchange-rate command identifiers are invalid") from exc
+        channel_id = str(source_channel_id or "").strip()
+        if update_id < 0 or message_id <= 0 or not channel_id:
+            raise ValueError("exchange-rate command identifiers are invalid")
+        if not 5000 <= normalized_rate <= 50000:
+            raise ValueError("exchange rate must be between 5000 and 50000")
+        at = _dt(now, "now", default=True)
+        formatted = f"{normalized_rate:,}".replace(",", " ")
+        with self._tx(True) as db:
+            existing = db.execute(
+                """SELECT * FROM exchange_rate_change_requests
+                   WHERE source_channel_id=? AND source_message_id=?""",
+                (channel_id, message_id),
+            ).fetchone()
+            if existing is not None:
+                if int(existing["rate"]) != normalized_rate:
+                    raise IdempotencyConflictError(
+                        "exchange-rate source message already has another value"
+                    )
+                result = dict(existing)
+                result["duplicate"] = True
+                return result
+            cursor = db.execute(
+                """INSERT INTO exchange_rate_change_requests(
+                     source_update_id,source_channel_id,source_message_id,
+                     rate,formatted_rate,requested_at,status,phase,attempts,
+                     max_attempts,next_attempt_at,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,'pending','planned',0,100,?,?,?)""",
+                (
+                    update_id,
+                    channel_id,
+                    message_id,
+                    normalized_rate,
+                    formatted,
+                    _iso(at),
+                    _iso(at),
+                    _iso(at),
+                    _iso(at),
+                ),
+            )
+            request_id = int(cursor.lastrowid)
+            self._audit(
+                db,
+                "exchange_rate_requested",
+                "exchange_rate_change",
+                request_id,
+                {
+                    "source_channel_id": channel_id,
+                    "source_message_id": message_id,
+                    "rate": normalized_rate,
+                },
+                at,
+            )
+            row = db.execute(
+                "SELECT * FROM exchange_rate_change_requests WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            assert row is not None
+            result = dict(row)
+            result["duplicate"] = False
+            return result
+
+    def get_exchange_rate_request(
+        self,
+        request_id: int,
+    ) -> dict[str, Any] | None:
+        with self._read() as db:
+            row = db.execute(
+                "SELECT * FROM exchange_rate_change_requests WHERE request_id=?",
+                (int(request_id),),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_exchange_rate_requests(
+        self,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        with self._read() as db:
+            rows = db.execute(
+                """SELECT * FROM exchange_rate_change_requests
+                   ORDER BY request_id DESC LIMIT ?""",
+                (min(1000, max(1, int(limit))),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def claim_exchange_rate_request(
+        self,
+        now_utc: datetime | str,
+        *,
+        lease_seconds: int = 180,
+    ) -> dict[str, Any] | None:
+        """Claim the oldest active request; never let an older retry overtake."""
+
+        now = _dt(now_utc, "now_utc")
+        expires = now + timedelta(
+            seconds=min(3600, max(10, int(lease_seconds)))
+        )
+        with self._tx(True) as db:
+            db.execute(
+                """UPDATE exchange_rate_change_requests
+                   SET status='needs_review',last_error=?,lease_token=NULL,
+                       lease_expires_at=NULL,updated_at=?
+                   WHERE status='running' AND phase='confirmation_inflight'
+                     AND (lease_expires_at IS NULL OR lease_expires_at<=?)""",
+                (
+                    "Telegram confirmation outcome is unknown after restart",
+                    _iso(now),
+                    _iso(now),
+                ),
+            )
+            db.execute(
+                """UPDATE exchange_rate_change_requests
+                   SET status='pending',lease_token=NULL,lease_expires_at=NULL,
+                       next_attempt_at=?,updated_at=?
+                   WHERE status='running' AND phase!='confirmation_inflight'
+                     AND (lease_expires_at IS NULL OR lease_expires_at<=?)""",
+                (_iso(now), _iso(now), _iso(now)),
+            )
+            row = db.execute(
+                """SELECT candidate.*
+                   FROM exchange_rate_change_requests AS candidate
+                   WHERE candidate.status='pending'
+                     AND (candidate.next_attempt_at IS NULL
+                          OR candidate.next_attempt_at<=?)
+                     AND NOT EXISTS(
+                       SELECT 1 FROM exchange_rate_change_requests AS earlier
+                       WHERE earlier.request_id<candidate.request_id
+                         AND earlier.status IN ('pending','running')
+                     )
+                   ORDER BY candidate.request_id LIMIT 1""",
+                (_iso(now),),
+            ).fetchone()
+            if row is None:
+                return None
+            token = secrets.token_urlsafe(24)
+            cursor = db.execute(
+                """UPDATE exchange_rate_change_requests
+                   SET status='running',lease_token=?,lease_expires_at=?,
+                       updated_at=?
+                   WHERE request_id=? AND status='pending'""",
+                (token, _iso(expires), _iso(now), int(row["request_id"])),
+            )
+            if cursor.rowcount != 1:
+                return None
+            claimed = db.execute(
+                "SELECT * FROM exchange_rate_change_requests WHERE request_id=?",
+                (int(row["request_id"]),),
+            ).fetchone()
+            return dict(claimed) if claimed is not None else None
+
+    def prepare_exchange_rate_catalog_update(
+        self,
+        request_id: int,
+        lease_token: str,
+        now_utc: datetime | str,
+    ) -> bool:
+        """Set the catalogue context and capture its exact desired revision."""
+
+        now = _dt(now_utc, "now_utc")
+        with self._tx(True) as db:
+            request = db.execute(
+                """SELECT * FROM exchange_rate_change_requests
+                   WHERE request_id=? AND status='running' AND phase='planned'
+                     AND lease_token=?""",
+                (int(request_id), str(lease_token)),
+            ).fetchone()
+            if request is None:
+                return False
+            post = db.execute(
+                """SELECT 1 FROM telegram_quick_link_posts
+                   WHERE quick_post_key=? AND status!='disabled'""",
+                (CATALOG_QUICK_POST_KEY,),
+            ).fetchone()
+            if post is None:
+                raise ValueError("main quick-link catalogue is not configured")
+            context_row = db.execute(
+                """SELECT context_json FROM telegram_quick_link_context
+                   WHERE quick_post_key=?""",
+                (CATALOG_QUICK_POST_KEY,),
+            ).fetchone()
+            context = _load(
+                context_row["context_json"]
+                if context_row is not None else None,
+                {},
+            )
+            context["exchange_rate"] = str(request["formatted_rate"])
+            db.execute(
+                """INSERT INTO telegram_quick_link_context(
+                     quick_post_key,context_json,updated_at)
+                   VALUES(?,?,?)
+                   ON CONFLICT(quick_post_key) DO UPDATE SET
+                    context_json=excluded.context_json,
+                    updated_at=excluded.updated_at""",
+                (CATALOG_QUICK_POST_KEY, _dump(context), _iso(now)),
+            )
+            self._queue_quick_link_post_tx(
+                db,
+                CATALOG_QUICK_POST_KEY,
+                now,
+            )
+            queue = db.execute(
+                """SELECT desired_revision FROM telegram_quick_link_queue
+                   WHERE quick_post_key=?""",
+                (CATALOG_QUICK_POST_KEY,),
+            ).fetchone()
+            if queue is None:
+                raise ValueError("main quick-link update was not queued")
+            revision = int(queue["desired_revision"])
+            cursor = db.execute(
+                """UPDATE exchange_rate_change_requests
+                   SET phase='main_queued',status='pending',attempts=0,
+                       target_quick_revision=?,next_attempt_at=?,
+                       lease_token=NULL,lease_expires_at=NULL,last_error=NULL,
+                       updated_at=?
+                   WHERE request_id=? AND status='running' AND phase='planned'
+                     AND lease_token=?""",
+                (
+                    revision,
+                    _iso(now),
+                    _iso(now),
+                    int(request_id),
+                    str(lease_token),
+                ),
+            )
+            if cursor.rowcount != 1:
+                return False
+            self._audit(
+                db,
+                "exchange_rate_catalog_queued",
+                "exchange_rate_change",
+                request_id,
+                {
+                    "rate": int(request["rate"]),
+                    "target_quick_revision": revision,
+                },
+                now,
+            )
+            return True
+
+    def observe_exchange_rate_catalog_update(
+        self,
+        request_id: int,
+        lease_token: str,
+        now_utc: datetime | str,
+    ) -> str:
+        """Fence Sheet writes behind the exact successfully rendered revision."""
+
+        now = _dt(now_utc, "now_utc")
+        with self._tx(True) as db:
+            request = db.execute(
+                """SELECT * FROM exchange_rate_change_requests
+                   WHERE request_id=? AND status='running'
+                     AND phase='main_queued' AND lease_token=?""",
+                (int(request_id), str(lease_token)),
+            ).fetchone()
+            if request is None:
+                return "lost"
+            queue = db.execute(
+                """SELECT status,applied_revision,desired_revision,last_error
+                   FROM telegram_quick_link_queue WHERE quick_post_key=?""",
+                (CATALOG_QUICK_POST_KEY,),
+            ).fetchone()
+            post = db.execute(
+                """SELECT last_rendered_html FROM telegram_quick_link_posts
+                   WHERE quick_post_key=?""",
+                (CATALOG_QUICK_POST_KEY,),
+            ).fetchone()
+            target_revision = int(request["target_quick_revision"] or 0)
+            if queue is None or post is None or target_revision <= 0:
+                raise ValueError("main quick-link revision is unavailable")
+            applied_revision = int(queue["applied_revision"])
+            if (
+                str(queue["status"]) == "failed"
+                and applied_revision < target_revision
+            ):
+                safe_error = str(
+                    queue["last_error"] or "main catalogue update failed"
+                )[:1000]
+                db.execute(
+                    """UPDATE exchange_rate_change_requests
+                       SET status='failed',last_error=?,lease_token=NULL,
+                           lease_expires_at=NULL,updated_at=?,completed_at=?
+                       WHERE request_id=? AND status='running'
+                         AND lease_token=?""",
+                    (
+                        safe_error,
+                        _iso(now),
+                        _iso(now),
+                        int(request_id),
+                        str(lease_token),
+                    ),
+                )
+                return "failed"
+            if applied_revision < target_revision:
+                db.execute(
+                    """UPDATE exchange_rate_change_requests
+                       SET status='pending',next_attempt_at=?,lease_token=NULL,
+                           lease_expires_at=NULL,updated_at=?
+                       WHERE request_id=? AND status='running'
+                         AND lease_token=?""",
+                    (
+                        _iso(now + timedelta(seconds=2)),
+                        _iso(now),
+                        int(request_id),
+                        str(lease_token),
+                    ),
+                )
+                return "waiting"
+            expected = (
+                "<b>Курс:</b> 1 $ = "
+                f"{request['formatted_rate']} сум"
+            )
+            if expected not in str(post["last_rendered_html"] or ""):
+                raise ValueError(
+                    "main catalogue revision does not contain requested rate"
+                )
+            cursor = db.execute(
+                """UPDATE exchange_rate_change_requests
+                   SET phase='main_applied',attempts=0,last_error=NULL,
+                       updated_at=?
+                   WHERE request_id=? AND status='running'
+                     AND phase='main_queued' AND lease_token=?""",
+                (_iso(now), int(request_id), str(lease_token)),
+            )
+            if cursor.rowcount != 1:
+                return "lost"
+            return "applied"
+
+    def mark_exchange_rate_sheet_updated(
+        self,
+        request_id: int,
+        lease_token: str,
+        now_utc: datetime | str,
+    ) -> bool:
+        now = _dt(now_utc, "now_utc")
+        with self._tx(True) as db:
+            cursor = db.execute(
+                """UPDATE exchange_rate_change_requests
+                   SET phase='sheet_updated',attempts=0,last_error=NULL,
+                       updated_at=?
+                   WHERE request_id=? AND status='running'
+                     AND phase='main_applied' AND lease_token=?""",
+                (_iso(now), int(request_id), str(lease_token)),
+            )
+            return cursor.rowcount == 1
+
+    def mark_exchange_rate_confirmation_inflight(
+        self,
+        request_id: int,
+        lease_token: str,
+        now_utc: datetime | str,
+    ) -> bool:
+        now = _dt(now_utc, "now_utc")
+        with self._tx(True) as db:
+            cursor = db.execute(
+                """UPDATE exchange_rate_change_requests
+                   SET phase='confirmation_inflight',updated_at=?
+                   WHERE request_id=? AND status='running'
+                     AND phase='sheet_updated' AND lease_token=?""",
+                (_iso(now), int(request_id), str(lease_token)),
+            )
+            return cursor.rowcount == 1
+
+    def record_exchange_rate_confirmation_sent(
+        self,
+        request_id: int,
+        lease_token: str,
+        confirmation_message_id: int,
+        now_utc: datetime | str,
+    ) -> bool:
+        now = _dt(now_utc, "now_utc")
+        message_id = int(confirmation_message_id)
+        if message_id <= 0:
+            raise ValueError("confirmation message ID must be positive")
+        with self._tx(True) as db:
+            cursor = db.execute(
+                """UPDATE exchange_rate_change_requests
+                   SET phase='confirmed',confirmation_message_id=?,
+                       attempts=0,last_error=NULL,updated_at=?
+                   WHERE request_id=? AND status='running'
+                     AND phase='confirmation_inflight' AND lease_token=?""",
+                (
+                    message_id,
+                    _iso(now),
+                    int(request_id),
+                    str(lease_token),
+                ),
+            )
+            return cursor.rowcount == 1
+
+    def complete_exchange_rate_request(
+        self,
+        request_id: int,
+        lease_token: str,
+        now_utc: datetime | str,
+    ) -> bool:
+        now = _dt(now_utc, "now_utc")
+        with self._tx(True) as db:
+            cursor = db.execute(
+                """UPDATE exchange_rate_change_requests
+                   SET phase='completed',status='done',attempts=0,
+                       next_attempt_at=NULL,lease_token=NULL,
+                       lease_expires_at=NULL,last_error=NULL,updated_at=?,
+                       completed_at=?
+                   WHERE request_id=? AND status='running'
+                     AND phase='confirmed' AND lease_token=?""",
+                (
+                    _iso(now),
+                    _iso(now),
+                    int(request_id),
+                    str(lease_token),
+                ),
+            )
+            if cursor.rowcount != 1:
+                return False
+            self._audit(
+                db,
+                "exchange_rate_completed",
+                "exchange_rate_change",
+                request_id,
+                {},
+                now,
+            )
+            return True
+
+    def retry_exchange_rate_request(
+        self,
+        request_id: int,
+        lease_token: str,
+        now_utc: datetime | str,
+        error: Any,
+        *,
+        retry_after_seconds: float | int | None = None,
+        permanent: bool = False,
+        ambiguous: bool = False,
+    ) -> bool:
+        now = _dt(now_utc, "now_utc")
+        safe_error = str(error or "exchange-rate update failed").replace(
+            "\n", " "
+        )[:1000]
+        with self._tx(True) as db:
+            row = db.execute(
+                """SELECT * FROM exchange_rate_change_requests
+                   WHERE request_id=? AND status='running' AND lease_token=?""",
+                (int(request_id), str(lease_token)),
+            ).fetchone()
+            if row is None:
+                return False
+            attempts = int(row["attempts"]) + 1
+            if ambiguous:
+                status = "needs_review"
+                phase = str(row["phase"])
+                next_attempt = None
+            else:
+                terminal = permanent or attempts >= int(row["max_attempts"])
+                status = "failed" if terminal else "pending"
+                phase = str(row["phase"])
+                if phase == "confirmation_inflight" and not terminal:
+                    phase = "sheet_updated"
+                delay = (
+                    2 ** min(attempts, 11)
+                    if retry_after_seconds is None
+                    else float(retry_after_seconds)
+                )
+                next_attempt = None if terminal else _iso(
+                    now + timedelta(seconds=min(86400, max(0, delay)))
+                )
+            cursor = db.execute(
+                """UPDATE exchange_rate_change_requests
+                   SET status=?,phase=?,attempts=?,next_attempt_at=?,
+                       lease_token=NULL,lease_expires_at=NULL,last_error=?,
+                       updated_at=?,completed_at=?
+                   WHERE request_id=? AND status='running' AND lease_token=?""",
+                (
+                    status,
+                    phase,
+                    attempts,
+                    next_attempt,
+                    safe_error,
+                    _iso(now),
+                    _iso(now) if status == "failed" else None,
+                    int(request_id),
+                    str(lease_token),
+                ),
+            )
+            return cursor.rowcount == 1
 
     def get_quick_link_post(self, quick_post_key: str) -> dict[str, Any] | None:
         with self._read() as db:

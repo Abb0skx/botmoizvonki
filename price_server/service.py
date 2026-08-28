@@ -4,6 +4,7 @@ import html
 import json
 import hashlib
 import logging
+import re
 import uuid
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, timezone
@@ -17,6 +18,7 @@ from .quick_links import (
 )
 from .post_formatting import format_price_sections
 from .sheets_registry import (
+    BotSettingsRegistry,
     ProductSortCalendarRegistry,
     ProductSortPostIndex,
     ProductSortPostRegistry,
@@ -30,6 +32,7 @@ from .telegram_api import (
 
 
 LOG = logging.getLogger("price_server.service")
+_EXCHANGE_RATE_COMMAND_RE = re.compile(r"^[0-9]{4,6}$")
 
 
 class PublicationError(RuntimeError):
@@ -95,6 +98,7 @@ class PricePublicationService:
             ProductSortQuickLinkRotationRegistry | None
         ) = None
         self._last_quick_link_rotation_hash = ""
+        self._bot_settings_registry: BotSettingsRegistry | None = None
         self._quick_links_ready = False
 
     def _section_for_job(self, job: Any, section_key: str | None = None):
@@ -1372,6 +1376,194 @@ class PricePublicationService:
             show_alert=not completed,
         )
 
+    def _record_exchange_rate_channel_post(
+        self,
+        update_id: int,
+        message: Mapping[str, Any],
+    ) -> bool:
+        """Recognize a plain numeric rate only in the control channel."""
+
+        chat = message.get("chat")
+        if not isinstance(chat, Mapping) or str(chat.get("id")) != str(
+            self.settings.telegram_preview_channel_id
+        ):
+            return False
+        sender = message.get("from")
+        if (
+            isinstance(sender, Mapping)
+            and bool(sender.get("is_bot"))
+        ) or message.get("via_bot") is not None:
+            return False
+        raw_text = message.get("text")
+        if not isinstance(raw_text, str):
+            return False
+        text = raw_text.strip()
+        if _EXCHANGE_RATE_COMMAND_RE.fullmatch(text) is None:
+            return False
+        rate = int(text)
+        if not 5000 <= rate <= 50000:
+            return False
+        try:
+            message_id = int(message.get("message_id"))
+        except (TypeError, ValueError):
+            return False
+        if message_id <= 0:
+            return False
+        self.repository.record_exchange_rate_request(
+            source_update_id=int(update_id),
+            source_channel_id=str(chat["id"]),
+            source_message_id=message_id,
+            rate=rate,
+        )
+        return True
+
+    @staticmethod
+    def _external_error_is_permanent(exc: Exception) -> bool:
+        retryable = getattr(exc, "retryable", None)
+        if retryable is not None:
+            return not bool(retryable)
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+        try:
+            code = int(status_code) if status_code is not None else None
+        except (TypeError, ValueError):
+            code = None
+        if code is not None:
+            return code != 429 and code < 500
+        return isinstance(exc, (TypeError, ValueError))
+
+    def process_exchange_rate_updates(
+        self,
+        now_utc: datetime | str | None = None,
+    ) -> int:
+        """Advance one durable rate change without re-sending ambiguously."""
+
+        if not (
+            self.settings.telegram_configured
+            and self.settings.preview_configured
+        ):
+            return 0
+        now = now_utc if now_utc is not None else datetime.now(timezone.utc)
+        request = self.repository.claim_exchange_rate_request(now)
+        if request is None:
+            return 0
+        request_id = int(request["request_id"])
+        token = str(request["lease_token"])
+        phase = str(request["phase"])
+        try:
+            if phase == "planned":
+                if not self.repository.prepare_exchange_rate_catalog_update(
+                    request_id,
+                    token,
+                    now,
+                ):
+                    raise PublicationError(
+                        "Exchange-rate catalogue lease was lost"
+                    )
+                return 1
+
+            if phase == "main_queued":
+                outcome = self.repository.observe_exchange_rate_catalog_update(
+                    request_id,
+                    token,
+                    now,
+                )
+                if outcome != "applied":
+                    return 1
+                phase = "main_applied"
+
+            if phase == "main_applied":
+                if self._bot_settings_registry is None:
+                    self._bot_settings_registry = BotSettingsRegistry(
+                        self.settings
+                    )
+                requested_at = datetime.fromisoformat(
+                    str(request["requested_at"])
+                )
+                self._bot_settings_registry.update_exchange_rate(
+                    int(request["rate"]),
+                    requested_at,
+                )
+                if not self.repository.mark_exchange_rate_sheet_updated(
+                    request_id,
+                    token,
+                    now,
+                ):
+                    raise PublicationError(
+                        "Exchange-rate Sheet result could not be persisted"
+                    )
+                phase = "sheet_updated"
+
+            if phase == "sheet_updated":
+                if not self.repository.mark_exchange_rate_confirmation_inflight(
+                    request_id,
+                    token,
+                    now,
+                ):
+                    raise PublicationError(
+                        "Exchange-rate confirmation lease was lost"
+                    )
+                sent = self.telegram.send_message(
+                    self.settings.telegram_preview_channel_id,
+                    (
+                        "✅ Курс изменён: 1 $ = "
+                        f"{request['formatted_rate']} сум"
+                    ),
+                )
+                if not self.repository.record_exchange_rate_confirmation_sent(
+                    request_id,
+                    token,
+                    int(sent.message_id),
+                    datetime.now(timezone.utc),
+                ):
+                    raise PartialPublicationError(
+                        "Exchange-rate confirmation was sent but not persisted"
+                    )
+                phase = "confirmed"
+
+            if phase == "confirmed":
+                self.telegram.delete_message(
+                    request["source_channel_id"],
+                    int(request["source_message_id"]),
+                )
+                if not self.repository.complete_exchange_rate_request(
+                    request_id,
+                    token,
+                    datetime.now(timezone.utc),
+                ):
+                    raise PublicationError(
+                        "Exchange-rate completion lease was lost"
+                    )
+                return 1
+
+            raise PublicationError(
+                f"Unsupported exchange-rate phase: {phase}"
+            )
+        except Exception as exc:
+            self.repository.retry_exchange_rate_request(
+                request_id,
+                token,
+                datetime.now(timezone.utc),
+                exc,
+                retry_after_seconds=getattr(exc, "retry_after", None),
+                # A fixed permission, worksheet, or schema problem is
+                # recoverable without another Telegram edit because the
+                # exact Sheet write is idempotent. Keep the numeric command
+                # visible and retry after the operator fixes the Sheet.
+                permanent=(
+                    phase != "main_applied"
+                    and self._external_error_is_permanent(exc)
+                ),
+                ambiguous=bool(getattr(exc, "ambiguous", False)),
+            )
+            LOG.warning(
+                "price_exchange_rate_update_failed request_id=%s phase=%s type=%s",
+                request_id,
+                phase,
+                type(exc).__name__,
+            )
+            return 0
+
     def poll_preview_updates(self) -> int:
         if not self.settings.telegram_configured:
             return 0
@@ -1401,6 +1593,15 @@ class PricePublicationService:
             if isinstance(callback, Mapping):
                 self._handle_cancel_callback(callback)
                 self._handle_manual_deleted_callback(callback)
+            channel_post = update.get("channel_post")
+            if (
+                update_id >= 0
+                and isinstance(channel_post, Mapping)
+            ):
+                self._record_exchange_rate_channel_post(
+                    update_id,
+                    channel_post,
+                )
             for field in ("channel_post", "edited_channel_post"):
                 message = update.get(field)
                 if not isinstance(message, Mapping):

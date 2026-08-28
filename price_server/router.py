@@ -282,6 +282,9 @@ async def price_state(request: Request) -> dict[str, Any]:
         "quick_link_rotations": get_repository().list_quick_link_rotations(
             limit=20
         ),
+        "exchange_rate_changes": (
+            get_repository().list_exchange_rate_requests(limit=20)
+        ),
     }
 
 
@@ -331,6 +334,9 @@ async def price_jobs(request: Request) -> dict[str, Any]:
         ),
         "quick_link_rotations": (
             get_repository().list_quick_link_rotations(limit=100)
+        ),
+        "exchange_rate_changes": (
+            get_repository().list_exchange_rate_requests(limit=100)
         ),
     }
 

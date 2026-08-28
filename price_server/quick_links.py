@@ -79,7 +79,10 @@ QUICK_LINK_POST_SPECS: tuple[dict[str, Any], ...] = (
         "message_id": 5050,
         "rotating": True,
         "reconcile_on_install": True,
-        "initial_context": {"catalog_date": "26.08.2026"},
+        "initial_context": {
+            "catalog_date": "26.08.2026",
+            "exchange_rate": "11 900",
+        },
         "template_html": (
             "<b>Каталог товаров | {{context:catalog_date}}</b>\n\n"
             "Всё в одном месте — с <b>доставкой</b>\n"
@@ -99,7 +102,7 @@ QUICK_LINK_POST_SPECS: tuple[dict[str, Any], ...] = (
             '• <a href="{{post_url:storage-all}}">HDD, SSD, USB, MicroSD</a>\n\n'
             '• <a href="{{post_url:accessories-combined}}">AirTag, SmartTag, Pencil, Keyboard, Mouse</a>\n\n'
             "————————————\n\n"
-            "<b>Курс:</b> 1 $ = 11 930 сум\n\n"
+            "<b>Курс:</b> 1 $ = {{context:exchange_rate}} сум\n\n"
             "<b>Доставка:</b> по городу бесплатно\n"
             "<b>Оплата:</b> после доставки\n"
             '<b>Адрес:</b> Малика, Б2 — <a href="https://t.me/texnikach_info">Локация</a>\n\n'
