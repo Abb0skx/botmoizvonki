@@ -103,6 +103,35 @@
     .chart-legend i { width:13px; height:13px; display:inline-block; vertical-align:-2px; margin-right:5px; border-radius:3px; background:var(--accent) }
     .chart-legend i.forecast { background:#fff3d6; border:2px dashed #e2a329 }
     .chart-legend i.baseline { height:3px; border-radius:3px; background:var(--blue) }
+    .month-section { border-top:1px solid var(--line) }
+    .month-section-head { padding:15px 16px 4px }
+    .month-section-head h3 { margin:0; font-size:16px }
+    .month-section-head p { margin:3px 0 0; color:var(--muted); font-size:12px }
+    .courier-month-layout { display:grid; grid-template-columns:minmax(220px,.55fr) minmax(0,1.45fr); gap:16px; padding:12px 16px 18px }
+    .monthly-couriers { display:grid; gap:8px; align-content:start }
+    .monthly-courier { width:100%; min-height:64px; border:1px solid var(--line); border-radius:12px; padding:10px 12px; background:#fff; color:var(--ink); cursor:pointer; text-align:left }
+    .monthly-courier:hover { border-color:#bdc7d8 }
+    .monthly-courier:focus-visible { outline:3px solid #2563eb55; outline-offset:2px }
+    .monthly-courier[aria-pressed="true"] { border-color:var(--courier-color); box-shadow:inset 4px 0 0 var(--courier-color); background:#fafcff }
+    .monthly-courier-main { display:flex; align-items:center; justify-content:space-between; gap:10px; font-weight:800 }
+    .monthly-courier-main b { font-size:22px }
+    .monthly-courier small { display:block; margin-top:2px; color:var(--muted) }
+    .courier-calendar-wrap { min-width:0; border:1px solid var(--line); border-radius:13px; overflow:hidden }
+    .courier-calendar-title { padding:11px 13px; background:#fafbfc; border-bottom:1px solid var(--line) }
+    .courier-calendar-title h3 { margin:0; font-size:15px }
+    .courier-calendar-title p { margin:2px 0 0; color:var(--muted); font-size:12px }
+    .calendar-scroll { overflow-x:auto }
+    table.delivery-calendar { min-width:0; table-layout:fixed; border-collapse:separate; border-spacing:5px; padding:4px 6px 7px }
+    .delivery-calendar caption { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0 }
+    .delivery-calendar th,.delivery-calendar td { border:0; padding:5px; text-align:center; vertical-align:middle }
+    .delivery-calendar th { background:transparent; color:var(--muted); font-size:11px }
+    .delivery-calendar td { height:58px; border:1px solid #edf0f4; border-radius:9px; background:#fff }
+    .delivery-calendar td.has-deliveries { border-color:var(--courier-color); box-shadow:inset 0 -4px 0 var(--courier-color) }
+    .delivery-calendar td.future { color:#a3aabc; background:#fafbfc }
+    .delivery-calendar td.calendar-empty { border-color:transparent; background:transparent }
+    .delivery-calendar span,.delivery-calendar strong { display:block }
+    .delivery-calendar span { color:var(--muted); font-size:10px }
+    .delivery-calendar strong { margin-top:2px; font-size:18px }
     .districts,.forecast-list { padding:0 16px 16px }
     .district-row { display:grid; grid-template-columns:minmax(130px,1fr) 2fr auto; gap:10px; align-items:center; padding:8px 0 }
     .district-bar { height:8px; background:#eef1f5; border-radius:8px; overflow:hidden }.district-bar i{display:block;height:100%;background:var(--blue);border-radius:8px}
@@ -121,8 +150,8 @@
     .loading.visible { display:grid }
     .error { display:none; margin-bottom:16px; padding:13px 15px; border-radius:12px; color:#8d1d19; background:#fff0ef; border:1px solid #f1c0bd }
     @media (max-width:1100px) { .metrics{grid-template-columns:repeat(3,1fr)} .layout{grid-template-columns:1fr} #map{height:520px} .side{grid-template-columns:1fr 1fr} }
-    @media (max-width:820px) { .analytics-grid{grid-template-columns:1fr}.analytics-wide{grid-column:auto}.breakdowns{grid-template-columns:1fr} }
-    @media (max-width:720px) { .shell{padding:12px} .secure{display:none} .controls{grid-template-columns:1fr 1fr;top:4px}.segmented{grid-column:1/-1}.refresh{min-height:46px}.metrics{grid-template-columns:repeat(2,1fr);gap:8px}.metric{min-height:94px;padding:13px}.side{grid-template-columns:1fr}#map{height:470px}.card-head{display:block}.map-tabs,.chart-toolbar{margin-top:10px}.subtitle{font-size:13px}.district-row{grid-template-columns:1fr auto}.district-bar{grid-column:1/-1;grid-row:2}.bar-chart{height:230px} }
+    @media (max-width:820px) { .analytics-grid{grid-template-columns:1fr}.analytics-wide{grid-column:auto}.breakdowns{grid-template-columns:1fr}.courier-month-layout{grid-template-columns:1fr}.monthly-couriers{grid-template-columns:repeat(3,minmax(0,1fr))} }
+    @media (max-width:720px) { .shell{padding:12px} .secure{display:none} .controls{grid-template-columns:1fr 1fr;top:4px}.segmented{grid-column:1/-1}.refresh{min-height:46px}.metrics{grid-template-columns:repeat(2,1fr);gap:8px}.metric{min-height:94px;padding:13px}.side{grid-template-columns:1fr}#map{height:470px}.card-head{display:block}.map-tabs,.chart-toolbar{margin-top:10px}.subtitle{font-size:13px}.district-row{grid-template-columns:1fr auto}.district-bar{grid-column:1/-1;grid-row:2}.bar-chart{height:230px}.monthly-couriers{grid-template-columns:1fr}.delivery-calendar th,.delivery-calendar td{padding:3px}.delivery-calendar td{height:48px}.delivery-calendar strong{font-size:16px} }
   </style>
 </head>
 <body>
@@ -170,7 +199,26 @@
     </section>
 
     <section class="analytics-grid">
-      <article class="panel analytics-wide"><div class="card-head"><div><h2>Заказы по дням месяца</h2><p id="monthCaption">Факт и прогноз будущих дней.</p></div><div class="chart-toolbar"><button id="monthPrev">←</button><div class="chart-label" id="monthLabel">—</div><button id="monthNext">→</button></div></div><div class="bar-chart" id="monthChart"></div><div class="chart-legend"><span><i></i> Фактически</span><span><i class="forecast"></i> Прогноз</span></div></article>
+      <article class="panel analytics-wide">
+        <div class="card-head">
+          <div><h2>Статистика за месяц</h2><p id="monthCaption" aria-live="polite">Факт и прогноз будущих дней.</p></div>
+          <div class="chart-toolbar"><button id="monthPrev" type="button" aria-label="Предыдущий месяц">←</button><div class="chart-label" id="monthLabel" aria-live="polite">—</div><button id="monthNext" type="button" aria-label="Следующий месяц">→</button></div>
+        </div>
+        <section class="month-section" aria-labelledby="createdMonthTitle">
+          <div class="month-section-head"><h3 id="createdMonthTitle">Созданные заказы по дням</h3><p>Дата, когда менеджер создал заказ.</p></div>
+          <div class="bar-chart" id="monthChart"></div><div class="chart-legend"><span><i></i> Фактически</span><span><i class="forecast"></i> Прогноз</span></div>
+        </section>
+        <section class="month-section" aria-labelledby="courierMonthTitle">
+          <div class="month-section-head"><h3 id="courierMonthTitle">Доставки курьеров за месяц</h3><p id="courierMonthCaption">Нажмите на курьера, чтобы увидеть результат по каждому дню.</p></div>
+          <div class="courier-month-layout">
+            <div class="monthly-couriers" id="monthlyCouriers" aria-label="Количество доставок по курьерам"></div>
+            <div class="courier-calendar-wrap">
+              <div class="courier-calendar-title"><h3 id="monthlyCourierTitle" aria-live="polite">—</h3><p id="monthlyCourierSummary"></p></div>
+              <div class="calendar-scroll" id="courierCalendar"></div>
+            </div>
+          </div>
+        </section>
+      </article>
       <article class="panel analytics-wide"><div class="card-head"><div><h2>Неделя и привычные дни</h2><p>Столбец — выбранная неделя; синяя отметка — среднее этого дня недели за 12 недель.</p></div><div class="chart-toolbar"><button id="weekPrev">←</button><div class="chart-label" id="weekLabel">—</div><button id="weekNext">→</button></div></div><div class="bar-chart" id="weekChart"></div><div class="chart-legend"><span><i></i> Фактически</span><span><i class="forecast"></i> Вероятный объём</span><span><i class="baseline"></i> Обычная нагрузка</span></div></article>
       <article class="panel"><div class="card-head"><div><h2>Заказы по районам</h2><p id="districtCaption">Распределение выбранного месяца.</p></div></div><div class="districts" id="districts"></div></article>
       <article class="panel"><div class="card-head"><div><h2>Следующие 7 дней</h2><p>Вероятность хотя бы одного заказа и ожидаемое количество.</p></div></div><div class="forecast-list" id="forecast"></div><div class="forecast-note" id="forecastNote"></div></article>
@@ -187,7 +235,9 @@
     let requestedCourier = params.get("courier_id") || "";
     let requestedMonth = params.get("month") || "";
     let requestedWeek = params.get("week") || "";
-    let map, routeLayer, noLocationControl, reportVersion="", photoLoadedKey="", loadGeneration=0;
+    let deliveryCourierId = params.get("delivery_courier_id") || requestedCourier || "";
+    let latestAnalytics = null;
+    let map, routeLayer, noLocationControl, reportVersion="", photoLoadedKey="", loadGeneration=0, analyticsGeneration=0;
     const $ = id => document.getElementById(id);
     const escapeHtml = value => String(value ?? "").replace(/[&<>'"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[c]));
     const statusLabels = {draft:"Черновик",pending:"Ожидает",remaining:"Ожидает",picked_up:"Товар у курьера",on_way:"Курьер едет",awaiting_photo:"Подтверждается",awaiting_amount:"Ожидается сумма",completed:"Доставлен",cancelled:"Отменён"};
@@ -214,6 +264,7 @@
       if (requestedCourier) q.set("courier_id", requestedCourier);
       if (requestedMonth) q.set("month", requestedMonth);
       if (requestedWeek) q.set("week", requestedWeek);
+      if (deliveryCourierId) q.set("delivery_courier_id", deliveryCourierId);
       history.replaceState(null, "", `${BASE}?${q}`);
     }
     function metric(label, value, hint="") { return `<article class="panel metric"><div class="label">${label}</div><div class="value">${escapeHtml(value)}</div><div class="hint">${escapeHtml(hint)}</div></article>`; }
@@ -342,11 +393,59 @@
       }).join("");
     }
 
+    function deliveryCourierKey(courier) { return courier.id == null ? "unassigned" : String(courier.id); }
+
+    function renderCourierDeliveries(result) {
+      const delivery = result.month.courier_deliveries;
+      const couriers = delivery.couriers || [];
+      if (!couriers.length) {
+        $("monthlyCouriers").innerHTML = '<div class="empty">Нет данных о курьерах.</div>';
+        $("courierCalendar").innerHTML = "";
+        $("monthlyCourierTitle").textContent = "Нет данных";
+        $("monthlyCourierSummary").textContent = "";
+        return;
+      }
+      let selected = couriers.find(courier => deliveryCourierKey(courier) === deliveryCourierId);
+      if (!selected) {
+        selected = couriers.reduce((best, courier) => courier.completed > best.completed ? courier : best, couriers[0]);
+        deliveryCourierId = deliveryCourierKey(selected);
+      }
+      $("courierMonthCaption").textContent = `${result.month.label} · всего доставлено: ${delivery.total}. Нажмите на курьера, чтобы увидеть дни.`;
+      $("monthlyCouriers").innerHTML = couriers.map(courier => {
+        const key = deliveryCourierKey(courier), active = key === deliveryCourierId;
+        return `<button class="monthly-courier" type="button" data-id="${escapeHtml(key)}" aria-label="${escapeHtml(courier.name)}: доставлено ${courier.completed}" aria-pressed="${active}" style="--courier-color:${escapeHtml(courier.color)}"><span class="monthly-courier-main"><span><i class="dot" style="background:${escapeHtml(courier.color)}"></i>${escapeHtml(courier.name)}</span><b>${courier.completed}</b></span><small>Дней с доставками: ${courier.active_days} · ${courier.share}% месяца</small></button>`;
+      }).join("");
+      document.querySelectorAll(".monthly-courier").forEach(button => button.onclick = () => {
+        deliveryCourierId = button.dataset.id;
+        renderCourierDeliveries(latestAnalytics);
+        updateLocation();
+      });
+
+      $("monthlyCourierTitle").textContent = selected.name;
+      $("monthlyCourierSummary").textContent = `Доставлено: ${selected.completed} · дней с доставками: ${selected.active_days}`;
+      const days = selected.daily || [];
+      const cells = Array(days[0]?.weekday || 0).fill(null).concat(days);
+      while (cells.length % 7) cells.push(null);
+      const rows = [];
+      for (let index = 0; index < cells.length; index += 7) rows.push(cells.slice(index, index + 7));
+      const weekdayNames = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"];
+      const body = rows.map(week => `<tr>${week.map(day => {
+        if (!day) return '<td class="calendar-empty" aria-hidden="true"></td>';
+        const classes = [day.completed ? "has-deliveries" : "", day.future ? "future" : ""].filter(Boolean).join(" ");
+        const value = day.future ? "—" : day.completed;
+        const label = day.future ? `${day.day}: день ещё не наступил` : `${day.day}: доставок ${day.completed}`;
+        return `<td class="${classes}" style="--courier-color:${escapeHtml(selected.color)}" aria-label="${escapeHtml(label)}"><span>${day.day}</span><strong>${value}</strong></td>`;
+      }).join("")}</tr>`).join("");
+      $("courierCalendar").innerHTML = `<table class="delivery-calendar"><caption>Доставки ${escapeHtml(selected.name)} по дням, ${escapeHtml(result.month.label)}</caption><thead><tr>${weekdayNames.map(name => `<th scope="col">${name}</th>`).join("")}</tr></thead><tbody>${body}</tbody></table>`;
+    }
+
     function renderAnalytics(result) {
+      latestAnalytics = result;
       requestedMonth = result.month.value; requestedWeek = result.week.value;
       $("monthLabel").textContent = result.month.label; $("weekLabel").textContent = result.week.label;
       $("monthCaption").textContent = `${result.month.orders} заказов · ${result.month.comparison_label}: ${result.month.change >= 0 ? "+" : ""}${result.month.change}`;
       renderBars("monthChart", result.month.series); renderBars("weekChart", result.week.series);
+      renderCourierDeliveries(result);
       const max = Math.max(1, ...result.month.districts.map(item => item.orders));
       $("districts").innerHTML = result.month.districts.length ? result.month.districts.map(item => `<div class="district-row"><span>${escapeHtml(item.name)}</span><div class="district-bar"><i style="width:${item.orders / max * 100}%"></i></div><b>${item.orders} <small class="delta ${item.change >= 0 ? "up" : "down"}">${item.change >= 0 ? "+" : ""}${item.change}</small></b></div>`).join("") : '<div class="empty">В этом месяце районов пока нет.</div>';
       $("forecast").innerHTML = result.next_7_days.map(item => `<div class="forecast-row"><span>${escapeHtml(item.label)}<small style="display:block;color:var(--muted)">уверенность: ${escapeHtml(item.confidence)}</small></span><b>~${item.expected}</b><span>${item.probability}%</span></div>`).join("");
@@ -357,10 +456,16 @@
     }
 
     async function loadAnalytics(generation=null) {
-      const response = await fetch(analyticsUrl(), {credentials:"same-origin", cache:"no-store"});
-      if (!response.ok) throw new Error(`Не удалось получить аналитику (${response.status}).`);
-      const result = await response.json();
-      if (generation == null || generation === loadGeneration) renderAnalytics(result);
+      const requestGeneration = ++analyticsGeneration;
+      try {
+        const response = await fetch(analyticsUrl(), {credentials:"same-origin", cache:"no-store"});
+        if (requestGeneration !== analyticsGeneration) return;
+        if (!response.ok) throw new Error(`Не удалось получить аналитику (${response.status}).`);
+        const result = await response.json();
+        if (requestGeneration === analyticsGeneration && (generation == null || generation === loadGeneration)) renderAnalytics(result);
+      } catch (error) {
+        if (requestGeneration === analyticsGeneration) throw error;
+      }
     }
 
     async function load() {

@@ -1275,6 +1275,21 @@ class OrderRepository:
             ).fetchall()
         return [OrderEvent.from_row(row) for row in rows]
 
+    def list_orders_with_events(self) -> tuple[list[Order], list[OrderEvent]]:
+        """Read orders and their audit stream from one consistent SQLite snapshot."""
+        with self.connect() as db:
+            db.execute("BEGIN")
+            order_rows = db.execute(
+                "SELECT * FROM orders ORDER BY order_number DESC"
+            ).fetchall()
+            event_rows = db.execute(
+                "SELECT * FROM order_events ORDER BY created_at, id"
+            ).fetchall()
+        return (
+            [Order.from_row(row) for row in order_rows],
+            [OrderEvent.from_row(row) for row in event_rows],
+        )
+
     def list_events_between(
         self,
         start: datetime,
