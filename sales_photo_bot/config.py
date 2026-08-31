@@ -70,7 +70,7 @@ class Settings:
     db_path: Path = Path("data/sales_photo.db")
     heartbeat_path: Path = Path("/tmp/sales-photo-heartbeat")
     allowed_user_ids: frozenset[int] = frozenset()
-    ocr_timeout_seconds: int = 30
+    ocr_timeout_seconds: int = 15
     ocr_max_bytes: int = 12 * 1024 * 1024
     ocr_max_pixels: int = 32_000_000
     delete_retry_seconds: int = 30
@@ -120,7 +120,7 @@ class Settings:
                 values.get("SALES_PHOTO_ALLOWED_USER_IDS", "")
             ),
             ocr_timeout_seconds=_bounded_int(
-                values, "SALES_PHOTO_OCR_TIMEOUT_SECONDS", 30, 5, 120
+                values, "SALES_PHOTO_OCR_TIMEOUT_SECONDS", 15, 5, 120
             ),
             ocr_max_bytes=_positive_int(
                 values, "SALES_PHOTO_OCR_MAX_BYTES", 12 * 1024 * 1024

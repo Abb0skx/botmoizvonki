@@ -157,7 +157,7 @@ class ConfigTests(unittest.TestCase):
                 "SALES_PHOTO_CHAT_ID": str(CHAT_ID),
             }
         )
-        self.assertEqual(parsed.ocr_timeout_seconds, 30)
+        self.assertEqual(parsed.ocr_timeout_seconds, 15)
         with self.assertRaises(ConfigError):
             Settings.from_env(
                 {
@@ -569,6 +569,44 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("📦", caption)
         self.assertIn("🛒💵:", caption)
         bot.delete_message.assert_awaited_once_with(CHAT_ID, 10)
+
+    async def test_total_ocr_deadline_includes_queue_and_download_wait(self):
+        class QueuedRecognizer:
+            def __init__(self):
+                self.gate = asyncio.Semaphore(1)
+
+            async def recognize(self, image_bytes: bytes, mime_type: str):
+                async with self.gate:
+                    await asyncio.Event().wait()
+
+        repo = SalesPhotoRepository(self.root / "db.sqlite")
+        configured = replace(settings(self.root), ocr_timeout_seconds=0.02)
+        service = SalesPhotoService(configured, repo, QueuedRecognizer())
+        bot = telegram_bot()
+        replacement_id = 200
+
+        async def unique_send(**kwargs):
+            nonlocal replacement_id
+            result = SimpleNamespace(message_id=replacement_id)
+            replacement_id += 1
+            return result
+
+        bot.send_photo.side_effect = unique_send
+
+        started = asyncio.get_running_loop().time()
+        await asyncio.gather(
+            service.handle_photo(photo_message(message_id=10, caption=None), bot),
+            service.handle_photo(photo_message(message_id=11, caption=None), bot),
+        )
+        elapsed = asyncio.get_running_loop().time() - started
+
+        self.assertLess(elapsed, 1)
+        self.assertEqual(bot.send_photo.await_count, 2)
+        for call in bot.send_photo.await_args_list:
+            caption = call.kwargs["caption"]
+            self.assertNotIn("<blockquote>IMEI:", caption)
+            self.assertNotIn("<blockquote>S/N:", caption)
+        self.assertEqual(bot.delete_message.await_count, 2)
 
     async def test_source_edit_during_ocr_cancels_stale_repost_and_delete(self):
         entered = asyncio.Event()

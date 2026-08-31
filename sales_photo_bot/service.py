@@ -584,6 +584,12 @@ class SalesPhotoService:
         message_thread_id: int | None,
         photo: object | None = None,
     ) -> None:
+        started = time.monotonic()
+        logger.info(
+            "sales_photo_processing_started chat_id=%s source_message_id=%s",
+            chat_id,
+            source_message_id,
+        )
         try:
             identifiers = await self._read_identifiers(photo, file_id, bot)
         except asyncio.CancelledError:
@@ -596,6 +602,22 @@ class SalesPhotoService:
             except Exception:
                 pass
             raise
+        identifier_count = sum(
+            value is not None
+            for value in (
+                identifiers.imei,
+                identifiers.imei2,
+                identifiers.serial_number,
+            )
+        )
+        logger.info(
+            "sales_photo_ocr_complete chat_id=%s source_message_id=%s "
+            "identifiers=%s elapsed_ms=%s",
+            chat_id,
+            source_message_id,
+            identifier_count,
+            round((time.monotonic() - started) * 1000),
+        )
         key = (chat_id, source_message_id)
         if key in self._cancelled_sources:
             try:
@@ -775,6 +797,16 @@ class SalesPhotoService:
             )
             return
 
+        logger.info(
+            "sales_photo_reposted chat_id=%s source_message_id=%s "
+            "replacement_message_id=%s identifiers=%s elapsed_ms=%s",
+            chat_id,
+            source_message_id,
+            replacement_message_id,
+            identifier_count,
+            round((time.monotonic() - started) * 1000),
+        )
+
         # Keep the original briefly so Telegram can dispatch a source edit that
         # happened while OCR or sendPhoto was running. on_photo itself runs this
         # work in a background task, leaving update-processor slots available.
@@ -902,12 +934,19 @@ class SalesPhotoService:
         if file_size > self.settings.ocr_max_bytes:
             logger.warning("sales_photo_ocr_skipped reason=file_too_large")
             return EMPTY_IDENTIFIERS
-        try:
+
+        async def download_and_recognize() -> ProductIdentifiers:
             telegram_file = await bot.get_file(file_id)
             data = bytes(await telegram_file.download_as_bytearray())
             if len(data) > self.settings.ocr_max_bytes:
                 return EMPTY_IDENTIFIERS
             return await self.recognizer.recognize(data, "image/jpeg")
+
+        try:
+            return await asyncio.wait_for(
+                download_and_recognize(),
+                timeout=self.settings.ocr_timeout_seconds,
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
