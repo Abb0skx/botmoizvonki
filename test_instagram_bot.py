@@ -1,6 +1,10 @@
+import asyncio
+import json
 import os
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 
@@ -45,6 +49,24 @@ FALSE,media-disabled,https://instagram.com/reel/two,Samsung Galaxy S25,Post two,
 TRUE,media-empty,https://instagram.com/reel/three,,Post three,2026-08-20,2026-08-20
 '''
 
+DIRECT_RULES_CSV = '''priority,enabled,keywords,match_type,reply_text,description
+100,TRUE,"заказ, заказать, купить, buyurtma",contains_any,"Заказ: {manager_url}",Заказ
+0,TRUE,DEFAULT,default,"Канал: {telegram_url}\nМенеджер: {manager_url}",По умолчанию
+'''
+
+DIRECT_SETTINGS_CSV = '''setting,value,description
+telegram_url,https://t.me/texnikach,Канал
+manager_url,https://t.me/texnikach_admin,Менеджер
+model_intro,TEXNIKACH,Вступление
+model_prices_label,Актуальные цены:,Цены
+model_course_label,Курс:,Курс
+model_footer,"Заказ: {manager_url}",Заказ модели
+model_other_variants,Другие варианты у менеджера.,Сокращение
+model_from_prefix,от,Префикс минимальной цены
+model_empty_memory_label,Цена,Подпись без памяти
+model_not_found_reply,"Уточните модель: {manager_url}",Модель не найдена
+'''
+
 
 class TriggerDetectionTests(unittest.TestCase):
 
@@ -54,6 +76,17 @@ class TriggerDetectionTests(unittest.TestCase):
             PRODUCTS_CSV,
             SETTINGS_CSV,
         )
+        cls.direct_config = {
+            "rules": instagram_bot.parse_direct_rules_csv(
+                DIRECT_RULES_CSV
+            ),
+            "settings": {
+                **instagram_bot.LOCAL_DIRECT_SETTINGS,
+                **instagram_bot.parse_direct_settings_csv(
+                    DIRECT_SETTINGS_CSV
+                ),
+            },
+        }
 
     def test_supported_generic_triggers(self):
         triggers = (
@@ -539,6 +572,540 @@ class TriggerDetectionTests(unittest.TestCase):
         self.assertEqual(worksheet.appended[0][1], "new-media")
         self.assertEqual(worksheet.appended[0][3], "")
         self.assertEqual(worksheet.value_input_option, "RAW")
+
+    def test_direct_sheet_config_and_placeholders(self):
+        rules = instagram_bot.parse_direct_rules_csv(
+            DIRECT_RULES_CSV
+        )
+        settings = instagram_bot.parse_direct_settings_csv(
+            DIRECT_SETTINGS_CSV
+        )
+
+        order = instagram_bot.resolve_direct_rule(
+            "Хочу заказать телефон",
+            rules=rules,
+        )
+        default = instagram_bot.resolve_direct_rule(
+            "Привет",
+            rules=rules,
+        )
+
+        self.assertEqual(order["source"], "direct_sheet_rule_row_2")
+        self.assertEqual(default["source"], "direct_sheet_default")
+        self.assertEqual(
+            instagram_bot.render_direct_template(
+                order["rule"]["reply_text"],
+                settings,
+            ),
+            "Заказ: https://t.me/texnikach_admin",
+        )
+        self.assertIn(
+            "https://t.me/texnikach",
+            instagram_bot.render_direct_template(
+                default["rule"]["reply_text"],
+                settings,
+            ),
+        )
+
+    def test_direct_known_model_sends_price_and_order_link(self):
+        sent = []
+        statuses = []
+
+        with patch.object(
+            instagram_bot,
+            "get_direct_config",
+            return_value=self.direct_config,
+        ), patch.object(
+            instagram_bot,
+            "get_product_catalog",
+            return_value=self.product_catalog,
+        ), patch.object(
+            instagram_bot,
+            "send_direct_message",
+            side_effect=lambda *args: sent.append(args[2]),
+        ), patch.object(
+            instagram_bot,
+            "update_direct_message_status",
+            side_effect=lambda *args, **kwargs: statuses.append(
+                (args, kwargs)
+            ),
+        ):
+            instagram_bot.process_instagram_direct_message(
+                instagram_account_id="account-id",
+                sender_id="customer-id",
+                message_id="direct-model",
+                message_text="Хочу заказать S25",
+            )
+
+        self.assertEqual(len(sent), 1)
+        self.assertIn("TEXNIKACH", sent[0])
+        self.assertIn("Актуальные цены:", sent[0])
+        self.assertIn("Курс:", sent[0])
+        self.assertIn("Samsung Galaxy S25", sent[0])
+        self.assertIn("8 152 000 So'm", sent[0])
+        self.assertIn("https://t.me/texnikach_admin", sent[0])
+        self.assertNotIn("$", sent[0])
+        self.assertEqual(statuses[-1][0][1], "done")
+        self.assertEqual(
+            statuses[-1][1]["detection_source"],
+            "direct_product_model",
+        )
+
+    def test_direct_plain_model_name_sends_price(self):
+        sent = []
+
+        with patch.object(
+            instagram_bot,
+            "get_direct_config",
+            return_value=self.direct_config,
+        ), patch.object(
+            instagram_bot,
+            "get_product_catalog",
+            return_value=self.product_catalog,
+        ), patch.object(
+            instagram_bot,
+            "send_direct_message",
+            side_effect=lambda *args: sent.append(args[2]),
+        ), patch.object(
+            instagram_bot,
+            "update_direct_message_status",
+        ):
+            instagram_bot.process_instagram_direct_message(
+                instagram_account_id="account-id",
+                sender_id="customer-id",
+                message_id="direct-plain-model",
+                message_text="S25",
+            )
+
+        self.assertEqual(len(sent), 1)
+        self.assertIn("Samsung Galaxy S25", sent[0])
+        self.assertIn("So'm", sent[0])
+        self.assertIn("https://t.me/texnikach_admin", sent[0])
+
+    def test_direct_order_without_model_uses_order_rule(self):
+        sent = []
+
+        with patch.object(
+            instagram_bot,
+            "get_direct_config",
+            return_value=self.direct_config,
+        ), patch.object(
+            instagram_bot,
+            "get_product_catalog",
+            return_value=self.product_catalog,
+        ), patch.object(
+            instagram_bot,
+            "send_direct_message",
+            side_effect=lambda *args: sent.append(args[2]),
+        ), patch.object(
+            instagram_bot,
+            "update_direct_message_status",
+        ):
+            instagram_bot.process_instagram_direct_message(
+                instagram_account_id="account-id",
+                sender_id="customer-id",
+                message_id="direct-order",
+                message_text="Хочу заказать телефон",
+            )
+
+        self.assertEqual(
+            sent,
+            ["Заказ: https://t.me/texnikach_admin"],
+        )
+
+    def test_direct_unknown_text_uses_sheet_default(self):
+        sent = []
+
+        with patch.object(
+            instagram_bot,
+            "get_direct_config",
+            return_value=self.direct_config,
+        ), patch.object(
+            instagram_bot,
+            "get_product_catalog",
+            return_value=self.product_catalog,
+        ), patch.object(
+            instagram_bot,
+            "send_direct_message",
+            side_effect=lambda *args: sent.append(args[2]),
+        ), patch.object(
+            instagram_bot,
+            "update_direct_message_status",
+        ):
+            instagram_bot.process_instagram_direct_message(
+                instagram_account_id="account-id",
+                sender_id="customer-id",
+                message_id="direct-default",
+                message_text="Здравствуйте",
+            )
+
+        self.assertIn("https://t.me/texnikach", sent[0])
+        self.assertIn("https://t.me/texnikach_admin", sent[0])
+
+    def test_direct_ambiguous_model_is_not_guessed(self):
+        sent = []
+
+        with patch.object(
+            instagram_bot,
+            "get_direct_config",
+            return_value=self.direct_config,
+        ), patch.object(
+            instagram_bot,
+            "get_product_catalog",
+            return_value=self.product_catalog,
+        ), patch.object(
+            instagram_bot,
+            "send_direct_message",
+            side_effect=lambda *args: sent.append(args[2]),
+        ), patch.object(
+            instagram_bot,
+            "update_direct_message_status",
+        ):
+            instagram_bot.process_instagram_direct_message(
+                instagram_account_id="account-id",
+                sender_id="customer-id",
+                message_id="direct-ambiguous",
+                message_text="A56 narx",
+            )
+
+        self.assertEqual(
+            sent,
+            ["Уточните модель: https://t.me/texnikach_admin"],
+        )
+        self.assertNotIn("Brand A56", sent[0])
+
+    def test_direct_event_extraction_ignores_echo_and_service_events(self):
+        account_id = instagram_bot.INSTAGRAM_ACCOUNT_ID
+        entry = {
+            "id": account_id,
+            "messaging": [
+                {
+                    "sender": {"id": "customer-id"},
+                    "recipient": {"id": account_id},
+                    "message": {
+                        "mid": "inbound-mid",
+                        "text": "S25 narx",
+                    },
+                },
+                {
+                    "sender": {"id": account_id},
+                    "recipient": {"id": "customer-id"},
+                    "message": {
+                        "mid": "echo-mid",
+                        "text": "Ответ",
+                        "is_echo": True,
+                    },
+                },
+                {
+                    "sender": {"id": "customer-id"},
+                    "recipient": {"id": account_id},
+                    "read": {"mid": "read-mid"},
+                },
+                {
+                    "sender": {"id": "customer-id"},
+                    "recipient": {"id": account_id},
+                    "message_edit": {"mid": "edit-mid"},
+                },
+            ],
+        }
+
+        result = instagram_bot.extract_direct_message_events(entry)
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["message_id"], "inbound-mid")
+        self.assertEqual(result[0]["sender_id"], "customer-id")
+
+    def test_direct_message_claim_is_atomic_and_failed_can_retry(self):
+        message_id = "direct-claim-mid"
+
+        with instagram_bot.connect_instagram_db() as conn:
+            conn.execute(
+                "DELETE FROM instagram_processed_messages WHERE message_id = ?",
+                (message_id,),
+            )
+            conn.commit()
+
+        first = instagram_bot.claim_direct_message(
+            message_id=message_id,
+            sender_id="customer-id",
+            recipient_id="account-id",
+        )
+        duplicate = instagram_bot.claim_direct_message(
+            message_id=message_id,
+            sender_id="customer-id",
+            recipient_id="account-id",
+        )
+
+        instagram_bot.update_direct_message_status(
+            message_id,
+            "failed",
+            error="temporary",
+        )
+
+        retry = instagram_bot.claim_direct_message(
+            message_id=message_id,
+            sender_id="customer-id",
+            recipient_id="account-id",
+        )
+
+        self.assertTrue(first)
+        self.assertFalse(duplicate)
+        self.assertTrue(retry)
+
+    def test_send_direct_message_uses_recipient_id(self):
+        class FakeResponse:
+            ok = True
+            status_code = 200
+            text = ""
+
+            @staticmethod
+            def json():
+                return {
+                    "recipient_id": "customer-id",
+                    "message_id": "sent-mid",
+                }
+
+        with patch.object(
+            instagram_bot,
+            "instagram_headers",
+            return_value={"Authorization": "Bearer test"},
+        ), patch.object(
+            instagram_bot.HTTP,
+            "post",
+            return_value=FakeResponse(),
+        ) as post:
+            result = instagram_bot.send_direct_message(
+                "account-id",
+                "customer-id",
+                "Hello",
+            )
+
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["recipient"], {"id": "customer-id"})
+        self.assertNotIn("comment_id", payload["recipient"])
+        self.assertEqual(payload["message"]["text"], "Hello")
+        self.assertEqual(result["message_id"], "sent-mid")
+
+    def test_long_direct_message_preserves_unique_links(self):
+        manager_url = "https://t.me/texnikach_admin"
+        channel_url = "https://t.me/texnikach"
+        message = (
+            "Очень длинный текст " * 100
+            + "\n"
+            + channel_url
+            + "\n"
+            + manager_url
+            + "\n"
+            + manager_url
+        )
+
+        result = instagram_bot.limit_direct_message(message)
+
+        self.assertLessEqual(
+            len(result),
+            instagram_bot.INSTAGRAM_PRICE_MESSAGE_LIMIT,
+        )
+        self.assertIn(channel_url, result)
+        self.assertIn(manager_url, result)
+        self.assertEqual(result.count(manager_url), 1)
+
+    def test_direct_config_uses_named_sheets_and_protects_links(self):
+        settings_csv = '''setting,value,description
+telegram_url,,Канал
+manager_url,,Менеджер
+model_intro,НОВЫЙ ТЕКСТ,Вступление
+'''
+
+        with patch.object(
+            instagram_bot,
+            "fetch_direct_sheet_csv",
+            side_effect=[
+                DIRECT_RULES_CSV,
+                settings_csv,
+            ],
+        ) as fetch:
+            config = instagram_bot.fetch_direct_config()
+
+        self.assertEqual(
+            [call.args[0] for call in fetch.call_args_list],
+            [
+                instagram_bot.INSTAGRAM_DIRECT_RULES_SHEET_NAME,
+                instagram_bot.INSTAGRAM_DIRECT_SETTINGS_SHEET_NAME,
+            ],
+        )
+        self.assertEqual(config["settings"]["model_intro"], "НОВЫЙ ТЕКСТ")
+        self.assertEqual(
+            config["settings"]["telegram_url"],
+            instagram_bot.LOCAL_DIRECT_SETTINGS["telegram_url"],
+        )
+        self.assertEqual(
+            config["settings"]["manager_url"],
+            instagram_bot.LOCAL_DIRECT_SETTINGS["manager_url"],
+        )
+
+    def test_direct_message_claim_is_concurrent(self):
+        message_id = "direct-concurrent-mid"
+
+        with instagram_bot.connect_instagram_db() as conn:
+            conn.execute(
+                "DELETE FROM instagram_processed_messages WHERE message_id = ?",
+                (message_id,),
+            )
+            conn.commit()
+
+        barrier = threading.Barrier(2)
+
+        def claim():
+            barrier.wait()
+            return instagram_bot.claim_direct_message(
+                message_id=message_id,
+                sender_id="customer-id",
+                recipient_id="account-id",
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(lambda _: claim(), range(2)))
+
+        self.assertEqual(sorted(results), [False, True])
+
+        instagram_bot.update_direct_message_status(
+            message_id,
+            "done",
+        )
+
+        self.assertFalse(
+            instagram_bot.claim_direct_message(
+                message_id=message_id,
+                sender_id="customer-id",
+                recipient_id="account-id",
+            )
+        )
+
+    def test_direct_send_failure_marks_message_failed(self):
+        statuses = []
+
+        with patch.object(
+            instagram_bot,
+            "get_direct_config",
+            return_value=self.direct_config,
+        ), patch.object(
+            instagram_bot,
+            "get_product_catalog",
+            return_value=self.product_catalog,
+        ), patch.object(
+            instagram_bot,
+            "send_direct_message",
+            side_effect=RuntimeError("temporary direct error"),
+        ), patch.object(
+            instagram_bot,
+            "update_direct_message_status",
+            side_effect=lambda *args, **kwargs: statuses.append(
+                (args, kwargs)
+            ),
+        ):
+            instagram_bot.process_instagram_direct_message(
+                instagram_account_id="account-id",
+                sender_id="customer-id",
+                message_id="direct-failed",
+                message_text="Здравствуйте",
+            )
+
+        self.assertEqual(len(statuses), 1)
+        self.assertEqual(statuses[0][0][1], "failed")
+        self.assertIn("temporary direct error", statuses[0][1]["error"])
+
+    def test_instagram_webhook_schedules_direct_once(self):
+        account_id = instagram_bot.INSTAGRAM_ACCOUNT_ID
+        payload = {
+            "object": "instagram",
+            "entry": [
+                {
+                    "id": account_id,
+                    "messaging": [
+                        {
+                            "sender": {"id": "customer-id"},
+                            "recipient": {"id": account_id},
+                            "message": {
+                                "mid": "webhook-direct-mid",
+                                "text": "S25",
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+        raw_body = json.dumps(payload).encode("utf-8")
+
+        class FakeRequest:
+            headers = {"X-Hub-Signature-256": "test"}
+
+            async def body(self):
+                return raw_body
+
+            async def json(self):
+                return payload
+
+        first_tasks = instagram_bot.BackgroundTasks()
+
+        with patch.object(
+            instagram_bot,
+            "INSTAGRAM_APP_SECRET",
+            "configured-secret",
+        ), patch.object(
+            instagram_bot,
+            "verify_meta_signature",
+            return_value=True,
+        ), patch.object(
+            instagram_bot,
+            "claim_direct_message",
+            return_value=True,
+        ) as claim:
+            result = asyncio.run(
+                instagram_bot.instagram_webhook_event(
+                    FakeRequest(),
+                    first_tasks,
+                )
+            )
+
+        self.assertEqual(result, {"ok": True})
+        claim.assert_called_once_with(
+            message_id="webhook-direct-mid",
+            sender_id="customer-id",
+            recipient_id=account_id,
+        )
+        self.assertEqual(len(first_tasks.tasks), 1)
+        self.assertIs(
+            first_tasks.tasks[0].func,
+            instagram_bot.process_instagram_direct_message,
+        )
+        self.assertEqual(
+            first_tasks.tasks[0].kwargs["message_text"],
+            "S25",
+        )
+
+        duplicate_tasks = instagram_bot.BackgroundTasks()
+
+        with patch.object(
+            instagram_bot,
+            "INSTAGRAM_APP_SECRET",
+            "configured-secret",
+        ), patch.object(
+            instagram_bot,
+            "verify_meta_signature",
+            return_value=True,
+        ), patch.object(
+            instagram_bot,
+            "claim_direct_message",
+            return_value=False,
+        ):
+            asyncio.run(
+                instagram_bot.instagram_webhook_event(
+                    FakeRequest(),
+                    duplicate_tasks,
+                )
+            )
+
+        self.assertEqual(len(duplicate_tasks.tasks), 0)
 
 
 if __name__ == "__main__":

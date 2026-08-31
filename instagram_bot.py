@@ -124,6 +124,16 @@ INSTAGRAM_POST_MODELS_SHEET_NAME = os.getenv(
     "post_models",
 ).strip()
 
+INSTAGRAM_DIRECT_RULES_SHEET_NAME = os.getenv(
+    "INSTAGRAM_DIRECT_RULES_SHEET_NAME",
+    "direct_rules",
+).strip()
+
+INSTAGRAM_DIRECT_SETTINGS_SHEET_NAME = os.getenv(
+    "INSTAGRAM_DIRECT_SETTINGS_SHEET_NAME",
+    "direct_settings",
+).strip()
+
 INSTAGRAM_ACCOUNT_ID = os.getenv(
     "INSTAGRAM_ACCOUNT_ID",
     "17841444196466655",
@@ -221,6 +231,7 @@ HTTP = requests.Session()
 RULES_HTTP = requests.Session()
 PRODUCTS_HTTP = requests.Session()
 POSTS_HTTP = requests.Session()
+DIRECT_HTTP = requests.Session()
 
 RULES_CACHE_LOCK = threading.Lock()
 RULES_CACHE = {
@@ -239,6 +250,14 @@ PRODUCTS_CACHE = {
 POST_MODELS_CACHE_LOCK = threading.Lock()
 POST_MODELS_CACHE = {
     "mappings": {},
+    "loaded_at": 0.0,
+    "source": "not_loaded",
+}
+
+DIRECT_CONFIG_CACHE_LOCK = threading.Lock()
+DIRECT_CONFIG_CACHE = {
+    "rules": [],
+    "settings": {},
     "loaded_at": 0.0,
     "source": "not_loaded",
 }
@@ -494,6 +513,38 @@ def init_instagram_db():
         )
 
         # -------------------------------------------------
+        # PROCESSED DIRECT MESSAGES
+        # -------------------------------------------------
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS
+            instagram_processed_messages (
+
+                message_id TEXT
+                    PRIMARY KEY,
+
+                sender_id TEXT,
+
+                recipient_id TEXT,
+
+                detection_source TEXT,
+
+                status TEXT
+                    NOT NULL,
+
+                error TEXT,
+
+                created_at TIMESTAMP
+                    DEFAULT CURRENT_TIMESTAMP,
+
+                updated_at TIMESTAMP
+                    DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+        # -------------------------------------------------
         # INDEXES
         # -------------------------------------------------
 
@@ -514,6 +565,17 @@ def init_instagram_db():
             idx_instagram_processed_status
 
             ON instagram_processed_comments(
+                status
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_instagram_messages_status
+
+            ON instagram_processed_messages(
                 status
             )
             """
@@ -720,6 +782,87 @@ LOCAL_DEFAULT_RULE = {
     "public_reply": "Ответили в Direct ✅",
     "row_number": 0,
 }
+
+LOCAL_DIRECT_SETTINGS = {
+    "telegram_url":
+        "https://t.me/texnikach",
+
+    "manager_url":
+        "https://t.me/texnikach_admin",
+
+    "model_intro":
+        "TEXNIKACH",
+
+    "model_prices_label":
+        "Актуальные цены / Aktual narxlar:",
+
+    "model_course_label":
+        "💱 Курс:",
+
+    "model_footer": (
+        "Для оформления заказа напишите менеджеру:\n"
+        "{manager_url}\n\n"
+        "Buyurtma berish uchun menejerga yozing:\n"
+        "{manager_url}"
+    ),
+
+    "model_other_variants":
+        "Другие варианты уточните у менеджера.",
+
+    "model_from_prefix":
+        "от",
+
+    "model_empty_memory_label":
+        "Цена",
+
+    "model_not_found_reply": (
+        "Пожалуйста, напишите полное название модели. "
+        "Для помощи и заказа свяжитесь с менеджером:\n"
+        "{manager_url}\n\n"
+        "Iltimos, modelning to‘liq nomini yozing. "
+        "Yordam va buyurtma uchun menejerga murojaat qiling:\n"
+        "{manager_url}"
+    ),
+}
+
+LOCAL_DIRECT_RULES = [
+    {
+        "priority": 100,
+        "keywords": [
+            "заказ",
+            "заказать",
+            "купить",
+            "buyurtma",
+            "sotib olish",
+        ],
+        "match_type": "contains_any",
+        "reply_text": (
+            "Для оформления заказа напишите менеджеру:\n"
+            "{manager_url}\n\n"
+            "Buyurtma berish uchun menejerga yozing:\n"
+            "{manager_url}"
+        ),
+        "row_number": 0,
+    },
+    {
+        "priority": 0,
+        "keywords": [],
+        "match_type": "default",
+        "reply_text": (
+            "Здравствуйте! Не совсем понял ваш вопрос.\n\n"
+            "Актуальные модели и цены есть в Telegram-канале:\n"
+            "{telegram_url}\n\n"
+            "Для помощи и заказа напишите менеджеру:\n"
+            "{manager_url}\n\n"
+            "Assalomu alaykum! Savolingizni to‘liq tushunmadim.\n\n"
+            "Aktual modellar va narxlar Telegram-kanalimizda:\n"
+            "{telegram_url}\n\n"
+            "Yordam va buyurtma uchun menejerga yozing:\n"
+            "{manager_url}"
+        ),
+        "row_number": 0,
+    },
+]
 
 
 def parse_enabled(value: str | None) -> bool:
@@ -1221,6 +1364,637 @@ def resolve_response_rule(
             else "local_default"
         ),
     }
+
+
+# =========================================================
+# GOOGLE SHEETS DIRECT CONFIG
+# =========================================================
+
+def parse_direct_rules_csv(
+    csv_text: str,
+) -> list[dict]:
+
+    reader = csv.DictReader(
+        io.StringIO(
+            csv_text.lstrip(
+                "\ufeff"
+            )
+        )
+    )
+
+    headers = {
+        str(
+            header
+            or ""
+        ).strip().lower()
+        for header in (
+            reader.fieldnames
+            or []
+        )
+    }
+
+    required_headers = {
+        "priority",
+        "enabled",
+        "keywords",
+        "match_type",
+        "reply_text",
+    }
+
+    missing_headers = (
+        required_headers
+        - headers
+    )
+
+    if missing_headers:
+
+        raise ValueError(
+            "direct_rules is missing columns: "
+            + ", ".join(
+                sorted(
+                    missing_headers
+                )
+            )
+        )
+
+    rules = []
+
+    for row_number, raw_row in enumerate(
+        reader,
+        start=2,
+    ):
+
+        row = {
+            str(
+                key
+                or ""
+            ).strip().lower(): (
+                value
+                or ""
+            )
+            for key, value in raw_row.items()
+        }
+
+        if not parse_enabled(
+            row.get(
+                "enabled"
+            )
+        ):
+            continue
+
+        match_type = str(
+            row.get(
+                "match_type"
+            )
+            or ""
+        ).strip().lower()
+
+        if (
+            match_type
+            not in SUPPORTED_RULE_MATCH_TYPES
+        ):
+
+            print(
+                "INSTAGRAM DIRECT RULE SKIPPED:",
+                {
+                    "row": row_number,
+                    "reason": "unsupported_match_type",
+                    "match_type": match_type,
+                },
+            )
+
+            continue
+
+        reply_text = str(
+            row.get(
+                "reply_text"
+            )
+            or ""
+        ).strip()
+
+        if not reply_text:
+
+            print(
+                "INSTAGRAM DIRECT RULE SKIPPED:",
+                {
+                    "row": row_number,
+                    "reason": "empty_reply_text",
+                },
+            )
+
+            continue
+
+        try:
+            priority = int(
+                str(
+                    row.get(
+                        "priority"
+                    )
+                    or "0"
+                ).strip()
+            )
+        except ValueError:
+            priority = 0
+
+        keywords = split_rule_keywords(
+            row.get(
+                "keywords"
+            )
+        )
+
+        if (
+            match_type != "default"
+            and
+            not keywords
+        ):
+
+            print(
+                "INSTAGRAM DIRECT RULE SKIPPED:",
+                {
+                    "row": row_number,
+                    "reason": "empty_keywords",
+                },
+            )
+
+            continue
+
+        rules.append(
+            {
+                "priority": priority,
+                "keywords": keywords,
+                "match_type": match_type,
+                "reply_text": reply_text,
+                "row_number": row_number,
+            }
+        )
+
+    if not rules:
+
+        raise ValueError(
+            "direct_rules contains no active valid rules"
+        )
+
+    return sorted(
+        rules,
+        key=lambda rule: (
+            -rule[
+                "priority"
+            ],
+            rule[
+                "row_number"
+            ],
+        ),
+    )
+
+
+def parse_direct_settings_csv(
+    csv_text: str,
+) -> dict[str, str]:
+
+    reader = csv.DictReader(
+        io.StringIO(
+            csv_text.lstrip(
+                "\ufeff"
+            )
+        )
+    )
+
+    headers = {
+        str(
+            header
+            or ""
+        ).strip().lower()
+        for header in (
+            reader.fieldnames
+            or []
+        )
+    }
+
+    required_headers = {
+        "setting",
+        "value",
+    }
+
+    missing_headers = (
+        required_headers
+        - headers
+    )
+
+    if missing_headers:
+
+        raise ValueError(
+            "direct_settings is missing columns: "
+            + ", ".join(
+                sorted(
+                    missing_headers
+                )
+            )
+        )
+
+    settings = {}
+
+    for raw_row in reader:
+
+        row = {
+            str(
+                key
+                or ""
+            ).strip().lower(): (
+                value
+                if value is not None
+                else ""
+            )
+            for key, value in raw_row.items()
+        }
+
+        setting = str(
+            row.get(
+                "setting"
+            )
+            or ""
+        ).strip().lower()
+
+        if not setting:
+            continue
+
+        settings[
+            setting
+        ] = str(
+            row.get(
+                "value"
+            )
+            or ""
+        ).strip()
+
+    if not settings:
+
+        raise ValueError(
+            "direct_settings contains no settings"
+        )
+
+    return settings
+
+
+def fetch_direct_sheet_csv(
+    sheet_name: str,
+) -> str:
+
+    if not INSTAGRAM_RULES_SHEET_ID:
+
+        raise RuntimeError(
+            "INSTAGRAM_RULES_SHEET_ID is not configured"
+        )
+
+    url = (
+        "https://docs.google.com/spreadsheets/d/"
+        f"{INSTAGRAM_RULES_SHEET_ID}/gviz/tq"
+    )
+
+    response = DIRECT_HTTP.get(
+        url,
+        params={
+            "tqx": "out:csv",
+            "sheet": sheet_name,
+        },
+        timeout=INSTAGRAM_RULES_HTTP_TIMEOUT,
+    )
+
+    if not response.ok:
+
+        print(
+            "INSTAGRAM DIRECT SHEET DOWNLOAD ERROR:",
+            {
+                "sheet": sheet_name,
+                "status": response.status_code,
+                "body": response.text[
+                    :500
+                ],
+            },
+        )
+
+        response.raise_for_status()
+
+    return response.content.decode(
+        "utf-8-sig"
+    )
+
+
+def fetch_direct_config() -> dict:
+
+    rules = parse_direct_rules_csv(
+        fetch_direct_sheet_csv(
+            INSTAGRAM_DIRECT_RULES_SHEET_NAME
+        )
+    )
+
+    sheet_settings = parse_direct_settings_csv(
+        fetch_direct_sheet_csv(
+            INSTAGRAM_DIRECT_SETTINGS_SHEET_NAME
+        )
+    )
+
+    settings = dict(
+        LOCAL_DIRECT_SETTINGS
+    )
+
+    settings.update(
+        sheet_settings
+    )
+
+    for required_setting in (
+        "telegram_url",
+        "manager_url",
+    ):
+
+        if str(
+            settings.get(
+                required_setting
+            )
+            or ""
+        ).strip():
+            continue
+
+        print(
+            "INSTAGRAM DIRECT SETTING FALLBACK:",
+            required_setting,
+        )
+
+        settings[
+            required_setting
+        ] = LOCAL_DIRECT_SETTINGS[
+            required_setting
+        ]
+
+    return {
+        "rules": rules,
+        "settings": settings,
+    }
+
+
+def get_direct_config(
+    *,
+    force_refresh: bool = False,
+) -> dict:
+
+    now = time.monotonic()
+
+    cached_rules = DIRECT_CONFIG_CACHE[
+        "rules"
+    ]
+
+    if (
+        not force_refresh
+        and
+        cached_rules
+        and
+        now
+        - DIRECT_CONFIG_CACHE[
+            "loaded_at"
+        ]
+        < INSTAGRAM_RULES_CACHE_TTL
+    ):
+
+        return {
+            "rules": cached_rules,
+            "settings": DIRECT_CONFIG_CACHE[
+                "settings"
+            ],
+        }
+
+    with DIRECT_CONFIG_CACHE_LOCK:
+
+        now = time.monotonic()
+
+        cached_rules = DIRECT_CONFIG_CACHE[
+            "rules"
+        ]
+
+        if (
+            not force_refresh
+            and
+            cached_rules
+            and
+            now
+            - DIRECT_CONFIG_CACHE[
+                "loaded_at"
+            ]
+            < INSTAGRAM_RULES_CACHE_TTL
+        ):
+
+            return {
+                "rules": cached_rules,
+                "settings": DIRECT_CONFIG_CACHE[
+                    "settings"
+                ],
+            }
+
+        try:
+
+            config = fetch_direct_config()
+
+            DIRECT_CONFIG_CACHE.update(
+                {
+                    "rules": config[
+                        "rules"
+                    ],
+                    "settings": config[
+                        "settings"
+                    ],
+                    "loaded_at": now,
+                    "source": "google_sheets",
+                }
+            )
+
+            print(
+                "INSTAGRAM DIRECT CONFIG LOADED:",
+                {
+                    "rules": len(
+                        config[
+                            "rules"
+                        ]
+                    ),
+                    "settings": len(
+                        config[
+                            "settings"
+                        ]
+                    ),
+                },
+            )
+
+            return config
+
+        except Exception as exc:
+
+            print(
+                "INSTAGRAM DIRECT CONFIG LOAD FAILED:",
+                repr(
+                    exc
+                )[
+                    :1000
+                ],
+            )
+
+            if cached_rules:
+
+                DIRECT_CONFIG_CACHE.update(
+                    {
+                        "loaded_at": now,
+                        "source": "stale_cache",
+                    }
+                )
+
+                return {
+                    "rules": cached_rules,
+                    "settings": DIRECT_CONFIG_CACHE[
+                        "settings"
+                    ],
+                }
+
+            fallback = {
+                "rules": [
+                    dict(
+                        rule
+                    )
+                    for rule in LOCAL_DIRECT_RULES
+                ],
+                "settings": dict(
+                    LOCAL_DIRECT_SETTINGS
+                ),
+            }
+
+            DIRECT_CONFIG_CACHE.update(
+                {
+                    "rules": fallback[
+                        "rules"
+                    ],
+                    "settings": fallback[
+                        "settings"
+                    ],
+                    "loaded_at": now,
+                    "source": "local_fallback",
+                }
+            )
+
+            return fallback
+
+
+def resolve_direct_rule(
+    text: str,
+    *,
+    rules: list[dict] | None = None,
+) -> dict:
+
+    normalized = normalize_text(
+        text
+    )
+
+    active_rules = (
+        rules
+        if rules is not None
+        else get_direct_config()[
+            "rules"
+        ]
+    )
+
+    default_rule = None
+
+    for rule in active_rules:
+
+        match_type = rule[
+            "match_type"
+        ]
+
+        if match_type == "default":
+
+            if default_rule is None:
+                default_rule = rule
+
+            continue
+
+        keyword_results = [
+            keyword_matches_text(
+                normalized,
+                keyword,
+            )
+            for keyword in rule[
+                "keywords"
+            ]
+        ]
+
+        matched = False
+
+        if match_type == "contains_any":
+            matched = any(
+                keyword_results
+            )
+
+        elif match_type == "contains_all":
+            matched = all(
+                keyword_results
+            )
+
+        elif match_type == "exact":
+            matched = normalized in rule[
+                "keywords"
+            ]
+
+        if matched:
+
+            return {
+                "rule": rule,
+                "source": (
+                    "direct_sheet_rule_"
+                    f"row_{rule['row_number']}"
+                ),
+            }
+
+    selected_default = (
+        default_rule
+        or LOCAL_DIRECT_RULES[
+            -1
+        ]
+    )
+
+    return {
+        "rule": selected_default,
+        "source": (
+            "direct_sheet_default"
+            if default_rule
+            else "direct_local_default"
+        ),
+    }
+
+
+def render_direct_template(
+    value: str,
+    settings: dict[str, str],
+) -> str:
+
+    rendered = str(
+        value
+        or ""
+    )
+
+    for _ in range(
+        3
+    ):
+
+        previous = rendered
+
+        for key, replacement in settings.items():
+
+            rendered = rendered.replace(
+                "{" + key + "}",
+                str(
+                    replacement
+                    or ""
+                ),
+            )
+
+        if rendered == previous:
+            break
+
+    return rendered.strip()
 
 
 # =========================================================
@@ -2150,7 +2924,29 @@ def concrete_model_qualifier(
 def build_live_product_message(
     family: dict,
     kurs: Decimal,
+    *,
+    text_settings: dict[str, str] | None = None,
 ) -> str:
+
+    active_texts = {
+        "model_intro": "",
+        "model_prices_label": "Актуальные цены:",
+        "model_course_label": "💱 Курс:",
+        "model_footer": (
+            "Цвета и точное наличие уточняйте у менеджера:\n"
+            "https://t.me/texnikach_admin"
+        ),
+        "model_other_variants":
+            "Другие варианты уточните у менеджера.",
+        "model_from_prefix": "от",
+        "model_empty_memory_label": "Цена",
+    }
+
+    if text_settings:
+
+        active_texts.update(
+            text_settings
+        )
 
     rows_by_model = {}
 
@@ -2234,13 +3030,21 @@ def build_live_product_message(
                 price_values
             ) > 1:
                 price_text = (
-                    "от "
+                    str(
+                        active_texts.get(
+                            "model_from_prefix"
+                        )
+                        or ""
+                    ).strip()
+                    + " "
                     + price_text
-                )
+                ).strip()
 
             label = (
                 memory
-                or "Цена"
+                or active_texts[
+                    "model_empty_memory_label"
+                ]
             )
 
             detail_lines.append(
@@ -2266,12 +3070,64 @@ def build_live_product_message(
         " ",
     )
 
+    intro_text = str(
+        active_texts.get(
+            "model_intro"
+        )
+        or ""
+    ).strip()
+
+    heading_lines = []
+
+    if intro_text:
+
+        heading_lines.extend(
+            intro_text.splitlines()
+        )
+
+        heading_lines.append(
+            ""
+        )
+
+    heading_lines.extend(
+        [
+            family[
+                "name"
+            ],
+            "",
+            str(
+                active_texts[
+                    "model_prices_label"
+                ]
+            ),
+        ]
+    )
+
+    model_footer = str(
+        active_texts.get(
+            "model_footer"
+        )
+        or ""
+    ).strip()
+
     footer_lines = [
         "",
-        f"💱 Курс: {kurs_text}",
-        "Цвета и точное наличие уточняйте у менеджера:",
-        "https://t.me/texnikach_admin",
+        (
+            str(
+                active_texts[
+                    "model_course_label"
+                ]
+            ).rstrip()
+            + " "
+            + kurs_text
+        ).strip(),
     ]
+
+    if model_footer:
+
+        footer_lines.extend(
+            model_footer.splitlines()
+        )
 
     selected_detail_lines = []
     omitted = False
@@ -2279,11 +3135,7 @@ def build_live_product_message(
     for line in detail_lines:
 
         candidate_lines = [
-            family[
-                "name"
-            ],
-            "",
-            "Актуальные цены:",
+            *heading_lines,
             *selected_detail_lines,
             line,
             *footer_lines,
@@ -2306,18 +3158,18 @@ def build_live_product_message(
 
         omitted_lines = [
             "",
-            "Другие варианты уточните у менеджера.",
+            str(
+                active_texts[
+                    "model_other_variants"
+                ]
+            ),
         ]
 
         while selected_detail_lines:
 
             candidate_message = "\n".join(
                 [
-                    family[
-                        "name"
-                    ],
-                    "",
-                    "Актуальные цены:",
+                    *heading_lines,
                     *selected_detail_lines,
                     *omitted_lines,
                     *footer_lines,
@@ -2337,14 +3189,146 @@ def build_live_product_message(
 
     return "\n".join(
         [
-            family[
-                "name"
-            ],
-            "",
-            "Актуальные цены:",
+            *heading_lines,
             *selected_detail_lines,
             *footer_lines,
         ]
+    )
+
+
+def limit_instagram_message(
+    message: str,
+) -> str:
+
+    text = str(
+        message
+        or ""
+    ).strip()
+
+    if len(
+        text
+    ) <= INSTAGRAM_PRICE_MESSAGE_LIMIT:
+        return text
+
+    return (
+        text[
+            :INSTAGRAM_PRICE_MESSAGE_LIMIT
+            - 1
+        ].rstrip()
+        + "…"
+    )
+
+
+DIRECT_URL_PATTERN = re.compile(
+    r"https?://[^\s<>()]+",
+    flags=re.IGNORECASE,
+)
+
+
+def limit_direct_message(
+    message: str,
+) -> str:
+
+    text = str(
+        message
+        or ""
+    ).strip()
+
+    if len(
+        text
+    ) <= INSTAGRAM_PRICE_MESSAGE_LIMIT:
+        return text
+
+    urls = []
+
+    for matched_url in DIRECT_URL_PATTERN.findall(
+        text
+    ):
+
+        url = matched_url.rstrip(
+            ".,;:!?"
+        )
+
+        if (
+            url
+            and
+            url not in urls
+        ):
+            urls.append(
+                url
+            )
+
+    if not urls:
+        return limit_instagram_message(
+            text
+        )
+
+    links_footer = "\n".join(
+        urls
+    )
+
+    separator = "\n\n"
+
+    body_limit = (
+        INSTAGRAM_PRICE_MESSAGE_LIMIT
+        - len(
+            separator
+            + links_footer
+        )
+        - 1
+    )
+
+    if body_limit < 1:
+        return limit_instagram_message(
+            text
+        )
+
+    body = text[
+        :body_limit
+    ].rstrip()
+
+    return (
+        body
+        + "…"
+        + separator
+        + links_footer
+    )
+
+
+def build_direct_product_message(
+    family: dict,
+    kurs: Decimal,
+    settings: dict[str, str],
+) -> str:
+
+    text_keys = {
+        "model_intro",
+        "model_prices_label",
+        "model_course_label",
+        "model_footer",
+        "model_other_variants",
+        "model_from_prefix",
+        "model_empty_memory_label",
+    }
+
+    text_settings = {
+        key: render_direct_template(
+            settings.get(
+                key,
+                "",
+            ),
+            settings,
+        )
+        for key in text_keys
+        if key in settings
+    }
+
+    return limit_direct_message(
+        build_live_product_message(
+            family,
+            kurs,
+            text_settings=text_settings,
+        )
     )
 
 
@@ -3962,6 +4946,86 @@ def send_private_reply(
 
 
 # =========================================================
+# DIRECT MESSAGE
+# =========================================================
+
+def send_direct_message(
+    instagram_account_id: str,
+    recipient_id: str,
+    message: str,
+):
+
+    if not instagram_account_id:
+
+        raise RuntimeError(
+            "Instagram account ID is empty"
+        )
+
+    if not recipient_id:
+
+        raise RuntimeError(
+            "Direct recipient ID is empty"
+        )
+
+    message_text = limit_direct_message(
+        message
+    )
+
+    if not message_text:
+
+        raise RuntimeError(
+            "Direct message text is empty"
+        )
+
+    url = (
+        f"{GRAPH_BASE_URL}/"
+        f"{instagram_account_id}/messages"
+    )
+
+    payload = {
+        "recipient": {
+            "id": recipient_id,
+        },
+        "message": {
+            "text": message_text,
+        },
+    }
+
+    response = HTTP.post(
+        url,
+        headers=instagram_headers(),
+        json=payload,
+        timeout=30,
+    )
+
+    if not response.ok:
+
+        print(
+            "INSTAGRAM DIRECT SEND ERROR:",
+            response.status_code,
+            response.text[
+                :1000
+            ],
+        )
+
+        response.raise_for_status()
+
+    result = response.json()
+
+    print(
+        "INSTAGRAM DIRECT SENT:",
+        {
+            "recipient_id": recipient_id,
+            "message_id": result.get(
+                "message_id"
+            ),
+        },
+    )
+
+    return result
+
+
+# =========================================================
 # PUBLIC COMMENT REPLY
 # =========================================================
 
@@ -4170,6 +5234,317 @@ def update_comment_status(
         )
 
         conn.commit()
+
+
+# =========================================================
+# DIRECT MESSAGE DEDUPLICATION
+# =========================================================
+
+def claim_direct_message(
+    *,
+    message_id: str,
+    sender_id: str,
+    recipient_id: str,
+) -> bool:
+
+    if (
+        not message_id
+        or
+        not sender_id
+    ):
+        return False
+
+    with connect_instagram_db() as conn:
+
+        cursor = conn.execute(
+            """
+            INSERT INTO
+            instagram_processed_messages (
+
+                message_id,
+                sender_id,
+                recipient_id,
+                status,
+                updated_at
+            )
+
+            VALUES (
+                ?, ?, ?,
+                'processing',
+                CURRENT_TIMESTAMP
+            )
+
+            ON CONFLICT(message_id)
+
+            DO UPDATE SET
+
+                sender_id =
+                    excluded.sender_id,
+
+                recipient_id =
+                    excluded.recipient_id,
+
+                status =
+                    'processing',
+
+                detection_source =
+                    NULL,
+
+                error =
+                    NULL,
+
+                updated_at =
+                    CURRENT_TIMESTAMP
+
+            WHERE
+                instagram_processed_messages.status =
+                    'failed'
+
+                OR (
+                    instagram_processed_messages.status =
+                        'processing'
+
+                    AND
+
+                    instagram_processed_messages.updated_at <
+                        datetime(
+                            'now',
+                            '-10 minutes'
+                        )
+                )
+            """,
+            (
+                message_id,
+                sender_id,
+                recipient_id,
+            ),
+        )
+
+        conn.commit()
+
+        return cursor.rowcount == 1
+
+
+def update_direct_message_status(
+    message_id: str,
+    status: str,
+    *,
+    detection_source: str | None = None,
+    error: str | None = None,
+):
+
+    with connect_instagram_db() as conn:
+
+        conn.execute(
+            """
+            UPDATE
+                instagram_processed_messages
+
+            SET
+                status = ?,
+
+                detection_source = ?,
+
+                error = ?,
+
+                updated_at =
+                    CURRENT_TIMESTAMP
+
+            WHERE
+                message_id = ?
+            """,
+            (
+                status,
+                detection_source,
+                error,
+                message_id,
+            ),
+        )
+
+        conn.commit()
+
+
+# =========================================================
+# PROCESS DIRECT MESSAGE
+# =========================================================
+
+def process_instagram_direct_message(
+    *,
+    instagram_account_id: str,
+    sender_id: str,
+    message_id: str,
+    message_text: str,
+):
+
+    try:
+
+        print(
+            "INSTAGRAM DIRECT RECEIVED:",
+            {
+                "sender_id": sender_id,
+                "message_id": message_id,
+                "has_text": bool(
+                    str(
+                        message_text
+                        or ""
+                    ).strip()
+                ),
+            },
+        )
+
+        config = get_direct_config()
+
+        settings = config[
+            "settings"
+        ]
+
+        catalog = get_product_catalog()
+
+        if catalog is None:
+
+            model_resolution = {
+                "status": "unavailable",
+                "family": None,
+                "alias": None,
+            }
+
+        else:
+
+            model_resolution = find_price_model_in_text(
+                message_text,
+                catalog=catalog,
+            )
+
+        if (
+            model_resolution[
+                "status"
+            ]
+            == "found"
+        ):
+
+            family = model_resolution[
+                "family"
+            ]
+
+            reply_text = build_direct_product_message(
+                family,
+                model_resolution[
+                    "kurs"
+                ],
+                settings,
+            )
+
+            source = "direct_product_model"
+
+            print(
+                "INSTAGRAM DIRECT PRODUCT MATCH:",
+                {
+                    "message_id": message_id,
+                    "model": family[
+                        "name"
+                    ],
+                    "variants": len(
+                        family[
+                            "rows"
+                        ]
+                    ),
+                },
+            )
+
+        elif (
+            model_resolution[
+                "status"
+            ]
+            == "ambiguous"
+            or
+            looks_like_model_request(
+                message_text
+            )
+        ):
+
+            reply_text = render_direct_template(
+                settings.get(
+                    "model_not_found_reply",
+                    LOCAL_DIRECT_SETTINGS[
+                        "model_not_found_reply"
+                    ],
+                ),
+                settings,
+            )
+
+            source = "direct_model_not_found"
+
+        else:
+
+            resolution = resolve_direct_rule(
+                message_text,
+                rules=config[
+                    "rules"
+                ],
+            )
+
+            reply_text = render_direct_template(
+                resolution[
+                    "rule"
+                ][
+                    "reply_text"
+                ],
+                settings,
+            )
+
+            source = resolution[
+                "source"
+            ]
+
+            print(
+                "INSTAGRAM DIRECT RULE MATCH:",
+                {
+                    "message_id": message_id,
+                    "source": source,
+                    "row": resolution[
+                        "rule"
+                    ].get(
+                        "row_number"
+                    ),
+                },
+            )
+
+        send_direct_message(
+            instagram_account_id,
+            sender_id,
+            reply_text,
+        )
+
+        update_direct_message_status(
+            message_id,
+            "done",
+            detection_source=source,
+        )
+
+        print(
+            "INSTAGRAM DIRECT DONE:",
+            message_id,
+        )
+
+    except Exception as exc:
+
+        print(
+            "INSTAGRAM DIRECT ERROR:",
+            message_id,
+            repr(
+                exc
+            ),
+        )
+
+        update_direct_message_status(
+            message_id,
+            "failed",
+            error=str(
+                exc
+            )[
+                :2000
+            ],
+        )
 
 
 # =========================================================
@@ -4908,6 +6283,22 @@ async def instagram_status():
         else None
     )
 
+    direct_loaded_at = DIRECT_CONFIG_CACHE[
+        "loaded_at"
+    ]
+
+    direct_cache_age_seconds = (
+        int(
+            max(
+                0,
+                time.monotonic()
+                - direct_loaded_at,
+            )
+        )
+        if direct_loaded_at
+        else None
+    )
+
     live_catalog = PRODUCTS_CACHE[
         "catalog"
     ]
@@ -4960,6 +6351,13 @@ async def instagram_status():
             """
         ).fetchone()[0]
 
+        processed_direct = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM instagram_processed_messages
+            """
+        ).fetchone()[0]
+
     return {
 
         "status":
@@ -4975,6 +6373,11 @@ async def instagram_status():
                 INSTAGRAM_VERIFY_TOKEN
             ),
 
+        "app_secret":
+            bool(
+                INSTAGRAM_APP_SECRET
+            ),
+
         "products":
             products,
 
@@ -4986,6 +6389,22 @@ async def instagram_status():
 
         "processed_comments":
             processed,
+
+        "processed_direct_messages":
+            processed_direct,
+
+        "direct_messages_ready":
+            bool(
+                INSTAGRAM_ACCESS_TOKEN
+                and
+                INSTAGRAM_APP_SECRET
+                and
+                INSTAGRAM_ACCOUNT_ID
+                and
+                INSTAGRAM_RULES_SHEET_ID
+                and
+                INSTAGRAM_PRODUCTS_SHEET_ID
+            ),
 
         "rules_sheet_configured":
             bool(
@@ -5009,6 +6428,34 @@ async def instagram_status():
 
         "rules_cache_age_seconds":
             rules_cache_age_seconds,
+
+        "direct_rules_sheet_name":
+            INSTAGRAM_DIRECT_RULES_SHEET_NAME,
+
+        "direct_settings_sheet_name":
+            INSTAGRAM_DIRECT_SETTINGS_SHEET_NAME,
+
+        "direct_cache_source":
+            DIRECT_CONFIG_CACHE[
+                "source"
+            ],
+
+        "direct_rules_count":
+            len(
+                DIRECT_CONFIG_CACHE[
+                    "rules"
+                ]
+            ),
+
+        "direct_settings_count":
+            len(
+                DIRECT_CONFIG_CACHE[
+                    "settings"
+                ]
+            ),
+
+        "direct_cache_age_seconds":
+            direct_cache_age_seconds,
 
         "products_sheet_configured":
             bool(
@@ -5156,6 +6603,152 @@ async def instagram_webhook_verify(
 # INSTAGRAM WEBHOOK EVENTS
 # =========================================================
 
+def extract_direct_message_events(
+    entry: dict,
+) -> list[dict]:
+
+    instagram_account_id = str(
+        entry.get(
+            "id"
+        )
+        or ""
+    )
+
+    if not instagram_account_id:
+        return []
+
+    if (
+        INSTAGRAM_ACCOUNT_ID
+        and
+        instagram_account_id
+        != INSTAGRAM_ACCOUNT_ID
+    ):
+
+        print(
+            "INSTAGRAM DIRECT ACCOUNT IGNORED:",
+            instagram_account_id,
+        )
+
+        return []
+
+    result = []
+
+    for event in (
+        entry.get(
+            "messaging"
+        )
+        or []
+    ):
+
+        if not isinstance(
+            event,
+            dict,
+        ):
+            continue
+
+        message = event.get(
+            "message"
+        )
+
+        if not isinstance(
+            message,
+            dict,
+        ):
+            continue
+
+        if (
+            message.get(
+                "is_echo"
+            )
+            or
+            message.get(
+                "is_deleted"
+            )
+            or
+            message.get(
+                "reaction"
+            )
+        ):
+            continue
+
+        sender_id = str(
+            (
+                event.get(
+                    "sender"
+                )
+                or {}
+            ).get(
+                "id"
+            )
+            or ""
+        )
+
+        recipient_id = str(
+            (
+                event.get(
+                    "recipient"
+                )
+                or {}
+            ).get(
+                "id"
+            )
+            or ""
+        )
+
+        message_id = str(
+            message.get(
+                "mid"
+            )
+            or ""
+        )
+
+        message_text = str(
+            message.get(
+                "text"
+            )
+            or ""
+        )
+
+        attachments = (
+            message.get(
+                "attachments"
+            )
+            or []
+        )
+
+        if (
+            not sender_id
+            or
+            sender_id
+            == instagram_account_id
+            or
+            not recipient_id
+            or
+            recipient_id
+            != instagram_account_id
+            or
+            not message_id
+            or (
+                not message_text.strip()
+                and
+                not attachments
+            )
+        ):
+            continue
+
+        result.append(
+            {
+                "instagram_account_id":
+                    instagram_account_id,
+                "sender_id": sender_id,
+                "recipient_id": recipient_id,
+                "message_id": message_id,
+                "message_text": message_text,
+            }
+        )
+
+    return result
+
 @router.post(
     "/webhooks/instagram"
 )
@@ -5195,9 +6788,41 @@ async def instagram_webhook_event(
             detail="Invalid JSON",
         ) from exc
 
+    entries = (
+        data.get(
+            "entry"
+        )
+        or []
+    )
+
     print(
         "INSTAGRAM WEBHOOK EVENT:",
-        data,
+        {
+            "object": data.get(
+                "object"
+            ),
+            "entries": len(
+                entries
+            ),
+            "changes": sum(
+                len(
+                    entry.get(
+                        "changes"
+                    )
+                    or []
+                )
+                for entry in entries
+            ),
+            "messaging": sum(
+                len(
+                    entry.get(
+                        "messaging"
+                    )
+                    or []
+                )
+                for entry in entries
+            ),
+        },
     )
 
     if (
@@ -5212,12 +6837,7 @@ async def instagram_webhook_event(
             "ignored": True,
         }
 
-    for entry in (
-        data.get(
-            "entry"
-        )
-        or []
-    ):
+    for entry in entries:
 
         instagram_account_id = str(
             entry.get(
@@ -5359,6 +6979,68 @@ async def instagram_webhook_event(
 
                 comment_text=
                     comment_text,
+            )
+
+        # -------------------------------------------------
+        # INCOMING DIRECT MESSAGES
+        # -------------------------------------------------
+
+        if (
+            entry.get(
+                "messaging"
+            )
+            and
+            not INSTAGRAM_APP_SECRET
+        ):
+
+            print(
+                "INSTAGRAM DIRECT DISABLED:",
+                "instagram_app_secret_missing",
+            )
+
+            continue
+
+        for direct_event in extract_direct_message_events(
+            entry
+        ):
+
+            claimed = claim_direct_message(
+                message_id=direct_event[
+                    "message_id"
+                ],
+                sender_id=direct_event[
+                    "sender_id"
+                ],
+                recipient_id=direct_event[
+                    "recipient_id"
+                ],
+            )
+
+            if not claimed:
+
+                print(
+                    "INSTAGRAM DIRECT DUPLICATE:",
+                    direct_event[
+                        "message_id"
+                    ],
+                )
+
+                continue
+
+            background_tasks.add_task(
+                process_instagram_direct_message,
+                instagram_account_id=direct_event[
+                    "instagram_account_id"
+                ],
+                sender_id=direct_event[
+                    "sender_id"
+                ],
+                message_id=direct_event[
+                    "message_id"
+                ],
+                message_text=direct_event[
+                    "message_text"
+                ],
             )
 
     return {
