@@ -1,0 +1,26 @@
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+COPY requirements-sales-photo.txt .
+RUN pip install --no-cache-dir -r requirements-sales-photo.txt
+
+COPY sales_photo_bot ./sales_photo_bot
+
+RUN groupadd --system --gid 10001 salesbot \
+    && useradd --system --uid 10001 --gid salesbot --home-dir /app --shell /usr/sbin/nologin salesbot \
+    && mkdir -p /app/data \
+    && chown -R salesbot:salesbot /app/data
+
+USER 10001:10001
+
+VOLUME ["/app/data"]
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
+  CMD python -c "import os,time; from pathlib import Path; p=Path(os.getenv('SALES_PHOTO_HEARTBEAT_PATH','/tmp/sales-photo-heartbeat')); assert p.is_file() and time.time()-p.stat().st_mtime<180"
+
+CMD ["python", "-m", "sales_photo_bot.main"]

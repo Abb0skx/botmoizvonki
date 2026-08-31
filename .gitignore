@@ -2,6 +2,7 @@
 .env.*
 !.env.delivery.example
 !.env.example
+!.env.sales-photo.example
 data/.env
 __pycache__/
 *.pyc
@@ -18,3 +19,7 @@ data/delivery.db-shm
 data/delivery.db-wal
 data/delivery-state.pickle*
 data/delivery-heartbeat
+data/sales_photo.db*
+sales_photo*.key
+*.sqlite.key
+*.sqlite3.key

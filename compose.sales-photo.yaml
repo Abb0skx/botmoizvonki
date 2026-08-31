@@ -1,0 +1,48 @@
+services:
+  sales-photo-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.sales-photo
+    restart: unless-stopped
+    stop_grace_period: 180s
+    init: true
+    cpus: 1.0
+    mem_limit: 512m
+    pids_limit: 256
+    environment:
+      SALES_PHOTO_BOT_TOKEN: ${SALES_PHOTO_BOT_TOKEN:?set SALES_PHOTO_BOT_TOKEN}
+      SALES_PHOTO_CHAT_ID: ${SALES_PHOTO_CHAT_ID:?set SALES_PHOTO_CHAT_ID}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:?set GEMINI_API_KEY}
+      SERPER_API_KEY: ${SERPER_API_KEY:?set SERPER_API_KEY}
+      SALES_PHOTO_DB_PATH: /app/data/sales_photo.db
+      SALES_PHOTO_HEARTBEAT_PATH: /tmp/sales-photo-heartbeat
+      SALES_PHOTO_ALLOWED_USER_IDS: "${SALES_PHOTO_ALLOWED_USER_IDS:-}"
+      SALES_PHOTO_GEMINI_MODEL: "${SALES_PHOTO_GEMINI_MODEL:-gemini-2.5-flash}"
+      SALES_PHOTO_SEARCH_COUNTRY: "${SALES_PHOTO_SEARCH_COUNTRY:-uz}"
+      SALES_PHOTO_SEARCH_LANGUAGE: "${SALES_PHOTO_SEARCH_LANGUAGE:-ru}"
+      SALES_PHOTO_RECOGNITION_TIMEOUT_SECONDS: "${SALES_PHOTO_RECOGNITION_TIMEOUT_SECONDS:-75}"
+      SALES_PHOTO_SEARCH_TIMEOUT_SECONDS: "${SALES_PHOTO_SEARCH_TIMEOUT_SECONDS:-12}"
+      SALES_PHOTO_RECOGNITION_MAX_BYTES: "${SALES_PHOTO_RECOGNITION_MAX_BYTES:-12582912}"
+      SALES_PHOTO_MIN_CONFIDENCE: "${SALES_PHOTO_MIN_CONFIDENCE:-0.72}"
+      SALES_PHOTO_CACHE_DAYS: "${SALES_PHOTO_CACHE_DAYS:-30}"
+      SALES_PHOTO_DELETE_RETRY_SECONDS: "${SALES_PHOTO_DELETE_RETRY_SECONDS:-30}"
+      SALES_PHOTO_CONCURRENT_UPDATES: "${SALES_PHOTO_CONCURRENT_UPDATES:-4}"
+      SALES_PHOTO_DROP_PENDING_ON_FIRST_START: "${SALES_PHOTO_DROP_PENDING_ON_FIRST_START:-true}"
+      SALES_PHOTO_LOG_LEVEL: "${SALES_PHOTO_LOG_LEVEL:-INFO}"
+    volumes:
+      - sales-photo-data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  sales-photo-data:

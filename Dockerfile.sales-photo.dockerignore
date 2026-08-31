@@ -1,0 +1,7 @@
+**
+!requirements-sales-photo.txt
+!sales_photo_bot/
+!sales_photo_bot/**
+sales_photo_bot/**/__pycache__/
+sales_photo_bot/**/__pycache__/**
+sales_photo_bot/**/*.py[co]
