@@ -980,7 +980,7 @@ class PricePublicationService:
                                     lease_token,
                                     message_id=sent.message_id,
                                     post_url=sent.post_url,
-                                    now=datetime.now(timezone.utc),
+                                    now=now,
                                 )
                             )
                         except Exception as exc:
@@ -1095,7 +1095,7 @@ class PricePublicationService:
                 self.repository.retry_quick_link_rotation(
                     rotation_id,
                     lease_token,
-                    datetime.now(timezone.utc),
+                    now,
                     exc,
                     retry_after_seconds=getattr(exc, "retry_after", None),
                     permanent=(
