@@ -3480,6 +3480,152 @@ class PriceRepositoryTests(unittest.TestCase):
 
 
 class PricePageAuthTests(unittest.TestCase):
+    @staticmethod
+    def _startup_settings(folder, **overrides):
+        values = {
+            "enabled": True,
+            "db_path": Path(folder) / "price.db",
+            "legacy_html_path": Path(folder) / "index.html",
+            "admin_username": "admin",
+            "admin_password": "secret",
+            "sync_api_key": "sync",
+            "telegram_bot_token": "",
+            "telegram_channel_id": "",
+            "telegram_channel_username": "",
+            "product_sort_sheet_id": "sheet",
+            "posts_sheet_name": "Telegram Posts",
+            "timezone": "Asia/Tashkent",
+            "scheduler_poll_seconds": 1,
+            "sync_max_bytes": 2_000_000,
+        }
+        values.update(overrides)
+        return PriceSettings(**values)
+
+    def test_disabled_monolith_fence_is_expected_and_skips_runtime(self):
+        module = importlib.import_module("price_server.router")
+        with tempfile.TemporaryDirectory() as folder:
+            configured = self._startup_settings(
+                folder,
+                admin_password="",
+                sync_api_key="",
+                scheduler_mode="disabled",
+            )
+            old = (
+                module.settings,
+                module._repository,
+                module._service,
+                module._scheduler,
+                module._startup_error,
+            )
+            module.settings = configured
+            module._repository = None
+            module._service = None
+            module._scheduler = None
+            module._startup_error = ""
+            try:
+                with self.assertLogs(
+                    "price_server.router", level="INFO"
+                ) as logs:
+                    asyncio.run(module.start_price_server())
+                self.assertEqual(
+                    module._startup_error,
+                    "scheduler_disabled",
+                )
+                self.assertIsNone(module._repository)
+                self.assertIsNone(module._scheduler)
+                self.assertIn(
+                    "price_server_start_fenced scheduler_mode=disabled",
+                    "\n".join(logs.output),
+                )
+                self.assertFalse(configured.db_path.exists())
+            finally:
+                (
+                    module.settings,
+                    module._repository,
+                    module._service,
+                    module._scheduler,
+                    module._startup_error,
+                ) = old
+
+    def test_external_mode_never_starts_embedded_scheduler(self):
+        module = importlib.import_module("price_server.router")
+        with tempfile.TemporaryDirectory() as folder:
+            configured = self._startup_settings(
+                folder,
+                telegram_bot_token="fake-token",
+                telegram_channel_id="-1001234567890",
+                telegram_channel_username="testchannel",
+                telegram_preview_channel_id="-1009876543210",
+                scheduler_mode="external",
+            )
+            old = (
+                module.settings,
+                module._repository,
+                module._service,
+                module._scheduler,
+                module._startup_error,
+            )
+            module.settings = configured
+            module._repository = None
+            module._service = None
+            module._scheduler = None
+            module._startup_error = ""
+            try:
+                asyncio.run(module.start_price_server())
+                self.assertEqual(module._startup_error, "")
+                self.assertIsNotNone(module._repository)
+                self.assertIsNone(module._service)
+                self.assertIsNone(module._scheduler)
+            finally:
+                asyncio.run(module.stop_price_server())
+                (
+                    module.settings,
+                    module._repository,
+                    module._service,
+                    module._scheduler,
+                    module._startup_error,
+                ) = old
+
+    def test_startup_log_identifies_invalid_price_configuration(self):
+        module = importlib.import_module("price_server.router")
+        with tempfile.TemporaryDirectory() as folder:
+            configured = self._startup_settings(
+                folder,
+                sync_api_key="",
+                scheduler_mode="embedded",
+            )
+            old = (
+                module.settings,
+                module._repository,
+                module._service,
+                module._scheduler,
+                module._startup_error,
+            )
+            module.settings = configured
+            module._repository = None
+            module._service = None
+            module._scheduler = None
+            module._startup_error = ""
+            try:
+                with self.assertLogs(
+                    "price_server.router", level="ERROR"
+                ) as logs:
+                    asyncio.run(module.start_price_server())
+                self.assertEqual(module._startup_error, "RuntimeError")
+                self.assertIsNone(module._repository)
+                self.assertIn(
+                    "reason=PRICE_SYNC_API_KEY is not configured",
+                    "\n".join(logs.output),
+                )
+            finally:
+                (
+                    module.settings,
+                    module._repository,
+                    module._service,
+                    module._scheduler,
+                    module._startup_error,
+                ) = old
+
     def test_admin_script_exposes_guarded_manual_catalogue_action(self):
         script = (
             Path(__file__).resolve().parent

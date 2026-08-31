@@ -81,15 +81,42 @@ async def start_price_server() -> None:
     if not settings.enabled:
         LOG.info("price_server_disabled")
         return
+
+    # The standalone price deployment deliberately fences the legacy
+    # monolith with ``disabled`` (and removes its sync key).  Recognize that
+    # state before validation so an intentional safety fence is not reported
+    # as a broken application startup and no stale repository is opened.
+    if settings.scheduler_mode == "disabled":
+        _startup_error = "scheduler_disabled"
+        LOG.info("price_server_start_fenced scheduler_mode=disabled")
+        return
+
     try:
         settings.validate_runtime()
+    except RuntimeError as exc:
+        _startup_error = type(exc).__name__
+        LOG.error(
+            "price_server_start_blocked type=%s reason=%s",
+            type(exc).__name__,
+            str(exc).replace("\n", " ")[:500],
+        )
+        return
+
+    try:
         repository = get_repository()
-        if settings.telegram_configured:
+        if (
+            settings.telegram_configured
+            and settings.scheduler_mode == "embedded"
+        ):
             service = get_service()
             _scheduler = PriceScheduler(settings, repository, service)
             await _scheduler.start()
         _startup_error = ""
-        LOG.info("price_server_started telegram=%s", settings.telegram_configured)
+        LOG.info(
+            "price_server_started telegram=%s scheduler_mode=%s",
+            settings.telegram_configured,
+            settings.scheduler_mode,
+        )
     except Exception as exc:
         _startup_error = type(exc).__name__
         LOG.error("price_server_start_blocked type=%s", type(exc).__name__)

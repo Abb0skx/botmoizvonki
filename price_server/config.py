@@ -51,6 +51,10 @@ class PriceSettings:
         "1TrS6C4oHe6nzQTPTa_4se_upXBFF6rmbfnE7RqznR8U"
     )
     bot_settings_sheet_name: str = "bot_settings"
+    # ``embedded`` preserves the original monolith behaviour.  A dedicated
+    # price runtime uses ``external``; ``disabled`` is the explicit safety
+    # fence for an old monolith after that migration.
+    scheduler_mode: str = "embedded"
 
     @classmethod
     def load(cls) -> "PriceSettings":
@@ -145,6 +149,12 @@ class PriceSettings:
                 ).strip()
                 or "bot_settings"
             ),
+            scheduler_mode=(
+                os.getenv("PRICE_SCHEDULER_MODE", "embedded")
+                .strip()
+                .casefold()
+                or "embedded"
+            ),
         )
 
     def validate_runtime(self) -> None:
@@ -159,6 +169,10 @@ class PriceSettings:
             raise RuntimeError("PRICE_ADMIN_PASSWORD is not configured")
         if not self.sync_api_key:
             raise RuntimeError("PRICE_SYNC_API_KEY is not configured")
+        if self.scheduler_mode not in {"embedded", "external", "disabled"}:
+            raise RuntimeError(
+                "PRICE_SCHEDULER_MODE must be embedded, external or disabled"
+            )
         if self.telegram_preview_channel_id:
             preview = self.telegram_preview_channel_id
             if not (preview.startswith("-100") and preview[4:].isdigit()):
