@@ -3022,7 +3022,11 @@ class PriceRepository:
                    JOIN telegram_quick_link_posts AS p
                      ON p.quick_post_key=q.quick_post_key
                    WHERE q.status='pending' AND p.status!='disabled'
-                     AND (q.next_attempt_at IS NULL OR q.next_attempt_at<=?)
+                     AND (
+                       q.attempts=0
+                       OR q.next_attempt_at IS NULL
+                       OR q.next_attempt_at<=?
+                     )
                      AND NOT EXISTS(
                        SELECT 1 FROM telegram_quick_link_rotations AS rotation
                        WHERE (
@@ -3760,7 +3764,8 @@ class PriceRepository:
                    FROM telegram_quick_link_rotations AS rotation
                    WHERE rotation.status='pending'
                      AND rotation.scheduled_for<=?
-                     AND (rotation.next_attempt_at IS NULL
+                     AND (rotation.attempts=0
+                          OR rotation.next_attempt_at IS NULL
                           OR rotation.next_attempt_at<=?)
                      AND NOT EXISTS(
                        SELECT 1 FROM telegram_quick_link_rotations AS earlier
