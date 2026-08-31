@@ -78,6 +78,7 @@ class CallSourceTests(unittest.TestCase):
         self.assertEqual(call_one["src_number"], "+998998446162")
         self.assertEqual(call_two["src_number"], "+998901313999")
         self.assertEqual(call_one["provider_src_number"], "+998000000000")
+        self.assertEqual(call_one["device_name"], "Poco")
         self.assertEqual(call_one["talk_manager_code"], "abbos")
         self.assertEqual(call_two["talk_manager_code"], "abbos")
         self.assertEqual(call_one["effective_lead_source_code"], "olx")
@@ -120,6 +121,8 @@ class CallSourceTests(unittest.TestCase):
         self.assertIn("+998900000010", message)
         self.assertIn("9 сек", message)
         self.assertIn(bot.format_call_time(call["start_time"]), message)
+        self.assertIn("📱 Устройство: <b>Poco</b>", message)
+        self.assertNotIn("texnikach@gmail.com", message)
         self.assertNotIn("Исходящий без ответа", message)
 
     def test_manual_manager_survives_duplicate_webhook(self):
@@ -136,15 +139,15 @@ class CallSourceTests(unittest.TestCase):
         call = bot.get_call(saved["call_id"])
         self.assertEqual(call["talk_manager_code"], "ali")
 
-    def test_techno_is_olx_without_fixed_manager(self):
+    def test_tecno_sim_one_is_olx_and_assigns_otabek(self):
         saved = self.save(
             "texnikacholx@gmail.com",
             self.event(4, "+998900000004", 0, "+998977777777"),
         )
         call = bot.get_call(saved["call_id"])
 
-        self.assertEqual(call["device_name"], "Techno")
-        self.assertIsNone(call["talk_manager_code"])
+        self.assertEqual(call["device_name"], "Tecno")
+        self.assertEqual(call["talk_manager_code"], "otabek")
         self.assertEqual(call["effective_lead_source_code"], "olx")
 
         keyboard = bot.build_call_state_keyboard(call)
@@ -153,8 +156,38 @@ class CallSourceTests(unittest.TestCase):
             for row in keyboard["inline_keyboard"]
             for button in row
         }
-        self.assertIn("👤 Abbos", button_texts)
+        self.assertIn("👤 Менеджер: Otabek", button_texts)
         self.assertIn("📣 Источник: OLX", button_texts)
+
+    def test_tecno_sim_two_has_no_automatic_source(self):
+        saved = self.save(
+            "texnikacholx@gmail.com",
+            self.event(16, "+998900000016", 1, "+998908456162"),
+        )
+        call = bot.get_call(saved["call_id"])
+
+        self.assertEqual(call["device_name"], "Tecno")
+        self.assertEqual(call["talk_manager_code"], "otabek")
+        self.assertIsNone(call["effective_lead_source_code"])
+
+    def test_redmi_assigns_olmas_and_only_sim_one_is_olx(self):
+        first = self.save(
+            "AASHSHDJDJDJSJ@gmail.com",
+            self.event(17, "+998900000017", 0, "+998955555551"),
+        )
+        second = self.save(
+            "aashshdjdjdjsj@gmail.com",
+            self.event(18, "+998900000018", 1, "+998955555552"),
+        )
+
+        call_one = bot.get_call(first["call_id"])
+        call_two = bot.get_call(second["call_id"])
+
+        self.assertEqual(call_one["device_name"], "Redmi")
+        self.assertEqual(call_one["talk_manager_code"], "olmas")
+        self.assertEqual(call_one["effective_lead_source_code"], "olx")
+        self.assertEqual(call_two["talk_manager_code"], "olmas")
+        self.assertIsNone(call_two["effective_lead_source_code"])
 
     def test_manual_source_overrides_auto_for_the_30_hour_window(self):
         saved = self.save(
