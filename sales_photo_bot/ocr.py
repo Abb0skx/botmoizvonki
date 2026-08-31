@@ -376,7 +376,7 @@ def _add_anchor(
 def _result_from_anchors(anchors: Sequence[_AnchorEvidence]) -> ProductIdentifiers:
     imei_values: dict[str, set[str]] = {"imei": set(), "imei2": set()}
     serial_counts: Counter[str] = Counter()
-    serial_barcodes: set[str] = set()
+    serial_barcode_counts: Counter[str] = Counter()
     for anchor in anchors:
         if anchor.field_name in imei_values:
             imei_values[anchor.field_name].update(anchor.candidates)
@@ -384,7 +384,8 @@ def _result_from_anchors(anchors: Sequence[_AnchorEvidence]) -> ProductIdentifie
             continue
         for value in anchor.candidates:
             serial_counts[value] += 1
-        serial_barcodes.update(anchor.barcode_values)
+        for value in anchor.barcode_values:
+            serial_barcode_counts[value] += 1
 
     first = next(iter(imei_values["imei"])) if len(imei_values["imei"]) == 1 else None
     second = (
@@ -397,14 +398,25 @@ def _result_from_anchors(anchors: Sequence[_AnchorEvidence]) -> ProductIdentifie
         second = None
 
     serial: str | None = None
+    serial_barcodes = set(serial_barcode_counts)
     if len(serial_barcodes) == 1:
         barcode_value = next(iter(serial_barcodes))
         supported_ocr = {
             value for value, count in serial_counts.items() if count >= 2
         }
-        if all(
+        has_matching_ocr = any(
             _comparison_key(value) == _comparison_key(barcode_value)
-            for value in supported_ocr
+            for value in serial_counts
+        )
+        if (
+            all(
+                _comparison_key(value) == _comparison_key(barcode_value)
+                for value in supported_ocr
+            )
+            and (
+                has_matching_ocr
+                or serial_barcode_counts[barcode_value] >= 2
+            )
         ):
             serial = barcode_value
     elif not serial_barcodes:
@@ -463,8 +475,11 @@ class TesseractIdentifierRecognizer:
     @staticmethod
     def _fit(image: Image.Image) -> Image.Image:
         longest = max(image.size)
-        if longest < 1800:
-            scale = min(3.0, 2200 / max(1, longest))
+        # Full 12 MP Telegram photos can make a single Tesseract pass exceed
+        # its deadline on the one-CPU VPS. Labels remain comfortably readable
+        # at this bound, while the pixel count (and OCR cost) drops sharply.
+        if longest < 1200:
+            scale = min(2.5, 1600 / max(1, longest))
             image = image.resize(
                 (
                     max(1, round(image.width * scale)),
@@ -472,26 +487,57 @@ class TesseractIdentifierRecognizer:
                 ),
                 Image.Resampling.LANCZOS,
             )
-        elif longest > 3200:
+        elif longest > 1800:
+            image.thumbnail((1800, 1800), Image.Resampling.LANCZOS)
+        return image
+
+    @staticmethod
+    def _fit_barcode_image(image: Image.Image) -> Image.Image:
+        # Preserve the narrow bars present in typical 2.5K phone photos. The
+        # full-frame Tesseract path gets a smaller copy via ``_fit`` below,
+        # while ZXing and its small OCR crops use this barcode-safe bound.
+        if max(image.size) > 3200:
             image.thumbnail((3200, 3200), Image.Resampling.LANCZOS)
         return image
 
     @staticmethod
-    def _variants(image: Image.Image) -> tuple[Image.Image, Image.Image]:
+    def _barcode_draft_size(width: int, height: int) -> tuple[int, int]:
+        # Pillow's JPEG ``draft`` only offers 1/2, 1/4 and 1/8 reductions.
+        # Asking for an exact 3200-pixel aspect-ratio box can still select the
+        # full decode when half-size rounds just below the request. Force the
+        # first native reduction once pixel pressure becomes material.
+        if width * height > 16_000_000:
+            return max(1, width // 2), max(1, height // 2)
+        return width, height
+
+    @staticmethod
+    def _enhanced(image: Image.Image) -> Image.Image:
         gray = ImageOps.grayscale(image)
         enhanced = ImageOps.autocontrast(gray, cutoff=1)
         enhanced = ImageEnhance.Contrast(enhanced).enhance(1.35)
-        enhanced = ImageEnhance.Sharpness(enhanced).enhance(1.8)
-        threshold = enhanced.filter(ImageFilter.MedianFilter(3)).point(
+        return ImageEnhance.Sharpness(enhanced).enhance(1.8)
+
+    @staticmethod
+    def _threshold(enhanced: Image.Image) -> Image.Image:
+        return enhanced.filter(ImageFilter.MedianFilter(3)).point(
             lambda value: 255 if value >= 165 else 0
         )
-        return enhanced, threshold
+
+    @classmethod
+    def _variants(cls, image: Image.Image) -> tuple[Image.Image, Image.Image]:
+        enhanced = cls._enhanced(image)
+        return enhanced, cls._threshold(enhanced)
 
     @staticmethod
     def _remaining(deadline: float) -> float:
         return max(0.0, deadline - time.monotonic())
 
-    def _ocr_data(self, image: Image.Image, deadline: float) -> dict[str, list[object]]:
+    def _ocr_data(
+        self,
+        image: Image.Image,
+        deadline: float,
+        max_seconds: float = 10.0,
+    ) -> dict[str, list[object]]:
         remaining = self._remaining(deadline)
         if remaining < 0.5:
             return {}
@@ -502,7 +548,7 @@ class TesseractIdentifierRecognizer:
                     lang="eng",
                     config="--oem 1 --psm 11",
                     output_type=Output.DICT,
-                    timeout=max(0.5, min(8.0, remaining)),
+                    timeout=max(0.5, min(max_seconds, remaining)),
                 )
                 or {}
             )
@@ -582,6 +628,31 @@ class TesseractIdentifierRecognizer:
             return _serial_candidates(value)
         return _imeis_in(value)
 
+    def _append_data_anchors(
+        self,
+        anchors: list[_AnchorEvidence],
+        data: dict[str, list[object]],
+        offset_x: int = 0,
+        offset_y: int = 0,
+    ) -> None:
+        for line in _lines_from_tesseract(data):
+            for label, segment in _label_segments(line.text):
+                box = _box_for_match(line, label)
+                if box is None:
+                    continue
+                translated = _Box(
+                    box.left + offset_x,
+                    box.top + offset_y,
+                    box.right + offset_x,
+                    box.bottom + offset_y,
+                )
+                _add_anchor(
+                    anchors,
+                    label.field_name,
+                    translated,
+                    self._candidates(label.field_name, segment),
+                )
+
     def _collect_anchors(
         self,
         image: Image.Image,
@@ -591,17 +662,7 @@ class TesseractIdentifierRecognizer:
         anchors: list[_AnchorEvidence] = []
         for variant in (enhanced, threshold):
             data = self._ocr_data(variant, deadline)
-            for line in _lines_from_tesseract(data):
-                for label, segment in _label_segments(line.text):
-                    box = _box_for_match(line, label)
-                    if box is None:
-                        continue
-                    _add_anchor(
-                        anchors,
-                        label.field_name,
-                        box,
-                        self._candidates(label.field_name, segment),
-                    )
+            self._append_data_anchors(anchors, data)
             if self._remaining(deadline) < 0.5:
                 break
 
@@ -628,6 +689,151 @@ class TesseractIdentifierRecognizer:
         return anchors, enhanced, threshold
 
     @staticmethod
+    def _barcode_crop_box(
+        barcode: _BarcodeEvidence,
+        image: Image.Image,
+    ) -> tuple[int, int, int, int]:
+        horizontal_pad = max(60, min(500, barcode.box.width // 2))
+        vertical_pad = max(
+            90,
+            min(500, max(barcode.box.height * 4, barcode.box.width // 3)),
+        )
+        return (
+            max(0, barcode.box.left - horizontal_pad),
+            max(0, barcode.box.top - vertical_pad),
+            min(image.width, barcode.box.right + horizontal_pad),
+            min(image.height, barcode.box.bottom + vertical_pad),
+        )
+
+    @staticmethod
+    def _merge_crop_boxes(
+        boxes: Sequence[tuple[int, int, int, int]],
+    ) -> tuple[tuple[int, int, int, int], ...]:
+        merged: list[tuple[int, int, int, int]] = []
+        for candidate in boxes:
+            current = candidate
+            index = 0
+            while index < len(merged):
+                existing = merged[index]
+                overlaps = not (
+                    current[2] <= existing[0]
+                    or existing[2] <= current[0]
+                    or current[3] <= existing[1]
+                    or existing[3] <= current[1]
+                )
+                if not overlaps:
+                    index += 1
+                    continue
+                current = (
+                    min(current[0], existing[0]),
+                    min(current[1], existing[1]),
+                    max(current[2], existing[2]),
+                    max(current[3], existing[3]),
+                )
+                merged.pop(index)
+                index = 0
+            merged.append(current)
+        return tuple(merged)
+
+    def _scan_barcode_regions(
+        self,
+        image: Image.Image,
+        deadline: float,
+        ocr_budget: list[int] | None = None,
+        max_ocr_calls: int | None = None,
+    ) -> ProductIdentifiers:
+        """Read small label regions before expensive full-frame OCR."""
+
+        budget = ocr_budget if ocr_budget is not None else [6]
+        if budget[0] <= 0 or self._remaining(deadline) < 0.5:
+            return EMPTY_IDENTIFIERS
+        enhanced = self._enhanced(image)
+        barcodes = self._decode_barcodes(enhanced)
+        barcode_counts = Counter(barcode.text for barcode in barcodes)
+        relevant_barcodes = tuple(
+            sorted(
+                (
+                    barcode
+                    for barcode in barcodes
+                    if valid_imei(barcode.text)
+                    or _barcode_serial(barcode.text) is not None
+                ),
+                key=lambda barcode: (
+                    0 if valid_imei(barcode.text) else 1,
+                    -barcode_counts[barcode.text],
+                    barcode.box.top,
+                    barcode.box.left,
+                ),
+            )
+        )
+        if not relevant_barcodes:
+            return EMPTY_IDENTIFIERS
+
+        anchors: list[_AnchorEvidence] = []
+        crop_boxes = self._merge_crop_boxes(
+            tuple(
+                self._barcode_crop_box(barcode, image)
+                for barcode in relevant_barcodes[:12]
+            )
+        )
+        call_limit = min(
+            budget[0],
+            max(1, int(max_ocr_calls))
+            if max_ocr_calls is not None
+            else budget[0],
+        )
+        calls_used = 0
+        for crop_box in crop_boxes[:6]:
+            if (
+                budget[0] <= 0
+                or calls_used >= call_limit
+                or self._remaining(deadline) < 0.5
+            ):
+                break
+            enhanced_crop = enhanced.crop(crop_box)
+            candidate_count_before = sum(
+                len(anchor.candidates) for anchor in anchors
+            )
+            data = self._ocr_data(
+                enhanced_crop,
+                deadline,
+                max_seconds=3.0,
+            )
+            budget[0] -= 1
+            calls_used += 1
+            self._append_data_anchors(
+                anchors,
+                data,
+                offset_x=crop_box[0],
+                offset_y=crop_box[1],
+            )
+            if (
+                sum(len(anchor.candidates) for anchor in anchors)
+                == candidate_count_before
+                and budget[0] > 0
+                and calls_used < call_limit
+                and self._remaining(deadline) >= 0.5
+            ):
+                data = self._ocr_data(
+                    self._threshold(enhanced_crop),
+                    deadline,
+                    max_seconds=3.0,
+                )
+                budget[0] -= 1
+                calls_used += 1
+                self._append_data_anchors(
+                    anchors,
+                    data,
+                    offset_x=crop_box[0],
+                    offset_y=crop_box[1],
+                )
+            if budget[0] <= 0 or calls_used >= call_limit:
+                break
+
+        self._attach_barcodes(anchors, relevant_barcodes)
+        return _result_from_anchors(anchors)
+
+    @staticmethod
     def _attach_barcodes(
         anchors: list[_AnchorEvidence],
         barcodes: Sequence[_BarcodeEvidence],
@@ -642,9 +848,13 @@ class TesseractIdentifierRecognizer:
                     value = exact_imei
                 else:
                     value = exact_serial
-                    if value is not None and not any(
-                        _comparison_key(candidate) == _comparison_key(value)
-                        for candidate in anchor.candidates
+                    if (
+                        value is not None
+                        and anchor.candidates
+                        and not any(
+                            _comparison_key(candidate) == _comparison_key(value)
+                            for candidate in anchor.candidates
+                        )
                     ):
                         value = None
                 if value is None:
@@ -680,8 +890,16 @@ class TesseractIdentifierRecognizer:
                 width, height = source.size
                 if width <= 0 or height <= 0 or width * height > self.max_pixels:
                     raise ValueError("Недопустимый размер изображения")
+                # Preserve enough JPEG detail for thin product-label barcodes.
+                # Draft decoding still bounds very large inputs before the
+                # exact resize; the original dimensions above remain what the
+                # decompression-bomb limit validates.
+                source.draft("RGB", self._barcode_draft_size(width, height))
                 source.load()
-                image = self._fit(ImageOps.exif_transpose(source).convert("RGB"))
+                barcode_image = self._fit_barcode_image(
+                    ImageOps.exif_transpose(source).convert("RGB")
+                )
+                image = self._fit(barcode_image.copy())
         except (
             UnidentifiedImageError,
             Image.DecompressionBombError,
@@ -689,7 +907,46 @@ class TesseractIdentifierRecognizer:
         ) as exc:
             raise ValueError("Файл не является поддерживаемым JPEG") from exc
 
-        results: list[ProductIdentifiers] = []
+        # Barcode-guided crops are much smaller than a full photo and usually
+        # contain the printed IMEI/S/N label itself. Try all orientations here
+        # first so an upside-down label does not spend the entire budget on one
+        # full-frame Tesseract pass.
+        barcode_deadline = min(
+            deadline,
+            time.monotonic()
+            + min(12.0, max(2.0, float(self.timeout_seconds) - 10.0)),
+        )
+        barcode_ocr_budget = [6]
+        barcode_results: list[ProductIdentifiers] = []
+        for angle, orientation_calls in zip(
+            (0, 180, 90, 270),
+            (2, 2, 1, 1),
+        ):
+            if barcode_ocr_budget[0] <= 0:
+                break
+            if self._remaining(barcode_deadline) < 0.5:
+                logger.info("sales_photo_barcode_budget_reached")
+                break
+            oriented = (
+                barcode_image
+                if angle == 0
+                else barcode_image.rotate(angle, expand=True)
+            )
+            result = self._scan_barcode_regions(
+                oriented,
+                barcode_deadline,
+                barcode_ocr_budget,
+                max_ocr_calls=orientation_calls,
+            )
+            if result != EMPTY_IDENTIFIERS:
+                barcode_results.append(result)
+        # Any non-empty ROI evidence is authoritative for this recognition
+        # attempt. An empty merge means the independently scanned orientations
+        # disagreed, so fail closed instead of letting a later full-frame pass
+        # promote one side of the conflict.
+        if barcode_results:
+            return _merge_results(barcode_results)
+
         for angle in (0, 180, 90, 270):
             if self._remaining(deadline) < 0.5:
                 logger.warning("sales_photo_ocr_deadline_reached")
@@ -697,11 +954,8 @@ class TesseractIdentifierRecognizer:
             oriented = image if angle == 0 else image.rotate(angle, expand=True)
             result = self._scan_orientation(oriented, deadline)
             if result != EMPTY_IDENTIFIERS:
-                results.append(result)
-            merged = _merge_results(results)
-            if merged.imei and merged.imei2 and merged.serial_number:
-                return merged
-        return _merge_results(results)
+                return result
+        return EMPTY_IDENTIFIERS
 
     async def recognize(
         self, image_bytes: bytes, mime_type: str
