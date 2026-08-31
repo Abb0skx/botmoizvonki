@@ -17,9 +17,8 @@ from telegram.ext import (
 
 from .config import Settings
 from .keyboards import CALLBACK_PREFIX
-from .ocr import IdentifierRecognizer, TesseractIdentifierRecognizer
 from .repository import SalesPhotoRepository
-from .service import SalesPhotoService
+from .service import IdentifierRecognizer, SalesPhotoService
 
 
 logger = logging.getLogger(__name__)
@@ -111,12 +110,9 @@ def build_application(
     recognizer: IdentifierRecognizer | None = None,
 ) -> Application:
     repo = repository or SalesPhotoRepository(settings.db_path)
-    identifier_recognizer = recognizer or TesseractIdentifierRecognizer(
-        timeout_seconds=settings.ocr_timeout_seconds,
-        max_pixels=settings.ocr_max_pixels,
-        max_parallel=1,
-    )
-    service = SalesPhotoService(settings, repo, identifier_recognizer)
+    # Production intentionally passes no recognizer: Telegram's existing
+    # file_id is reposted without downloading or inspecting the photo.
+    service = SalesPhotoService(settings, repo, recognizer)
 
     async def post_init(application: Application) -> None:
         await _prepare_polling(settings, repo, service, application.bot)

@@ -157,7 +157,7 @@ class ConfigTests(unittest.TestCase):
                 "SALES_PHOTO_CHAT_ID": str(CHAT_ID),
             }
         )
-        self.assertEqual(parsed.ocr_timeout_seconds, 15)
+        self.assertFalse(hasattr(parsed, "ocr_timeout_seconds"))
         with self.assertRaises(ConfigError):
             Settings.from_env(
                 {
@@ -558,7 +558,7 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(sent["reply_markup"].inline_keyboard), 2)
         self.assertTrue(repo.is_replacement(CHAT_ID, 200))
 
-    async def test_failed_ocr_still_reposts_template_without_identifiers(self):
+    async def test_failed_optional_recognizer_reposts_empty_template(self):
         repo = SalesPhotoRepository(self.root / "db.sqlite")
         service = SalesPhotoService(
             settings(self.root), repo, StaticRecognizer(error=TimeoutError())
@@ -570,45 +570,22 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("🛒💵:", caption)
         bot.delete_message.assert_awaited_once_with(CHAT_ID, 10)
 
-    async def test_total_ocr_deadline_includes_queue_and_download_wait(self):
-        class QueuedRecognizer:
-            def __init__(self):
-                self.gate = asyncio.Semaphore(1)
-
-            async def recognize(self, image_bytes: bytes, mime_type: str):
-                async with self.gate:
-                    await asyncio.Event().wait()
-
+    async def test_production_passthrough_never_downloads_or_reads_photo(self):
         repo = SalesPhotoRepository(self.root / "db.sqlite")
-        configured = replace(settings(self.root), ocr_timeout_seconds=0.02)
-        service = SalesPhotoService(configured, repo, QueuedRecognizer())
+        service = SalesPhotoService(settings(self.root), repo)
         bot = telegram_bot()
-        replacement_id = 200
+        bot.get_file.side_effect = AssertionError("photo must not be downloaded")
 
-        async def unique_send(**kwargs):
-            nonlocal replacement_id
-            result = SimpleNamespace(message_id=replacement_id)
-            replacement_id += 1
-            return result
+        await service.handle_photo(photo_message(caption=None), bot)
 
-        bot.send_photo.side_effect = unique_send
+        bot.get_file.assert_not_awaited()
+        sent = bot.send_photo.await_args.kwargs
+        self.assertEqual(sent["photo"], "large")
+        self.assertNotIn("<blockquote>IMEI:", sent["caption"])
+        self.assertNotIn("<blockquote>S/N:", sent["caption"])
+        bot.delete_message.assert_awaited_once_with(CHAT_ID, 10)
 
-        started = asyncio.get_running_loop().time()
-        await asyncio.gather(
-            service.handle_photo(photo_message(message_id=10, caption=None), bot),
-            service.handle_photo(photo_message(message_id=11, caption=None), bot),
-        )
-        elapsed = asyncio.get_running_loop().time() - started
-
-        self.assertLess(elapsed, 1)
-        self.assertEqual(bot.send_photo.await_count, 2)
-        for call in bot.send_photo.await_args_list:
-            caption = call.kwargs["caption"]
-            self.assertNotIn("<blockquote>IMEI:", caption)
-            self.assertNotIn("<blockquote>S/N:", caption)
-        self.assertEqual(bot.delete_message.await_count, 2)
-
-    async def test_source_edit_during_ocr_cancels_stale_repost_and_delete(self):
+    async def test_source_edit_during_optional_recognizer_cancels_repost(self):
         entered = asyncio.Event()
         release = asyncio.Event()
 
@@ -763,7 +740,7 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
         release.set()
         await asyncio.gather(*tuple(service._photo_tasks))
 
-    async def test_graceful_stop_during_ocr_makes_job_retryable(self):
+    async def test_graceful_stop_during_optional_recognizer_is_retryable(self):
         entered = asyncio.Event()
 
         class BlockingRecognizer:
@@ -1919,9 +1896,11 @@ class ApplicationWiringTests(unittest.TestCase):
             app = build_application(
                 settings(root),
                 repository=repo,
-                recognizer=StaticRecognizer(),
             )
             self.assertIsInstance(app.bot, StartupDrainBot)
+            self.assertIsNone(
+                app.bot_data["sales_photo_service"].recognizer
+            )
             self.assertEqual(len(app.handlers[0]), 3)
             self.assertEqual(app.update_processor.max_concurrent_updates, 4)
             keyboard = manager_keyboard().to_dict()

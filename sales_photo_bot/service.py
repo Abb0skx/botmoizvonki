@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
 from telegram import Bot, Message, Update
 from telegram.constants import ChatType, ParseMode
@@ -26,7 +26,6 @@ from .keyboards import (
     manager_keyboard,
 )
 from .models import EMPTY_IDENTIFIERS, ProductIdentifiers
-from .ocr import IdentifierRecognizer
 from .phones import normalize_caption_phone_field
 from .repository import SalesPhotoRepository, utc_now
 
@@ -36,6 +35,7 @@ UTC = timezone.utc
 BOT_CARD_MARKER = "\u2063\u2063"
 CAPTION_REVISION_TTL_SECONDS = 600.0
 CAPTION_REVISION_LIMIT = 4096
+PROCESSING_STALE_SECONDS = 180
 _SOURCE_CALLBACK_RE = re.compile(
     r"^sp:(?:m:[a-z]+|b):(\d+):(\d+):([0-9a-f]{12})$"
 )
@@ -53,6 +53,14 @@ class _PhotoClaim:
 
 class _RetryWaitCancelled(asyncio.CancelledError):
     """Cancellation while Telegram has definitively rejected the last send."""
+
+
+class IdentifierRecognizer(Protocol):
+    """Optional test hook; production does not configure image recognition."""
+
+    async def recognize(
+        self, image_bytes: bytes, mime_type: str
+    ) -> ProductIdentifiers: ...
 
 
 def _error_code(error: BaseException) -> str:
@@ -124,7 +132,7 @@ class SalesPhotoService:
         self,
         settings: Settings,
         repository: SalesPhotoRepository,
-        recognizer: IdentifierRecognizer,
+        recognizer: IdentifierRecognizer | None = None,
     ):
         self.settings = settings
         self.repository = repository
@@ -590,18 +598,26 @@ class SalesPhotoService:
             chat_id,
             source_message_id,
         )
-        try:
-            identifiers = await self._read_identifiers(photo, file_id, bot)
-        except asyncio.CancelledError:
+        if self.recognizer is None:
+            identifiers = EMPTY_IDENTIFIERS
+            logger.info(
+                "sales_photo_photo_passthrough chat_id=%s source_message_id=%s",
+                chat_id,
+                source_message_id,
+            )
+        else:
             try:
-                self.repository.mark_failed(
-                    chat_id,
-                    source_message_id,
-                    "cancelled_before_send",
-                )
-            except Exception:
-                pass
-            raise
+                identifiers = await self._run_optional_recognizer(file_id, bot)
+            except asyncio.CancelledError:
+                try:
+                    self.repository.mark_failed(
+                        chat_id,
+                        source_message_id,
+                        "cancelled_before_send",
+                    )
+                except Exception:
+                    pass
+                raise
         identifier_count = sum(
             value is not None
             for value in (
@@ -609,14 +625,6 @@ class SalesPhotoService:
                 identifiers.imei2,
                 identifiers.serial_number,
             )
-        )
-        logger.info(
-            "sales_photo_ocr_complete chat_id=%s source_message_id=%s "
-            "identifiers=%s elapsed_ms=%s",
-            chat_id,
-            source_message_id,
-            identifier_count,
-            round((time.monotonic() - started) * 1000),
         )
         key = (chat_id, source_message_id)
         if key in self._cancelled_sources:
@@ -808,7 +816,7 @@ class SalesPhotoService:
         )
 
         # Keep the original briefly so Telegram can dispatch a source edit that
-        # happened while OCR or sendPhoto was running. on_photo itself runs this
+        # happened while card creation or sendPhoto was running. on_photo runs this
         # work in a background task, leaving update-processor slots available.
         await asyncio.sleep(max(0, self.settings.source_edit_grace_seconds))
         if key in self._cancelled_sources:
@@ -924,34 +932,24 @@ class SalesPhotoService:
             source_message_id=source_message_id,
         )
 
-    async def _read_identifiers(
+    async def _run_optional_recognizer(
         self,
-        photo: object,
         file_id: str,
         bot: Bot | Any,
     ) -> ProductIdentifiers:
-        file_size = int(getattr(photo, "file_size", 0) or 0)
-        if file_size > self.settings.ocr_max_bytes:
-            logger.warning("sales_photo_ocr_skipped reason=file_too_large")
+        recognizer = self.recognizer
+        if recognizer is None:
             return EMPTY_IDENTIFIERS
-
-        async def download_and_recognize() -> ProductIdentifiers:
+        try:
             telegram_file = await bot.get_file(file_id)
             data = bytes(await telegram_file.download_as_bytearray())
-            if len(data) > self.settings.ocr_max_bytes:
-                return EMPTY_IDENTIFIERS
-            return await self.recognizer.recognize(data, "image/jpeg")
-
-        try:
-            return await asyncio.wait_for(
-                download_and_recognize(),
-                timeout=self.settings.ocr_timeout_seconds,
-            )
+            return await recognizer.recognize(data, "image/jpeg")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.warning(
-                "sales_photo_ocr_failed error_type=%s", _error_code(exc)
+                "sales_photo_optional_recognizer_failed error_type=%s",
+                _error_code(exc),
             )
             return EMPTY_IDENTIFIERS
 
@@ -1568,11 +1566,7 @@ class SalesPhotoService:
             self._safe_touch_heartbeat()
             try:
                 stale_before = utc_now() - timedelta(
-                    seconds=(
-                        self.settings.ocr_timeout_seconds
-                        * self.settings.concurrent_updates
-                        + 90
-                    )
+                    seconds=PROCESSING_STALE_SECONDS
                 )
                 stale_count = self.repository.fail_stale_processing(
                     self.settings.chat_id,

@@ -5,11 +5,9 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class ProductIdentifiers:
-    """Identifiers read from a product label by local OCR.
+    """Optional legacy identifier fields used by caption-formatting helpers.
 
-    Missing values stay ``None`` and are omitted from the Telegram card.  IMEI
-    values are accepted by the OCR layer only after their check digit has been
-    validated.
+    Production photo handling no longer extracts these values from images.
     """
 
     imei: str | None = None
