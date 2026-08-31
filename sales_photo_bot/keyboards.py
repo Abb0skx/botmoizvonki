@@ -49,12 +49,18 @@ def back_keyboard(
     source_message_id: int | None = None,
     generation: int = 0,
     signature: str | None = None,
+    manager: str | None = None,
 ) -> InlineKeyboardMarkup:
+    label = "↩️ Назад"
+    if manager:
+        selected = SELLER_BY_KEY.get(str(manager).casefold())
+        if selected:
+            label = f"👤 {selected} · {label}"
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
-                    text="↩️ Назад",
+                    text=label,
                     callback_data=(
                         f"{BACK_CALLBACK}{_suffix(source_message_id, generation, signature)}"
                     ),

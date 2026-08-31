@@ -4,9 +4,9 @@ import html
 import re
 
 from .models import ProductIdentifiers
+from .phones import extract_uzbek_phones, phone_line
 
 
-MAX_CLIENT_TEXT = 300
 MAX_SERIAL_NUMBER = 64
 MANAGER_LINE_RE = re.compile(
     r"(?:\n\n)?👤 Менеджер: <b>[^<>\r\n]{1,64}</b>\s*\Z"
@@ -32,21 +32,15 @@ def build_caption(
     identifiers: ProductIdentifiers,
     manager: str | None = None,
 ) -> str:
-    """Build the sales template and omit identifiers that OCR could not verify."""
+    """Build the sales card, retaining only verified phones and identifiers."""
 
-    lines: list[str] = []
-    client = _safe(client_caption, MAX_CLIENT_TEXT)
-    if client:
-        lines.append(f"📞 Клиент: {client}")
-
-    if lines:
-        lines.append("")
-    lines.extend(
-        [
-            "🛒💵:",
-            "rasxod:",
-        ]
-    )
+    phones = extract_uzbek_phones(client_caption)
+    lines: list[str] = [
+        "🛒💵:",
+        "rasxod:",
+        "",
+        phone_line(phones),
+    ]
 
     identifier_lines: list[str] = []
     if identifiers.imei:

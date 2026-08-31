@@ -4,15 +4,16 @@ import asyncio
 import sqlite3
 import tempfile
 import unittest
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from cryptography.fernet import Fernet
+from telegram import Chat, Message, MessageEntity, PhotoSize, Update
 from telegram.error import NetworkError, RetryAfter
 
-from sales_photo_bot.application import _prepare_polling, build_application
+from sales_photo_bot.application import _prepare_polling, build_application, run
 from sales_photo_bot.config import ConfigError, Settings
 from sales_photo_bot.formatting import (
     add_manager_selection,
@@ -160,9 +161,9 @@ class CaptionFormattingTests(unittest.TestCase):
         )
         self.assertEqual(
             caption,
-            "📞 Клиент: +998 90 123 45 67\n"
-            "\n🛒💵:\n"
+            "🛒💵:\n"
             "rasxod:\n\n"
+            "📞: +998 90 123 45 67\n\n"
             "<blockquote>IMEI: 490154203237518</blockquote>\n"
             "<blockquote>IMEI2: 352099001761481</blockquote>\n"
             "<blockquote>S/N: R8YL50R510N</blockquote>\n\n"
@@ -180,6 +181,18 @@ class CaptionFormattingTests(unittest.TestCase):
         self.assertNotIn("S/N", caption)
         self.assertTrue(caption.startswith("🛒💵:"))
 
+    def test_only_two_normalized_phones_survive_the_source_caption(self):
+        caption = build_caption(
+            "клиент 42: 90‑123‑45‑67 / +998 (91) 765 43 21",
+            ProductIdentifiers(),
+        )
+        self.assertIn(
+            "📞: +998 90 123 45 67 / +998 91 765 43 21",
+            caption,
+        )
+        self.assertNotIn("клиент", caption)
+        self.assertNotIn("42:", caption)
+
     def test_product_model_fields_are_never_rendered(self):
         caption = build_caption(None, ProductIdentifiers(serial_number="ABC12345"))
         self.assertNotIn("SM-X133", caption)
@@ -192,7 +205,9 @@ class CaptionFormattingTests(unittest.TestCase):
             "<b>client</b> & " + "x" * 500,
             ProductIdentifiers(serial_number="ABC<123>"),
         )
-        self.assertIn("&lt;b&gt;client&lt;/b&gt; &amp;", caption)
+        self.assertNotIn("client", caption)
+        self.assertEqual(caption.count("📞:"), 1)
+        self.assertIn("📞:\n", caption)
         self.assertIn("ABC&lt;123&gt;", caption)
         self.assertLess(len(caption), 1024)
 
@@ -519,6 +534,7 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(sent["caption"].startswith(BOT_CARD_MARKER))
         self.assertIn("<blockquote>IMEI:", sent["caption"])
         self.assertIn("<blockquote>S/N:", sent["caption"])
+        self.assertIn("📞: +998 90 123 45 67", sent["caption"])
         self.assertNotIn("📦", sent["caption"])
         self.assertEqual(len(sent["reply_markup"].inline_keyboard), 2)
         self.assertTrue(repo.is_replacement(CHAT_ID, 200))
@@ -778,6 +794,195 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
             await service.preflight(bot)
 
 
+class EditedCaptionTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.repo = SalesPhotoRepository(self.root / "db.sqlite")
+        self.repo.claim_photo(CHAT_ID, 10, "file")
+        self.repo.mark_reposted(CHAT_ID, 10, 200)
+        self.repo.mark_complete(CHAT_ID, 10)
+        self.service = SalesPhotoService(
+            settings(self.root), self.repo, StaticRecognizer()
+        )
+
+    async def asyncTearDown(self):
+        self.temp.cleanup()
+
+    @staticmethod
+    def message(caption: str, message_id: int = 200, entities=()):
+        return SimpleNamespace(
+            chat_id=CHAT_ID,
+            chat=SimpleNamespace(id=CHAT_ID),
+            message_id=message_id,
+            caption=caption,
+            caption_entities=entities,
+            photo=(SimpleNamespace(file_id="card"),),
+        )
+
+    @staticmethod
+    def bot():
+        return SimpleNamespace(edit_message_caption=AsyncMock())
+
+    async def test_manual_edit_normalizes_two_phones_and_preserves_finance(self):
+        caption = (
+            BOT_CARD_MARKER
+            + "🛒💵: ACME / $100\n"
+            "rasxod: $3\n\n"
+            "📞: 90 123-45-67 / 998 91 765 43 21\n\n"
+            "Наличка\n"
+            "💵: 101\n"
+            "🇺🇿: 1 250 000"
+        )
+        cash_start = len(caption[: caption.index("Наличка")].encode("utf-16-le")) // 2
+        entities = (
+            MessageEntity(
+                type=MessageEntity.BOLD,
+                offset=cash_start,
+                length=len("Наличка"),
+            ),
+        )
+        bot = self.bot()
+
+        await self.service.handle_edited_photo(
+            self.message(caption, entities=entities), bot, update_id=100
+        )
+
+        bot.edit_message_caption.assert_awaited_once()
+        kwargs = bot.edit_message_caption.await_args.kwargs
+        self.assertEqual(kwargs["chat_id"], CHAT_ID)
+        self.assertEqual(kwargs["message_id"], 200)
+        self.assertIn(
+            "📞: +998 90 123 45 67 / +998 91 765 43 21",
+            kwargs["caption"],
+        )
+        self.assertIn("🛒💵: ACME / $100", kwargs["caption"])
+        self.assertIn("rasxod: $3", kwargs["caption"])
+        self.assertIn("🇺🇿: 1 250 000", kwargs["caption"])
+        self.assertNotIn("parse_mode", kwargs)
+        markup = kwargs["reply_markup"].to_dict()
+        self.assertEqual(
+            [[button["text"] for button in row] for row in markup["inline_keyboard"]],
+            [["Olmas", "Otabek"], ["Ali", "Abbos"]],
+        )
+        self.assertEqual(kwargs["caption_entities"][0].type, MessageEntity.BOLD)
+
+    async def test_phone_edit_rebuilds_current_selected_manager_keyboard(self):
+        self.assertTrue(
+            self.repo.apply_manager_selection(CHAT_ID, 200, "Otabek", 0)
+        )
+        bot = self.bot()
+        caption = "🛒💵:\nrasxod:\n\n📞: 901234567\n\nНаличка"
+
+        await self.service.handle_edited_photo(
+            self.message(caption), bot, update_id=100
+        )
+
+        markup = bot.edit_message_caption.await_args.kwargs[
+            "reply_markup"
+        ].to_dict()
+        button = markup["inline_keyboard"][0][0]
+        self.assertEqual(button["text"], "👤 Otabek · ↩️ Назад")
+        self.assertIn(":1:", button["callback_data"])
+
+    async def test_card_is_found_by_ledger_even_when_marker_was_removed(self):
+        bot = self.bot()
+        caption = "🛒💵:\nrasxod:\n\n📞: 901234567\n\nНаличка"
+
+        await self.service.handle_edited_photo(
+            self.message(caption), bot, update_id=101
+        )
+
+        normalized = bot.edit_message_caption.await_args.kwargs["caption"]
+        self.assertTrue(normalized.startswith("🛒💵:"))
+        self.assertIn("📞: +998 90 123 45 67", normalized)
+
+    async def test_unknown_card_invalid_value_and_canonical_value_are_no_ops(self):
+        bot = self.bot()
+        cases = (
+            self.message("🛒💵:\nrasxod:\n\n📞: 901234567", message_id=999),
+            self.message("🛒💵:\nrasxod:\n\n📞: клиент 42"),
+            self.message("🛒💵:\nrasxod:\n\n📞: +998 90 123 45 67"),
+        )
+
+        for revision, message in enumerate(cases, start=200):
+            await self.service.handle_edited_photo(message, bot, update_id=revision)
+
+        bot.edit_message_caption.assert_not_awaited()
+
+    async def test_newer_manual_edit_wins_when_older_update_arrives_late(self):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        applied: list[str] = []
+
+        async def slow_edit(**kwargs):
+            applied.append(kwargs["caption"])
+            entered.set()
+            await release.wait()
+            return True
+
+        bot = SimpleNamespace(edit_message_caption=AsyncMock(side_effect=slow_edit))
+        newer = self.message(
+            "🛒💵: NEW\nrasxod: 2\n\n📞: 911112233\n\nНаличка"
+        )
+        older = self.message(
+            "🛒💵: OLD\nrasxod: 1\n\n📞: 901234567\n\nНаличка"
+        )
+
+        newer_task = asyncio.create_task(
+            self.service.handle_edited_photo(newer, bot, update_id=301)
+        )
+        await entered.wait()
+        older_task = asyncio.create_task(
+            self.service.handle_edited_photo(older, bot, update_id=300)
+        )
+        release.set()
+        await asyncio.gather(newer_task, older_task)
+
+        self.assertEqual(bot.edit_message_caption.await_count, 1)
+        self.assertIn("🛒💵: NEW", applied[-1])
+        self.assertIn("📞: +998 91 111 22 33", applied[-1])
+
+    async def test_newer_canonical_snapshot_is_reapplied_after_old_write(self):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        applied: list[str] = []
+
+        async def slow_first_edit(**kwargs):
+            applied.append(kwargs["caption"])
+            if len(applied) == 1:
+                entered.set()
+                await release.wait()
+            return True
+
+        bot = SimpleNamespace(
+            edit_message_caption=AsyncMock(side_effect=slow_first_edit)
+        )
+        older = self.message(
+            "🛒💵: OLD\nrasxod: 1\n\n📞: 901234567\n\nНаличка"
+        )
+        newer = self.message(
+            "🛒💵: NEW\nrasxod: 2\n\n"
+            "📞: +998 91 111 22 33\n\nНаличка"
+        )
+
+        older_task = asyncio.create_task(
+            self.service.handle_edited_photo(older, bot, update_id=300)
+        )
+        await entered.wait()
+        newer_task = asyncio.create_task(
+            self.service.handle_edited_photo(newer, bot, update_id=301)
+        )
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(older_task, newer_task)
+
+        self.assertEqual(bot.edit_message_caption.await_count, 2)
+        self.assertIn("🛒💵: OLD", applied[0])
+        self.assertEqual(applied[-1], newer.caption)
+        self.assertIn("rasxod: 2", applied[-1])
+
+
 class ManagerCallbackTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -793,7 +998,13 @@ class ManagerCallbackTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         self.temp.cleanup()
 
-    def query(self, data: str, caption_html: str, actor_id: int = 50):
+    def query(
+        self,
+        data: str,
+        caption_html: str,
+        actor_id: int = 50,
+        reply_markup=None,
+    ):
         return SimpleNamespace(
             data=data,
             from_user=SimpleNamespace(id=actor_id),
@@ -803,9 +1014,11 @@ class ManagerCallbackTests(unittest.IsolatedAsyncioTestCase):
                 message_id=200,
                 caption=caption_html,
                 caption_html=caption_html,
+                reply_markup=reply_markup,
             ),
             answer=AsyncMock(),
             edit_message_caption=AsyncMock(),
+            edit_message_reply_markup=AsyncMock(),
         )
 
     def callback(self, action: str, generation: int) -> str:
@@ -828,23 +1041,36 @@ class ManagerCallbackTests(unittest.IsolatedAsyncioTestCase):
         await service.on_manager_callback(
             SimpleNamespace(callback_query=selected_query), self.context()
         )
-        selected_caption = selected_query.edit_message_caption.await_args.kwargs["caption"]
-        self.assertIn("👤 Менеджер: <b>Olmas</b>", selected_caption)
-        back_markup = selected_query.edit_message_caption.await_args.kwargs[
+        selected_query.edit_message_caption.assert_not_awaited()
+        back_markup_object = selected_query.edit_message_reply_markup.await_args.kwargs[
             "reply_markup"
-        ].to_dict()
+        ]
+        back_markup = back_markup_object.to_dict()
+        self.assertEqual(
+            back_markup["inline_keyboard"][0][0]["text"],
+            "👤 Olmas · ↩️ Назад",
+        )
         self.assertEqual(
             back_markup["inline_keyboard"][0][0]["callback_data"],
             self.callback("b", 1),
         )
         self.assertEqual(self.repo.selected_manager(CHAT_ID, 200), "Olmas")
 
-        back_query = self.query(self.callback("b", 1), selected_caption)
+        back_query = self.query(
+            self.callback("b", 1),
+            self.base,
+            reply_markup=back_markup_object,
+        )
         await service.on_manager_callback(
             SimpleNamespace(callback_query=back_query), self.context()
         )
+        back_query.edit_message_caption.assert_not_awaited()
+        manager_markup = back_query.edit_message_reply_markup.await_args.kwargs[
+            "reply_markup"
+        ].to_dict()
         self.assertEqual(
-            back_query.edit_message_caption.await_args.kwargs["caption"], self.base
+            [[button["text"] for button in row] for row in manager_markup["inline_keyboard"]],
+            [["Olmas", "Otabek"], ["Ali", "Abbos"]],
         )
         self.assertIsNone(self.repo.selected_manager(CHAT_ID, 200))
 
@@ -854,7 +1080,7 @@ class ManagerCallbackTests(unittest.IsolatedAsyncioTestCase):
         await service.on_manager_callback(
             SimpleNamespace(callback_query=query), self.context(admin=False)
         )
-        query.edit_message_caption.assert_not_awaited()
+        query.edit_message_reply_markup.assert_not_awaited()
         query.answer.assert_awaited_once_with(
             "У вас нет доступа к выбору менеджера", show_alert=True
         )
@@ -869,7 +1095,8 @@ class ManagerCallbackTests(unittest.IsolatedAsyncioTestCase):
         await service.on_manager_callback(
             SimpleNamespace(callback_query=query), self.context(admin=True)
         )
-        query.edit_message_caption.assert_awaited_once()
+        query.edit_message_reply_markup.assert_awaited_once()
+        query.edit_message_caption.assert_not_awaited()
         self.assertEqual(self.repo.selected_manager(CHAT_ID, 200), "Ali")
 
     async def test_stale_callback_cannot_replace_newer_manager(self):
@@ -886,7 +1113,7 @@ class ManagerCallbackTests(unittest.IsolatedAsyncioTestCase):
         await service.on_manager_callback(
             SimpleNamespace(callback_query=second), self.context(admin=False)
         )
-        second.edit_message_caption.assert_not_awaited()
+        second.edit_message_reply_markup.assert_not_awaited()
         second.answer.assert_awaited_once_with(
             "Кнопка устарела",
             show_alert=True,
@@ -909,22 +1136,26 @@ class ManagerCallbackTests(unittest.IsolatedAsyncioTestCase):
                 SimpleNamespace(callback_query=first),
                 self.context(admin=False),
             )
-        selected_caption = first.edit_message_caption.await_args.kwargs["caption"]
+        back_markup = first.edit_message_reply_markup.await_args.kwargs["reply_markup"]
 
         stale = self.query(self.callback("m:abbos", 0), self.base)
         await service.on_manager_callback(
             SimpleNamespace(callback_query=stale),
             self.context(admin=False),
         )
-        stale.edit_message_caption.assert_not_awaited()
+        stale.edit_message_reply_markup.assert_not_awaited()
         stale.answer.assert_awaited_once_with("Кнопка устарела", show_alert=True)
 
-        repair = self.query(self.callback("b", 1), selected_caption)
+        repair = self.query(
+            self.callback("b", 1),
+            self.base,
+            reply_markup=back_markup,
+        )
         await service.on_manager_callback(
             SimpleNamespace(callback_query=repair),
             self.context(admin=False),
         )
-        repair.edit_message_caption.assert_awaited_once()
+        repair.edit_message_reply_markup.assert_awaited_once()
         self.assertEqual(self.repo.ui_generation_for_replacement(CHAT_ID, 200), 2)
 
     async def test_ambiguous_manager_edit_invalidates_old_buttons_durably(self):
@@ -934,7 +1165,7 @@ class ManagerCallbackTests(unittest.IsolatedAsyncioTestCase):
             StaticRecognizer(),
         )
         first = self.query(self.callback("m:ali", 0), self.base)
-        first.edit_message_caption.side_effect = NetworkError("response lost")
+        first.edit_message_reply_markup.side_effect = NetworkError("response lost")
         await first_service.on_manager_callback(
             SimpleNamespace(callback_query=first),
             self.context(admin=False),
@@ -951,7 +1182,7 @@ class ManagerCallbackTests(unittest.IsolatedAsyncioTestCase):
             SimpleNamespace(callback_query=stale),
             self.context(admin=False),
         )
-        stale.edit_message_caption.assert_not_awaited()
+        stale.edit_message_reply_markup.assert_not_awaited()
         stale.answer.assert_awaited_once_with("Кнопка устарела", show_alert=True)
 
     async def test_definite_manager_edit_failure_releases_reservation(self):
@@ -961,7 +1192,7 @@ class ManagerCallbackTests(unittest.IsolatedAsyncioTestCase):
             StaticRecognizer(),
         )
         failed = self.query(self.callback("m:ali", 0), self.base)
-        failed.edit_message_caption.side_effect = RuntimeError("rejected")
+        failed.edit_message_reply_markup.side_effect = RuntimeError("rejected")
         await service.on_manager_callback(
             SimpleNamespace(callback_query=failed),
             self.context(admin=False),
@@ -973,7 +1204,7 @@ class ManagerCallbackTests(unittest.IsolatedAsyncioTestCase):
             SimpleNamespace(callback_query=retry),
             self.context(admin=False),
         )
-        retry.edit_message_caption.assert_awaited_once()
+        retry.edit_message_reply_markup.assert_awaited_once()
         self.assertEqual(self.repo.selected_manager(CHAT_ID, 200), "Ali")
 
 
@@ -987,7 +1218,7 @@ class ApplicationWiringTests(unittest.TestCase):
                 repository=repo,
                 recognizer=StaticRecognizer(),
             )
-            self.assertEqual(len(app.handlers[0]), 2)
+            self.assertEqual(len(app.handlers[0]), 3)
             self.assertEqual(app.update_processor.max_concurrent_updates, 4)
             keyboard = manager_keyboard().to_dict()
             self.assertEqual(
@@ -996,7 +1227,39 @@ class ApplicationWiringTests(unittest.TestCase):
             )
             signature = repo.callback_signature(CHAT_ID, 10, 0)
             callback_data = f"sp:m:olmas:10:0:{signature}"
-            self.assertIsNotNone(app.handlers[0][1].pattern.fullmatch(callback_data))
+            self.assertIsNotNone(app.handlers[0][2].pattern.fullmatch(callback_data))
+
+            chat = Chat(id=CHAT_ID, type="channel")
+            photo = PhotoSize(
+                file_id="file",
+                file_unique_id="unique",
+                width=100,
+                height=100,
+            )
+            message = Message(
+                message_id=10,
+                date=datetime.now(timezone.utc),
+                chat=chat,
+                photo=(photo,),
+            )
+            channel_post = Update(update_id=1, channel_post=message)
+            edited_post = Update(update_id=2, edited_channel_post=message)
+            self.assertTrue(app.handlers[0][0].check_update(channel_post))
+            self.assertFalse(app.handlers[0][0].check_update(edited_post))
+            self.assertFalse(app.handlers[0][1].check_update(channel_post))
+            self.assertTrue(app.handlers[0][1].check_update(edited_post))
+
+    def test_polling_subscribes_to_edited_channel_posts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fake_app = SimpleNamespace(run_polling=MagicMock())
+            with patch(
+                "sales_photo_bot.application.build_application",
+                return_value=fake_app,
+            ):
+                run(settings(Path(directory)))
+
+        kwargs = fake_app.run_polling.call_args.kwargs
+        self.assertIn("edited_channel_post", kwargs["allowed_updates"])
 
 
 class StartupSafetyTests(unittest.IsolatedAsyncioTestCase):

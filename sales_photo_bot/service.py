@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import html
 import logging
 import re
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -14,12 +14,7 @@ from telegram.error import BadRequest, NetworkError, RetryAfter
 from telegram.ext import ContextTypes
 
 from .config import Settings
-from .formatting import (
-    add_manager_selection,
-    build_caption,
-    remove_manager_selection,
-    selected_manager_from_caption,
-)
+from .formatting import build_caption
 from .keyboards import (
     BACK_CALLBACK,
     MANAGER_CALLBACK_PREFIX,
@@ -29,6 +24,7 @@ from .keyboards import (
 )
 from .models import EMPTY_IDENTIFIERS, ProductIdentifiers
 from .ocr import IdentifierRecognizer
+from .phones import normalize_caption_phone_field
 from .repository import SalesPhotoRepository, utc_now
 
 
@@ -62,13 +58,6 @@ def _chat_id(message: object) -> int | None:
         return None
 
 
-def _caption_html(message: object) -> str:
-    rendered = getattr(message, "caption_html", None)
-    if rendered:
-        return str(rendered)
-    return html.escape(str(getattr(message, "caption", "") or ""), quote=True)
-
-
 def _callback_source_claim(data: object) -> tuple[int, int, str] | None:
     match = _SOURCE_CALLBACK_RE.fullmatch(str(data or ""))
     if not match:
@@ -84,6 +73,21 @@ def _source_claim_from_markup(message: object) -> tuple[int, int, str] | None:
             claim = _callback_source_claim(getattr(button, "callback_data", None))
             if claim is not None:
                 return claim
+    return None
+
+
+def _selected_manager_from_markup(message: object) -> str | None:
+    markup = getattr(message, "reply_markup", None)
+    rows = getattr(markup, "inline_keyboard", None) or ()
+    for row in rows:
+        for button in row:
+            data = str(getattr(button, "callback_data", "") or "")
+            text = str(getattr(button, "text", "") or "")
+            if not data.startswith(f"{BACK_CALLBACK}:"):
+                continue
+            for manager in SELLER_BY_KEY.values():
+                if f"👤 {manager}" in text:
+                    return manager
     return None
 
 
@@ -109,8 +113,11 @@ class SalesPhotoService:
         self.bot_id: int | None = None
         self._photo_locks: dict[tuple[int, int], asyncio.Lock] = {}
         self._photo_lock_users: dict[tuple[int, int], int] = {}
-        self._callback_locks: dict[tuple[int, int], asyncio.Lock] = {}
-        self._callback_lock_users: dict[tuple[int, int], int] = {}
+        self._card_locks: dict[tuple[int, int], asyncio.Lock] = {}
+        self._card_lock_users: dict[tuple[int, int], int] = {}
+        self._caption_update_ids: dict[tuple[int, int], int] = {}
+        self._caption_reapply_ids: dict[tuple[int, int], int] = {}
+        self._pending_managers: dict[tuple[int, int], str] = {}
         self._ui_generations: dict[tuple[int, int], int] = {}
         self._maintenance_task: asyncio.Task[None] | None = None
 
@@ -154,6 +161,164 @@ class SalesPhotoService:
         if message is None:
             return
         await self.handle_photo(message, context.bot)
+
+    async def on_edited_photo(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        message = update.edited_channel_post
+        if message is None:
+            return
+        await self.handle_edited_photo(
+            message,
+            context.bot,
+            update_id=getattr(update, "update_id", None),
+        )
+
+    @asynccontextmanager
+    async def _card_lock(self, key: tuple[int, int]):
+        lock = self._card_locks.setdefault(key, asyncio.Lock())
+        self._card_lock_users[key] = self._card_lock_users.get(key, 0) + 1
+        try:
+            async with lock:
+                yield
+        finally:
+            remaining = self._card_lock_users.get(key, 1) - 1
+            if remaining <= 0:
+                self._card_lock_users.pop(key, None)
+                if self._card_locks.get(key) is lock:
+                    self._card_locks.pop(key, None)
+                self._caption_update_ids.pop(key, None)
+                self._caption_reapply_ids.pop(key, None)
+            else:
+                self._card_lock_users[key] = remaining
+
+    async def handle_edited_photo(
+        self,
+        message: Message | Any,
+        bot: Bot | Any,
+        update_id: object = None,
+    ) -> None:
+        chat_id = _chat_id(message)
+        message_id = getattr(message, "message_id", None)
+        photos = tuple(getattr(message, "photo", None) or ())
+        if chat_id != self.settings.chat_id or message_id is None or not photos:
+            return
+        message_id = int(message_id)
+        if not self.repository.is_replacement(chat_id, message_id):
+            return
+
+        key = (chat_id, message_id)
+        try:
+            revision = int(update_id) if update_id is not None else None
+        except (TypeError, ValueError):
+            revision = None
+        if revision is not None:
+            previous = self._caption_update_ids.get(key)
+            if previous is None or revision > previous:
+                self._caption_update_ids[key] = revision
+                if key in self._caption_reapply_ids:
+                    self._caption_reapply_ids[key] = revision
+
+        async with self._card_lock(key):
+            if revision is not None:
+                latest_revision = self._caption_update_ids.get(key, revision)
+                if revision < latest_revision:
+                    if key in self._caption_reapply_ids:
+                        self._caption_reapply_ids[key] = latest_revision
+                    return
+            normalized = normalize_caption_phone_field(
+                getattr(message, "caption", None),
+                getattr(message, "caption_entities", None),
+            )
+            force_reapply = (
+                revision is not None
+                and self._caption_reapply_ids.get(key) == revision
+            )
+            if not normalized.changed and not force_reapply:
+                return
+            try:
+                await bot.edit_message_caption(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    caption=normalized.caption,
+                    caption_entities=normalized.entities,
+                    reply_markup=self._current_card_markup(
+                        chat_id,
+                        message_id,
+                        message,
+                    ),
+                )
+            except asyncio.CancelledError:
+                raise
+            except BadRequest as exc:
+                if "message is not modified" in str(exc).casefold():
+                    return
+                logger.warning(
+                    "sales_photo_phone_normalize_failed chat_id=%s message_id=%s "
+                    "error_type=%s",
+                    chat_id,
+                    message_id,
+                    _error_code(exc),
+                )
+            except Exception as exc:
+                # A transport error is ambiguous; do not retry a full caption
+                # replacement because a newer manual edit may already exist.
+                logger.warning(
+                    "sales_photo_phone_normalize_failed chat_id=%s message_id=%s "
+                    "error_type=%s",
+                    chat_id,
+                    message_id,
+                    _error_code(exc),
+                )
+            finally:
+                if revision is not None:
+                    latest_revision = self._caption_update_ids.get(key, revision)
+                    if latest_revision > revision:
+                        # This full-caption write may have landed after a newer
+                        # manual edit. Force the newest queued snapshot to be
+                        # written back even when its phone was already canonical.
+                        self._caption_reapply_ids[key] = latest_revision
+                    elif self._caption_reapply_ids.get(key) == revision:
+                        self._caption_reapply_ids.pop(key, None)
+
+    def _current_card_markup(
+        self,
+        chat_id: int,
+        message_id: int,
+        message: object,
+    ):
+        source_message_id = self.repository.source_for_replacement(
+            chat_id, message_id
+        )
+        generation = self.repository.ui_generation_for_replacement(
+            chat_id, message_id
+        )
+        if source_message_id is None or generation is None:
+            return getattr(message, "reply_markup", None)
+        signature = self.repository.callback_signature(
+            chat_id,
+            source_message_id,
+            generation,
+        )
+        if generation % 2:
+            manager = (
+                self.repository.selected_manager(chat_id, message_id)
+                or self._pending_managers.get((chat_id, message_id))
+                or _selected_manager_from_markup(message)
+            )
+            return back_keyboard(
+                source_message_id=source_message_id,
+                generation=generation,
+                signature=signature,
+                manager=manager,
+            )
+        return manager_keyboard(
+            source_message_id=source_message_id,
+            generation=generation,
+            signature=signature,
+        )
 
     async def handle_photo(self, message: Message | Any, bot: Bot | Any) -> None:
         chat_id = _chat_id(message)
@@ -537,64 +702,51 @@ class SalesPhotoService:
             return
 
         callback_key = (chat_id, int(message_id))
-        lock = self._callback_locks.setdefault(callback_key, asyncio.Lock())
-        self._callback_lock_users[callback_key] = (
-            self._callback_lock_users.get(callback_key, 0) + 1
-        )
-        try:
-            async with lock:
-                ledger_generation = self.repository.ui_generation_for_replacement(
+        async with self._card_lock(callback_key):
+            ledger_generation = self.repository.ui_generation_for_replacement(
+                chat_id,
+                int(message_id),
+            )
+            known_generation = max(
+                int(ledger_generation or 0),
+                self._ui_generations.get(callback_key, 0),
+            )
+            is_back = data == BACK_CALLBACK or data.startswith(
+                f"{BACK_CALLBACK}:"
+            )
+            if (
+                ledger_generation is None
+                or callback_generation < known_generation
+                or is_back != bool(callback_generation % 2)
+            ):
+                await query.answer("Кнопка устарела", show_alert=True)
+                return
+            if is_back:
+                await self._handle_back(
+                    query,
+                    message,
                     chat_id,
                     int(message_id),
+                    source_id,
+                    callback_generation,
                 )
-                known_generation = max(
-                    int(ledger_generation or 0),
-                    self._ui_generations.get(callback_key, 0),
-                )
-                is_back = data == BACK_CALLBACK or data.startswith(
-                    f"{BACK_CALLBACK}:"
-                )
-                if (
-                    ledger_generation is None
-                    or callback_generation < known_generation
-                    or is_back != bool(callback_generation % 2)
-                ):
-                    await query.answer("Кнопка устарела", show_alert=True)
+            elif data.startswith(MANAGER_CALLBACK_PREFIX):
+                seller_key = data[len(MANAGER_CALLBACK_PREFIX) :].split(":", 1)[0]
+                manager = SELLER_BY_KEY.get(seller_key)
+                if not manager:
+                    await query.answer("Неизвестный менеджер", show_alert=True)
                     return
-                if is_back:
-                    await self._handle_back(
-                        query,
-                        message,
-                        chat_id,
-                        int(message_id),
-                        source_id,
-                        callback_generation,
-                    )
-                elif data.startswith(MANAGER_CALLBACK_PREFIX):
-                    seller_key = data[len(MANAGER_CALLBACK_PREFIX) :].split(":", 1)[0]
-                    manager = SELLER_BY_KEY.get(seller_key)
-                    if not manager:
-                        await query.answer("Неизвестный менеджер", show_alert=True)
-                        return
-                    await self._handle_manager(
-                        query,
-                        message,
-                        chat_id,
-                        int(message_id),
-                        manager,
-                        source_id,
-                        callback_generation,
-                    )
-                else:
-                    await query.answer("Кнопка устарела", show_alert=True)
-        finally:
-            remaining = self._callback_lock_users.get(callback_key, 1) - 1
-            if remaining <= 0:
-                self._callback_lock_users.pop(callback_key, None)
-                if self._callback_locks.get(callback_key) is lock:
-                    self._callback_locks.pop(callback_key, None)
+                await self._handle_manager(
+                    query,
+                    message,
+                    chat_id,
+                    int(message_id),
+                    manager,
+                    source_id,
+                    callback_generation,
+                )
             else:
-                self._callback_lock_users[callback_key] = remaining
+                await query.answer("Кнопка устарела", show_alert=True)
 
     async def _manager_actor_allowed(self, bot: Bot | Any, actor_id: object) -> bool:
         try:
@@ -626,14 +778,6 @@ class SalesPhotoService:
         source_message_id: int,
         callback_generation: int,
     ) -> None:
-        selected = selected_manager_from_caption(_caption_html(message))
-        if selected:
-            await query.answer(
-                f"Уже выбран менеджер: {selected}",
-                show_alert=True,
-            )
-            return
-        caption = add_manager_selection(_caption_html(message), manager)
         next_generation = callback_generation + 1
         next_signature = self.repository.callback_signature(
             chat_id,
@@ -661,14 +805,14 @@ class SalesPhotoService:
             await query.answer("Кнопка устарела", show_alert=True)
             return
         self._ui_generations[callback_key] = next_generation
+        self._pending_managers[callback_key] = manager
         try:
-            await query.edit_message_caption(
-                caption=caption,
-                parse_mode=ParseMode.HTML,
+            await query.edit_message_reply_markup(
                 reply_markup=back_keyboard(
                     source_message_id=source_message_id,
                     generation=next_generation,
                     signature=next_signature,
+                    manager=manager,
                 ),
             )
         except Exception as exc:
@@ -683,6 +827,7 @@ class SalesPhotoService:
                     released = False
                 if released:
                     self._ui_generations.pop(callback_key, None)
+                    self._pending_managers.pop(callback_key, None)
             await query.answer("Не удалось обновить карточку", show_alert=True)
             logger.warning(
                 "sales_photo_manager_edit_failed chat_id=%s message_id=%s error_type=%s",
@@ -706,6 +851,7 @@ class SalesPhotoService:
                 )
             else:
                 self._ui_generations.pop(callback_key, None)
+                self._pending_managers.pop(callback_key, None)
         except Exception as exc:
             logger.warning(
                 "sales_photo_manager_ledger_failed chat_id=%s message_id=%s error_type=%s",
@@ -724,11 +870,6 @@ class SalesPhotoService:
         source_message_id: int,
         callback_generation: int,
     ) -> None:
-        selected = selected_manager_from_caption(_caption_html(message))
-        if not selected:
-            await query.answer("Менеджер ещё не выбран")
-            return
-        caption = remove_manager_selection(_caption_html(message))
         next_generation = callback_generation + 1
         next_signature = self.repository.callback_signature(
             chat_id,
@@ -757,9 +898,7 @@ class SalesPhotoService:
             return
         self._ui_generations[callback_key] = next_generation
         try:
-            await query.edit_message_caption(
-                caption=caption,
-                parse_mode=ParseMode.HTML,
+            await query.edit_message_reply_markup(
                 reply_markup=manager_keyboard(
                     source_message_id=source_message_id,
                     generation=next_generation,
@@ -800,6 +939,7 @@ class SalesPhotoService:
                 )
             else:
                 self._ui_generations.pop(callback_key, None)
+                self._pending_managers.pop(callback_key, None)
         except Exception as exc:
             logger.warning(
                 "sales_photo_back_ledger_failed chat_id=%s message_id=%s error_type=%s",

@@ -81,8 +81,18 @@ def build_application(
     application.bot_data["sales_photo_service"] = service
     application.add_handler(
         MessageHandler(
-            filters.Chat(chat_id=settings.chat_id) & filters.PHOTO,
+            filters.UpdateType.CHANNEL_POST
+            & filters.Chat(chat_id=settings.chat_id)
+            & filters.PHOTO,
             service.on_photo,
+        )
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.UpdateType.EDITED_CHANNEL_POST
+            & filters.Chat(chat_id=settings.chat_id)
+            & filters.PHOTO,
+            service.on_edited_photo,
         )
     )
     application.add_handler(
@@ -102,6 +112,11 @@ def run(settings: Settings) -> None:
     repository = SalesPhotoRepository(settings.db_path)
     application = build_application(settings, repository=repository)
     application.run_polling(
-        allowed_updates=["message", "channel_post", "callback_query"],
+        allowed_updates=[
+            "message",
+            "channel_post",
+            "edited_channel_post",
+            "callback_query",
+        ],
         drop_pending_updates=False,
     )
