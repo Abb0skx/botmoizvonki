@@ -43,6 +43,9 @@ class PendingPhoto:
     chat_id: int
     source_message_id: int
     source_file_id: str
+    source_file_ids: tuple[str, ...]
+    source_message_ids: tuple[int, ...]
+    source_kind: str
     client_caption: str | None
     message_thread_id: int | None
     attempts: int
@@ -196,10 +199,26 @@ class SalesPhotoRepository:
         source_file_id: str,
         client_caption: str | None,
         message_thread_id: int | None,
+        *,
+        source_file_ids: tuple[str, ...] | None = None,
+        source_message_ids: tuple[int, ...] | None = None,
+        source_kind: str = "photo",
     ) -> bytes:
+        file_ids = tuple(
+            str(value or "")[:300]
+            for value in (source_file_ids or (source_file_id,))
+            if value
+        )
         payload = json.dumps(
             {
-                "file_id": str(source_file_id or "")[:300],
+                # Keep file_id for backwards readability while the tuple fields
+                # make album retries durable.
+                "file_id": file_ids[0] if file_ids else "",
+                "file_ids": file_ids,
+                "source_message_ids": tuple(
+                    int(value) for value in (source_message_ids or ())
+                ),
+                "kind": str(source_kind or "photo")[:20],
                 "caption": (
                     " ".join(str(client_caption or "").split())[:300]
                     if client_caption
@@ -214,21 +233,38 @@ class SalesPhotoRepository:
         ).encode("utf-8")
         return self._cipher.encrypt(payload)
 
-    def _decrypt_payload(self, payload: bytes) -> tuple[str, str | None, int | None]:
+    def _decrypt_payload(
+        self,
+        payload: bytes,
+    ) -> tuple[tuple[str, ...], str | None, int | None, str, tuple[int, ...]]:
         try:
             value = json.loads(self._cipher.decrypt(bytes(payload)).decode("utf-8"))
         except (InvalidToken, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise RuntimeError("Повреждён retry payload") from exc
         if not isinstance(value, dict):
             raise RuntimeError("Повреждён retry payload")
-        file_id = str(value.get("file_id") or "")[:300]
+        raw_file_ids = value.get("file_ids")
+        if isinstance(raw_file_ids, list):
+            file_ids = tuple(
+                str(item or "")[:300] for item in raw_file_ids if item
+            )
+        else:
+            legacy_file_id = str(value.get("file_id") or "")[:300]
+            file_ids = (legacy_file_id,) if legacy_file_id else ()
         caption_value = value.get("caption")
         caption = str(caption_value)[:300] if caption_value else None
         thread_value = value.get("thread_id")
         thread_id = int(thread_value) if thread_value is not None else None
-        if not file_id:
+        source_kind = str(value.get("kind") or "photo")[:20]
+        raw_source_ids = value.get("source_message_ids")
+        source_message_ids = (
+            tuple(int(item) for item in raw_source_ids)
+            if isinstance(raw_source_ids, list)
+            else ()
+        )
+        if not file_ids:
             raise RuntimeError("Retry payload не содержит Telegram file_id")
-        return file_id, caption, thread_id
+        return file_ids, caption, thread_id, source_kind, source_message_ids
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -281,6 +317,26 @@ class SalesPhotoRepository:
                     PRIMARY KEY(chat_id,message_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS sales_photo_source_members (
+                    chat_id INTEGER NOT NULL,
+                    source_message_id INTEGER NOT NULL,
+                    member_message_id INTEGER NOT NULL,
+                    deleted INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(chat_id,source_message_id,member_message_id),
+                    UNIQUE(chat_id,member_message_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS sales_photo_output_members (
+                    chat_id INTEGER NOT NULL,
+                    source_message_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(chat_id,source_message_id,message_id),
+                    UNIQUE(chat_id,message_id)
+                );
+
                 DROP TABLE IF EXISTS sales_photo_name_cache;
                 """
             )
@@ -302,6 +358,26 @@ class SalesPhotoRepository:
                     "ALTER TABLE sales_photo_jobs ADD COLUMN "
                     "processing_attempts INTEGER NOT NULL DEFAULT 1"
                 )
+            migration_time = _iso(utc_now())
+            db.execute(
+                """INSERT OR IGNORE INTO sales_photo_source_members(
+                       chat_id,source_message_id,member_message_id,
+                       deleted,created_at,updated_at
+                   )
+                   SELECT chat_id,source_message_id,source_message_id,
+                          CASE WHEN status='complete' THEN 1 ELSE 0 END,?,?
+                   FROM sales_photo_jobs""",
+                (migration_time, migration_time),
+            )
+            db.execute(
+                """INSERT OR IGNORE INTO sales_photo_output_members(
+                       chat_id,source_message_id,message_id,created_at
+                   )
+                   SELECT chat_id,source_message_id,replacement_message_id,?
+                   FROM sales_photo_jobs
+                   WHERE replacement_message_id IS NOT NULL""",
+                (migration_time,),
+            )
             key_fingerprint = hashlib.sha256(self._signing_key).hexdigest()
             fingerprint_row = db.execute(
                 "SELECT value FROM sales_photo_meta WHERE key='cipher_key_fingerprint'"
@@ -377,18 +453,49 @@ class SalesPhotoRepository:
         client_caption: str | None = None,
         message_thread_id: int | None = None,
         at: datetime | None = None,
+        *,
+        source_file_ids: tuple[str, ...] | None = None,
+        source_message_ids: tuple[int, ...] | None = None,
+        source_kind: str = "photo",
     ) -> bool:
         now = _iso(at or utc_now())
+        member_ids = tuple(
+            dict.fromkeys(
+                int(value)
+                for value in (source_message_ids or (source_message_id,))
+            )
+        )
+        if int(source_message_id) not in member_ids:
+            member_ids = (int(source_message_id), *member_ids)
+        file_ids = tuple(
+            str(value or "")[:300]
+            for value in (source_file_ids or ())
+            if value
+        )
+        if not file_ids and source_file_id:
+            file_ids = (str(source_file_id)[:300],)
         encrypted_payload = (
             self._encrypt_payload(
-                source_file_id,
+                file_ids[0],
                 client_caption,
                 message_thread_id,
+                source_file_ids=file_ids,
+                source_message_ids=member_ids,
+                source_kind=source_kind,
             )
-            if source_file_id
+            if file_ids
             else None
         )
         with self._connect() as db:
+            placeholders = ",".join("?" for _ in member_ids)
+            conflicting_member = db.execute(
+                f"""SELECT 1 FROM sales_photo_source_members
+                       WHERE chat_id=? AND member_message_id IN ({placeholders})
+                         AND source_message_id<>? LIMIT 1""",
+                (int(chat_id), *member_ids, int(source_message_id)),
+            ).fetchone()
+            if conflicting_member is not None:
+                return False
             try:
                 db.execute(
                     """INSERT INTO sales_photo_jobs(
@@ -407,8 +514,6 @@ class SalesPhotoRepository:
                         now,
                     ),
                 )
-                db.commit()
-                return True
             except sqlite3.IntegrityError:
                 cursor = db.execute(
                     """UPDATE sales_photo_jobs
@@ -427,8 +532,33 @@ class SalesPhotoRepository:
                         str(source_file_unique_id or "unknown")[:200],
                     ),
                 )
-                db.commit()
-                return cursor.rowcount == 1
+                if cursor.rowcount != 1:
+                    db.rollback()
+                    return False
+            try:
+                db.executemany(
+                    """INSERT INTO sales_photo_source_members(
+                           chat_id,source_message_id,member_message_id,
+                           deleted,created_at,updated_at
+                       ) VALUES (?,?,?,0,?,?)
+                       ON CONFLICT(chat_id,source_message_id,member_message_id)
+                       DO UPDATE SET deleted=0,updated_at=excluded.updated_at""",
+                    (
+                        (
+                            int(chat_id),
+                            int(source_message_id),
+                            member_id,
+                            now,
+                            now,
+                        )
+                        for member_id in member_ids
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                db.rollback()
+                return False
+            db.commit()
+            return True
 
     def record_replacement(
         self,
@@ -436,6 +566,8 @@ class SalesPhotoRepository:
         source_message_id: int,
         replacement_message_id: int,
         at: datetime | None = None,
+        *,
+        output_message_ids: tuple[int, ...] | None = None,
     ) -> str:
         """Atomically reconcile a send response or a signed generated post.
 
@@ -443,6 +575,16 @@ class SalesPhotoRepository:
         identifies a duplicate Telegram send that the caller should delete.
         """
 
+        output_ids = tuple(
+            dict.fromkeys(
+                int(value)
+                for value in (
+                    output_message_ids or (int(replacement_message_id),)
+                )
+            )
+        )
+        if int(replacement_message_id) not in output_ids:
+            output_ids = (*output_ids, int(replacement_message_id))
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
@@ -456,26 +598,47 @@ class SalesPhotoRepository:
             existing = row["replacement_message_id"]
             if existing is not None:
                 if int(existing) == int(replacement_message_id):
-                    db.rollback()
+                    now = _iso(at or utc_now())
+                    db.executemany(
+                        """INSERT OR IGNORE INTO sales_photo_output_members(
+                               chat_id,source_message_id,message_id,created_at
+                           ) VALUES (?,?,?,?)""",
+                        (
+                            (
+                                int(chat_id),
+                                int(source_message_id),
+                                message_id,
+                                now,
+                            )
+                            for message_id in output_ids
+                        ),
+                    )
+                    db.commit()
                     return "same"
                 now = _iso(at or utc_now())
-                db.execute(
+                db.executemany(
                     """INSERT INTO sales_photo_duplicate_cleanup(
                            chat_id,message_id,created_at,updated_at
                        ) VALUES (?,?,?,?)
                        ON CONFLICT(chat_id,message_id) DO NOTHING""",
-                    (int(chat_id), int(replacement_message_id), now, now),
+                    (
+                        (int(chat_id), message_id, now, now)
+                        for message_id in output_ids
+                    ),
                 )
                 db.commit()
                 return "conflict"
             if str(row["status"]) not in {"processing", "failed"}:
                 now = _iso(at or utc_now())
-                db.execute(
+                db.executemany(
                     """INSERT INTO sales_photo_duplicate_cleanup(
                            chat_id,message_id,created_at,updated_at
                        ) VALUES (?,?,?,?)
                        ON CONFLICT(chat_id,message_id) DO NOTHING""",
-                    (int(chat_id), int(replacement_message_id), now, now),
+                    (
+                        (int(chat_id), message_id, now, now)
+                        for message_id in output_ids
+                    ),
                 )
                 db.commit()
                 return "conflict"
@@ -496,6 +659,22 @@ class SalesPhotoRepository:
             if cursor.rowcount != 1:
                 db.rollback()
                 return "conflict"
+            now = _iso(at or utc_now())
+            db.executemany(
+                """INSERT INTO sales_photo_output_members(
+                       chat_id,source_message_id,message_id,created_at
+                   ) VALUES (?,?,?,?)
+                   ON CONFLICT(chat_id,source_message_id,message_id) DO NOTHING""",
+                (
+                    (
+                        int(chat_id),
+                        int(source_message_id),
+                        message_id,
+                        now,
+                    )
+                    for message_id in output_ids
+                ),
+            )
             db.commit()
             return "recorded"
 
@@ -730,6 +909,19 @@ class SalesPhotoRepository:
                         now,
                     ),
                 )
+                db.execute(
+                    """INSERT OR IGNORE INTO sales_photo_source_members(
+                           chat_id,source_message_id,member_message_id,
+                           deleted,created_at,updated_at
+                       ) VALUES (?,?,?,0,?,?)""",
+                    (
+                        int(chat_id),
+                        int(source_message_id),
+                        int(source_message_id),
+                        now,
+                        now,
+                    ),
+                )
                 db.commit()
                 return True, None
             status = str(row["status"])
@@ -771,12 +963,23 @@ class SalesPhotoRepository:
                 db.commit()
                 return True, None
             if replacement_id is not None:
-                db.execute(
+                output_rows = db.execute(
+                    """SELECT message_id FROM sales_photo_output_members
+                       WHERE chat_id=? AND source_message_id=?""",
+                    (int(chat_id), int(source_message_id)),
+                ).fetchall()
+                output_ids = tuple(
+                    int(output_row["message_id"]) for output_row in output_rows
+                ) or (replacement_id,)
+                db.executemany(
                     """INSERT INTO sales_photo_duplicate_cleanup(
                            chat_id,message_id,created_at,updated_at
                        ) VALUES (?,?,?,?)
                        ON CONFLICT(chat_id,message_id) DO NOTHING""",
-                    (int(chat_id), replacement_id, now, now),
+                    (
+                        (int(chat_id), output_id, now, now)
+                        for output_id in output_ids
+                    ),
                 )
             cursor = db.execute(
                 """UPDATE sales_photo_jobs
@@ -861,6 +1064,71 @@ class SalesPhotoRepository:
             ).fetchone()
         return row is not None
 
+    def primary_source_for_member(
+        self,
+        chat_id: int,
+        member_message_id: int,
+    ) -> int | None:
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT source_message_id FROM sales_photo_source_members
+                   WHERE chat_id=? AND member_message_id=?""",
+                (int(chat_id), int(member_message_id)),
+            ).fetchone()
+        return int(row["source_message_id"]) if row is not None else None
+
+    def pending_source_members(
+        self,
+        chat_id: int,
+        source_message_id: int,
+    ) -> tuple[int, ...]:
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT member_message_id FROM sales_photo_source_members
+                   WHERE chat_id=? AND source_message_id=? AND deleted=0
+                   ORDER BY member_message_id""",
+                (int(chat_id), int(source_message_id)),
+            ).fetchall()
+        if rows:
+            return tuple(int(row["member_message_id"]) for row in rows)
+        return ()
+
+    def mark_source_member_deleted(
+        self,
+        chat_id: int,
+        source_message_id: int,
+        member_message_id: int,
+        at: datetime | None = None,
+    ) -> None:
+        with self._connect() as db:
+            db.execute(
+                """UPDATE sales_photo_source_members
+                   SET deleted=1,updated_at=?
+                   WHERE chat_id=? AND source_message_id=?
+                     AND member_message_id=?""",
+                (
+                    _iso(at or utc_now()),
+                    int(chat_id),
+                    int(source_message_id),
+                    int(member_message_id),
+                ),
+            )
+            db.commit()
+
+    def output_message_ids(
+        self,
+        chat_id: int,
+        source_message_id: int,
+    ) -> tuple[int, ...]:
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT message_id FROM sales_photo_output_members
+                   WHERE chat_id=? AND source_message_id=?
+                   ORDER BY message_id""",
+                (int(chat_id), int(source_message_id)),
+            ).fetchall()
+        return tuple(int(row["message_id"]) for row in rows)
+
     def fail_stale_processing(
         self,
         chat_id: int,
@@ -917,7 +1185,7 @@ class SalesPhotoRepository:
         jobs: list[PendingPhoto] = []
         for row in rows:
             try:
-                file_id, caption, thread_id = self._decrypt_payload(
+                file_ids, caption, thread_id, source_kind, source_ids = self._decrypt_payload(
                     bytes(row["encrypted_payload"])
                 )
             except RuntimeError:
@@ -946,7 +1214,17 @@ class SalesPhotoRepository:
                 PendingPhoto(
                     chat_id=int(row["chat_id"]),
                     source_message_id=int(row["source_message_id"]),
-                    source_file_id=file_id,
+                    source_file_id=file_ids[0],
+                    source_file_ids=file_ids,
+                    source_message_ids=(
+                        source_ids
+                        or self.pending_source_members(
+                            int(row["chat_id"]),
+                            int(row["source_message_id"]),
+                        )
+                        or (int(row["source_message_id"]),)
+                    ),
+                    source_kind=source_kind,
                     client_caption=caption,
                     message_thread_id=thread_id,
                     attempts=int(row["processing_attempts"]),
@@ -1049,8 +1327,21 @@ class SalesPhotoRepository:
         with self._connect() as db:
             row = db.execute(
                 """SELECT 1 FROM sales_photo_jobs
-                   WHERE chat_id=? AND replacement_message_id=?""",
-                (int(chat_id), int(message_id)),
+                   WHERE chat_id=? AND replacement_message_id=?
+                   UNION ALL
+                   SELECT 1 FROM sales_photo_output_members AS output
+                   JOIN sales_photo_jobs AS job
+                     ON job.chat_id=output.chat_id
+                    AND job.source_message_id=output.source_message_id
+                   WHERE output.chat_id=? AND output.message_id=?
+                     AND job.replacement_message_id IS NOT NULL
+                   LIMIT 1""",
+                (
+                    int(chat_id),
+                    int(message_id),
+                    int(chat_id),
+                    int(message_id),
+                ),
             ).fetchone()
             return row is not None
 

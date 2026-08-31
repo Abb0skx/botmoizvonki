@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import re
 import time
@@ -11,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
-from telegram import Bot, Message, Update
+from telegram import Bot, InputMediaPhoto, Message, Update
 from telegram.constants import ChatType, ParseMode
 from telegram.error import BadRequest, NetworkError, RetryAfter
 from telegram.ext import ContextTypes
@@ -26,7 +27,7 @@ from .keyboards import (
     manager_keyboard,
 )
 from .models import EMPTY_IDENTIFIERS, ProductIdentifiers
-from .phones import normalize_caption_phone_field
+from .phones import extract_product_label, normalize_caption_phone_field
 from .repository import SalesPhotoRepository, utc_now
 
 
@@ -36,6 +37,8 @@ BOT_CARD_MARKER = "\u2063\u2063"
 CAPTION_REVISION_TTL_SECONDS = 600.0
 CAPTION_REVISION_LIMIT = 4096
 PROCESSING_STALE_SECONDS = 180
+ALBUM_SETTLE_SECONDS = 1.0
+TEXT_SOURCE_FILE_ID = "sales-photo:text"
 _SOURCE_CALLBACK_RE = re.compile(
     r"^sp:(?:m:[a-z]+|b):(\d+):(\d+):([0-9a-f]{12})$"
 )
@@ -45,10 +48,15 @@ _SOURCE_CALLBACK_RE = re.compile(
 class _PhotoClaim:
     chat_id: int
     source_message_id: int
-    file_id: str
+    source_message_ids: tuple[int, ...]
+    file_ids: tuple[str, ...]
+    source_kind: str
     client_caption: str | None
     message_thread_id: int | None
-    photo: object
+
+    @property
+    def file_id(self) -> str:
+        return self.file_ids[0]
 
 
 class _RetryWaitCancelled(asyncio.CancelledError):
@@ -83,6 +91,26 @@ def _chat_id(message: object) -> int | None:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _message_content(
+    message: object,
+) -> tuple[str, str, tuple[Any, ...]] | None:
+    caption = getattr(message, "caption", None)
+    if caption is not None:
+        return (
+            "caption",
+            str(caption),
+            tuple(getattr(message, "caption_entities", None) or ()),
+        )
+    text = getattr(message, "text", None)
+    if text is not None:
+        return (
+            "text",
+            str(text),
+            tuple(getattr(message, "entities", None) or ()),
+        )
+    return None
 
 
 def _callback_source_claim(data: object) -> tuple[int, int, str] | None:
@@ -148,6 +176,9 @@ class SalesPhotoService:
         self._pending_managers: dict[tuple[int, int], str] = {}
         self._ui_generations: dict[tuple[int, int], int] = {}
         self._photo_tasks: set[asyncio.Task[None]] = set()
+        self._album_items: dict[tuple[int, str], dict[int, Any]] = {}
+        self._album_bots: dict[tuple[int, str], Any] = {}
+        self._album_tasks: dict[tuple[int, str], asyncio.Task[None]] = {}
         self._active_sources: set[tuple[int, int]] = set()
         self._cancelled_sources: set[tuple[int, int]] = set()
         self._startup_gate_active = False
@@ -201,9 +232,39 @@ class SalesPhotoService:
                 allow_source_delete=not self._startup_gate_active,
             )
             return
+        media_group_id = str(getattr(message, "media_group_id", "") or "")
+        if media_group_id:
+            self._queue_album(message, context.bot, media_group_id)
+            return
         claim = self._claim_photo(message)
         if claim is None:
             return
+        self._schedule_claim(claim, context.bot)
+
+    async def on_text(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        message = update.effective_message
+        if message is None:
+            return
+        content = _message_content(message)
+        if content is None:
+            return
+        _, body, _ = content
+        if body.startswith(BOT_CARD_MARKER):
+            await self._reconcile_generated_post(
+                message,
+                context.bot,
+                allow_source_delete=not self._startup_gate_active,
+            )
+            return
+        claim = self._claim_text(message)
+        if claim is not None:
+            self._schedule_claim(claim, context.bot)
+
+    def _schedule_claim(self, claim: _PhotoClaim, bot: Bot | Any) -> None:
         source_key = (claim.chat_id, claim.source_message_id)
         if self._startup_gate_active:
             try:
@@ -238,7 +299,7 @@ class SalesPhotoService:
             self._active_sources.discard(source_key)
             return
         task = asyncio.create_task(
-            self._run_photo_claim(claim, context.bot),
+            self._run_photo_claim(claim, bot),
             name=f"sales-photo-{claim.source_message_id}",
         )
         self._photo_tasks.add(task)
@@ -248,6 +309,52 @@ class SalesPhotoService:
                 key,
             )
         )
+
+    def _queue_album(
+        self,
+        message: Message | Any,
+        bot: Bot | Any,
+        media_group_id: str,
+    ) -> None:
+        chat_id = _chat_id(message)
+        message_id = getattr(message, "message_id", None)
+        if chat_id != self.settings.chat_id or message_id is None:
+            return
+        key = (chat_id, str(media_group_id))
+        self._album_items.setdefault(key, {})[int(message_id)] = message
+        self._album_bots[key] = bot
+        task = self._album_tasks.get(key)
+        if task is None or task.done():
+            task = asyncio.create_task(
+                self._drain_album(key),
+                name=f"sales-photo-album-{media_group_id}",
+            )
+            self._album_tasks[key] = task
+
+    async def _drain_album(self, key: tuple[int, str]) -> None:
+        try:
+            previous_size = -1
+            while True:
+                current_size = len(self._album_items.get(key, {}))
+                if current_size == previous_size:
+                    break
+                previous_size = current_size
+                await asyncio.sleep(ALBUM_SETTLE_SECONDS)
+            messages = tuple(
+                message
+                for _, message in sorted(
+                    self._album_items.pop(key, {}).items()
+                )
+            )
+            bot = self._album_bots.pop(key, None)
+            if messages and bot is not None:
+                claim = self._claim_album(messages, key[1])
+                if claim is not None:
+                    self._schedule_claim(claim, bot)
+        finally:
+            self._album_items.pop(key, None)
+            self._album_bots.pop(key, None)
+            self._album_tasks.pop(key, None)
 
     def _photo_task_done(
         self,
@@ -340,11 +447,17 @@ class SalesPhotoService:
     ) -> None:
         chat_id = _chat_id(message)
         message_id = getattr(message, "message_id", None)
-        photos = tuple(getattr(message, "photo", None) or ())
         if chat_id != self.settings.chat_id or message_id is None:
             return
         message_id = int(message_id)
-        source_key = (chat_id, message_id)
+        try:
+            primary_source_id = (
+                self.repository.primary_source_for_member(chat_id, message_id)
+                or message_id
+            )
+        except Exception:
+            primary_source_id = message_id
+        source_key = (chat_id, primary_source_id)
         try:
             is_replacement = self.repository.is_replacement(chat_id, message_id)
         except Exception as exc:
@@ -362,7 +475,7 @@ class SalesPhotoService:
             try:
                 cancelled, replacement_id = self.repository.cancel_edited_source(
                     chat_id,
-                    message_id,
+                    primary_source_id,
                 )
             except Exception as exc:
                 logger.warning(
@@ -383,13 +496,19 @@ class SalesPhotoService:
                     message_id,
                 )
                 if replacement_id is not None:
-                    await self._delete_duplicate(bot, chat_id, replacement_id)
+                    output_ids = self.repository.output_message_ids(
+                        chat_id,
+                        primary_source_id,
+                    ) or (replacement_id,)
+                    await self._delete_known_outputs(bot, chat_id, output_ids)
             elif source_key in self._active_sources:
                 self._cancelled_sources.add(source_key)
             return
 
-        if not photos:
+        content = _message_content(message)
+        if content is None:
             return
+        content_kind, body, entities = content
 
         key = (chat_id, message_id)
         logger.info(
@@ -412,21 +531,31 @@ class SalesPhotoService:
                 if latest is not None and revision < latest[0]:
                     return
             normalized = normalize_caption_phone_field(
-                getattr(message, "caption", None),
-                getattr(message, "caption_entities", None),
+                body,
+                entities,
             )
             try:
-                await bot.edit_message_caption(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    caption=normalized.caption,
-                    caption_entities=normalized.entities,
-                    reply_markup=self._current_card_markup(
+                edit_kwargs: dict[str, Any] = {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "reply_markup": self._current_card_markup(
                         chat_id,
                         message_id,
                         message,
                     ),
-                )
+                }
+                if content_kind == "caption":
+                    edit_kwargs.update(
+                        caption=normalized.caption,
+                        caption_entities=normalized.entities,
+                    )
+                    await bot.edit_message_caption(**edit_kwargs)
+                else:
+                    edit_kwargs.update(
+                        text=normalized.caption,
+                        entities=normalized.entities,
+                    )
+                    await bot.edit_message_text(**edit_kwargs)
                 if normalized.changed:
                     logger.info(
                         "sales_photo_phone_normalized_from_edit chat_id=%s "
@@ -538,10 +667,141 @@ class SalesPhotoService:
         return _PhotoClaim(
             chat_id=chat_id,
             source_message_id=source_message_id,
-            file_id=file_id,
+            source_message_ids=(source_message_id,),
+            file_ids=(file_id,),
+            source_kind="photo",
             client_caption=getattr(message, "caption", None),
             message_thread_id=getattr(message, "message_thread_id", None),
-            photo=photo,
+        )
+
+    def _claim_text(self, message: Message | Any) -> _PhotoClaim | None:
+        chat_id = _chat_id(message)
+        source_message_id = getattr(message, "message_id", None)
+        text = str(getattr(message, "text", "") or "").strip()
+        if (
+            chat_id != self.settings.chat_id
+            or source_message_id is None
+            or not text
+            or extract_product_label(text) is None
+        ):
+            return None
+        source_message_id = int(source_message_id)
+        if self.repository.is_replacement(chat_id, source_message_id):
+            return None
+        sender = getattr(message, "from_user", None)
+        if bool(getattr(sender, "is_bot", False)):
+            return None
+        if self.bot_id is not None and getattr(sender, "id", None) == self.bot_id:
+            return None
+
+        key = (chat_id, source_message_id)
+        if key in self._cancelled_sources:
+            return None
+        unique_id = "text:" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
+        if not self.repository.claim_photo(
+            chat_id,
+            source_message_id,
+            unique_id,
+            source_file_id=TEXT_SOURCE_FILE_ID,
+            client_caption=text,
+            message_thread_id=getattr(message, "message_thread_id", None),
+            source_message_ids=(source_message_id,),
+            source_kind="text",
+        ):
+            return None
+        self._active_sources.add(key)
+        return _PhotoClaim(
+            chat_id=chat_id,
+            source_message_id=source_message_id,
+            source_message_ids=(source_message_id,),
+            file_ids=(TEXT_SOURCE_FILE_ID,),
+            source_kind="text",
+            client_caption=text,
+            message_thread_id=getattr(message, "message_thread_id", None),
+        )
+
+    def _claim_album(
+        self,
+        messages: tuple[Message | Any, ...],
+        media_group_id: str,
+    ) -> _PhotoClaim | None:
+        ordered = tuple(
+            sorted(
+                messages,
+                key=lambda item: int(getattr(item, "message_id", 0) or 0),
+            )
+        )
+        if len(ordered) == 1:
+            return self._claim_photo(ordered[0])
+        if not 2 <= len(ordered) <= 10:
+            return None
+
+        chat_id = _chat_id(ordered[0])
+        source_message_ids: list[int] = []
+        file_ids: list[str] = []
+        unique_ids: list[str] = []
+        client_caption: str | None = None
+        for message in ordered:
+            message_id = getattr(message, "message_id", None)
+            photos = tuple(getattr(message, "photo", None) or ())
+            if chat_id != self.settings.chat_id or message_id is None or not photos:
+                return None
+            if _chat_id(message) != chat_id:
+                return None
+            sender = getattr(message, "from_user", None)
+            if bool(getattr(sender, "is_bot", False)):
+                return None
+            if self.bot_id is not None and getattr(sender, "id", None) == self.bot_id:
+                return None
+            photo = max(
+                photos,
+                key=lambda item: (
+                    int(getattr(item, "file_size", 0) or 0),
+                    int(getattr(item, "width", 0) or 0)
+                    * int(getattr(item, "height", 0) or 0),
+                ),
+            )
+            file_id = str(getattr(photo, "file_id", "") or "")
+            if not file_id:
+                return None
+            source_message_ids.append(int(message_id))
+            file_ids.append(file_id)
+            unique_ids.append(
+                str(getattr(photo, "file_unique_id", "") or file_id)
+            )
+            candidate_caption = getattr(message, "caption", None)
+            if client_caption is None and candidate_caption:
+                client_caption = str(candidate_caption)
+
+        source_message_id = source_message_ids[0]
+        key = (chat_id, source_message_id)
+        if key in self._cancelled_sources:
+            return None
+        unique_material = "\x1f".join(
+            (str(media_group_id), *unique_ids)
+        ).encode("utf-8")
+        unique_id = "album:" + hashlib.sha256(unique_material).hexdigest()[:32]
+        if not self.repository.claim_photo(
+            chat_id,
+            source_message_id,
+            unique_id,
+            source_file_id=file_ids[0],
+            source_file_ids=tuple(file_ids),
+            source_message_ids=tuple(source_message_ids),
+            source_kind="album",
+            client_caption=client_caption,
+            message_thread_id=getattr(ordered[0], "message_thread_id", None),
+        ):
+            return None
+        self._active_sources.add(key)
+        return _PhotoClaim(
+            chat_id=chat_id,
+            source_message_id=source_message_id,
+            source_message_ids=tuple(source_message_ids),
+            file_ids=tuple(file_ids),
+            source_kind="album",
+            client_caption=client_caption,
+            message_thread_id=getattr(ordered[0], "message_thread_id", None),
         )
 
     async def _run_photo_claim(
@@ -562,12 +822,7 @@ class SalesPhotoService:
                     return
                 await self._process_claimed_photo(
                     bot,
-                    claim.chat_id,
-                    claim.source_message_id,
-                    claim.file_id,
-                    claim.client_caption,
-                    claim.message_thread_id,
-                    claim.photo,
+                    claim,
                 )
         finally:
             remaining = self._photo_lock_users.get(key, 1) - 1
@@ -597,25 +852,27 @@ class SalesPhotoService:
     async def _process_claimed_photo(
         self,
         bot: Bot | Any,
-        chat_id: int,
-        source_message_id: int,
-        file_id: str,
-        client_caption: str | None,
-        message_thread_id: int | None,
-        photo: object | None = None,
+        claim: _PhotoClaim,
     ) -> None:
+        chat_id = claim.chat_id
+        source_message_id = claim.source_message_id
+        file_id = claim.file_id
+        client_caption = claim.client_caption
+        message_thread_id = claim.message_thread_id
         started = time.monotonic()
         logger.info(
             "sales_photo_processing_started chat_id=%s source_message_id=%s",
             chat_id,
             source_message_id,
         )
-        if self.recognizer is None:
+        if claim.source_kind == "text" or self.recognizer is None:
             identifiers = EMPTY_IDENTIFIERS
             logger.info(
-                "sales_photo_photo_passthrough chat_id=%s source_message_id=%s",
+                "sales_photo_content_passthrough chat_id=%s source_message_id=%s "
+                "source_kind=%s",
                 chat_id,
                 source_message_id,
+                claim.source_kind,
             )
         else:
             try:
@@ -666,26 +923,27 @@ class SalesPhotoService:
                 _error_code(exc),
             )
             return
-        caption = BOT_CARD_MARKER + build_caption(client_caption, identifiers)
+        product_label = (
+            extract_product_label(client_caption)
+            if claim.source_kind == "text"
+            else None
+        )
+        caption = BOT_CARD_MARKER + build_caption(
+            client_caption,
+            identifiers,
+            product_label=product_label,
+        )
         initial_generation = 0
         source_signature = self.repository.callback_signature(
             chat_id,
             source_message_id,
             initial_generation,
         )
-        send_kwargs: dict[str, Any] = {
-            "chat_id": chat_id,
-            "photo": file_id,
-            "caption": caption,
-            "parse_mode": ParseMode.HTML,
-            "reply_markup": manager_keyboard(
-                source_message_id=source_message_id,
-                generation=initial_generation,
-                signature=source_signature,
-            ),
-        }
-        if message_thread_id is not None:
-            send_kwargs["message_thread_id"] = int(message_thread_id)
+        reply_markup = manager_keyboard(
+            source_message_id=source_message_id,
+            generation=initial_generation,
+            signature=source_signature,
+        )
 
         if key in self._cancelled_sources:
             try:
@@ -706,19 +964,79 @@ class SalesPhotoService:
             )
             return
 
+        known_output_ids: tuple[int, ...] = ()
         try:
-            replacement = await self._send_photo(bot, send_kwargs)
-        except _RetryWaitCancelled:
-            try:
-                self.repository.mark_send_rejected(
-                    chat_id,
-                    source_message_id,
-                    "cancelled_retry_wait",
+            if claim.source_kind == "album":
+                media_kwargs: dict[str, Any] = {
+                    "chat_id": chat_id,
+                    "media": tuple(
+                        InputMediaPhoto(
+                            media=album_file_id,
+                            caption=BOT_CARD_MARKER,
+                        )
+                        for album_file_id in claim.file_ids
+                    ),
+                }
+                if message_thread_id is not None:
+                    media_kwargs["message_thread_id"] = int(message_thread_id)
+                album_messages = await self._send_media_group(bot, media_kwargs)
+                known_output_ids = tuple(
+                    int(message.message_id) for message in album_messages
                 )
+                card_kwargs: dict[str, Any] = {
+                    "chat_id": chat_id,
+                    "text": caption,
+                    "parse_mode": ParseMode.HTML,
+                    "reply_markup": reply_markup,
+                }
+                if message_thread_id is not None:
+                    card_kwargs["message_thread_id"] = int(message_thread_id)
+                replacement = await self._send_message(bot, card_kwargs)
+            elif claim.source_kind == "text":
+                text_kwargs: dict[str, Any] = {
+                    "chat_id": chat_id,
+                    "text": caption,
+                    "parse_mode": ParseMode.HTML,
+                    "reply_markup": reply_markup,
+                }
+                if message_thread_id is not None:
+                    text_kwargs["message_thread_id"] = int(message_thread_id)
+                replacement = await self._send_message(bot, text_kwargs)
+            else:
+                photo_kwargs: dict[str, Any] = {
+                    "chat_id": chat_id,
+                    "photo": file_id,
+                    "caption": caption,
+                    "parse_mode": ParseMode.HTML,
+                    "reply_markup": reply_markup,
+                }
+                if message_thread_id is not None:
+                    photo_kwargs["message_thread_id"] = int(message_thread_id)
+                replacement = await self._send_photo(bot, photo_kwargs)
+        except _RetryWaitCancelled:
+            cleanup_complete = await self._delete_known_outputs(
+                bot,
+                chat_id,
+                known_output_ids,
+            )
+            try:
+                if cleanup_complete:
+                    self.repository.mark_send_rejected(
+                        chat_id,
+                        source_message_id,
+                        "cancelled_retry_wait",
+                    )
+                else:
+                    self.repository.mark_ambiguous_send(
+                        chat_id,
+                        source_message_id,
+                        "cancelled_retry_cleanup",
+                    )
             except Exception:
                 pass
             raise
         except asyncio.CancelledError:
+            await self._delete_known_outputs(bot, chat_id, known_output_ids)
             try:
                 self.repository.mark_ambiguous_send(
                     chat_id,
@@ -728,41 +1046,39 @@ class SalesPhotoService:
             except Exception:
                 pass
             raise
-        except RetryAfter:
-            try:
-                self.repository.mark_send_rejected(
-                    chat_id,
-                    source_message_id,
-                    "RetryAfter",
-                )
-            except Exception:
-                pass
-            logger.warning(
-                "sales_photo_repost_deferred chat_id=%s source_message_id=%s",
+        except (RetryAfter, BadRequest) as exc:
+            cleanup_complete = await self._delete_known_outputs(
+                bot,
                 chat_id,
-                source_message_id,
+                known_output_ids,
             )
-            return
-        except BadRequest as exc:
             try:
-                self.repository.mark_send_rejected(
-                    chat_id,
-                    source_message_id,
-                    _error_code(exc),
-                )
+                if cleanup_complete:
+                    self.repository.mark_send_rejected(
+                        chat_id,
+                        source_message_id,
+                        _error_code(exc),
+                    )
+                else:
+                    self.repository.mark_ambiguous_send(
+                        chat_id,
+                        source_message_id,
+                        "partial_output_cleanup",
+                    )
             except Exception:
                 pass
             logger.warning(
-                "sales_photo_repost_rejected chat_id=%s source_message_id=%s",
+                "sales_photo_repost_deferred chat_id=%s source_message_id=%s "
+                "error_type=%s",
                 chat_id,
                 source_message_id,
+                _error_code(exc),
             )
             return
         except Exception as exc:
-            # Once sendPhoto has been invoked, a transport failure can mean that
-            # Telegram accepted the post but the response was lost. Bots do not
-            # receive channel_post updates for their own outgoing posts, so an
-            # automatic retry could create an orphan duplicate.
+            # A transport failure can mean that Telegram accepted the current
+            # request but its response was lost. Never retry an ambiguous send.
+            await self._delete_known_outputs(bot, chat_id, known_output_ids)
             self.repository.mark_ambiguous_send(
                 chat_id,
                 source_message_id,
@@ -777,11 +1093,13 @@ class SalesPhotoService:
             return
 
         replacement_message_id = int(replacement.message_id)
+        output_message_ids = (*known_output_ids, replacement_message_id)
         try:
             outcome = self.repository.record_replacement(
                 chat_id,
                 source_message_id,
                 replacement_message_id,
+                output_message_ids=output_message_ids,
             )
         except asyncio.CancelledError:
             raise
@@ -805,7 +1123,7 @@ class SalesPhotoService:
             return
 
         if outcome == "conflict":
-            await self._delete_duplicate(bot, chat_id, replacement_message_id)
+            await self._delete_known_outputs(bot, chat_id, output_message_ids)
             return
         if outcome == "missing":
             logger.error(
@@ -850,9 +1168,27 @@ class SalesPhotoService:
         )
 
     async def _send_photo(self, bot: Bot | Any, kwargs: dict[str, Any]) -> Any:
+        return await self._send_with_retry(bot.send_photo, kwargs)
+
+    async def _send_message(self, bot: Bot | Any, kwargs: dict[str, Any]) -> Any:
+        return await self._send_with_retry(bot.send_message, kwargs)
+
+    async def _send_media_group(
+        self,
+        bot: Bot | Any,
+        kwargs: dict[str, Any],
+    ) -> tuple[Any, ...]:
+        result = await self._send_with_retry(bot.send_media_group, kwargs)
+        return tuple(result)
+
+    async def _send_with_retry(
+        self,
+        sender: Callable[..., Any],
+        kwargs: dict[str, Any],
+    ) -> Any:
         for attempt in range(2):
             try:
-                return await bot.send_photo(**kwargs)
+                return await sender(**kwargs)
             except asyncio.CancelledError:
                 raise
             except RetryAfter as exc:
@@ -986,23 +1322,35 @@ class SalesPhotoService:
                 _error_code(exc),
             )
             return
-        try:
-            await bot.delete_message(chat_id, source_message_id)
-        except Exception as exc:
-            if _already_deleted(exc):
-                self.repository.mark_complete(chat_id, source_message_id)
-                return
-            self.repository.mark_delete_pending(
+        members = self.repository.pending_source_members(
+            chat_id,
+            source_message_id,
+        )
+        for member_message_id in members:
+            try:
+                await bot.delete_message(chat_id, member_message_id)
+            except Exception as exc:
+                if not _already_deleted(exc):
+                    self.repository.mark_delete_pending(
+                        chat_id,
+                        source_message_id,
+                        _error_code(exc),
+                    )
+                    logger.warning(
+                        "sales_photo_source_delete_pending chat_id=%s "
+                        "source_message_id=%s member_message_id=%s error_type=%s",
+                        chat_id,
+                        source_message_id,
+                        member_message_id,
+                        _error_code(exc),
+                    )
+                    continue
+            self.repository.mark_source_member_deleted(
                 chat_id,
                 source_message_id,
-                _error_code(exc),
+                member_message_id,
             )
-            logger.warning(
-                "sales_photo_source_delete_pending chat_id=%s source_message_id=%s error_type=%s",
-                chat_id,
-                source_message_id,
-                _error_code(exc),
-            )
+        if self.repository.pending_source_members(chat_id, source_message_id):
             return
         self.repository.mark_complete(chat_id, source_message_id)
 
@@ -1011,7 +1359,7 @@ class SalesPhotoService:
         bot: Bot | Any,
         chat_id: int,
         message_id: int,
-    ) -> None:
+    ) -> bool:
         # Persist intent before the Telegram side effect. A crash or failed delete
         # can then be retried without risking the canonical replacement.
         try:
@@ -1024,7 +1372,7 @@ class SalesPhotoService:
                 message_id,
                 _error_code(exc),
             )
-            return
+            return False
         try:
             await bot.delete_message(chat_id, message_id)
         except Exception as exc:
@@ -1033,7 +1381,7 @@ class SalesPhotoService:
                     self.repository.complete_duplicate_cleanup(chat_id, message_id)
                 except Exception:
                     pass
-                return
+                return True
             try:
                 self.repository.mark_duplicate_cleanup_failed(chat_id, message_id)
             except Exception:
@@ -1045,7 +1393,7 @@ class SalesPhotoService:
                 message_id,
                 _error_code(exc),
             )
-            return
+            return False
         try:
             self.repository.complete_duplicate_cleanup(chat_id, message_id)
         except Exception as exc:
@@ -1056,6 +1404,20 @@ class SalesPhotoService:
                 message_id,
                 _error_code(exc),
             )
+            return False
+        return True
+
+    async def _delete_known_outputs(
+        self,
+        bot: Bot | Any,
+        chat_id: int,
+        message_ids: tuple[int, ...],
+    ) -> bool:
+        outcomes = [
+            await self._delete_duplicate(bot, chat_id, message_id)
+            for message_id in message_ids
+        ]
+        return all(outcomes)
 
     async def on_manager_callback(
         self,
@@ -1220,21 +1582,30 @@ class SalesPhotoService:
         opportunity to normalize a manually entered phone number.
         """
 
-        normalized = normalize_caption_phone_field(
-            getattr(message, "caption", None),
-            getattr(message, "caption_entities", None),
-        )
+        content = _message_content(message)
+        if content is None:
+            await self._edit_callback_markup(query, reply_markup)
+            return
+        content_kind, body, entities = content
+        normalized = normalize_caption_phone_field(body, entities)
         if not normalized.changed:
             await self._edit_callback_markup(query, reply_markup)
             return
 
         for attempt in range(2):
             try:
-                await query.edit_message_caption(
-                    caption=normalized.caption,
-                    caption_entities=normalized.entities,
-                    reply_markup=reply_markup,
-                )
+                if content_kind == "caption":
+                    await query.edit_message_caption(
+                        caption=normalized.caption,
+                        caption_entities=normalized.entities,
+                        reply_markup=reply_markup,
+                    )
+                else:
+                    await query.edit_message_text(
+                        text=normalized.caption,
+                        entities=normalized.entities,
+                        reply_markup=reply_markup,
+                    )
                 logger.info(
                     "sales_photo_phone_normalized_via_callback chat_id=%s "
                     "message_id=%s",
@@ -1523,11 +1894,15 @@ class SalesPhotoService:
                     try:
                         await self._process_claimed_photo(
                             bot,
-                            job.chat_id,
-                            job.source_message_id,
-                            job.source_file_id,
-                            job.client_caption,
-                            job.message_thread_id,
+                            _PhotoClaim(
+                                chat_id=job.chat_id,
+                                source_message_id=job.source_message_id,
+                                source_message_ids=job.source_message_ids,
+                                file_ids=job.source_file_ids,
+                                source_kind=job.source_kind,
+                                client_caption=job.client_caption,
+                                message_thread_id=job.message_thread_id,
+                            ),
                         )
                     finally:
                         self._active_sources.discard(key)
@@ -1686,6 +2061,14 @@ class SalesPhotoService:
             except asyncio.CancelledError:
                 pass
             self._maintenance_task = None
+        album_tasks = tuple(self._album_tasks.values())
+        for album_task in album_tasks:
+            album_task.cancel()
+        if album_tasks:
+            await asyncio.gather(*album_tasks, return_exceptions=True)
+        self._album_tasks.clear()
+        self._album_items.clear()
+        self._album_bots.clear()
         tasks = tuple(self._photo_tasks)
         active_before_stop = tuple(self._active_sources)
         for photo_task in tasks:

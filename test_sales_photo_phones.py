@@ -5,6 +5,7 @@ import unittest
 from telegram import MessageEntity
 
 from sales_photo_bot.phones import (
+    extract_product_label,
     extract_uzbek_phones,
     normalize_caption_phone_field,
     normalize_uzbek_phone,
@@ -138,6 +139,30 @@ class ExtractUzbekPhonesTests(unittest.TestCase):
             ),
             "📞: +998 90 123 45 67 / +998 91 765 43 21",
         )
+
+
+class ProductLabelTests(unittest.TestCase):
+    def test_short_model_is_preserved_and_phone_is_removed(self):
+        self.assertEqual(extract_product_label("A16 8/256"), "A16 8/256")
+        self.assertEqual(
+            extract_product_label("iPhone 16 Pro 901234567"),
+            "iPhone 16 Pro",
+        )
+
+    def test_phone_only_or_long_numeric_value_has_no_product_label(self):
+        values = (
+            "901234567",
+            "+998 90 123 45 67",
+            "90 123 45 67 / 91 765 43 21",
+            "+7 916 123 45 67",
+            "490154203237518",
+        )
+        for value in values:
+            with self.subTest(value=value):
+                self.assertIsNone(extract_product_label(value))
+
+    def test_short_numeric_model_is_not_mistaken_for_phone(self):
+        self.assertEqual(extract_product_label("16"), "16")
 
 
 class CaptionPhoneFieldTests(unittest.TestCase):

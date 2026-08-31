@@ -102,6 +102,42 @@ def photo_message(
     )
 
 
+def text_message(
+    text: str,
+    message_id: int = 10,
+    sender_id: int = 50,
+):
+    return SimpleNamespace(
+        chat_id=CHAT_ID,
+        chat=SimpleNamespace(id=CHAT_ID),
+        message_id=message_id,
+        message_thread_id=None,
+        text=text,
+        entities=(),
+        photo=(),
+        from_user=SimpleNamespace(id=sender_id, is_bot=False),
+    )
+
+
+def album_photo_message(
+    message_id: int,
+    media_group_id: str = "album-1",
+    caption: str | None = None,
+):
+    message = photo_message(message_id=message_id, caption=caption)
+    message.media_group_id = media_group_id
+    message.photo = (
+        SimpleNamespace(
+            file_id=f"album-file-{message_id}",
+            file_unique_id=f"album-unique-{message_id}",
+            file_size=500,
+            width=1000,
+            height=1000,
+        ),
+    )
+    return message
+
+
 def telegram_bot(events: list[str] | None = None):
     events = events if events is not None else []
     bot = SimpleNamespace()
@@ -114,11 +150,24 @@ def telegram_bot(events: list[str] | None = None):
         events.append("send")
         return SimpleNamespace(message_id=200)
 
+    async def send_message(**kwargs):
+        events.append("send-message")
+        return SimpleNamespace(message_id=300)
+
+    async def send_media_group(**kwargs):
+        events.append("send-album")
+        return tuple(
+            SimpleNamespace(message_id=200 + index)
+            for index, _ in enumerate(kwargs["media"])
+        )
+
     async def delete_message(chat_id, message_id):
         events.append(f"delete:{message_id}")
         return True
 
     bot.send_photo = AsyncMock(side_effect=send_photo)
+    bot.send_message = AsyncMock(side_effect=send_message)
+    bot.send_media_group = AsyncMock(side_effect=send_media_group)
     bot.delete_message = AsyncMock(side_effect=delete_message)
     bot.get_chat_member = AsyncMock(
         return_value=SimpleNamespace(status="administrator")
@@ -199,6 +248,15 @@ class CaptionFormattingTests(unittest.TestCase):
         self.assertNotIn("IMEI", caption)
         self.assertNotIn("S/N", caption)
         self.assertTrue(caption.startswith("🛒💵:"))
+
+    def test_manually_typed_product_label_is_rendered_safely(self):
+        caption = build_caption(
+            "901234567",
+            ProductIdentifiers(),
+            product_label="A16 <8/256>",
+        )
+        self.assertTrue(caption.startswith("📦 A16 &lt;8/256&gt;\n\n🛒💵:"))
+        self.assertIn("📞: +998 90 123 45 67", caption)
 
     def test_only_two_normalized_phones_survive_the_source_caption(self):
         caption = build_caption(
@@ -490,6 +548,79 @@ class RepositoryTests(unittest.TestCase):
                 ).fetchone()[0]
             self.assertIsNone(payload)
 
+    def test_album_retry_payload_and_members_are_durable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = SalesPhotoRepository(Path(directory) / "sales.db")
+            old = utc_now() - timedelta(minutes=5)
+            self.assertTrue(
+                repo.claim_photo(
+                    CHAT_ID,
+                    10,
+                    "album-unique",
+                    source_file_id="file-10",
+                    source_file_ids=("file-10", "file-11"),
+                    source_message_ids=(10, 11),
+                    source_kind="album",
+                    client_caption="901234567",
+                    at=old,
+                )
+            )
+            repo.mark_failed(CHAT_ID, 10, "temporary", at=old)
+
+            pending = repo.retryable_photos(CHAT_ID)
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(pending[0].source_kind, "album")
+            self.assertEqual(pending[0].source_file_ids, ("file-10", "file-11"))
+            self.assertEqual(pending[0].source_message_ids, (10, 11))
+            self.assertEqual(repo.pending_source_members(CHAT_ID, 10), (10, 11))
+
+            self.assertTrue(repo.claim_retry(CHAT_ID, 10, pending[0].attempts))
+            self.assertEqual(
+                repo.record_replacement(
+                    CHAT_ID,
+                    10,
+                    300,
+                    output_message_ids=(200, 201, 300),
+                ),
+                "recorded",
+            )
+            self.assertEqual(
+                repo.output_message_ids(CHAT_ID, 10),
+                (200, 201, 300),
+            )
+
+            self.assertEqual(
+                repo.cancel_edited_source(CHAT_ID, 10),
+                (True, 300),
+            )
+            self.assertEqual(
+                [
+                    job.message_id
+                    for job in repo.pending_duplicate_cleanups(CHAT_ID)
+                ],
+                [200, 201, 300],
+            )
+            self.assertFalse(repo.is_replacement(CHAT_ID, 300))
+
+    def test_edited_album_member_blocks_later_album_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = SalesPhotoRepository(Path(directory) / "sales.db")
+            self.assertEqual(
+                repo.cancel_edited_source(CHAT_ID, 11),
+                (True, None),
+            )
+            self.assertFalse(
+                repo.claim_photo(
+                    CHAT_ID,
+                    10,
+                    "album-unique",
+                    source_file_id="file-10",
+                    source_file_ids=("file-10", "file-11"),
+                    source_message_ids=(10, 11),
+                    source_kind="album",
+                )
+            )
+
     def test_photo_retry_is_bounded_to_three_processing_attempts(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = SalesPhotoRepository(Path(directory) / "sales.db")
@@ -533,6 +664,141 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         self.temp.cleanup()
+
+    async def test_phone_only_text_message_is_ignored(self):
+        repo = SalesPhotoRepository(self.root / "db.sqlite")
+        service = SalesPhotoService(settings(self.root), repo)
+        bot = telegram_bot()
+
+        await service.on_text(
+            SimpleNamespace(effective_message=text_message("+998 90 123 45 67")),
+            SimpleNamespace(bot=bot),
+        )
+
+        self.assertEqual(service._photo_tasks, set())
+        bot.send_message.assert_not_awaited()
+        bot.send_photo.assert_not_awaited()
+        bot.delete_message.assert_not_awaited()
+
+    async def test_short_model_text_becomes_one_text_card(self):
+        repo = SalesPhotoRepository(self.root / "db.sqlite")
+        service = SalesPhotoService(settings(self.root), repo)
+        bot = telegram_bot()
+
+        await service.on_text(
+            SimpleNamespace(
+                effective_message=text_message("A16 8/256\n901234567")
+            ),
+            SimpleNamespace(bot=bot),
+        )
+        await asyncio.gather(*tuple(service._photo_tasks))
+
+        bot.send_photo.assert_not_awaited()
+        bot.send_media_group.assert_not_awaited()
+        bot.send_message.assert_awaited_once()
+        sent = bot.send_message.await_args.kwargs
+        self.assertIn("📦 A16 8/256", sent["text"])
+        self.assertIn("📞: +998 90 123 45 67", sent["text"])
+        self.assertIsNotNone(sent["reply_markup"])
+        bot.delete_message.assert_awaited_once_with(CHAT_ID, 10)
+        self.assertTrue(repo.is_replacement(CHAT_ID, 300))
+
+    async def test_text_card_retry_remains_text_only(self):
+        repo = SalesPhotoRepository(self.root / "db.sqlite")
+        old = utc_now() - timedelta(minutes=5)
+        self.assertTrue(
+            repo.claim_photo(
+                CHAT_ID,
+                10,
+                "text-unique",
+                source_file_id="sales-photo:text",
+                client_caption="A16",
+                source_kind="text",
+                at=old,
+            )
+        )
+        repo.mark_failed(CHAT_ID, 10, "temporary", at=old)
+        service = SalesPhotoService(settings(self.root), repo)
+        bot = telegram_bot()
+
+        await service.retry_failed_photos(bot)
+
+        bot.send_message.assert_awaited_once()
+        bot.send_photo.assert_not_awaited()
+        bot.send_media_group.assert_not_awaited()
+        self.assertIn("📦 A16", bot.send_message.await_args.kwargs["text"])
+        bot.delete_message.assert_awaited_once_with(CHAT_ID, 10)
+
+    async def test_photo_album_with_receipt_becomes_one_product(self):
+        repo = SalesPhotoRepository(self.root / "db.sqlite")
+        service = SalesPhotoService(settings(self.root), repo)
+        bot = telegram_bot()
+
+        with patch(
+            "sales_photo_bot.service.asyncio.sleep",
+            new=AsyncMock(),
+        ):
+            await service.on_photo(
+                SimpleNamespace(
+                    effective_message=album_photo_message(
+                        10,
+                        caption="901234567",
+                    )
+                ),
+                SimpleNamespace(bot=bot),
+            )
+            await service.on_photo(
+                SimpleNamespace(
+                    effective_message=album_photo_message(11)
+                ),
+                SimpleNamespace(bot=bot),
+            )
+            await asyncio.gather(*tuple(service._album_tasks.values()))
+            await asyncio.gather(*tuple(service._photo_tasks))
+
+        bot.send_photo.assert_not_awaited()
+        bot.send_media_group.assert_awaited_once()
+        media = bot.send_media_group.await_args.kwargs["media"]
+        self.assertEqual([item.media for item in media], [
+            "album-file-10",
+            "album-file-11",
+        ])
+        bot.send_message.assert_awaited_once()
+        card = bot.send_message.await_args.kwargs
+        self.assertIn("📞: +998 90 123 45 67", card["text"])
+        self.assertIsNotNone(card["reply_markup"])
+        self.assertEqual(
+            [call.args[1] for call in bot.delete_message.await_args_list],
+            [10, 11],
+        )
+        self.assertTrue(repo.is_replacement(CHAT_ID, 300))
+        self.assertEqual(repo.output_message_ids(CHAT_ID, 10), (200, 201, 300))
+
+    async def test_album_card_failure_removes_copied_album_and_keeps_sources(self):
+        repo = SalesPhotoRepository(self.root / "db.sqlite")
+        service = SalesPhotoService(settings(self.root), repo)
+        bot = telegram_bot()
+        bot.send_message.side_effect = BadRequest("text rejected")
+        claim = service._claim_album(
+            (
+                album_photo_message(10),
+                album_photo_message(11),
+            ),
+            "album-1",
+        )
+        self.assertIsNotNone(claim)
+
+        await service._run_photo_claim(claim, bot)
+
+        self.assertEqual(
+            [call.args[1] for call in bot.delete_message.await_args_list],
+            [200, 201],
+        )
+        self.assertEqual(
+            [job.source_message_id for job in repo.retryable_photos(CHAT_ID)],
+            [10],
+        )
+        self.assertEqual(repo.pending_source_members(CHAT_ID, 10), (10, 11))
 
     async def test_send_happens_before_original_delete_and_largest_photo_is_used(self):
         events: list[str] = []
@@ -1316,6 +1582,29 @@ class EditedCaptionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(kwargs["caption_entities"][0].type, MessageEntity.BOLD)
 
+    async def test_manual_edit_normalizes_a_text_card(self):
+        caption = (
+            BOT_CARD_MARKER
+            + "📦 A16\n\n🛒💵:\nrasxod:\n\n"
+            "📞: 901234567\n\nНаличка"
+        )
+        bot = SimpleNamespace(
+            edit_message_caption=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        )
+
+        await self.service.handle_edited_photo(
+            text_message(caption, message_id=200),
+            bot,
+            update_id=99,
+        )
+
+        bot.edit_message_caption.assert_not_awaited()
+        bot.edit_message_text.assert_awaited_once()
+        kwargs = bot.edit_message_text.await_args.kwargs
+        self.assertIn("📦 A16", kwargs["text"])
+        self.assertIn("📞: +998 90 123 45 67", kwargs["text"])
+
     async def test_phone_edit_rebuilds_current_selected_manager_keyboard(self):
         self.assertTrue(
             self.repo.apply_manager_selection(CHAT_ID, 200, "Otabek", 0)
@@ -1574,6 +1863,30 @@ class ManagerCallbackTests(unittest.IsolatedAsyncioTestCase):
             edit_message_reply_markup=AsyncMock(),
         )
 
+    def text_query(
+        self,
+        data: str,
+        text: str,
+        actor_id: int = 50,
+        reply_markup=None,
+    ):
+        return SimpleNamespace(
+            data=data,
+            from_user=SimpleNamespace(id=actor_id),
+            message=SimpleNamespace(
+                chat_id=CHAT_ID,
+                chat=SimpleNamespace(id=CHAT_ID),
+                message_id=200,
+                text=text,
+                entities=(),
+                reply_markup=reply_markup,
+            ),
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+            edit_message_caption=AsyncMock(),
+            edit_message_reply_markup=AsyncMock(),
+        )
+
     def callback(self, action: str, generation: int) -> str:
         signature = self.repo.callback_signature(CHAT_ID, 10, generation)
         return f"sp:{action}:10:{generation}:{signature}"
@@ -1640,6 +1953,28 @@ class ManagerCallbackTests(unittest.IsolatedAsyncioTestCase):
         query.edit_message_caption.assert_awaited_once()
         kwargs = query.edit_message_caption.await_args.kwargs
         self.assertIn("📞: +998 90 123 45 67", kwargs["caption"])
+        self.assertEqual(
+            kwargs["reply_markup"].to_dict()["inline_keyboard"][0][0]["text"],
+            "👤 Olmas · ↩️ Назад",
+        )
+
+    async def test_manager_click_normalizes_a_text_card(self):
+        service = SalesPhotoService(settings(self.root), self.repo)
+        raw_text = (
+            BOT_CARD_MARKER
+            + "📦 A16\n\n🛒💵:\nrasxod:\n\n📞: 901234567\n\nНаличка"
+        )
+        query = self.text_query(self.callback("m:olmas", 0), raw_text)
+
+        await service.on_manager_callback(
+            SimpleNamespace(callback_query=query), self.context()
+        )
+
+        query.edit_message_reply_markup.assert_not_awaited()
+        query.edit_message_caption.assert_not_awaited()
+        query.edit_message_text.assert_awaited_once()
+        kwargs = query.edit_message_text.await_args.kwargs
+        self.assertIn("📞: +998 90 123 45 67", kwargs["text"])
         self.assertEqual(
             kwargs["reply_markup"].to_dict()["inline_keyboard"][0][0]["text"],
             "👤 Olmas · ↩️ Назад",
@@ -1941,7 +2276,7 @@ class ApplicationWiringTests(unittest.TestCase):
             self.assertIsNone(
                 app.bot_data["sales_photo_service"].recognizer
             )
-            self.assertEqual(len(app.handlers[0]), 3)
+            self.assertEqual(len(app.handlers[0]), 4)
             self.assertEqual(app.update_processor.max_concurrent_updates, 4)
             keyboard = manager_keyboard().to_dict()
             self.assertEqual(
@@ -1950,7 +2285,7 @@ class ApplicationWiringTests(unittest.TestCase):
             )
             signature = repo.callback_signature(CHAT_ID, 10, 0)
             callback_data = f"sp:m:olmas:10:0:{signature}"
-            self.assertIsNotNone(app.handlers[0][2].pattern.fullmatch(callback_data))
+            self.assertIsNotNone(app.handlers[0][3].pattern.fullmatch(callback_data))
 
             chat = Chat(id=CHAT_ID, type="channel")
             photo = PhotoSize(
@@ -1977,11 +2312,22 @@ class ApplicationWiringTests(unittest.TestCase):
                 update_id=3,
                 edited_channel_post=edited_text_message,
             )
+            text_channel_post = Update(
+                update_id=4,
+                channel_post=Message(
+                    message_id=11,
+                    date=datetime.now(timezone.utc),
+                    chat=chat,
+                    text="A16",
+                ),
+            )
             self.assertTrue(app.handlers[0][0].check_update(channel_post))
             self.assertFalse(app.handlers[0][0].check_update(edited_post))
             self.assertFalse(app.handlers[0][1].check_update(channel_post))
             self.assertTrue(app.handlers[0][1].check_update(edited_post))
             self.assertTrue(app.handlers[0][1].check_update(edited_text_post))
+            self.assertFalse(app.handlers[0][2].check_update(channel_post))
+            self.assertTrue(app.handlers[0][2].check_update(text_channel_post))
 
     def test_polling_subscribes_to_edited_channel_posts(self):
         with tempfile.TemporaryDirectory() as directory:

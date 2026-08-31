@@ -61,6 +61,21 @@ _PHONE_LINE_RE = re.compile(
 _PHONE_FIELD_SEPARATORS_RE = re.compile(
     r"^[\s/|,;.()\-\u2010-\u2015\u2212]*$"
 )
+_PRODUCT_TRIM_RE = re.compile(
+    r"^[\s/|,;:.()\-\u2010-\u2015\u2212]+|"
+    r"[\s/|,;:.()\-\u2010-\u2015\u2212]+$"
+)
+_PHONE_ONLY_LABELS = frozenset(
+    {
+        "client",
+        "phone",
+        "tel",
+        "клиент",
+        "номер",
+        "тел",
+        "телефон",
+    }
+)
 
 
 def normalize_uzbek_phone(value: object) -> str | None:
@@ -138,6 +153,42 @@ def extract_uzbek_phones(value: object, limit: int = 2) -> tuple[str, ...]:
     return result if len(result) <= maximum else ()
 
 
+def extract_product_label(value: object, limit: int = 120) -> str | None:
+    """Return manually typed product text with phone numbers removed.
+
+    A long number-only value is treated as a telephone/identifier rather than
+    a product model. Short numeric model names (for example ``16``) remain
+    valid product labels.
+    """
+
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+
+    _, phone_spans = _scan_uzbek_phones(raw, stop_after=20)
+    residual: list[str] = []
+    previous_end = 0
+    for start, end in phone_spans:
+        residual.append(raw[previous_end:start])
+        previous_end = end
+    residual.append(raw[previous_end:])
+    compact = " ".join("".join(residual).split())
+    compact = _PRODUCT_TRIM_RE.sub("", compact).strip()
+    if compact.casefold().rstrip(":") in _PHONE_ONLY_LABELS:
+        return None
+
+    digits = "".join(character for character in compact if character.isdigit())
+    if len(digits) >= 7 and not any(character.isalpha() for character in compact):
+        return None
+    if not compact:
+        return None
+
+    maximum = max(1, int(limit))
+    if len(compact) <= maximum:
+        return compact
+    return compact[: maximum - 1].rstrip() + "…"
+
+
 def phone_line(phones: Sequence[str]) -> str:
     values = tuple(str(value) for value in phones[:2] if value)
     return f"📞: {' / '.join(values)}" if values else "📞:"
@@ -163,14 +214,22 @@ def _canonical_phone_span(
     """Locate the generated card's phone row, not arbitrary phone-like text."""
 
     lines = _line_spans(caption)
-    if len(lines) < 3 or _CARD_HEADER_RE.match(lines[0][2]) is None:
+    header_index = next(
+        (
+            index
+            for index, (_, _, line) in enumerate(lines[:4])
+            if _CARD_HEADER_RE.match(line) is not None
+        ),
+        None,
+    )
+    if header_index is None or len(lines) <= header_index + 2:
         return None
-    if _EXPENSE_LINE_RE.match(lines[1][2]) is None:
+    if _EXPENSE_LINE_RE.match(lines[header_index + 1][2]) is None:
         return None
 
     # In the generated layout the phone row is the first non-empty row after
     # ``rasxod``. Allow extra blank rows because managers edit captions by hand.
-    for start, end, line in lines[2:]:
+    for start, end, line in lines[header_index + 2 :]:
         if not line.strip(" \t\u2063"):
             continue
         match = _PHONE_LINE_RE.match(line)

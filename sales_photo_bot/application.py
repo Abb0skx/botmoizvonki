@@ -161,6 +161,14 @@ def build_application(
         )
     )
     application.add_handler(
+        MessageHandler(
+            filters.UpdateType.CHANNEL_POST
+            & filters.Chat(chat_id=settings.chat_id)
+            & filters.TEXT,
+            service.on_text,
+        )
+    )
+    application.add_handler(
         CallbackQueryHandler(
             service.on_manager_callback,
             pattern=(

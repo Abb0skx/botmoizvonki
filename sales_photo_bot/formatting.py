@@ -31,16 +31,20 @@ def build_caption(
     client_caption: str | None,
     identifiers: ProductIdentifiers,
     manager: str | None = None,
+    product_label: str | None = None,
 ) -> str:
     """Build the sales card, retaining only verified phones and identifiers."""
 
     phones = extract_uzbek_phones(client_caption)
-    lines: list[str] = [
+    lines: list[str] = []
+    if product_label:
+        lines.extend([f"📦 {_safe(product_label, 120)}", ""])
+    lines.extend([
         "🛒💵:",
         "rasxod:",
         "",
         phone_line(phones),
-    ]
+    ])
 
     identifier_lines: list[str] = []
     if identifiers.imei:
