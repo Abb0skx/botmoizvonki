@@ -392,6 +392,11 @@ class SalesPhotoService:
             return
 
         key = (chat_id, message_id)
+        logger.info(
+            "sales_photo_card_edit_received chat_id=%s message_id=%s",
+            chat_id,
+            message_id,
+        )
         try:
             revision = int(update_id) if update_id is not None else None
         except (TypeError, ValueError):
@@ -422,6 +427,13 @@ class SalesPhotoService:
                         message,
                     ),
                 )
+                if normalized.changed:
+                    logger.info(
+                        "sales_photo_phone_normalized_from_edit chat_id=%s "
+                        "message_id=%s",
+                        chat_id,
+                        message_id,
+                    )
             except asyncio.CancelledError:
                 raise
             except BadRequest as exc:
@@ -1194,6 +1206,51 @@ class SalesPhotoService:
                     raise
         raise RuntimeError("unreachable reply-markup retry state")
 
+    async def _edit_callback_card(
+        self,
+        query: Any,
+        message: Any,
+        reply_markup: Any,
+    ) -> None:
+        """Refresh a card's keyboard and normalize its current phone row.
+
+        Telegram does not always deliver a channel-post edit back to the bot
+        that originally created the post. A callback query does contain the
+        current message snapshot, so manager/back clicks are a reliable second
+        opportunity to normalize a manually entered phone number.
+        """
+
+        normalized = normalize_caption_phone_field(
+            getattr(message, "caption", None),
+            getattr(message, "caption_entities", None),
+        )
+        if not normalized.changed:
+            await self._edit_callback_markup(query, reply_markup)
+            return
+
+        for attempt in range(2):
+            try:
+                await query.edit_message_caption(
+                    caption=normalized.caption,
+                    caption_entities=normalized.entities,
+                    reply_markup=reply_markup,
+                )
+                logger.info(
+                    "sales_photo_phone_normalized_via_callback chat_id=%s "
+                    "message_id=%s",
+                    _chat_id(message),
+                    getattr(message, "message_id", None),
+                )
+                return
+            except BadRequest as exc:
+                if "message is not modified" in str(exc).casefold():
+                    return
+                raise
+            except NetworkError:
+                if attempt:
+                    raise
+        raise RuntimeError("unreachable caption retry state")
+
     async def _handle_manager(
         self,
         query: Any,
@@ -1271,7 +1328,7 @@ class SalesPhotoService:
             manager=manager,
         )
         try:
-            await self._edit_callback_markup(query, desired_markup)
+            await self._edit_callback_card(query, message, desired_markup)
         except Exception as exc:
             ambiguous = isinstance(exc, NetworkError) and not isinstance(
                 exc, BadRequest
@@ -1377,7 +1434,7 @@ class SalesPhotoService:
             signature=next_signature,
         )
         try:
-            await self._edit_callback_markup(query, desired_markup)
+            await self._edit_callback_card(query, message, desired_markup)
         except Exception as exc:
             ambiguous = isinstance(exc, NetworkError) and not isinstance(
                 exc, BadRequest

@@ -1627,6 +1627,46 @@ class ManagerCallbackTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(self.repo.selected_manager(CHAT_ID, 200))
 
+    async def test_manager_click_normalizes_phone_when_edit_update_was_missing(self):
+        service = SalesPhotoService(settings(self.root), self.repo, StaticRecognizer())
+        raw_caption = self.base.replace("📞:", "📞: 901234567")
+        query = self.query(self.callback("m:olmas", 0), raw_caption)
+
+        await service.on_manager_callback(
+            SimpleNamespace(callback_query=query), self.context()
+        )
+
+        query.edit_message_reply_markup.assert_not_awaited()
+        query.edit_message_caption.assert_awaited_once()
+        kwargs = query.edit_message_caption.await_args.kwargs
+        self.assertIn("📞: +998 90 123 45 67", kwargs["caption"])
+        self.assertEqual(
+            kwargs["reply_markup"].to_dict()["inline_keyboard"][0][0]["text"],
+            "👤 Olmas · ↩️ Назад",
+        )
+
+    async def test_back_click_normalizes_phone_when_edit_update_was_missing(self):
+        self.assertTrue(self.repo.apply_manager_selection(CHAT_ID, 200, "Ali", 0))
+        service = SalesPhotoService(settings(self.root), self.repo, StaticRecognizer())
+        raw_caption = self.base.replace("📞:", "📞: 998917654321")
+        query = self.query(self.callback("b", 1), raw_caption)
+
+        await service.on_manager_callback(
+            SimpleNamespace(callback_query=query), self.context()
+        )
+
+        query.edit_message_reply_markup.assert_not_awaited()
+        query.edit_message_caption.assert_awaited_once()
+        kwargs = query.edit_message_caption.await_args.kwargs
+        self.assertIn("📞: +998 91 765 43 21", kwargs["caption"])
+        self.assertEqual(
+            [
+                [button["text"] for button in row]
+                for row in kwargs["reply_markup"].to_dict()["inline_keyboard"]
+            ],
+            [["Olmas", "Otabek"], ["Ali", "Abbos"]],
+        )
+
     async def test_non_admin_is_denied_when_allowlist_is_empty(self):
         service = SalesPhotoService(settings(self.root), self.repo, StaticRecognizer())
         query = self.query(self.callback("m:ali", 0), self.base)
