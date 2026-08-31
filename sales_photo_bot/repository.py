@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator, Sequence
+from typing import Iterator
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -57,15 +57,8 @@ class PendingDuplicate:
     updated_at: datetime
 
 
-@dataclass(frozen=True)
-class CachedName:
-    model_name: str
-    confidence: float
-    source_count: int
-
-
 class SalesPhotoRepository:
-    """Small durable ledger for repost idempotency and automatic name cache."""
+    """Small durable ledger for safe reposting and callback idempotency."""
 
     def __init__(self, path: Path | str):
         self.path = Path(path)
@@ -273,16 +266,6 @@ class SalesPhotoRepository:
                     UNIQUE(chat_id, replacement_message_id)
                 );
 
-                CREATE TABLE IF NOT EXISTS sales_photo_name_cache (
-                    cache_key TEXT PRIMARY KEY,
-                    model_name TEXT NOT NULL,
-                    confidence REAL NOT NULL,
-                    source_count INTEGER NOT NULL,
-                    provider_model TEXT NOT NULL,
-                    expires_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
                 CREATE TABLE IF NOT EXISTS sales_photo_meta (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
@@ -297,6 +280,8 @@ class SalesPhotoRepository:
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(chat_id,message_id)
                 );
+
+                DROP TABLE IF EXISTS sales_photo_name_cache;
                 """
             )
             columns = {
@@ -1108,71 +1093,3 @@ class SalesPhotoRepository:
             cursor = db.execute(sql, values)
             db.commit()
             return cursor.rowcount == 1
-
-    def cached_name(
-        self,
-        keys: Sequence[str],
-        at: datetime | None = None,
-    ) -> CachedName | None:
-        normalized = tuple(dict.fromkeys(str(key).strip() for key in keys if str(key).strip()))
-        if not normalized:
-            return None
-        placeholders = ",".join("?" for _ in normalized)
-        with self._connect() as db:
-            row = db.execute(
-                f"""SELECT model_name,confidence,source_count
-                    FROM sales_photo_name_cache
-                    WHERE cache_key IN ({placeholders}) AND expires_at>?
-                    ORDER BY confidence DESC, source_count DESC
-                    LIMIT 1""",
-                (*normalized, _iso(at or utc_now())),
-            ).fetchone()
-        if row is None:
-            return None
-        return CachedName(
-            model_name=str(row["model_name"]),
-            confidence=float(row["confidence"]),
-            source_count=int(row["source_count"]),
-        )
-
-    def cache_name(
-        self,
-        keys: Sequence[str],
-        model_name: str,
-        confidence: float,
-        source_count: int,
-        provider_model: str,
-        expires_at: datetime,
-        at: datetime | None = None,
-    ) -> None:
-        normalized = tuple(dict.fromkeys(str(key).strip() for key in keys if str(key).strip()))
-        if not normalized:
-            return
-        now = _iso(at or utc_now())
-        with self._connect() as db:
-            db.executemany(
-                """INSERT INTO sales_photo_name_cache(
-                       cache_key,model_name,confidence,source_count,provider_model,
-                       expires_at,updated_at
-                   ) VALUES (?,?,?,?,?,?,?)
-                   ON CONFLICT(cache_key) DO UPDATE SET
-                       model_name=excluded.model_name,
-                       confidence=excluded.confidence,
-                       source_count=excluded.source_count,
-                       provider_model=excluded.provider_model,
-                       expires_at=excluded.expires_at,
-                       updated_at=excluded.updated_at""",
-                [
-                    (
-                        key,
-                        str(model_name)[:160],
-                        float(confidence),
-                        int(source_count),
-                        str(provider_model)[:100],
-                        _iso(expires_at),
-                        now,
-                    )
-                    for key in normalized
-                ],
-            )
-            db.commit()

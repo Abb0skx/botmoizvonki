@@ -1,5 +1,5 @@
 """Telegram bot that turns product photos into structured sales cards."""
 
-from .models import Recognition
+from .models import ProductIdentifiers
 
-__all__ = ["Recognition"]
+__all__ = ["ProductIdentifiers"]

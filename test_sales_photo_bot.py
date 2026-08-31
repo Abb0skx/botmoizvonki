@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import sqlite3
 import tempfile
 import unittest
@@ -10,7 +9,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
 from cryptography.fernet import Fernet
 from telegram.error import NetworkError, RetryAfter
 
@@ -23,23 +21,8 @@ from sales_photo_bot.formatting import (
     selected_manager_from_caption,
 )
 from sales_photo_bot.keyboards import manager_keyboard
-from sales_photo_bot.models import Recognition
-from sales_photo_bot.recognition import (
-    GeminiProductRecognizer,
-    _Extracted,
-    _cache_keys,
-    _field_supports_name,
-    _identifier,
-    _parse_json,
-    _registrable_domain,
-    _result_supports_identifier_and_name,
-    _strong_candidate,
-    _valid_commercial_name,
-    normalize_color,
-    normalize_memory,
-)
+from sales_photo_bot.models import ProductIdentifiers
 from sales_photo_bot.repository import SalesPhotoRepository, utc_now
-from sales_photo_bot.search import SearchResult, SerperProductSearch
 from sales_photo_bot.service import BOT_CARD_MARKER, SalesPhotoService
 
 
@@ -49,93 +32,28 @@ TOKEN = "1234567890:" + "A" * 35
 
 
 class StaticRecognizer:
-    def __init__(self, result: Recognition | None = None, error: Exception | None = None):
-        self.result = result or Recognition()
+    def __init__(
+        self,
+        result: ProductIdentifiers | None = None,
+        error: Exception | None = None,
+    ):
+        self.result = result or ProductIdentifiers()
         self.error = error
         self.calls = 0
 
-    async def recognize(self, image_bytes: bytes, mime_type: str) -> Recognition:
+    async def recognize(
+        self, image_bytes: bytes, mime_type: str
+    ) -> ProductIdentifiers:
         self.calls += 1
         if self.error:
             raise self.error
         return self.result
 
 
-class FakeSearch:
-    def __init__(
-        self,
-        results: tuple[SearchResult, ...] = (),
-        error: Exception | None = None,
-    ):
-        self.results = results
-        self.error = error
-        self.queries: list[str] = []
-
-    async def search(self, query: str) -> tuple[SearchResult, ...]:
-        self.queries.append(query)
-        if self.error:
-            raise self.error
-        return self.results
-
-    async def aclose(self) -> None:
-        return None
-
-
-def search_result(position: int, domain: str, text: str) -> SearchResult:
-    return SearchResult(
-        position=position,
-        title=text,
-        snippet=f"Official specification: {text}",
-        link=f"https://{domain}/product/{position}",
-        domain=domain,
-    )
-
-
-def extraction_json(
-    *,
-    brand: str = "Samsung",
-    product_type: str = "tablet",
-    model_code: str = "SM-X133",
-    model_kind: str = "model_code",
-    model_confidence: float = 0.99,
-    sku: str = "SM-X133NZSAMEA",
-    sku_kind: str = "model_variant",
-    sku_confidence: float = 0.99,
-    candidate: str = "",
-    candidate_confidence: float = 0.0,
-    memory: str = "4GB | 64GB",
-    memory_confidence: float = 0.99,
-    color: str = "Silver",
-    color_confidence: float = 0.98,
-) -> SimpleNamespace:
-    return SimpleNamespace(
-        text=json.dumps(
-            {
-                "brand": brand,
-                "product_type": product_type,
-                "model_code": model_code,
-                "model_code_kind": model_kind,
-                "model_code_confidence": model_confidence,
-                "sku": sku,
-                "sku_kind": sku_kind,
-                "sku_confidence": sku_confidence,
-                "visual_candidate_name": candidate,
-                "visual_candidate_confidence": candidate_confidence,
-                "memory": memory,
-                "memory_confidence": memory_confidence,
-                "color": color,
-                "color_confidence": color_confidence,
-            }
-        )
-    )
-
-
 def settings(tmp: Path, allowed: frozenset[int] = frozenset()) -> Settings:
     return Settings(
         bot_token=TOKEN,
         chat_id=CHAT_ID,
-        gemini_api_key="test-gemini-key",
-        serper_api_key="test-serper-key",
         db_path=tmp / "sales.db",
         heartbeat_path=tmp / "heartbeat",
         allowed_user_ids=allowed,
@@ -199,63 +117,55 @@ def telegram_bot(events: list[str] | None = None):
 
 
 class ConfigTests(unittest.TestCase):
-    def test_settings_parse_and_hide_secrets(self):
+    def test_settings_parse_and_hide_bot_token(self):
         with tempfile.TemporaryDirectory() as directory:
             parsed = Settings.from_env(
                 {
                     "SALES_PHOTO_BOT_TOKEN": TOKEN,
                     "SALES_PHOTO_CHAT_ID": str(CHAT_ID),
-                    "GEMINI_API_KEY": "gemini-secret",
-                    "SERPER_API_KEY": "serper-secret",
                     "SALES_PHOTO_DB_PATH": str(Path(directory) / "db.sqlite"),
                     "SALES_PHOTO_ALLOWED_USER_IDS": "1,2,2",
                 }
             )
         self.assertEqual(parsed.allowed_user_ids, frozenset({1, 2}))
         self.assertNotIn(TOKEN, repr(parsed))
-        self.assertNotIn("gemini-secret", repr(parsed))
-        self.assertNotIn("serper-secret", repr(parsed))
         self.assertEqual(parsed.heartbeat_path, Path("/tmp/sales-photo-heartbeat"))
 
-    def test_settings_require_negative_chat_id_and_both_api_keys(self):
+    def test_settings_require_negative_chat_id_and_no_external_api_keys(self):
         with self.assertRaises(ConfigError):
             Settings.from_env(
                 {
                     "SALES_PHOTO_BOT_TOKEN": TOKEN,
                     "SALES_PHOTO_CHAT_ID": "123",
-                    "GEMINI_API_KEY": "key",
-                    "SERPER_API_KEY": "key",
                 }
             )
-        with self.assertRaisesRegex(ConfigError, "SERPER_API_KEY"):
-            Settings.from_env(
-                {
-                    "SALES_PHOTO_BOT_TOKEN": TOKEN,
-                    "SALES_PHOTO_CHAT_ID": str(CHAT_ID),
-                    "GEMINI_API_KEY": "key",
-                }
-            )
+        parsed = Settings.from_env(
+            {
+                "SALES_PHOTO_BOT_TOKEN": TOKEN,
+                "SALES_PHOTO_CHAT_ID": str(CHAT_ID),
+            }
+        )
+        self.assertEqual(parsed.ocr_timeout_seconds, 30)
 
 
 class CaptionFormattingTests(unittest.TestCase):
     def test_complete_card(self):
         caption = build_caption(
             "+998 90 123 45 67",
-            Recognition(
-                model_name="Samsung Galaxy Tab A11",
-                model_code="SM-X133",
-                memory="4/64 GB",
-                color="Silver",
+            ProductIdentifiers(
+                imei="490154203237518",
+                imei2="352099001761481",
+                serial_number="R8YL50R510N",
             ),
         )
         self.assertEqual(
             caption,
             "📞 Клиент: +998 90 123 45 67\n"
-            "📦 Samsung Galaxy Tab A11\n"
-            "💾 4/64 GB\n"
-            "🎨 Silver\n\n"
-            "🛒💵:\n"
+            "\n🛒💵:\n"
             "rasxod:\n\n"
+            "<blockquote>IMEI: 490154203237518</blockquote>\n"
+            "<blockquote>IMEI2: 352099001761481</blockquote>\n"
+            "<blockquote>S/N: R8YL50R510N</blockquote>\n\n"
             "<b>Наличка</b>\n"
             "💵:\n"
             "🇺🇿:\n\n"
@@ -264,791 +174,65 @@ class CaptionFormattingTests(unittest.TestCase):
             "🇺🇿:",
         )
 
-    def test_unknown_model_omits_model_but_keeps_independent_fields(self):
-        caption = build_caption(None, Recognition(memory="256 GB", color="Black"))
-        self.assertNotIn("📦", caption)
-        self.assertIn("💾 256 GB", caption)
-        self.assertIn("🎨 Black", caption)
+    def test_missing_identifiers_are_omitted(self):
+        caption = build_caption(None, ProductIdentifiers())
+        self.assertNotIn("IMEI", caption)
+        self.assertNotIn("S/N", caption)
+        self.assertTrue(caption.startswith("🛒💵:"))
 
-    def test_raw_code_is_not_rendered_as_name(self):
-        caption = build_caption(None, Recognition(model_code="SM-X133"))
+    def test_product_model_fields_are_never_rendered(self):
+        caption = build_caption(None, ProductIdentifiers(serial_number="ABC12345"))
         self.assertNotIn("SM-X133", caption)
         self.assertNotIn("📦", caption)
+        self.assertNotIn("💾", caption)
+        self.assertNotIn("🎨", caption)
 
     def test_external_values_are_escaped_and_bounded(self):
         caption = build_caption(
             "<b>client</b> & " + "x" * 500,
-            Recognition(model_name="Phone <script>"),
+            ProductIdentifiers(serial_number="ABC<123>"),
         )
         self.assertIn("&lt;b&gt;client&lt;/b&gt; &amp;", caption)
-        self.assertIn("Phone &lt;script&gt;", caption)
+        self.assertIn("ABC&lt;123&gt;", caption)
         self.assertLess(len(caption), 1024)
 
+    def test_identifier_quotes_do_not_nest_telegram_entities(self):
+        caption = build_caption(
+            None,
+            ProductIdentifiers(imei="490154203237518", serial_number="ABC12345"),
+        )
+        self.assertIn("<blockquote>IMEI: 490154203237518</blockquote>", caption)
+        self.assertNotIn("<code>", caption)
+
     def test_manager_can_be_added_detected_and_removed(self):
-        base = build_caption(None, Recognition(model_name="Product"))
+        base = build_caption(None, ProductIdentifiers(serial_number="ABC12345"))
         selected = add_manager_selection(base, "Olmas")
         self.assertEqual(selected_manager_from_caption(selected), "Olmas")
         self.assertEqual(remove_manager_selection(selected), base)
 
 
-class RecognitionParsingTests(unittest.TestCase):
-    def test_memory_normalization(self):
-        self.assertEqual(normalize_memory("4GB | 64GB"), "4/64 GB")
-        self.assertEqual(normalize_memory("256 гб"), "256 GB")
-        self.assertEqual(normalize_memory("44 mm"), "")
-        self.assertEqual(normalize_color("Titanium Gray"), "Titanium Gray")
-        self.assertEqual(normalize_color("Starlight"), "Starlight")
-        self.assertEqual(normalize_color("Made in China"), "")
-        self.assertEqual(normalize_color("IMEI 490154203237518"), "")
-        self.assertEqual(normalize_color("Black 256"), "")
-
-    def test_json_and_commercial_name_validation(self):
-        self.assertEqual(_parse_json('```json\n{"a":1}\n```'), {"a": 1})
-        self.assertEqual(_valid_commercial_name("SM-X133", ["SM-X133"]), "")
-        self.assertEqual(
-            _valid_commercial_name(
-                "Samsung SM-X133",
-                ["SM-X133"],
-                "Samsung",
-            ),
-            "",
-        )
-        self.assertEqual(
-            _valid_commercial_name(
-                "Samsung Galaxy Tab A11",
-                ["SM-X133"],
-                "Samsung",
-            ),
-            "Samsung Galaxy Tab A11",
-        )
-
-    def test_sensitive_numeric_identifiers_are_rejected(self):
-        self.assertEqual(_identifier("490154203237518"), "")  # IMEI
-        self.assertEqual(_identifier("8806097804598"), "")  # EAN
-        self.assertEqual(_identifier("998901234567"), "")  # phone
-        self.assertEqual(_identifier("IMEI490154203237518"), "")
-        self.assertEqual(_identifier("EAN5901234123457"), "")
-        self.assertEqual(_identifier("S/N:SN123456789"), "")
-        self.assertEqual(_identifier("R8YL5OR510N"), "")
-        self.assertEqual(_identifier("SM-X133"), "SM-X133")
-        self.assertEqual(_identifier("ZX9A123456"), "")
-        self.assertEqual(_identifier("SN850X"), "SN850X")
-        self.assertEqual(_identifier("BX8071514900K"), "BX8071514900K")
-
-    def test_commercial_name_rejects_listing_metadata_and_internal_codes(self):
-        invalid = (
-            "Samsung Galaxy S24 256 GB",
-            "Samsung Galaxy S24 8/256 GB",
-            "Samsung Galaxy S24 Black",
-            "Samsung Galaxy S24 Global Version",
-            "Samsung Galaxy S24 $799",
-            "Buy Samsung Galaxy S24 Online",
-            "Samsung Galaxy Tab A11 SM-X133",
-            "Samsung Model SM-X133",
-            "Samsung Galaxy S24 IMEI 490154203237518",
-        )
-        for name in invalid:
-            with self.subTest(name=name):
-                self.assertEqual(
-                    _valid_commercial_name(name, ["SM-X133"], "Samsung"),
-                    "",
-                )
-
-    def test_legitimate_commercial_codes_and_color_named_brands_are_allowed(self):
-        cases = (
-            ("Sony WH-1000XM5", ["WH-1000XM5"], "Sony"),
-            ("HP LaserJet M404dn", ["M404dn"], "HP"),
-            ("Black Shark 5 Pro", [], "Black Shark"),
-            ("Orange Pi 5", [], "Orange Pi"),
-            ("Red Magic 9 Pro", [], "Red Magic"),
-            ("Apple iPhone SE", [], "Apple"),
-            ("Google Pixel Fold", [], "Google"),
-        )
-        for name, identifiers, brand in cases:
-            with self.subTest(name=name):
-                self.assertEqual(
-                    _valid_commercial_name(name, identifiers, brand),
-                    name,
-                )
-
-    def test_exact_name_matcher_does_not_collapse_variants(self):
-        rejected = (
-            ("Nintendo Switch 2", "Nintendo Switch"),
-            ("Nintendo Switch (OLED)", "Nintendo Switch"),
-            ("Samsung Galaxy S25 Edge", "Samsung Galaxy S25"),
-            ("Samsung Galaxy A15 5G Smartphone", "Samsung Galaxy A15"),
-            ("Apple Watch Series 10", "Apple Watch Series"),
-            ("Apple iPhone 15 (Pro)", "Apple iPhone 15"),
-            ("Samsung Galaxy S24+", "Samsung Galaxy S24"),
-        )
-        for field, base_name in rejected:
-            with self.subTest(field=field):
-                self.assertFalse(_field_supports_name(field, base_name))
-        self.assertTrue(
-            _field_supports_name(
-                "Samsung Galaxy S24 - 5G smartphone",
-                "Samsung Galaxy S24",
-            )
-        )
-
-    def test_identifier_and_name_must_be_in_the_same_local_clause(self):
-        unrelated = SearchResult(
-            position=1,
-            title="Related products",
-            snippet=(
-                "SM-X133 is discontinued. Customers also viewed "
-                "Samsung Galaxy Tab A11."
-            ),
-            link="https://example.com/item",
-            domain="example.com",
-        )
-        adjacent = search_result(
-            1,
-            "example.com",
-            "SM-X133 Samsung Galaxy Tab A11",
-        )
-        self.assertFalse(
-            _result_supports_identifier_and_name(
-                unrelated,
-                "SM-X133",
-                "Samsung Galaxy Tab A11",
-            )
-        )
-        self.assertTrue(
-            _result_supports_identifier_and_name(
-                adjacent,
-                "SM-X133",
-                "Samsung Galaxy Tab A11",
-            )
-        )
-
-    def test_generic_visual_candidates_are_rejected(self):
-        for candidate, brand in (
-            ("Samsung Black Tablet", "Samsung"),
-            ("Samsung Tablet 2026", "Samsung"),
-            ("Samsung 128GB Tablet", "Samsung"),
-            ("Samsung Model", "Samsung"),
-            ("Samsung Best Tablet", "Samsung"),
-            ("Android Phone", ""),
-            ("Самсунг черный планшет", "Самсунг"),
-        ):
-            with self.subTest(candidate=candidate):
-                self.assertFalse(
-                    _strong_candidate(
-                        _Extracted(brand=brand, candidate_name=candidate)
-                    )
-                )
-        self.assertTrue(
-            _strong_candidate(
-                _Extracted(
-                    brand="Black Shark",
-                    candidate_name="Black Shark 5 Pro",
-                )
-            )
-        )
-
-    def test_public_suffix_domains_are_counted_correctly(self):
-        self.assertEqual(_registrable_domain("a.shop.example.co.uk"), "example.co.uk")
-        self.assertEqual(_registrable_domain("samsung.com.evil.com"), "evil.com")
-
-    def test_cache_keys_are_hashed_and_policy_scoped(self):
-        keys = _cache_keys(
-            _Extracted(brand="Samsung", model_code="SM-X133", sku="SM-X133NZSAMEA")
-        )
-        self.assertEqual(len(keys), 2)
-        self.assertTrue(all(len(key) == 64 for key in keys))
-        self.assertNotIn("SM-X133", " ".join(keys))
-
-
-class GeminiRecognizerTests(unittest.IsolatedAsyncioTestCase):
-    def recognizer_with_responses(self, search: FakeSearch, *responses):
-        recognizer = object.__new__(GeminiProductRecognizer)
-        recognizer.model = "gemini-test"
-        recognizer.timeout_seconds = 5
-        recognizer.minimum_confidence = 0.72
-        recognizer.cache_days = 30
-        recognizer.repository = None
-        recognizer.search = search
-        recognizer._generate = AsyncMock(side_effect=responses)
-        return recognizer
-
-    async def test_two_source_resolution_for_sample_product(self):
-        results = (
-            search_result(1, "samsung.com", "Samsung Galaxy Tab A11 SM-X133"),
-            search_result(2, "gsmarena.com", "Samsung Galaxy Tab A11 SM-X133"),
-        )
-        resolver = SimpleNamespace(
-            text=(
-                '{"commercial_name":"Samsung Galaxy Tab A11",'
-                '"confidence":0.99,"evidence_positions":[1,2]}'
-            )
-        )
-        search = FakeSearch(results)
-        recognizer = self.recognizer_with_responses(
-            search, extraction_json(), resolver
-        )
-        result = await recognizer.recognize(b"image", "image/jpeg")
-        self.assertEqual(result.model_name, "Samsung Galaxy Tab A11")
-        self.assertEqual(result.model_code, "SM-X133")
-        self.assertEqual(result.memory, "4/64 GB")
-        self.assertEqual(result.color, "Silver")
-        self.assertEqual(result.source_count, 2)
-        self.assertIn('"SM-X133NZSAMEA"', search.queries[0])
-        resolver_config = recognizer._generate.await_args_list[1].kwargs["config"]
-        self.assertFalse(getattr(resolver_config, "tools", None))
-
-    async def test_one_domain_or_unrelated_source_never_publishes_name(self):
-        search = FakeSearch(
-            (
-                search_result(1, "shop.example.com", "Brand Phone ABC-1"),
-                search_result(2, "cdn.shop.example.com", "Brand Phone ABC-1"),
-                search_result(3, "other.net", "Different Product XYZ-9"),
-            )
-        )
-        recognizer = self.recognizer_with_responses(
-            search,
-            extraction_json(
-                brand="Brand",
-                product_type="phone",
-                model_code="ABC-1",
-                sku="",
-                sku_confidence=0,
-                memory="256GB",
-                color="Black",
-            ),
-        )
-        result = await recognizer.recognize(b"image", "image/jpeg")
-        self.assertIsNone(result.model_name)
-        self.assertEqual(result.memory, "256 GB")
-        self.assertEqual(result.color, "Black")
-        self.assertEqual(recognizer._generate.await_count, 1)
-
-    async def test_invalid_evidence_positions_or_name_fail_closed(self):
-        results = (
-            search_result(1, "one.com", "Brand Phone ABC-1"),
-            search_result(2, "two.net", "Brand Phone ABC-1"),
-        )
-        resolver = SimpleNamespace(
-            text=(
-                '{"commercial_name":"Totally Wrong Product",'
-                '"confidence":1,"evidence_positions":[1,99]}'
-            )
-        )
-        recognizer = self.recognizer_with_responses(
-            FakeSearch(results),
-            extraction_json(
-                brand="Brand", model_code="ABC-1", sku="", sku_confidence=0
-            ),
-            resolver,
-        )
-        result = await recognizer.recognize(b"image", "image/jpeg")
-        self.assertIsNone(result.model_name)
-        self.assertEqual(recognizer._generate.await_count, 2)
-
-    async def test_similar_model_number_cannot_pass_name_verifier(self):
-        results = (
-            search_result(1, "one.com", "ABC-1 Apple iPhone 14 Pro Max"),
-            search_result(2, "two.net", "ABC-1 Apple iPhone 14 Pro Max"),
-        )
-        resolver = SimpleNamespace(
-            text=(
-                '{"commercial_name":"Apple iPhone 15 Pro Max",'
-                '"confidence":1,"evidence_positions":[1,2]}'
-            )
-        )
-        recognizer = self.recognizer_with_responses(
-            FakeSearch(results),
-            extraction_json(
-                brand="Apple", model_code="ABC-1", sku="", sku_confidence=0
-            ),
-            resolver,
-        )
-        result = await recognizer.recognize(b"image", "image/jpeg")
-        self.assertIsNone(result.model_name)
-        self.assertEqual(recognizer._generate.await_count, 2)
-
-    async def test_name_token_boundary_rejects_a11_vs_a110(self):
-        results = (
-            search_result(1, "one.com", "SM-X133 Samsung Galaxy Tab A110"),
-            search_result(2, "two.net", "SM-X133 Samsung Galaxy Tab A110"),
-        )
-        resolver = SimpleNamespace(
-            text=(
-                '{"commercial_name":"Samsung Galaxy Tab A11",'
-                '"confidence":1,"evidence_positions":[1,2]}'
-            )
-        )
-        recognizer = self.recognizer_with_responses(
-            FakeSearch(results), extraction_json(sku="", sku_confidence=0), resolver
-        )
-        result = await recognizer.recognize(b"image", "image/jpeg")
-        self.assertIsNone(result.model_name)
-
-    async def test_variant_suffixes_must_match_exactly(self):
-        cases = (
-            (
-                "Samsung",
-                "ABC-1 Samsung Galaxy S24",
-                "Samsung Galaxy S24+",
-            ),
-            (
-                "Apple",
-                "ABC-1 Apple iPhone 15 Pro Max",
-                "Apple iPhone 15 Pro",
-            ),
-        )
-        for brand, evidence_text, resolved_name in cases:
-            with self.subTest(resolved_name=resolved_name):
-                results = (
-                    search_result(1, "one.com", evidence_text),
-                    search_result(2, "two.net", evidence_text),
-                )
-                resolver = SimpleNamespace(
-                    text=json.dumps(
-                        {
-                            "commercial_name": resolved_name,
-                            "confidence": 1,
-                            "evidence_positions": [1, 2],
-                        }
-                    )
-                )
-                recognizer = self.recognizer_with_responses(
-                    FakeSearch(results),
-                    extraction_json(
-                        brand=brand,
-                        model_code="ABC-1",
-                        sku="",
-                        sku_confidence=0,
-                    ),
-                    resolver,
-                )
-                result = await recognizer.recognize(b"image", "image/jpeg")
-                self.assertIsNone(result.model_name)
-
-    async def test_relationship_brand_and_privacy_evidence_fail_closed(self):
-        cases = (
-            (
-                "Samsung",
-                "ABC-1 vs Samsung Galaxy Tab A11",
-                "Samsung Galaxy Tab A11",
-            ),
-            (
-                "Samsung",
-                "Samsung Galaxy Tab A11 ABC-1 Ultra",
-                "Samsung Galaxy Tab A11",
-            ),
-            (
-                "Samsung",
-                "ABC-1 Acme Rocket Two",
-                "Acme Rocket Two",
-            ),
-            (
-                "Samsung",
-                "ABC-1 Samsung Galaxy S24 IMEI 490154203237518",
-                "Samsung Galaxy S24 IMEI 490154203237518",
-            ),
-        )
-        for brand, evidence_text, resolved_name in cases:
-            with self.subTest(evidence=evidence_text):
-                results = (
-                    search_result(1, "one.com", evidence_text),
-                    search_result(2, "two.net", evidence_text),
-                )
-                resolver = SimpleNamespace(
-                    text=json.dumps(
-                        {
-                            "commercial_name": resolved_name,
-                            "confidence": 1,
-                            "evidence_positions": [1, 2],
-                        }
-                    )
-                )
-                recognizer = self.recognizer_with_responses(
-                    FakeSearch(results),
-                    extraction_json(
-                        brand=brand,
-                        model_code="ABC-1",
-                        sku="",
-                        sku_confidence=0,
-                    ),
-                    resolver,
-                )
-                result = await recognizer.recognize(b"image", "image/jpeg")
-                self.assertIsNone(result.model_name)
-
-    async def test_sensitive_text_cannot_be_returned_as_color(self):
-        recognizer = self.recognizer_with_responses(
-            FakeSearch(),
-            extraction_json(
-                brand="",
-                model_code="",
-                model_confidence=0,
-                sku="",
-                sku_confidence=0,
-                color="IMEI 490154203237518",
-                color_confidence=0.99,
-            ),
-        )
-        result = await recognizer.recognize(b"image", "image/jpeg")
-        self.assertIsNone(result.color)
-        self.assertIsNone(result.model_name)
-
-    async def test_provider_preflight_checks_model_and_search_key(self):
-        search = FakeSearch()
-        recognizer = object.__new__(GeminiProductRecognizer)
-        recognizer.model = "gemini-test"
-        recognizer.timeout_seconds = 5
-        model_get = AsyncMock(return_value=SimpleNamespace(name="gemini-test"))
-        recognizer._aio = SimpleNamespace(models=SimpleNamespace(get=model_get))
-        recognizer.search = search
-        await recognizer.preflight()
-        model_get.assert_awaited_once_with(model="gemini-test")
-        self.assertEqual(search.queries, ['"SM-X133" Samsung'])
-
-    async def test_two_domains_must_support_the_same_identifier(self):
-        search = FakeSearch(
-            (
-                search_result(
-                    1,
-                    "one.com",
-                    "SKU-A1 Samsung Galaxy Tab A11",
-                ),
-                search_result(
-                    2,
-                    "two.net",
-                    "MOD-B2 Samsung Galaxy Tab A11",
-                ),
-            )
-        )
-        recognizer = self.recognizer_with_responses(
-            search,
-            extraction_json(
-                model_code="MOD-B2",
-                sku="SKU-A1",
-            ),
-        )
-        result = await recognizer.recognize(b"image", "image/jpeg")
-        self.assertIsNone(result.model_name)
-        self.assertEqual(recognizer._generate.await_count, 1)
-
-    async def test_only_verified_identifier_is_cached(self):
-        with tempfile.TemporaryDirectory() as directory:
-            repo = SalesPhotoRepository(Path(directory) / "sales.db")
-            results = (
-                search_result(
-                    1,
-                    "one.com",
-                    "SKU-A1 Samsung Galaxy Tab A11",
-                ),
-                search_result(
-                    2,
-                    "two.net",
-                    "SKU-A1 Samsung Galaxy Tab A11",
-                ),
-                search_result(
-                    3,
-                    "one.com",
-                    "MOD-B2 Samsung Galaxy Tab A11",
-                ),
-            )
-            resolver = SimpleNamespace(
-                text=(
-                    '{"commercial_name":"Samsung Galaxy Tab A11",'
-                    '"confidence":1,"evidence_positions":[1,2]}'
-                )
-            )
-            recognizer = self.recognizer_with_responses(
-                FakeSearch(results),
-                extraction_json(model_code="MOD-B2", sku="SKU-A1"),
-                resolver,
-            )
-            recognizer.repository = repo
-            result = await recognizer.recognize(b"image", "image/jpeg")
-            self.assertEqual(result.model_name, "Samsung Galaxy Tab A11")
-            sku_key, model_key = _cache_keys(
-                _Extracted(
-                    brand="Samsung",
-                    product_type="tablet",
-                    model_code="MOD-B2",
-                    sku="SKU-A1",
-                )
-            )
-            self.assertIsNotNone(repo.cached_name((sku_key,)))
-            self.assertIsNone(repo.cached_name((model_key,)))
-
-    async def test_conflicting_plus_variant_cache_entries_fail_closed(self):
-        with tempfile.TemporaryDirectory() as directory:
-            repo = SalesPhotoRepository(Path(directory) / "sales.db")
-            extracted = _Extracted(
-                brand="Samsung",
-                product_type="phone",
-                model_code="CODE-1",
-                sku="SKU-1",
-            )
-            sku_key, model_key = _cache_keys(extracted)
-            expires = utc_now() + timedelta(days=1)
-            repo.cache_name(
-                (sku_key,),
-                "Samsung Galaxy S24",
-                0.9,
-                2,
-                "test",
-                expires,
-            )
-            repo.cache_name(
-                (model_key,),
-                "Samsung Galaxy S24+",
-                0.9,
-                2,
-                "test",
-                expires,
-            )
-            recognizer = self.recognizer_with_responses(
-                FakeSearch(),
-                extraction_json(
-                    brand="Samsung",
-                    product_type="phone",
-                    model_code="CODE-1",
-                    sku="SKU-1",
-                    memory="",
-                    memory_confidence=0,
-                    color="",
-                    color_confidence=0,
-                ),
-            )
-            recognizer.repository = repo
-            result = await recognizer.recognize(b"image", "image/jpeg")
-            self.assertIsNone(result.model_name)
-            self.assertEqual(recognizer._generate.await_count, 1)
-
-    async def test_search_budget_is_balanced_across_identifiers(self):
-        class IdentifierSearch:
-            def __init__(self):
-                self.queries: list[str] = []
-
-            async def search(self, query: str) -> tuple[SearchResult, ...]:
-                self.queries.append(query)
-                identifier = "SKU-A1" if "SKU-A1" in query else "MOD-B2"
-                count = 10 if identifier == "SKU-A1" else 2
-                domains = (
-                    ["one.com"] * count
-                    if identifier == "SKU-A1"
-                    else ["two.net", "three.org"]
-                )
-                return tuple(
-                    SearchResult(
-                        position=index,
-                        title=f"{identifier} Samsung Galaxy Tab A11",
-                        snippet="",
-                        link=f"https://{domain}/{identifier}/{index}",
-                        domain=domain,
-                    )
-                    for index, domain in enumerate(domains, start=1)
-                )
-
-            async def aclose(self) -> None:
-                return None
-
-        search = IdentifierSearch()
-        recognizer = object.__new__(GeminiProductRecognizer)
-        recognizer.search = search
-        evidence = await recognizer._search_evidence(
-            _Extracted(
-                brand="Samsung",
-                product_type="tablet",
-                model_code="MOD-B2",
-                sku="SKU-A1",
-            )
-        )
-        self.assertEqual(len(search.queries), 2)
-        self.assertEqual(len(evidence), 7)
-        self.assertTrue(any("MOD-B2" in result.title for result in evidence))
-
-    async def test_identifier_requires_alphanumeric_boundary(self):
-        results = (
-            search_result(1, "one.com", "Brand Phone A150"),
-            search_result(2, "two.net", "Brand Phone A150"),
-        )
-        recognizer = self.recognizer_with_responses(
-            FakeSearch(results),
-            extraction_json(
-                brand="Brand", model_code="A15", sku="", sku_confidence=0
-            ),
-        )
-        result = await recognizer.recognize(b"image", "image/jpeg")
-        self.assertIsNone(result.model_name)
-        self.assertEqual(recognizer._generate.await_count, 1)
-
-    async def test_generic_candidate_does_not_select_random_model(self):
-        search = FakeSearch(
-            (
-                search_result(1, "one.example", "Samsung Galaxy Tab A9 tablet"),
-                search_result(2, "two.example", "Samsung Galaxy Tab A9 tablet"),
-            )
-        )
-        recognizer = self.recognizer_with_responses(
-            search,
-            extraction_json(
-                model_code="",
-                model_confidence=0,
-                sku="",
-                sku_confidence=0,
-                candidate="Samsung Android tablet",
-                candidate_confidence=0.99,
-            ),
-        )
-        result = await recognizer.recognize(b"image", "image/jpeg")
-        self.assertIsNone(result.model_name)
-        self.assertEqual(search.queries, [])
-
-    async def test_candidate_only_path_cannot_change_the_printed_name(self):
-        evidence_text = "Samsung Alpha One / Samsung Galaxy Tab A9"
-        search = FakeSearch(
-            (
-                search_result(1, "one.com", evidence_text),
-                search_result(2, "two.net", evidence_text),
-            )
-        )
-        resolver = SimpleNamespace(
-            text=(
-                '{"commercial_name":"Samsung Galaxy Tab A9",'
-                '"confidence":1,"evidence_positions":[1,2]}'
-            )
-        )
-        recognizer = self.recognizer_with_responses(
-            search,
-            extraction_json(
-                model_code="",
-                model_kind="unknown",
-                model_confidence=0,
-                sku="",
-                sku_kind="unknown",
-                sku_confidence=0,
-                candidate="Samsung Alpha One",
-                candidate_confidence=0.99,
-            ),
-            resolver,
-        )
-        result = await recognizer.recognize(b"image", "image/jpeg")
-        self.assertIsNone(result.model_name)
-        self.assertEqual(recognizer._generate.await_count, 1)
-
-    async def test_weak_identifier_does_not_trigger_search(self):
-        search = FakeSearch()
-        recognizer = self.recognizer_with_responses(
-            search,
-            extraction_json(
-                model_code="490154203237518",
-                model_confidence=0.99,
-                sku="",
-                sku_confidence=0,
-                candidate="Samsung tablet",
-                candidate_confidence=0.5,
-            ),
-        )
-        result = await recognizer.recognize(b"image", "image/jpeg")
-        self.assertIsNone(result.model_name)
-        self.assertEqual(search.queries, [])
-
-    async def test_unlabelled_alphanumeric_serial_does_not_trigger_search(self):
-        search = FakeSearch()
-        recognizer = self.recognizer_with_responses(
-            search,
-            extraction_json(
-                model_code="ZX9A123456",
-                model_kind="unknown",
-                model_confidence=0.99,
-                sku="",
-                sku_kind="unknown",
-                sku_confidence=0,
-                candidate="",
-                candidate_confidence=0,
-            ),
-        )
-        result = await recognizer.recognize(b"image", "image/jpeg")
-        self.assertIsNone(result.model_name)
-        self.assertEqual(search.queries, [])
-
-    async def test_search_error_keeps_extracted_memory_and_color(self):
-        search = FakeSearch(error=TimeoutError("search unavailable"))
-        recognizer = self.recognizer_with_responses(
-            search,
-            extraction_json(
-                brand="Brand",
-                model_code="ABC-1",
-                sku="",
-                sku_confidence=0,
-                memory="128GB",
-                color="Blue",
-            ),
-        )
-        result = await recognizer.recognize(b"image", "image/jpeg")
-        self.assertIsNone(result.model_name)
-        self.assertEqual(result.memory, "128 GB")
-        self.assertEqual(result.color, "Blue")
-
-
-class SerperClientTests(unittest.IsolatedAsyncioTestCase):
-    async def test_request_contract_and_bounded_response(self):
-        captured: list[httpx.Request] = []
-
-        async def handler(request: httpx.Request) -> httpx.Response:
-            captured.append(request)
-            return httpx.Response(
-                200,
-                json={
-                    "organic": [
-                        {
-                            "title": "Samsung Galaxy Tab A11 SM-X133",
-                            "link": "https://samsung.com/item",
-                            "snippet": "SM-X133 Samsung Galaxy Tab A11",
-                        },
-                        {
-                            "title": "Unsafe",
-                            "link": "http://unsafe.example/item",
-                            "snippet": "ignored",
-                        },
-                    ]
-                },
-            )
-
-        client = SerperProductSearch("secret", country="uz", language="ru")
-        await client._client.aclose()
-        client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        try:
-            results = await client.search('"SM-X133" Samsung')
-        finally:
-            await client.aclose()
-        self.assertEqual(len(captured), 1)
-        self.assertEqual(captured[0].url, httpx.URL("https://google.serper.dev/search"))
-        self.assertEqual(captured[0].headers["x-api-key"], "secret")
-        self.assertNotIn("secret", str(captured[0].url))
-        payload = json.loads(captured[0].content)
-        self.assertEqual((payload["gl"], payload["hl"], payload["num"]), ("uz", "ru", 10))
-        self.assertEqual(len(results), 1)
-
-    async def test_401_is_not_retried_and_503_is_bounded(self):
-        for status, expected_calls in ((401, 1), (503, 2)):
-            calls = 0
-
-            async def handler(request: httpx.Request) -> httpx.Response:
-                nonlocal calls
-                calls += 1
-                return httpx.Response(status, request=request)
-
-            client = SerperProductSearch("secret")
-            await client._client.aclose()
-            client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-            try:
-                with patch("sales_photo_bot.search.asyncio.sleep", new=AsyncMock()):
-                    with self.assertRaises(httpx.HTTPStatusError):
-                        await client.search("SM-X133")
-            finally:
-                await client.aclose()
-            self.assertEqual(calls, expected_calls)
-
-
 class RepositoryTests(unittest.TestCase):
+    def test_obsolete_model_cache_is_removed_during_migration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sales.db"
+            with sqlite3.connect(path) as db:
+                db.execute(
+                    "CREATE TABLE sales_photo_name_cache "
+                    "(cache_key TEXT PRIMARY KEY, model_name TEXT)"
+                )
+                db.execute(
+                    "INSERT INTO sales_photo_name_cache VALUES (?, ?)",
+                    ("old-key", "Old Product Name"),
+                )
+                db.commit()
+            SalesPhotoRepository(path)
+            with sqlite3.connect(path) as db:
+                row = db.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type='table' AND name='sales_photo_name_cache'"
+                ).fetchone()
+            self.assertIsNone(row)
+
     def test_job_manager_and_bootstrap_state_are_durable(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "sales.db"
@@ -1320,10 +504,9 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
         events: list[str] = []
         repo = SalesPhotoRepository(self.root / "db.sqlite")
         recognizer = StaticRecognizer(
-            Recognition(
-                model_name="Samsung Galaxy Tab A11",
-                memory="4/64 GB",
-                color="Silver",
+            ProductIdentifiers(
+                imei="490154203237518",
+                serial_number="R8YL50R510N",
             )
         )
         service = SalesPhotoService(settings(self.root), repo, recognizer)
@@ -1334,11 +517,13 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
         sent = bot.send_photo.await_args.kwargs
         self.assertEqual(sent["photo"], "large")
         self.assertTrue(sent["caption"].startswith(BOT_CARD_MARKER))
-        self.assertIn("📦 Samsung Galaxy Tab A11", sent["caption"])
+        self.assertIn("<blockquote>IMEI:", sent["caption"])
+        self.assertIn("<blockquote>S/N:", sent["caption"])
+        self.assertNotIn("📦", sent["caption"])
         self.assertEqual(len(sent["reply_markup"].inline_keyboard), 2)
         self.assertTrue(repo.is_replacement(CHAT_ID, 200))
 
-    async def test_unknown_recognition_still_reposts_template_without_model(self):
+    async def test_failed_ocr_still_reposts_template_without_identifiers(self):
         repo = SalesPhotoRepository(self.root / "db.sqlite")
         service = SalesPhotoService(
             settings(self.root), repo, StaticRecognizer(error=TimeoutError())
@@ -1436,7 +621,7 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
         bot.delete_message.side_effect = RuntimeError("temporary")
         duplicate = photo_message(
             message_id=201,
-            caption=BOT_CARD_MARKER + build_caption(None, Recognition()),
+            caption=BOT_CARD_MARKER + build_caption(None, ProductIdentifiers()),
         )
         duplicate.reply_markup = manager_keyboard(
             10,
@@ -1470,7 +655,7 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
         await service.handle_photo(original, bot)
         replacement = photo_message(
             message_id=201,
-            caption=BOT_CARD_MARKER + build_caption(None, Recognition()),
+            caption=BOT_CARD_MARKER + build_caption(None, ProductIdentifiers()),
         )
         replacement.from_user = None
         await service.handle_photo(replacement, bot)
@@ -1493,7 +678,7 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
         await entered_send.wait()
         replacement = photo_message(
             message_id=200,
-            caption=BOT_CARD_MARKER + build_caption(None, Recognition()),
+            caption=BOT_CARD_MARKER + build_caption(None, ProductIdentifiers()),
         )
         replacement.from_user = None
         replacement.reply_markup = manager_keyboard(
@@ -1514,7 +699,7 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
         bot = telegram_bot()
         forged = photo_message(
             message_id=200,
-            caption=BOT_CARD_MARKER + build_caption(None, Recognition()),
+            caption=BOT_CARD_MARKER + build_caption(None, ProductIdentifiers()),
         )
         forged.reply_markup = manager_keyboard(10, 0, "deadbeefdead")
         await service.handle_photo(forged, bot)
@@ -1602,7 +787,7 @@ class ManagerCallbackTests(unittest.IsolatedAsyncioTestCase):
         self.repo.mark_reposted(CHAT_ID, 10, 200)
         self.repo.mark_complete(CHAT_ID, 10)
         self.base = BOT_CARD_MARKER + build_caption(
-            None, Recognition(model_name="Samsung Galaxy Tab A11")
+            None, ProductIdentifiers(serial_number="ABC12345")
         )
 
     async def asyncTearDown(self):

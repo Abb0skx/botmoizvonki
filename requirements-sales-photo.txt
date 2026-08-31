@@ -1,5 +1,6 @@
 python-telegram-bot==22.8
-google-genai==2.20.0
 cryptography==50.0.0
 httpx==0.28.1
-tldextract==5.3.0
+Pillow==12.3.0
+pytesseract==0.3.13
+zxing-cpp==3.1.1

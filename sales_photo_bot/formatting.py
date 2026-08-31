@@ -3,11 +3,11 @@ from __future__ import annotations
 import html
 import re
 
-from .models import Recognition
+from .models import ProductIdentifiers
 
 
 MAX_CLIENT_TEXT = 300
-MAX_PRODUCT_FIELD = 120
+MAX_SERIAL_NUMBER = 64
 MANAGER_LINE_RE = re.compile(
     r"(?:\n\n)?👤 Менеджер: <b>[^<>\r\n]{1,64}</b>\s*\Z"
 )
@@ -29,25 +29,15 @@ def _safe(value: object, limit: int) -> str:
 
 def build_caption(
     client_caption: str | None,
-    recognition: Recognition,
+    identifiers: ProductIdentifiers,
     manager: str | None = None,
 ) -> str:
-    """Build the sales template while omitting unavailable product fields."""
+    """Build the sales template and omit identifiers that OCR could not verify."""
 
     lines: list[str] = []
     client = _safe(client_caption, MAX_CLIENT_TEXT)
     if client:
         lines.append(f"📞 Клиент: {client}")
-
-    model = _safe(recognition.model_name, MAX_PRODUCT_FIELD)
-    memory = _safe(recognition.memory, MAX_PRODUCT_FIELD)
-    color = _safe(recognition.color, MAX_PRODUCT_FIELD)
-    if model:
-        lines.append(f"📦 {model}")
-    if memory:
-        lines.append(f"💾 {memory}")
-    if color:
-        lines.append(f"🎨 {color}")
 
     if lines:
         lines.append("")
@@ -55,6 +45,28 @@ def build_caption(
         [
             "🛒💵:",
             "rasxod:",
+        ]
+    )
+
+    identifier_lines: list[str] = []
+    if identifiers.imei:
+        identifier_lines.append(
+            f"<blockquote>IMEI: {_safe(identifiers.imei, 15)}</blockquote>"
+        )
+    if identifiers.imei2:
+        identifier_lines.append(
+            f"<blockquote>IMEI2: {_safe(identifiers.imei2, 15)}</blockquote>"
+        )
+    if identifiers.serial_number:
+        identifier_lines.append(
+            f"<blockquote>S/N: {_safe(identifiers.serial_number, MAX_SERIAL_NUMBER)}"
+            "</blockquote>"
+        )
+    if identifier_lines:
+        lines.extend(["", *identifier_lines])
+
+    lines.extend(
+        [
             "",
             "<b>Наличка</b>",
             "💵:",

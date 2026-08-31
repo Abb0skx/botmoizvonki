@@ -13,9 +13,8 @@ from telegram.ext import (
 
 from .config import Settings
 from .keyboards import CALLBACK_PREFIX
-from .recognition import GeminiProductRecognizer, ProductRecognizer
+from .ocr import IdentifierRecognizer, TesseractIdentifierRecognizer
 from .repository import SalesPhotoRepository
-from .search import SerperProductSearch
 from .service import SalesPhotoService
 
 
@@ -55,24 +54,15 @@ async def _prepare_polling(
 def build_application(
     settings: Settings,
     repository: SalesPhotoRepository | None = None,
-    recognizer: ProductRecognizer | None = None,
+    recognizer: IdentifierRecognizer | None = None,
 ) -> Application:
     repo = repository or SalesPhotoRepository(settings.db_path)
-    product_recognizer = recognizer or GeminiProductRecognizer(
-        api_key=settings.gemini_api_key,
-        model=settings.gemini_model,
-        timeout_seconds=settings.recognition_timeout_seconds,
-        minimum_confidence=settings.recognition_min_confidence,
-        cache_days=settings.cache_days,
-        search=SerperProductSearch(
-            api_key=settings.serper_api_key,
-            timeout_seconds=settings.search_timeout_seconds,
-            country=settings.serper_country,
-            language=settings.serper_language,
-        ),
-        repository=repo,
+    identifier_recognizer = recognizer or TesseractIdentifierRecognizer(
+        timeout_seconds=settings.ocr_timeout_seconds,
+        max_pixels=settings.ocr_max_pixels,
+        max_parallel=1,
     )
-    service = SalesPhotoService(settings, repo, product_recognizer)
+    service = SalesPhotoService(settings, repo, identifier_recognizer)
 
     async def post_init(application: Application) -> None:
         await _prepare_polling(settings, repo, service, application.bot)

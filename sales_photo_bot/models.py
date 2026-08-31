@@ -4,21 +4,17 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
-class Recognition:
-    """Allowlisted product fields safe for rendering in a Telegram card.
+class ProductIdentifiers:
+    """Identifiers read from a product label by local OCR.
 
-    ``model_name`` is a commercial name such as ``Samsung Galaxy Tab A11``.
-    A raw manufacturer code such as ``SM-X133`` is deliberately kept separate
-    and is never rendered as the commercial model name.
+    Missing values stay ``None`` and are omitted from the Telegram card.  IMEI
+    values are accepted by the OCR layer only after their check digit has been
+    validated.
     """
 
-    model_name: str | None = None
-    model_code: str | None = None
-    sku: str | None = None
-    memory: str | None = None
-    color: str | None = None
-    confidence: float = 0.0
-    source_count: int = 0
+    imei: str | None = None
+    imei2: str | None = None
+    serial_number: str | None = None
 
 
-EMPTY_RECOGNITION = Recognition()
+EMPTY_IDENTIFIERS = ProductIdentifiers()

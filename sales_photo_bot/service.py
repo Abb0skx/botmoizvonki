@@ -27,8 +27,8 @@ from .keyboards import (
     back_keyboard,
     manager_keyboard,
 )
-from .models import EMPTY_RECOGNITION, Recognition
-from .recognition import ProductRecognizer
+from .models import EMPTY_IDENTIFIERS, ProductIdentifiers
+from .ocr import IdentifierRecognizer
 from .repository import SalesPhotoRepository, utc_now
 
 
@@ -101,7 +101,7 @@ class SalesPhotoService:
         self,
         settings: Settings,
         repository: SalesPhotoRepository,
-        recognizer: ProductRecognizer,
+        recognizer: IdentifierRecognizer,
     ):
         self.settings = settings
         self.repository = repository
@@ -228,8 +228,8 @@ class SalesPhotoService:
         message_thread_id: int | None,
         photo: object | None = None,
     ) -> None:
-        recognition = await self._recognize_photo(photo, file_id, bot)
-        caption = BOT_CARD_MARKER + build_caption(client_caption, recognition)
+        identifiers = await self._read_identifiers(photo, file_id, bot)
+        caption = BOT_CARD_MARKER + build_caption(client_caption, identifiers)
         initial_generation = 0
         source_signature = self.repository.callback_signature(
             chat_id,
@@ -394,29 +394,29 @@ class SalesPhotoService:
             source_message_id=source_message_id,
         )
 
-    async def _recognize_photo(
+    async def _read_identifiers(
         self,
         photo: object,
         file_id: str,
         bot: Bot | Any,
-    ) -> Recognition:
+    ) -> ProductIdentifiers:
         file_size = int(getattr(photo, "file_size", 0) or 0)
-        if file_size > self.settings.recognition_max_bytes:
-            logger.warning("sales_photo_recognition_skipped reason=file_too_large")
-            return EMPTY_RECOGNITION
+        if file_size > self.settings.ocr_max_bytes:
+            logger.warning("sales_photo_ocr_skipped reason=file_too_large")
+            return EMPTY_IDENTIFIERS
         try:
             telegram_file = await bot.get_file(file_id)
             data = bytes(await telegram_file.download_as_bytearray())
-            if len(data) > self.settings.recognition_max_bytes:
-                return EMPTY_RECOGNITION
+            if len(data) > self.settings.ocr_max_bytes:
+                return EMPTY_IDENTIFIERS
             return await self.recognizer.recognize(data, "image/jpeg")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.warning(
-                "sales_photo_recognition_failed error_type=%s", _error_code(exc)
+                "sales_photo_ocr_failed error_type=%s", _error_code(exc)
             )
-            return EMPTY_RECOGNITION
+            return EMPTY_IDENTIFIERS
 
     async def _delete_source(
         self,
@@ -909,7 +909,11 @@ class SalesPhotoService:
                 )
             try:
                 stale_before = utc_now() - timedelta(
-                    seconds=self.settings.recognition_timeout_seconds + 90
+                    seconds=(
+                        self.settings.ocr_timeout_seconds
+                        * self.settings.concurrent_updates
+                        + 90
+                    )
                 )
                 stale_count = self.repository.fail_stale_processing(
                     self.settings.chat_id,
