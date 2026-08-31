@@ -148,6 +148,14 @@ class ProductLabelTests(unittest.TestCase):
             extract_product_label("iPhone 16 Pro 901234567"),
             "iPhone 16 Pro",
         )
+        self.assertEqual(
+            extract_product_label("A16 8/256 901234567"),
+            "A16 8/256",
+        )
+        self.assertEqual(
+            extract_uzbek_phones("A16 8/256 901234567"),
+            ("+998 90 123 45 67",),
+        )
 
     def test_phone_only_or_long_numeric_value_has_no_product_label(self):
         values = (

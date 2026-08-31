@@ -104,20 +104,47 @@ def normalize_uzbek_phone(value: object) -> str | None:
     )
 
 
-def _phones_from_run(value: str) -> tuple[str, ...]:
+def _phones_from_run(
+    value: str,
+) -> tuple[tuple[str, tuple[int, int]], ...]:
     normalized = normalize_uzbek_phone(value)
     if normalized:
-        return (normalized,)
+        return ((normalized, (0, len(value))),)
 
     # Two national numbers are often pasted with only a space between them.
     # Try every whitespace boundary and accept only one unambiguous split.
-    pairs: list[tuple[str, str]] = []
+    pairs: list[tuple[tuple[str, tuple[int, int]], ...]] = []
+    singles: list[tuple[str, tuple[int, int]]] = []
     for gap in re.finditer(r"[ \t\u00a0]+", value):
         first = normalize_uzbek_phone(value[: gap.start()])
         second = normalize_uzbek_phone(value[gap.end() :])
-        if first and second and (first, second) not in pairs:
-            pairs.append((first, second))
-    return pairs[0] if len(pairs) == 1 else ()
+        if first and second:
+            pair = (
+                (first, (0, gap.start())),
+                (second, (gap.end(), len(value))),
+            )
+            if pair not in pairs:
+                pairs.append(pair)
+            continue
+
+        # A short numeric model/memory fragment can immediately precede or
+        # follow a phone: ``A16 8/256 901234567``. Keep the short fragment as
+        # product text and accept only one unambiguous phone suffix/prefix.
+        left_digits = sum(character.isdigit() for character in value[: gap.start()])
+        right_digits = sum(character.isdigit() for character in value[gap.end() :])
+        if second and left_digits <= 4:
+            candidate = (second, (gap.end(), len(value)))
+            if candidate not in singles:
+                singles.append(candidate)
+        if first and right_digits <= 4:
+            candidate = (first, (0, gap.start()))
+            if candidate not in singles:
+                singles.append(candidate)
+    if len(pairs) == 1:
+        return pairs[0]
+    if not pairs and len(singles) == 1:
+        return (singles[0],)
+    return ()
 
 
 def _scan_uzbek_phones(
@@ -127,11 +154,16 @@ def _scan_uzbek_phones(
     result: list[str] = []
     accepted_spans: list[tuple[int, int]] = []
     for match in _PHONE_RUN_RE.finditer(str(value or "")):
-        phones = _phones_from_run(match.group(0))
-        if not phones:
+        phone_matches = _phones_from_run(match.group(0))
+        if not phone_matches:
             continue
-        accepted_spans.append(match.span())
-        for normalized in phones:
+        for normalized, (relative_start, relative_end) in phone_matches:
+            accepted_spans.append(
+                (
+                    match.start() + relative_start,
+                    match.start() + relative_end,
+                )
+            )
             if normalized not in result:
                 result.append(normalized)
                 if len(result) >= max(1, int(stop_after)):
