@@ -26,6 +26,14 @@ MUZROB_ID = 1799690992
 ABBOS_ID = 202134293
 
 
+def _rgb_pixels(image):
+    rgb_image = image.convert("RGB")
+    get_flattened_data = getattr(rgb_image, "get_flattened_data", None)
+    if get_flattened_data is not None:
+        return get_flattened_data()
+    return rgb_image.getdata()
+
+
 class DeliveryStatsServiceTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
@@ -682,7 +690,7 @@ class DeliverySequenceMapTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(image.size, (MAP_WIDTH, MAP_HEIGHT))
             green_pixels = sum(
                 1
-                for red, green, blue in image.convert("RGB").get_flattened_data()
+                for red, green, blue in _rgb_pixels(image)
                 if green > 100 and red < 80 and blue < 170
             )
         self.assertGreater(green_pixels, 300)

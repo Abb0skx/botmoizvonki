@@ -23,6 +23,14 @@ from app.utils.static_map import (
 )
 
 
+def _rgb_pixels(image):
+    rgb_image = image.convert("RGB")
+    get_flattened_data = getattr(rgb_image, "get_flattened_data", None)
+    if get_flattened_data is not None:
+        return get_flattened_data()
+    return rgb_image.getdata()
+
+
 class StaticMapTests(unittest.IsolatedAsyncioTestCase):
     async def test_png_map_contains_active_order_markers(self):
         order = Order(
@@ -52,7 +60,7 @@ class StaticMapTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(image.format, "PNG")
             red_pixels = sum(
                 1
-                for red, green, blue in image.convert("RGB").get_flattened_data()
+                for red, green, blue in _rgb_pixels(image)
                 if red > 180 and green < 90 and blue < 100
             )
         self.assertGreater(red_pixels, 100)
@@ -83,7 +91,7 @@ class StaticMapTests(unittest.IsolatedAsyncioTestCase):
         with Image.open(result) as image:
             orange_pixels = sum(
                 1
-                for red, green, blue in image.convert("RGB").get_flattened_data()
+                for red, green, blue in _rgb_pixels(image)
                 if red > 200 and 90 < green < 190 and blue < 80
             )
         self.assertGreater(orange_pixels, 100)
