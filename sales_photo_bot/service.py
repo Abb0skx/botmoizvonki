@@ -3,10 +3,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
+from collections import OrderedDict
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from telegram import Bot, Message, Update
 from telegram.constants import ChatType, ParseMode
@@ -31,9 +34,25 @@ from .repository import SalesPhotoRepository, utc_now
 logger = logging.getLogger(__name__)
 UTC = timezone.utc
 BOT_CARD_MARKER = "\u2063\u2063"
+CAPTION_REVISION_TTL_SECONDS = 600.0
+CAPTION_REVISION_LIMIT = 4096
 _SOURCE_CALLBACK_RE = re.compile(
     r"^sp:(?:m:[a-z]+|b):(\d+):(\d+):([0-9a-f]{12})$"
 )
+
+
+@dataclass(frozen=True)
+class _PhotoClaim:
+    chat_id: int
+    source_message_id: int
+    file_id: str
+    client_caption: str | None
+    message_thread_id: int | None
+    photo: object
+
+
+class _RetryWaitCancelled(asyncio.CancelledError):
+    """Cancellation while Telegram has definitively rejected the last send."""
 
 
 def _error_code(error: BaseException) -> str:
@@ -115,10 +134,15 @@ class SalesPhotoService:
         self._photo_lock_users: dict[tuple[int, int], int] = {}
         self._card_locks: dict[tuple[int, int], asyncio.Lock] = {}
         self._card_lock_users: dict[tuple[int, int], int] = {}
-        self._caption_update_ids: dict[tuple[int, int], int] = {}
-        self._caption_reapply_ids: dict[tuple[int, int], int] = {}
+        self._caption_update_ids: OrderedDict[
+            tuple[int, int], tuple[int, float]
+        ] = OrderedDict()
         self._pending_managers: dict[tuple[int, int], str] = {}
         self._ui_generations: dict[tuple[int, int], int] = {}
+        self._photo_tasks: set[asyncio.Task[None]] = set()
+        self._active_sources: set[tuple[int, int]] = set()
+        self._cancelled_sources: set[tuple[int, int]] = set()
+        self._startup_gate_active = False
         self._maintenance_task: asyncio.Task[None] | None = None
 
     async def preflight(self, bot: Bot) -> int:
@@ -160,7 +184,80 @@ class SalesPhotoService:
         message = update.effective_message
         if message is None:
             return
-        await self.handle_photo(message, context.bot)
+        if str(getattr(message, "caption", "") or "").startswith(
+            BOT_CARD_MARKER
+        ):
+            await self._reconcile_generated_post(
+                message,
+                context.bot,
+                allow_source_delete=not self._startup_gate_active,
+            )
+            return
+        claim = self._claim_photo(message)
+        if claim is None:
+            return
+        source_key = (claim.chat_id, claim.source_message_id)
+        if self._startup_gate_active:
+            try:
+                self.repository.mark_failed(
+                    claim.chat_id,
+                    claim.source_message_id,
+                    "startup_drain",
+                    # Maintenance itself is gated, so make this safe deferred
+                    # item immediately eligible when the gate finally opens.
+                    at=utc_now()
+                    - timedelta(seconds=self.settings.delete_retry_seconds),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "sales_photo_startup_defer_failed chat_id=%s "
+                    "source_message_id=%s error_type=%s",
+                    claim.chat_id,
+                    claim.source_message_id,
+                    _error_code(exc),
+                )
+            self._active_sources.discard(source_key)
+            return
+        for finished in tuple(self._photo_tasks):
+            if finished.done():
+                self._photo_tasks.discard(finished)
+        if len(self._photo_tasks) >= self.settings.concurrent_updates:
+            self.repository.mark_failed(
+                claim.chat_id,
+                claim.source_message_id,
+                "worker_capacity",
+            )
+            self._active_sources.discard(source_key)
+            return
+        task = asyncio.create_task(
+            self._run_photo_claim(claim, context.bot),
+            name=f"sales-photo-{claim.source_message_id}",
+        )
+        self._photo_tasks.add(task)
+        task.add_done_callback(
+            lambda finished, key=source_key: self._photo_task_done(
+                finished,
+                key,
+            )
+        )
+
+    def _photo_task_done(
+        self,
+        task: asyncio.Task[None],
+        source_key: tuple[int, int] | None,
+    ) -> None:
+        self._photo_tasks.discard(task)
+        if source_key is not None:
+            self._active_sources.discard(source_key)
+            self._cancelled_sources.discard(source_key)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logger.error(
+                "sales_photo_background_failed error_type=%s",
+                _error_code(error),
+            )
 
     async def on_edited_photo(
         self,
@@ -189,10 +286,43 @@ class SalesPhotoService:
                 self._card_lock_users.pop(key, None)
                 if self._card_locks.get(key) is lock:
                     self._card_locks.pop(key, None)
-                self._caption_update_ids.pop(key, None)
-                self._caption_reapply_ids.pop(key, None)
             else:
                 self._card_lock_users[key] = remaining
+
+    def _register_caption_revision(
+        self,
+        key: tuple[int, int],
+        revision: int,
+    ) -> bool:
+        """Keep a short-lived per-card ordering watermark for edited posts."""
+
+        now = time.monotonic()
+        cutoff = now - CAPTION_REVISION_TTL_SECONDS
+        for candidate, (_, seen_at) in tuple(self._caption_update_ids.items()):
+            if seen_at >= cutoff or self._card_lock_users.get(candidate, 0):
+                continue
+            self._caption_update_ids.pop(candidate, None)
+
+        previous = self._caption_update_ids.get(key)
+        if previous is not None and previous[1] >= cutoff:
+            previous_revision, _ = previous
+            if revision <= previous_revision:
+                self._caption_update_ids.move_to_end(key)
+                return False
+
+        self._caption_update_ids[key] = (revision, now)
+        self._caption_update_ids.move_to_end(key)
+        while len(self._caption_update_ids) > CAPTION_REVISION_LIMIT:
+            evicted = False
+            for candidate in tuple(self._caption_update_ids):
+                if candidate == key or self._card_lock_users.get(candidate, 0):
+                    continue
+                self._caption_update_ids.pop(candidate, None)
+                evicted = True
+                break
+            if not evicted:
+                break
+        return True
 
     async def handle_edited_photo(
         self,
@@ -203,10 +333,54 @@ class SalesPhotoService:
         chat_id = _chat_id(message)
         message_id = getattr(message, "message_id", None)
         photos = tuple(getattr(message, "photo", None) or ())
-        if chat_id != self.settings.chat_id or message_id is None or not photos:
+        if chat_id != self.settings.chat_id or message_id is None:
             return
         message_id = int(message_id)
-        if not self.repository.is_replacement(chat_id, message_id):
+        source_key = (chat_id, message_id)
+        try:
+            is_replacement = self.repository.is_replacement(chat_id, message_id)
+        except Exception as exc:
+            if source_key in self._active_sources:
+                self._cancelled_sources.add(source_key)
+            logger.warning(
+                "sales_photo_edit_classify_failed chat_id=%s message_id=%s "
+                "error_type=%s",
+                chat_id,
+                message_id,
+                _error_code(exc),
+            )
+            return
+        if not is_replacement:
+            try:
+                cancelled, replacement_id = self.repository.cancel_edited_source(
+                    chat_id,
+                    message_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "sales_photo_source_edit_quarantine_failed chat_id=%s "
+                    "message_id=%s error_type=%s",
+                    chat_id,
+                    message_id,
+                    _error_code(exc),
+                )
+                if source_key in self._active_sources:
+                    self._cancelled_sources.add(source_key)
+                return
+            if cancelled:
+                self._cancelled_sources.add(source_key)
+                logger.info(
+                    "sales_photo_source_edit_quarantined chat_id=%s message_id=%s",
+                    chat_id,
+                    message_id,
+                )
+                if replacement_id is not None:
+                    await self._delete_duplicate(bot, chat_id, replacement_id)
+            elif source_key in self._active_sources:
+                self._cancelled_sources.add(source_key)
+            return
+
+        if not photos:
             return
 
         key = (chat_id, message_id)
@@ -214,30 +388,20 @@ class SalesPhotoService:
             revision = int(update_id) if update_id is not None else None
         except (TypeError, ValueError):
             revision = None
-        if revision is not None:
-            previous = self._caption_update_ids.get(key)
-            if previous is None or revision > previous:
-                self._caption_update_ids[key] = revision
-                if key in self._caption_reapply_ids:
-                    self._caption_reapply_ids[key] = revision
+        if revision is not None and not self._register_caption_revision(
+            key, revision
+        ):
+            return
 
         async with self._card_lock(key):
             if revision is not None:
-                latest_revision = self._caption_update_ids.get(key, revision)
-                if revision < latest_revision:
-                    if key in self._caption_reapply_ids:
-                        self._caption_reapply_ids[key] = latest_revision
+                latest = self._caption_update_ids.get(key)
+                if latest is not None and revision < latest[0]:
                     return
             normalized = normalize_caption_phone_field(
                 getattr(message, "caption", None),
                 getattr(message, "caption_entities", None),
             )
-            force_reapply = (
-                revision is not None
-                and self._caption_reapply_ids.get(key) == revision
-            )
-            if not normalized.changed and not force_reapply:
-                return
             try:
                 await bot.edit_message_caption(
                     chat_id=chat_id,
@@ -272,16 +436,6 @@ class SalesPhotoService:
                     message_id,
                     _error_code(exc),
                 )
-            finally:
-                if revision is not None:
-                    latest_revision = self._caption_update_ids.get(key, revision)
-                    if latest_revision > revision:
-                        # This full-caption write may have landed after a newer
-                        # manual edit. Force the newest queued snapshot to be
-                        # written back even when its phone was already canonical.
-                        self._caption_reapply_ids[key] = latest_revision
-                    elif self._caption_reapply_ids.get(key) == revision:
-                        self._caption_reapply_ids.pop(key, None)
 
     def _current_card_markup(
         self,
@@ -320,23 +474,20 @@ class SalesPhotoService:
             signature=signature,
         )
 
-    async def handle_photo(self, message: Message | Any, bot: Bot | Any) -> None:
+    def _claim_photo(self, message: Message | Any) -> _PhotoClaim | None:
         chat_id = _chat_id(message)
         source_message_id = getattr(message, "message_id", None)
         photos = tuple(getattr(message, "photo", None) or ())
         if chat_id != self.settings.chat_id or source_message_id is None or not photos:
-            return
-        if str(getattr(message, "caption", "") or "").startswith(BOT_CARD_MARKER):
-            await self._reconcile_generated_post(message, bot)
-            return
+            return None
         source_message_id = int(source_message_id)
         if self.repository.is_replacement(chat_id, source_message_id):
-            return
+            return None
         sender = getattr(message, "from_user", None)
         if bool(getattr(sender, "is_bot", False)):
-            return
+            return None
         if self.bot_id is not None and getattr(sender, "id", None) == self.bot_id:
-            return
+            return None
 
         photo = max(
             photos,
@@ -349,30 +500,54 @@ class SalesPhotoService:
         file_id = str(getattr(photo, "file_id", "") or "")
         file_unique_id = str(getattr(photo, "file_unique_id", "") or file_id)
         if not file_id:
-            return
+            return None
 
         key = (chat_id, source_message_id)
+        if key in self._cancelled_sources:
+            return None
+        if not self.repository.claim_photo(
+            chat_id,
+            source_message_id,
+            file_unique_id,
+            source_file_id=file_id,
+            client_caption=getattr(message, "caption", None),
+            message_thread_id=getattr(message, "message_thread_id", None),
+        ):
+            return None
+        self._active_sources.add(key)
+        return _PhotoClaim(
+            chat_id=chat_id,
+            source_message_id=source_message_id,
+            file_id=file_id,
+            client_caption=getattr(message, "caption", None),
+            message_thread_id=getattr(message, "message_thread_id", None),
+            photo=photo,
+        )
+
+    async def _run_photo_claim(
+        self,
+        claim: _PhotoClaim,
+        bot: Bot | Any,
+    ) -> None:
+        key = (claim.chat_id, claim.source_message_id)
         lock = self._photo_locks.setdefault(key, asyncio.Lock())
         self._photo_lock_users[key] = self._photo_lock_users.get(key, 0) + 1
         try:
             async with lock:
-                if not self.repository.claim_photo(
-                    chat_id,
-                    source_message_id,
-                    file_unique_id,
-                    source_file_id=file_id,
-                    client_caption=getattr(message, "caption", None),
-                    message_thread_id=getattr(message, "message_thread_id", None),
-                ):
+                if key in self._cancelled_sources:
+                    try:
+                        self.repository.preserve_after_source_edit(*key)
+                    except Exception:
+                        pass
                     return
                 await self._process_claimed_photo(
                     bot,
-                    chat_id,
-                    source_message_id,
-                    file_id,
-                    getattr(message, "caption", None),
-                    getattr(message, "message_thread_id", None),
-                    photo,
+                    claim.chat_id,
+                    claim.source_message_id,
+                    claim.file_id,
+                    claim.client_caption,
+                    claim.message_thread_id,
+                    claim.photo,
                 )
         finally:
             remaining = self._photo_lock_users.get(key, 1) - 1
@@ -382,6 +557,22 @@ class SalesPhotoService:
                     self._photo_locks.pop(key, None)
             else:
                 self._photo_lock_users[key] = remaining
+
+    async def handle_photo(self, message: Message | Any, bot: Bot | Any) -> None:
+        if str(getattr(message, "caption", "") or "").startswith(
+            BOT_CARD_MARKER
+        ):
+            await self._reconcile_generated_post(message, bot)
+            return
+        claim = self._claim_photo(message)
+        if claim is None:
+            return
+        try:
+            await self._run_photo_claim(claim, bot)
+        finally:
+            key = (claim.chat_id, claim.source_message_id)
+            self._active_sources.discard(key)
+            self._cancelled_sources.discard(key)
 
     async def _process_claimed_photo(
         self,
@@ -393,7 +584,46 @@ class SalesPhotoService:
         message_thread_id: int | None,
         photo: object | None = None,
     ) -> None:
-        identifiers = await self._read_identifiers(photo, file_id, bot)
+        try:
+            identifiers = await self._read_identifiers(photo, file_id, bot)
+        except asyncio.CancelledError:
+            try:
+                self.repository.mark_failed(
+                    chat_id,
+                    source_message_id,
+                    "cancelled_before_send",
+                )
+            except Exception:
+                pass
+            raise
+        key = (chat_id, source_message_id)
+        if key in self._cancelled_sources:
+            try:
+                self.repository.preserve_after_source_edit(*key)
+            except Exception:
+                pass
+            return
+        try:
+            if not self.repository.source_accepts_replacement(
+                chat_id,
+                source_message_id,
+            ):
+                logger.info(
+                    "sales_photo_processing_cancelled chat_id=%s "
+                    "source_message_id=%s",
+                    chat_id,
+                    source_message_id,
+                )
+                return
+        except Exception as exc:
+            logger.warning(
+                "sales_photo_publish_guard_failed chat_id=%s source_message_id=%s "
+                "error_type=%s",
+                chat_id,
+                source_message_id,
+                _error_code(exc),
+            )
+            return
         caption = BOT_CARD_MARKER + build_caption(client_caption, identifiers)
         initial_generation = 0
         source_signature = self.repository.callback_signature(
@@ -415,10 +645,77 @@ class SalesPhotoService:
         if message_thread_id is not None:
             send_kwargs["message_thread_id"] = int(message_thread_id)
 
+        if key in self._cancelled_sources:
+            try:
+                self.repository.preserve_after_source_edit(*key)
+            except Exception:
+                pass
+            return
+        try:
+            if not self.repository.mark_send_started(chat_id, source_message_id):
+                return
+        except Exception as exc:
+            logger.warning(
+                "sales_photo_send_guard_failed chat_id=%s source_message_id=%s "
+                "error_type=%s",
+                chat_id,
+                source_message_id,
+                _error_code(exc),
+            )
+            return
+
         try:
             replacement = await self._send_photo(bot, send_kwargs)
-        except asyncio.CancelledError:
+        except _RetryWaitCancelled:
+            try:
+                self.repository.mark_send_rejected(
+                    chat_id,
+                    source_message_id,
+                    "cancelled_retry_wait",
+                )
+            except Exception:
+                pass
             raise
+        except asyncio.CancelledError:
+            try:
+                self.repository.mark_ambiguous_send(
+                    chat_id,
+                    source_message_id,
+                    "cancelled_during_send",
+                )
+            except Exception:
+                pass
+            raise
+        except RetryAfter:
+            try:
+                self.repository.mark_send_rejected(
+                    chat_id,
+                    source_message_id,
+                    "RetryAfter",
+                )
+            except Exception:
+                pass
+            logger.warning(
+                "sales_photo_repost_deferred chat_id=%s source_message_id=%s",
+                chat_id,
+                source_message_id,
+            )
+            return
+        except BadRequest as exc:
+            try:
+                self.repository.mark_send_rejected(
+                    chat_id,
+                    source_message_id,
+                    _error_code(exc),
+                )
+            except Exception:
+                pass
+            logger.warning(
+                "sales_photo_repost_rejected chat_id=%s source_message_id=%s",
+                chat_id,
+                source_message_id,
+            )
+            return
         except Exception as exc:
             # Once sendPhoto has been invoked, a transport failure can mean that
             # Telegram accepted the post but the response was lost. Bots do not
@@ -478,6 +775,22 @@ class SalesPhotoService:
             )
             return
 
+        # Keep the original briefly so Telegram can dispatch a source edit that
+        # happened while OCR or sendPhoto was running. on_photo itself runs this
+        # work in a background task, leaving update-processor slots available.
+        await asyncio.sleep(max(0, self.settings.source_edit_grace_seconds))
+        if key in self._cancelled_sources:
+            try:
+                self.repository.preserve_after_source_edit(*key)
+            except Exception:
+                pass
+            return
+        if not self.repository.source_pending_deletion(
+            chat_id,
+            source_message_id,
+            replacement_message_id,
+        ):
+            return
         await self._delete_source(
             bot,
             chat_id=chat_id,
@@ -496,13 +809,18 @@ class SalesPhotoService:
                 retry_seconds = _retry_after_seconds(exc)
                 if retry_seconds > 60:
                     raise
-                await asyncio.sleep(retry_seconds)
+                try:
+                    await asyncio.sleep(retry_seconds)
+                except asyncio.CancelledError as cancelled:
+                    raise _RetryWaitCancelled() from cancelled
         raise RuntimeError("unreachable send retry state")
 
     async def _reconcile_generated_post(
         self,
         message: Message | Any,
         bot: Bot | Any,
+        *,
+        allow_source_delete: bool = True,
     ) -> None:
         chat_id = _chat_id(message)
         replacement_message_id = getattr(message, "message_id", None)
@@ -553,6 +871,21 @@ class SalesPhotoService:
                 replacement_message_id,
             )
             return
+        if not allow_source_delete:
+            logger.info(
+                "sales_photo_reconcile_delete_deferred chat_id=%s "
+                "source_message_id=%s",
+                chat_id,
+                source_message_id,
+            )
+            return
+        await asyncio.sleep(max(0, self.settings.source_edit_grace_seconds))
+        if not self.repository.source_pending_deletion(
+            chat_id,
+            source_message_id,
+            replacement_message_id,
+        ):
+            return
         await self._delete_source(
             bot,
             chat_id=chat_id,
@@ -589,6 +922,21 @@ class SalesPhotoService:
         chat_id: int,
         source_message_id: int,
     ) -> None:
+        try:
+            if not self.repository.begin_source_delete(
+                chat_id,
+                source_message_id,
+            ):
+                return
+        except Exception as exc:
+            logger.warning(
+                "sales_photo_source_delete_guard_failed chat_id=%s "
+                "source_message_id=%s error_type=%s",
+                chat_id,
+                source_message_id,
+                _error_code(exc),
+            )
+            return
         try:
             await bot.delete_message(chat_id, source_message_id)
         except Exception as exc:
@@ -714,12 +1062,37 @@ class SalesPhotoService:
             is_back = data == BACK_CALLBACK or data.startswith(
                 f"{BACK_CALLBACK}:"
             )
-            if (
-                ledger_generation is None
-                or callback_generation < known_generation
-                or is_back != bool(callback_generation % 2)
+            if ledger_generation is None or is_back != bool(
+                callback_generation % 2
             ):
                 await query.answer("Кнопка устарела", show_alert=True)
+                return
+            if callback_generation < known_generation:
+                try:
+                    await self._edit_callback_markup(
+                        query,
+                        self._current_card_markup(
+                            chat_id,
+                            int(message_id),
+                            message,
+                        ),
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "sales_photo_stale_keyboard_repair_failed chat_id=%s "
+                        "message_id=%s error_type=%s",
+                        chat_id,
+                        message_id,
+                        _error_code(exc),
+                    )
+                    await query.answer("Кнопка устарела", show_alert=True)
+                    return
+                await query.answer(
+                    "Клавиатура обновлена. Нажмите ещё раз.",
+                    show_alert=True,
+                )
                 return
             if is_back:
                 await self._handle_back(
@@ -768,6 +1141,22 @@ class SalesPhotoService:
             "owner",
         }
 
+    async def _edit_callback_markup(self, query: Any, reply_markup: Any) -> None:
+        """Retry an idempotent keyboard edit after one ambiguous network error."""
+
+        for attempt in range(2):
+            try:
+                await query.edit_message_reply_markup(reply_markup=reply_markup)
+                return
+            except BadRequest as exc:
+                if "message is not modified" in str(exc).casefold():
+                    return
+                raise
+            except NetworkError:
+                if attempt:
+                    raise
+        raise RuntimeError("unreachable reply-markup retry state")
+
     async def _handle_manager(
         self,
         query: Any,
@@ -786,6 +1175,7 @@ class SalesPhotoService:
         )
         callback_key = (chat_id, message_id)
         try:
+            manager_before = self.repository.selected_manager(chat_id, message_id)
             reserved = self.repository.reserve_ui_transition(
                 chat_id,
                 message_id,
@@ -807,58 +1197,75 @@ class SalesPhotoService:
         self._ui_generations[callback_key] = next_generation
         self._pending_managers[callback_key] = manager
         try:
-            await query.edit_message_reply_markup(
-                reply_markup=back_keyboard(
-                    source_message_id=source_message_id,
-                    generation=next_generation,
-                    signature=next_signature,
-                    manager=manager,
-                ),
-            )
-        except Exception as exc:
-            if not isinstance(exc, NetworkError):
-                try:
-                    released = self.repository.release_ui_transition(
-                        chat_id,
-                        message_id,
-                        callback_generation,
-                    )
-                except Exception:
-                    released = False
-                if released:
-                    self._ui_generations.pop(callback_key, None)
-                    self._pending_managers.pop(callback_key, None)
-            await query.answer("Не удалось обновить карточку", show_alert=True)
-            logger.warning(
-                "sales_photo_manager_edit_failed chat_id=%s message_id=%s error_type=%s",
-                chat_id,
-                message_id,
-                _error_code(exc),
-            )
-            return
-        try:
             persisted = self.repository.commit_reserved_manager_selection(
                 chat_id,
                 message_id,
                 manager,
                 callback_generation,
             )
-            if not persisted:
-                logger.warning(
-                    "sales_photo_manager_ledger_stale chat_id=%s message_id=%s",
-                    chat_id,
-                    message_id,
-                )
-            else:
-                self._ui_generations.pop(callback_key, None)
-                self._pending_managers.pop(callback_key, None)
         except Exception as exc:
+            persisted = False
             logger.warning(
-                "sales_photo_manager_ledger_failed chat_id=%s message_id=%s error_type=%s",
+                "sales_photo_manager_ledger_failed chat_id=%s message_id=%s "
+                "error_type=%s",
                 chat_id,
                 message_id,
                 _error_code(exc),
             )
+        if not persisted:
+            try:
+                rolled_back = self.repository.rollback_ui_transition(
+                    chat_id,
+                    message_id,
+                    callback_generation,
+                    manager_before,
+                )
+            except Exception:
+                rolled_back = False
+            if rolled_back:
+                self._ui_generations.pop(callback_key, None)
+                self._pending_managers.pop(callback_key, None)
+            await query.answer("Не удалось обновить карточку", show_alert=True)
+            return
+        desired_markup = back_keyboard(
+            source_message_id=source_message_id,
+            generation=next_generation,
+            signature=next_signature,
+            manager=manager,
+        )
+        try:
+            await self._edit_callback_markup(query, desired_markup)
+        except Exception as exc:
+            ambiguous = isinstance(exc, NetworkError) and not isinstance(
+                exc, BadRequest
+            )
+            if not ambiguous:
+                try:
+                    rolled_back = self.repository.rollback_ui_transition(
+                        chat_id,
+                        message_id,
+                        callback_generation,
+                        manager_before,
+                    )
+                except Exception:
+                    rolled_back = False
+                if rolled_back:
+                    self._ui_generations.pop(callback_key, None)
+                    self._pending_managers.pop(callback_key, None)
+            else:
+                self._ui_generations.pop(callback_key, None)
+                self._pending_managers.pop(callback_key, None)
+            await query.answer("Не удалось обновить карточку", show_alert=True)
+            logger.warning(
+                "sales_photo_manager_edit_failed chat_id=%s message_id=%s "
+                "error_type=%s",
+                chat_id,
+                message_id,
+                _error_code(exc),
+            )
+            return
+        self._ui_generations.pop(callback_key, None)
+        self._pending_managers.pop(callback_key, None)
         await query.answer(f"Выбран менеджер: {manager}")
 
     async def _handle_back(
@@ -878,6 +1285,7 @@ class SalesPhotoService:
         )
         callback_key = (chat_id, message_id)
         try:
+            manager_before = self.repository.selected_manager(chat_id, message_id)
             reserved = self.repository.reserve_ui_transition(
                 chat_id,
                 message_id,
@@ -898,25 +1306,59 @@ class SalesPhotoService:
             return
         self._ui_generations[callback_key] = next_generation
         try:
-            await query.edit_message_reply_markup(
-                reply_markup=manager_keyboard(
-                    source_message_id=source_message_id,
-                    generation=next_generation,
-                    signature=next_signature,
-                ),
+            persisted = self.repository.commit_reserved_manager_clear(
+                chat_id,
+                message_id,
+                callback_generation,
             )
         except Exception as exc:
-            if not isinstance(exc, NetworkError):
+            persisted = False
+            logger.warning(
+                "sales_photo_back_ledger_failed chat_id=%s message_id=%s "
+                "error_type=%s",
+                chat_id,
+                message_id,
+                _error_code(exc),
+            )
+        if not persisted:
+            try:
+                rolled_back = self.repository.rollback_ui_transition(
+                    chat_id,
+                    message_id,
+                    callback_generation,
+                    manager_before,
+                )
+            except Exception:
+                rolled_back = False
+            if rolled_back:
+                self._ui_generations.pop(callback_key, None)
+            await query.answer("Не удалось вернуть список", show_alert=True)
+            return
+        desired_markup = manager_keyboard(
+            source_message_id=source_message_id,
+            generation=next_generation,
+            signature=next_signature,
+        )
+        try:
+            await self._edit_callback_markup(query, desired_markup)
+        except Exception as exc:
+            ambiguous = isinstance(exc, NetworkError) and not isinstance(
+                exc, BadRequest
+            )
+            if not ambiguous:
                 try:
-                    released = self.repository.release_ui_transition(
+                    rolled_back = self.repository.rollback_ui_transition(
                         chat_id,
                         message_id,
                         callback_generation,
+                        manager_before,
                     )
                 except Exception:
-                    released = False
-                if released:
+                    rolled_back = False
+                if rolled_back:
                     self._ui_generations.pop(callback_key, None)
+            else:
+                self._ui_generations.pop(callback_key, None)
             await query.answer("Не удалось вернуть список", show_alert=True)
             logger.warning(
                 "sales_photo_back_edit_failed chat_id=%s message_id=%s error_type=%s",
@@ -925,28 +1367,8 @@ class SalesPhotoService:
                 _error_code(exc),
             )
             return
-        try:
-            persisted = self.repository.commit_reserved_manager_clear(
-                chat_id,
-                message_id,
-                callback_generation,
-            )
-            if not persisted:
-                logger.warning(
-                    "sales_photo_back_ledger_stale chat_id=%s message_id=%s",
-                    chat_id,
-                    message_id,
-                )
-            else:
-                self._ui_generations.pop(callback_key, None)
-                self._pending_managers.pop(callback_key, None)
-        except Exception as exc:
-            logger.warning(
-                "sales_photo_back_ledger_failed chat_id=%s message_id=%s error_type=%s",
-                chat_id,
-                message_id,
-                _error_code(exc),
-            )
+        self._ui_generations.pop(callback_key, None)
+        self._pending_managers.pop(callback_key, None)
         await query.answer()
 
     async def retry_pending_deletions(self, bot: Bot | Any) -> None:
@@ -963,6 +1385,12 @@ class SalesPhotoService:
             if updated_at.tzinfo is None:
                 updated_at = updated_at.replace(tzinfo=UTC)
             if (now - updated_at).total_seconds() < delay:
+                continue
+            if not self.repository.source_pending_deletion(
+                job.chat_id,
+                job.source_message_id,
+                job.replacement_message_id,
+            ):
                 continue
             await self._delete_source(
                 bot,
@@ -997,14 +1425,19 @@ class SalesPhotoService:
                         job.attempts,
                     ):
                         continue
-                    await self._process_claimed_photo(
-                        bot,
-                        job.chat_id,
-                        job.source_message_id,
-                        job.source_file_id,
-                        job.client_caption,
-                        job.message_thread_id,
-                    )
+                    self._active_sources.add(key)
+                    try:
+                        await self._process_claimed_photo(
+                            bot,
+                            job.chat_id,
+                            job.source_message_id,
+                            job.source_file_id,
+                            job.client_caption,
+                            job.message_thread_id,
+                        )
+                    finally:
+                        self._active_sources.discard(key)
+                        self._cancelled_sources.discard(key)
                     self._touch_heartbeat()
                     return
             finally:
@@ -1039,14 +1472,61 @@ class SalesPhotoService:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(datetime.now(UTC).isoformat(), encoding="utf-8")
 
-    async def _maintenance(self, bot: Bot | Any) -> None:
+    def _safe_touch_heartbeat(self) -> None:
+        try:
+            self._touch_heartbeat()
+        except Exception as exc:
+            logger.warning(
+                "sales_photo_heartbeat_failed error_type=%s", _error_code(exc)
+            )
+
+    async def _wait_for_startup_drain(
+        self,
+        startup_ready: Callable[[], bool] | None,
+        update_queue: asyncio.Queue[Any] | Any | None,
+    ) -> None:
+        if startup_ready is None:
+            return
+
+        # post_init runs before Updater.start_polling and Application.start.
+        # Stay fail-closed until the polling bot has observed a successful empty
+        # long-poll response, proving that the pre-start Telegram backlog was
+        # fetched. Keep the heartbeat fresh while Telegram is unreachable.
         while True:
+            self._safe_touch_heartbeat()
             try:
-                self._touch_heartbeat()
+                if startup_ready():
+                    break
             except Exception as exc:
                 logger.warning(
-                    "sales_photo_heartbeat_failed error_type=%s", _error_code(exc)
+                    "sales_photo_startup_gate_failed error_type=%s",
+                    _error_code(exc),
                 )
+            await asyncio.sleep(1)
+
+        if update_queue is not None:
+            await update_queue.join()
+
+        # Close the small hand-off window between the successful empty poll and
+        # the next Bot API request, then wait for everything fetched in that
+        # window to finish before enabling retries or deletions.
+        self._safe_touch_heartbeat()
+        await asyncio.sleep(self.settings.startup_drain_seconds)
+        if update_queue is not None:
+            await update_queue.join()
+        self._safe_touch_heartbeat()
+        logger.info("sales_photo_startup_drain_complete")
+
+    async def _maintenance(
+        self,
+        bot: Bot | Any,
+        startup_ready: Callable[[], bool] | None = None,
+        update_queue: asyncio.Queue[Any] | Any | None = None,
+    ) -> None:
+        await self._wait_for_startup_drain(startup_ready, update_queue)
+        self._startup_gate_active = False
+        while True:
+            self._safe_touch_heartbeat()
             try:
                 stale_before = utc_now() - timedelta(
                     seconds=(
@@ -1093,10 +1573,18 @@ class SalesPhotoService:
                     )
             await asyncio.sleep(min(self.settings.delete_retry_seconds, 60))
 
-    def start_maintenance(self, bot: Bot | Any) -> None:
+    def start_maintenance(
+        self,
+        bot: Bot | Any,
+        *,
+        startup_ready: Callable[[], bool] | None = None,
+        update_queue: asyncio.Queue[Any] | Any | None = None,
+    ) -> None:
         if self._maintenance_task is None or self._maintenance_task.done():
+            self._startup_gate_active = startup_ready is not None
             self._maintenance_task = asyncio.create_task(
-                self._maintenance(bot), name="sales-photo-maintenance"
+                self._maintenance(bot, startup_ready, update_queue),
+                name="sales-photo-maintenance",
             )
 
     async def stop(self) -> None:
@@ -1108,6 +1596,25 @@ class SalesPhotoService:
             except asyncio.CancelledError:
                 pass
             self._maintenance_task = None
+        tasks = tuple(self._photo_tasks)
+        active_before_stop = tuple(self._active_sources)
+        for photo_task in tasks:
+            photo_task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._photo_tasks.clear()
+        for chat_id, source_message_id in active_before_stop:
+            try:
+                self.repository.mark_failed(
+                    chat_id,
+                    source_message_id,
+                    "cancelled_before_worker_start",
+                )
+            except Exception:
+                pass
+        self._active_sources.clear()
+        self._cancelled_sources.clear()
+        self._startup_gate_active = False
         close = getattr(self.recognizer, "aclose", None)
         if close is not None:
             await close()

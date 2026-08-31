@@ -393,14 +393,16 @@ class SalesPhotoRepository:
                 db.execute(
                     """INSERT INTO sales_photo_jobs(
                            chat_id,source_message_id,source_file_unique_id,
-                           encrypted_payload,status,created_at,updated_at
-                       ) VALUES (?,?,?,?,?,?,?)""",
+                           encrypted_payload,status,last_error_code,
+                           created_at,updated_at
+                       ) VALUES (?,?,?,?,?,?,?,?)""",
                     (
                         int(chat_id),
                         int(source_message_id),
                         str(source_file_unique_id or "unknown")[:200],
                         encrypted_payload,
                         "processing",
+                        "before_send",
                         now,
                         now,
                     ),
@@ -410,7 +412,7 @@ class SalesPhotoRepository:
             except sqlite3.IntegrityError:
                 cursor = db.execute(
                     """UPDATE sales_photo_jobs
-                       SET status='processing',last_error_code=NULL,
+                       SET status='processing',last_error_code='before_send',
                            encrypted_payload=COALESCE(?,encrypted_payload),
                            processing_attempts=processing_attempts+1,updated_at=?
                        WHERE chat_id=? AND source_message_id=?
@@ -553,6 +555,30 @@ class SalesPhotoRepository:
             )
             db.commit()
 
+    def begin_source_delete(
+        self,
+        chat_id: int,
+        source_message_id: int,
+        at: datetime | None = None,
+    ) -> bool:
+        """Persist that source deletion may now be in flight."""
+
+        with self._connect() as db:
+            cursor = db.execute(
+                """UPDATE sales_photo_jobs
+                   SET status='delete_pending',last_error_code=NULL,updated_at=?
+                   WHERE chat_id=? AND source_message_id=?
+                     AND replacement_message_id IS NOT NULL
+                     AND status IN ('reposted','delete_pending')""",
+                (
+                    _iso(at or utc_now()),
+                    int(chat_id),
+                    int(source_message_id),
+                ),
+            )
+            db.commit()
+            return cursor.rowcount == 1
+
     def mark_failed(
         self,
         chat_id: int,
@@ -568,7 +594,8 @@ class SalesPhotoRepository:
                            WHEN processing_attempts>=3 THEN NULL
                            ELSE encrypted_payload
                        END
-                   WHERE chat_id=? AND source_message_id=? AND status='processing'""",
+                   WHERE chat_id=? AND source_message_id=? AND status='processing'
+                     AND last_error_code='before_send'""",
                 (
                     str(error_code or "send_failed")[:80],
                     _iso(at or utc_now()),
@@ -602,6 +629,238 @@ class SalesPhotoRepository:
             )
             db.commit()
 
+    def mark_send_started(
+        self,
+        chat_id: int,
+        source_message_id: int,
+        at: datetime | None = None,
+    ) -> bool:
+        """Persist the point after which a send cancellation is ambiguous."""
+
+        with self._connect() as db:
+            cursor = db.execute(
+                """UPDATE sales_photo_jobs
+                   SET last_error_code='send_started',updated_at=?
+                   WHERE chat_id=? AND source_message_id=?
+                     AND status='processing'
+                     AND replacement_message_id IS NULL
+                     AND last_error_code='before_send'""",
+                (
+                    _iso(at or utc_now()),
+                    int(chat_id),
+                    int(source_message_id),
+                ),
+            )
+            db.commit()
+            return cursor.rowcount == 1
+
+    def mark_send_rejected(
+        self,
+        chat_id: int,
+        source_message_id: int,
+        error_code: str,
+        at: datetime | None = None,
+    ) -> bool:
+        """Make a definitively rejected Telegram send safe to retry."""
+
+        with self._connect() as db:
+            cursor = db.execute(
+                """UPDATE sales_photo_jobs
+                   SET status='failed',last_error_code=?,updated_at=?,
+                       encrypted_payload=CASE
+                           WHEN processing_attempts>=3 THEN NULL
+                           ELSE encrypted_payload
+                       END
+                   WHERE chat_id=? AND source_message_id=?
+                     AND status='processing'
+                     AND replacement_message_id IS NULL
+                     AND last_error_code='send_started'""",
+                (
+                    str(error_code or "send_rejected")[:80],
+                    _iso(at or utc_now()),
+                    int(chat_id),
+                    int(source_message_id),
+                ),
+            )
+            db.commit()
+            return cursor.rowcount == 1
+
+    def cancel_edited_source(
+        self,
+        chat_id: int,
+        source_message_id: int,
+        at: datetime | None = None,
+    ) -> tuple[bool, int | None]:
+        """Quarantine a source that changed after its processing was claimed.
+
+        If a replacement was already recorded but the source still exists, its
+        cleanup is queued and the replacement mapping is removed atomically.
+        The caller should also attempt that cleanup immediately.
+        """
+
+        now = _iso(at or utc_now())
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                """SELECT status,replacement_message_id
+                   FROM sales_photo_jobs
+                   WHERE chat_id=? AND source_message_id=?""",
+                (int(chat_id), int(source_message_id)),
+            ).fetchone()
+            if row is None:
+                # Telegram can deliver an edited_channel_post before the
+                # corresponding channel_post is dispatched locally after a
+                # restart. Message IDs are never reused inside a chat, so a
+                # durable tombstone safely prevents the stale original from
+                # being claimed later.
+                db.execute(
+                    """INSERT INTO sales_photo_jobs(
+                           chat_id,source_message_id,source_file_unique_id,
+                           encrypted_payload,replacement_message_id,manager,
+                           ui_generation,status,delete_attempts,
+                           processing_attempts,last_error_code,
+                           created_at,updated_at
+                       ) VALUES (?,?,?,NULL,NULL,NULL,0,'complete',0,3,?,?,?)""",
+                    (
+                        int(chat_id),
+                        int(source_message_id),
+                        "edited-before-claim",
+                        "source_edited_before_claim",
+                        now,
+                        now,
+                    ),
+                )
+                db.commit()
+                return True, None
+            status = str(row["status"])
+            replacement_value = row["replacement_message_id"]
+            replacement_id = (
+                int(replacement_value) if replacement_value is not None else None
+            )
+            if status not in {
+                "processing",
+                "failed",
+                "reposted",
+                "delete_pending",
+            }:
+                db.rollback()
+                return False, None
+            if status == "delete_pending" and replacement_id is not None:
+                # A delete request may already have reached Telegram. Keep the
+                # replacement as a fallback, stop retries, and never risk
+                # deleting both copies after a late edited_channel_post.
+                cursor = db.execute(
+                    """UPDATE sales_photo_jobs
+                       SET status='complete',encrypted_payload=NULL,
+                           processing_attempts=3,
+                           last_error_code='source_edited_delete_ambiguous',
+                           updated_at=?
+                       WHERE chat_id=? AND source_message_id=?
+                         AND status='delete_pending'
+                         AND replacement_message_id=?""",
+                    (
+                        now,
+                        int(chat_id),
+                        int(source_message_id),
+                        replacement_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    db.rollback()
+                    return False, None
+                db.commit()
+                return True, None
+            if replacement_id is not None:
+                db.execute(
+                    """INSERT INTO sales_photo_duplicate_cleanup(
+                           chat_id,message_id,created_at,updated_at
+                       ) VALUES (?,?,?,?)
+                       ON CONFLICT(chat_id,message_id) DO NOTHING""",
+                    (int(chat_id), replacement_id, now, now),
+                )
+            cursor = db.execute(
+                """UPDATE sales_photo_jobs
+                   SET status='complete',replacement_message_id=NULL,
+                       encrypted_payload=NULL,manager=NULL,ui_generation=0,
+                       processing_attempts=3,last_error_code='source_edited',
+                       updated_at=?
+                   WHERE chat_id=? AND source_message_id=?
+                     AND status=?""",
+                (
+                    now,
+                    int(chat_id),
+                    int(source_message_id),
+                    status,
+                ),
+            )
+            if cursor.rowcount != 1:
+                db.rollback()
+                return False, None
+            db.commit()
+            return True, replacement_id
+
+    def preserve_after_source_edit(
+        self,
+        chat_id: int,
+        source_message_id: int,
+        at: datetime | None = None,
+    ) -> bool:
+        """Stop stale work while preserving any replacement as a safe fallback."""
+
+        with self._connect() as db:
+            cursor = db.execute(
+                """UPDATE sales_photo_jobs
+                   SET status='complete',encrypted_payload=NULL,
+                       processing_attempts=3,
+                       last_error_code='source_edit_fail_safe',updated_at=?
+                   WHERE chat_id=? AND source_message_id=?
+                     AND status IN (
+                         'processing','failed','reposted','delete_pending'
+                     )""",
+                (
+                    _iso(at or utc_now()),
+                    int(chat_id),
+                    int(source_message_id),
+                ),
+            )
+            db.commit()
+            return cursor.rowcount == 1
+
+    def source_accepts_replacement(
+        self,
+        chat_id: int,
+        source_message_id: int,
+    ) -> bool:
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT 1 FROM sales_photo_jobs
+                   WHERE chat_id=? AND source_message_id=?
+                     AND status='processing'
+                     AND replacement_message_id IS NULL""",
+                (int(chat_id), int(source_message_id)),
+            ).fetchone()
+        return row is not None
+
+    def source_pending_deletion(
+        self,
+        chat_id: int,
+        source_message_id: int,
+        replacement_message_id: int,
+    ) -> bool:
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT 1 FROM sales_photo_jobs
+                   WHERE chat_id=? AND source_message_id=?
+                     AND replacement_message_id=?
+                     AND status IN ('reposted','delete_pending')""",
+                (
+                    int(chat_id),
+                    int(source_message_id),
+                    int(replacement_message_id),
+                ),
+            ).fetchone()
+        return row is not None
+
     def fail_stale_processing(
         self,
         chat_id: int,
@@ -609,7 +868,18 @@ class SalesPhotoRepository:
         at: datetime | None = None,
     ) -> int:
         with self._connect() as db:
-            cursor = db.execute(
+            now = _iso(at or utc_now())
+            retryable = db.execute(
+                """UPDATE sales_photo_jobs
+                   SET status='failed',last_error_code='stale_before_send',
+                       updated_at=?
+                   WHERE chat_id=? AND status='processing'
+                     AND replacement_message_id IS NULL
+                     AND last_error_code='before_send'
+                     AND updated_at<?""",
+                (now, int(chat_id), _iso(older_than)),
+            )
+            ambiguous = db.execute(
                 """UPDATE sales_photo_jobs
                    SET status='failed',processing_attempts=3,
                        last_error_code='stale_processing_ambiguous',updated_at=?,
@@ -618,13 +888,13 @@ class SalesPhotoRepository:
                      AND replacement_message_id IS NULL
                      AND updated_at<?""",
                 (
-                    _iso(at or utc_now()),
+                    now,
                     int(chat_id),
                     _iso(older_than),
                 ),
             )
             db.commit()
-            return int(cursor.rowcount)
+            return int(retryable.rowcount) + int(ambiguous.rowcount)
 
     def retryable_photos(
         self,
@@ -696,7 +966,7 @@ class SalesPhotoRepository:
             cursor = db.execute(
                 """UPDATE sales_photo_jobs
                    SET status='processing',processing_attempts=processing_attempts+1,
-                       last_error_code=NULL,updated_at=?
+                       last_error_code='before_send',updated_at=?
                    WHERE chat_id=? AND source_message_id=? AND status='failed'
                      AND replacement_message_id IS NULL
                      AND encrypted_payload IS NOT NULL
@@ -948,6 +1218,36 @@ class SalesPhotoRepository:
                      AND ui_generation=?
                      AND status IN ('reposted','delete_pending','complete')""",
                 (
+                    current_generation,
+                    _iso(at or utc_now()),
+                    int(chat_id),
+                    int(replacement_message_id),
+                    current_generation + 1,
+                ),
+            )
+            db.commit()
+            return cursor.rowcount == 1
+
+    def rollback_ui_transition(
+        self,
+        chat_id: int,
+        replacement_message_id: int,
+        callback_generation: int,
+        manager_before: str | None,
+        at: datetime | None = None,
+    ) -> bool:
+        """Atomically restore both generation and manager after a definite reject."""
+
+        current_generation = max(0, int(callback_generation))
+        with self._connect() as db:
+            cursor = db.execute(
+                """UPDATE sales_photo_jobs
+                   SET manager=?,ui_generation=?,updated_at=?
+                   WHERE chat_id=? AND replacement_message_id=?
+                     AND ui_generation=?
+                     AND status IN ('reposted','delete_pending','complete')""",
+                (
+                    str(manager_before)[:64] if manager_before else None,
                     current_generation,
                     _iso(at or utc_now()),
                     int(chat_id),

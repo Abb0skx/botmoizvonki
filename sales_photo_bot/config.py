@@ -74,6 +74,8 @@ class Settings:
     ocr_max_bytes: int = 12 * 1024 * 1024
     ocr_max_pixels: int = 32_000_000
     delete_retry_seconds: int = 30
+    source_edit_grace_seconds: int = 3
+    startup_drain_seconds: int = 10
     concurrent_updates: int = 4
     drop_pending_on_first_start: bool = True
     log_level: str = "INFO"
@@ -128,6 +130,12 @@ class Settings:
             ),
             delete_retry_seconds=_positive_int(
                 values, "SALES_PHOTO_DELETE_RETRY_SECONDS", 30
+            ),
+            source_edit_grace_seconds=_bounded_int(
+                values, "SALES_PHOTO_SOURCE_EDIT_GRACE_SECONDS", 3, 1, 30
+            ),
+            startup_drain_seconds=_bounded_int(
+                values, "SALES_PHOTO_STARTUP_DRAIN_SECONDS", 10, 1, 60
             ),
             concurrent_updates=_bounded_int(
                 values, "SALES_PHOTO_CONCURRENT_UPDATES", 4, 2, 16

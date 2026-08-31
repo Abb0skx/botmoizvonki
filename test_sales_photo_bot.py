@@ -4,6 +4,7 @@ import asyncio
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,9 +12,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from cryptography.fernet import Fernet
 from telegram import Chat, Message, MessageEntity, PhotoSize, Update
-from telegram.error import NetworkError, RetryAfter
+from telegram.error import BadRequest, NetworkError, RetryAfter
+from telegram.ext import ExtBot
 
-from sales_photo_bot.application import _prepare_polling, build_application, run
+from sales_photo_bot.application import (
+    StartupDrainBot,
+    _prepare_polling,
+    build_application,
+    run,
+)
 from sales_photo_bot.config import ConfigError, Settings
 from sales_photo_bot.formatting import (
     add_manager_selection,
@@ -59,6 +66,8 @@ def settings(tmp: Path, allowed: frozenset[int] = frozenset()) -> Settings:
         heartbeat_path=tmp / "heartbeat",
         allowed_user_ids=allowed,
         delete_retry_seconds=1,
+        source_edit_grace_seconds=0,
+        startup_drain_seconds=0,
     )
 
 
@@ -131,6 +140,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(parsed.allowed_user_ids, frozenset({1, 2}))
         self.assertNotIn(TOKEN, repr(parsed))
         self.assertEqual(parsed.heartbeat_path, Path("/tmp/sales-photo-heartbeat"))
+        self.assertEqual(parsed.source_edit_grace_seconds, 3)
+        self.assertEqual(parsed.startup_drain_seconds, 10)
 
     def test_settings_require_negative_chat_id_and_no_external_api_keys(self):
         with self.assertRaises(ConfigError):
@@ -147,6 +158,14 @@ class ConfigTests(unittest.TestCase):
             }
         )
         self.assertEqual(parsed.ocr_timeout_seconds, 30)
+        with self.assertRaises(ConfigError):
+            Settings.from_env(
+                {
+                    "SALES_PHOTO_BOT_TOKEN": TOKEN,
+                    "SALES_PHOTO_CHAT_ID": str(CHAT_ID),
+                    "SALES_PHOTO_STARTUP_DRAIN_SECONDS": "0",
+                }
+            )
 
 
 class CaptionFormattingTests(unittest.TestCase):
@@ -551,6 +570,333 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("🛒💵:", caption)
         bot.delete_message.assert_awaited_once_with(CHAT_ID, 10)
 
+    async def test_source_edit_during_ocr_cancels_stale_repost_and_delete(self):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        class BlockingRecognizer:
+            async def recognize(self, image_bytes: bytes, mime_type: str):
+                entered.set()
+                await release.wait()
+                return ProductIdentifiers(serial_number="OLD12345")
+
+        repo = SalesPhotoRepository(self.root / "db.sqlite")
+        service = SalesPhotoService(settings(self.root), repo, BlockingRecognizer())
+        bot = telegram_bot()
+        original = photo_message(caption="+998 90 123 45 67")
+        task = asyncio.create_task(service.handle_photo(original, bot))
+        await entered.wait()
+
+        edited = photo_message(caption="+998 91 765 43 21")
+        edited.photo = (
+            SimpleNamespace(
+                file_id="new-file",
+                file_unique_id="new-unique",
+                file_size=600,
+                width=1200,
+                height=1200,
+            ),
+        )
+        await service.handle_edited_photo(edited, bot, update_id=101)
+        release.set()
+        await task
+
+        bot.send_photo.assert_not_awaited()
+        bot.delete_message.assert_not_awaited()
+        with sqlite3.connect(repo.path) as db:
+            status, error = db.execute(
+                "SELECT status,last_error_code FROM sales_photo_jobs "
+                "WHERE chat_id=? AND source_message_id=?",
+                (CHAT_ID, 10),
+            ).fetchone()
+        self.assertEqual((status, error), ("complete", "source_edited"))
+
+    async def test_source_media_change_away_from_photo_cancels_stale_work(self):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        class BlockingRecognizer:
+            async def recognize(self, image_bytes: bytes, mime_type: str):
+                entered.set()
+                await release.wait()
+                return ProductIdentifiers(serial_number="OLD12345")
+
+        repo = SalesPhotoRepository(self.root / "db.sqlite")
+        service = SalesPhotoService(settings(self.root), repo, BlockingRecognizer())
+        bot = telegram_bot()
+        await service.on_photo(
+            SimpleNamespace(effective_message=photo_message()),
+            SimpleNamespace(bot=bot),
+        )
+        await entered.wait()
+        edited = photo_message(caption="заменено на документ")
+        edited.photo = ()
+        edited.document = SimpleNamespace(file_id="new-document")
+
+        await service.handle_edited_photo(edited, bot, update_id=106)
+        release.set()
+        await asyncio.gather(*tuple(service._photo_tasks))
+
+        bot.send_photo.assert_not_awaited()
+        bot.delete_message.assert_not_awaited()
+
+    async def test_on_photo_claims_before_delayed_background_first_slice(self):
+        background_entered = asyncio.Event()
+        release_background = asyncio.Event()
+        repo = SalesPhotoRepository(self.root / "db.sqlite")
+        service = SalesPhotoService(settings(self.root), repo, StaticRecognizer())
+        bot = telegram_bot()
+        original_run = service._run_photo_claim
+
+        async def delayed_run(claim, target_bot):
+            background_entered.set()
+            await release_background.wait()
+            await original_run(claim, target_bot)
+
+        service._run_photo_claim = delayed_run
+        await service.on_photo(
+            SimpleNamespace(effective_message=photo_message()),
+            SimpleNamespace(bot=bot),
+        )
+        await background_entered.wait()
+        with sqlite3.connect(repo.path) as db:
+            status = db.execute(
+                "SELECT status FROM sales_photo_jobs "
+                "WHERE chat_id=? AND source_message_id=?",
+                (CHAT_ID, 10),
+            ).fetchone()[0]
+        self.assertEqual(status, "processing")
+        await service.handle_edited_photo(
+            photo_message(caption="+998 91 765 43 21"),
+            bot,
+            update_id=101,
+        )
+        release_background.set()
+        await asyncio.gather(*tuple(service._photo_tasks))
+
+        bot.send_photo.assert_not_awaited()
+        bot.delete_message.assert_not_awaited()
+        self.assertFalse(repo.is_replacement(CHAT_ID, 200))
+
+    async def test_on_photo_bounds_workers_and_defers_overflow_durably(self):
+        entered_count = 0
+        all_entered = asyncio.Event()
+        release = asyncio.Event()
+
+        class BoundedRecognizer:
+            async def recognize(self, image_bytes: bytes, mime_type: str):
+                nonlocal entered_count
+                entered_count += 1
+                if entered_count == 2:
+                    all_entered.set()
+                await release.wait()
+                return ProductIdentifiers()
+
+        repo = SalesPhotoRepository(self.root / "db.sqlite")
+        configured = replace(settings(self.root), concurrent_updates=2)
+        service = SalesPhotoService(configured, repo, BoundedRecognizer())
+        bot = telegram_bot()
+        next_replacement = 200
+
+        async def unique_send(**kwargs):
+            nonlocal next_replacement
+            result = SimpleNamespace(message_id=next_replacement)
+            next_replacement += 1
+            return result
+
+        bot.send_photo.side_effect = unique_send
+        for message_id in range(10, 15):
+            await service.on_photo(
+                SimpleNamespace(
+                    effective_message=photo_message(message_id=message_id)
+                ),
+                SimpleNamespace(bot=bot),
+            )
+        await all_entered.wait()
+
+        self.assertEqual(len(service._photo_tasks), 2)
+        self.assertEqual(bot.get_file.await_count, 2)
+        deferred = repo.retryable_photos(CHAT_ID)
+        self.assertEqual(
+            [job.source_message_id for job in deferred],
+            [12, 13, 14],
+        )
+
+        release.set()
+        await asyncio.gather(*tuple(service._photo_tasks))
+
+    async def test_graceful_stop_during_ocr_makes_job_retryable(self):
+        entered = asyncio.Event()
+
+        class BlockingRecognizer:
+            async def recognize(self, image_bytes: bytes, mime_type: str):
+                entered.set()
+                await asyncio.Event().wait()
+
+        repo = SalesPhotoRepository(self.root / "db.sqlite")
+        service = SalesPhotoService(settings(self.root), repo, BlockingRecognizer())
+        bot = telegram_bot()
+        await service.on_photo(
+            SimpleNamespace(effective_message=photo_message()),
+            SimpleNamespace(bot=bot),
+        )
+        await entered.wait()
+
+        await service.stop()
+
+        jobs = repo.retryable_photos(CHAT_ID)
+        self.assertEqual([job.source_message_id for job in jobs], [10])
+        bot.send_photo.assert_not_awaited()
+        bot.delete_message.assert_not_awaited()
+
+    async def test_source_edit_db_error_fails_closed_before_send(self):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        class BlockingRecognizer:
+            async def recognize(self, image_bytes: bytes, mime_type: str):
+                entered.set()
+                await release.wait()
+                return ProductIdentifiers(serial_number="OLD12345")
+
+        repo = SalesPhotoRepository(self.root / "db.sqlite")
+        service = SalesPhotoService(settings(self.root), repo, BlockingRecognizer())
+        bot = telegram_bot()
+        await service.on_photo(
+            SimpleNamespace(effective_message=photo_message()),
+            SimpleNamespace(bot=bot),
+        )
+        await entered.wait()
+
+        with patch.object(
+            repo,
+            "cancel_edited_source",
+            side_effect=RuntimeError("database unavailable"),
+        ):
+            await service.handle_edited_photo(
+                photo_message(caption="+998 91 765 43 21"),
+                bot,
+                update_id=104,
+            )
+        release.set()
+        await asyncio.gather(*tuple(service._photo_tasks))
+
+        bot.send_photo.assert_not_awaited()
+        bot.delete_message.assert_not_awaited()
+        with sqlite3.connect(repo.path) as db:
+            status, error = db.execute(
+                "SELECT status,last_error_code FROM sales_photo_jobs "
+                "WHERE chat_id=? AND source_message_id=?",
+                (CHAT_ID, 10),
+            ).fetchone()
+        self.assertEqual((status, error), ("complete", "source_edit_fail_safe"))
+
+    async def test_source_edit_classification_error_fails_closed(self):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        recognizer = StaticRecognizer()
+
+        async def blocked_recognize(image_bytes, mime_type):
+            entered.set()
+            await release.wait()
+            return ProductIdentifiers()
+
+        recognizer.recognize = blocked_recognize
+        repo = SalesPhotoRepository(self.root / "db.sqlite")
+        service = SalesPhotoService(settings(self.root), repo, recognizer)
+        bot = telegram_bot()
+        await service.on_photo(
+            SimpleNamespace(effective_message=photo_message()),
+            SimpleNamespace(bot=bot),
+        )
+        await entered.wait()
+
+        with patch.object(
+            repo,
+            "is_replacement",
+            side_effect=RuntimeError("database unavailable"),
+        ):
+            await service.handle_edited_photo(
+                photo_message(caption="+998 91 765 43 21"),
+                bot,
+                update_id=105,
+            )
+        release.set()
+        await asyncio.gather(*tuple(service._photo_tasks))
+
+        bot.send_photo.assert_not_awaited()
+        bot.delete_message.assert_not_awaited()
+
+    async def test_source_edit_after_repost_keeps_source_and_removes_card(self):
+        sent = asyncio.Event()
+        repo = SalesPhotoRepository(self.root / "db.sqlite")
+        configured = replace(settings(self.root), source_edit_grace_seconds=1)
+        service = SalesPhotoService(configured, repo, StaticRecognizer())
+        bot = telegram_bot()
+
+        async def signal_send(**kwargs):
+            sent.set()
+            return SimpleNamespace(message_id=200)
+
+        bot.send_photo.side_effect = signal_send
+        task = asyncio.create_task(service.handle_photo(photo_message(), bot))
+        await sent.wait()
+        await asyncio.sleep(0.05)
+        await service.handle_edited_photo(
+            photo_message(caption="+998 91 765 43 21"),
+            bot,
+            update_id=102,
+        )
+        await task
+
+        bot.send_photo.assert_awaited_once()
+        deleted_ids = [
+            call.args[1] for call in bot.delete_message.await_args_list
+        ]
+        self.assertIn(200, deleted_ids)
+        self.assertNotIn(10, deleted_ids)
+        self.assertFalse(repo.is_replacement(CHAT_ID, 200))
+
+    async def test_source_edit_during_delete_keeps_replacement_fallback(self):
+        delete_started = asyncio.Event()
+        release_delete = asyncio.Event()
+        deleted_ids: list[int] = []
+
+        async def blocking_delete(chat_id, message_id):
+            deleted_ids.append(message_id)
+            if message_id == 10:
+                delete_started.set()
+                await release_delete.wait()
+            return True
+
+        repo = SalesPhotoRepository(self.root / "db.sqlite")
+        service = SalesPhotoService(settings(self.root), repo, StaticRecognizer())
+        bot = telegram_bot()
+        bot.delete_message.side_effect = blocking_delete
+        task = asyncio.create_task(service.handle_photo(photo_message(), bot))
+        await delete_started.wait()
+
+        await service.handle_edited_photo(
+            photo_message(caption="+998 91 765 43 21"),
+            bot,
+            update_id=103,
+        )
+        release_delete.set()
+        await task
+
+        self.assertEqual(deleted_ids, [10])
+        self.assertTrue(repo.is_replacement(CHAT_ID, 200))
+        with sqlite3.connect(repo.path) as db:
+            status, error = db.execute(
+                "SELECT status,last_error_code FROM sales_photo_jobs "
+                "WHERE chat_id=? AND source_message_id=?",
+                (CHAT_ID, 10),
+            ).fetchone()
+        self.assertEqual(
+            (status, error),
+            ("complete", "source_edited_delete_ambiguous"),
+        )
+
     async def test_send_failure_never_deletes_original(self):
         repo = SalesPhotoRepository(self.root / "db.sqlite")
         service = SalesPhotoService(settings(self.root), repo, StaticRecognizer())
@@ -591,7 +937,7 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(pending), 1)
         self.assertEqual(pending[0].source_message_id, 10)
 
-    async def test_stale_processing_job_is_quarantined_without_repost(self):
+    async def test_stale_before_send_job_is_safely_retried(self):
         repo = SalesPhotoRepository(self.root / "db.sqlite")
         old = utc_now() - timedelta(minutes=10)
         self.assertTrue(
@@ -615,10 +961,10 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
         service = SalesPhotoService(settings(self.root), repo, StaticRecognizer())
         bot = telegram_bot()
         await service.retry_failed_photos(bot)
-        self.assertFalse(repo.is_replacement(CHAT_ID, 200))
+        self.assertTrue(repo.is_replacement(CHAT_ID, 200))
         self.assertEqual(repo.retryable_photos(CHAT_ID), ())
-        bot.send_photo.assert_not_awaited()
-        bot.delete_message.assert_not_awaited()
+        bot.send_photo.assert_awaited_once()
+        bot.delete_message.assert_awaited_once_with(CHAT_ID, 10)
         with sqlite3.connect(repo.path) as db:
             payload = db.execute(
                 "SELECT encrypted_payload FROM sales_photo_jobs "
@@ -626,6 +972,36 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 (CHAT_ID, 10),
             ).fetchone()[0]
         self.assertIsNone(payload)
+
+    async def test_stale_send_started_job_is_quarantined_without_duplicate(self):
+        repo = SalesPhotoRepository(self.root / "db.sqlite")
+        old = utc_now() - timedelta(minutes=10)
+        self.assertTrue(
+            repo.claim_photo(
+                CHAT_ID,
+                10,
+                "unique-large",
+                source_file_id="large",
+                at=old,
+            )
+        )
+        self.assertTrue(repo.mark_send_started(CHAT_ID, 10, at=old))
+        self.assertEqual(
+            repo.fail_stale_processing(
+                CHAT_ID,
+                utc_now() - timedelta(minutes=1),
+                at=old,
+            ),
+            1,
+        )
+        service = SalesPhotoService(settings(self.root), repo, StaticRecognizer())
+        bot = telegram_bot()
+
+        await service.retry_failed_photos(bot)
+
+        bot.send_photo.assert_not_awaited()
+        bot.delete_message.assert_not_awaited()
+        self.assertEqual(repo.retryable_photos(CHAT_ID), ())
 
     async def test_failed_duplicate_delete_is_durable_and_retried(self):
         repo = SalesPhotoRepository(self.root / "db.sqlite")
@@ -765,6 +1141,64 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(repo.is_replacement(CHAT_ID, 200))
         bot.delete_message.assert_awaited_once_with(CHAT_ID, 10)
 
+    async def test_long_retry_after_remains_durably_retryable(self):
+        repo = SalesPhotoRepository(self.root / "db.sqlite")
+        service = SalesPhotoService(settings(self.root), repo, StaticRecognizer())
+        bot = telegram_bot()
+        bot.send_photo.side_effect = RetryAfter(61)
+
+        await service.handle_photo(photo_message(), bot)
+
+        self.assertEqual(bot.send_photo.await_count, 1)
+        self.assertEqual(
+            [job.source_message_id for job in repo.retryable_photos(CHAT_ID)],
+            [10],
+        )
+        bot.delete_message.assert_not_awaited()
+
+    async def test_two_retry_after_responses_remain_retryable(self):
+        repo = SalesPhotoRepository(self.root / "db.sqlite")
+        service = SalesPhotoService(settings(self.root), repo, StaticRecognizer())
+        bot = telegram_bot()
+        bot.send_photo.side_effect = (RetryAfter(0.1), RetryAfter(0.2))
+
+        with patch("sales_photo_bot.service.asyncio.sleep", new=AsyncMock()):
+            await service.handle_photo(photo_message(), bot)
+
+        self.assertEqual(bot.send_photo.await_count, 2)
+        self.assertEqual(
+            [job.source_message_id for job in repo.retryable_photos(CHAT_ID)],
+            [10],
+        )
+        bot.delete_message.assert_not_awaited()
+
+    async def test_cancel_during_retry_after_wait_remains_retryable(self):
+        wait_started = asyncio.Event()
+
+        async def blocked_wait(delay):
+            wait_started.set()
+            await asyncio.Event().wait()
+
+        repo = SalesPhotoRepository(self.root / "db.sqlite")
+        service = SalesPhotoService(settings(self.root), repo, StaticRecognizer())
+        bot = telegram_bot()
+        bot.send_photo.side_effect = RetryAfter(30)
+        with patch(
+            "sales_photo_bot.service.asyncio.sleep",
+            new=AsyncMock(side_effect=blocked_wait),
+        ):
+            task = asyncio.create_task(service.handle_photo(photo_message(), bot))
+            await wait_started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.assertEqual(
+            [job.source_message_id for job in repo.retryable_photos(CHAT_ID)],
+            [10],
+        )
+        bot.delete_message.assert_not_awaited()
+
     async def test_other_chat_is_ignored(self):
         repo = SalesPhotoRepository(self.root / "db.sqlite")
         service = SalesPhotoService(settings(self.root), repo, StaticRecognizer())
@@ -897,18 +1331,52 @@ class EditedCaptionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(normalized.startswith("🛒💵:"))
         self.assertIn("📞: +998 90 123 45 67", normalized)
 
-    async def test_unknown_card_invalid_value_and_canonical_value_are_no_ops(self):
+    async def test_unknown_card_is_ignored(self):
         bot = self.bot()
-        cases = (
-            self.message("🛒💵:\nrasxod:\n\n📞: 901234567", message_id=999),
-            self.message("🛒💵:\nrasxod:\n\n📞: клиент 42"),
-            self.message("🛒💵:\nrasxod:\n\n📞: +998 90 123 45 67"),
+        await self.service.handle_edited_photo(
+            self.message(
+                "🛒💵:\nrasxod:\n\n📞: 901234567",
+                message_id=999,
+            ),
+            bot,
+            update_id=200,
         )
 
-        for revision, message in enumerate(cases, start=200):
-            await self.service.handle_edited_photo(message, bot, update_id=revision)
-
         bot.edit_message_caption.assert_not_awaited()
+
+    async def test_known_invalid_and_canonical_snapshots_are_reasserted(self):
+        bot = self.bot()
+        captions = (
+            "🛒💵:\nrasxod:\n\n📞: клиент 42",
+            "🛒💵:\nrasxod:\n\n📞: +998 90 123 45 67",
+        )
+
+        for revision, caption in enumerate(captions, start=201):
+            await self.service.handle_edited_photo(
+                self.message(caption), bot, update_id=revision
+            )
+
+        self.assertEqual(bot.edit_message_caption.await_count, 2)
+        self.assertEqual(
+            [
+                call.kwargs["caption"]
+                for call in bot.edit_message_caption.await_args_list
+            ],
+            list(captions),
+        )
+
+    async def test_canonical_snapshot_treats_not_modified_as_success(self):
+        bot = self.bot()
+        bot.edit_message_caption.side_effect = BadRequest(
+            "Message is not modified"
+        )
+        caption = "🛒💵:\nrasxod:\n\n📞: +998 90 123 45 67"
+
+        await self.service.handle_edited_photo(
+            self.message(caption), bot, update_id=203
+        )
+
+        bot.edit_message_caption.assert_awaited_once()
 
     async def test_newer_manual_edit_wins_when_older_update_arrives_late(self):
         entered = asyncio.Event()
@@ -981,6 +1449,76 @@ class EditedCaptionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("🛒💵: OLD", applied[0])
         self.assertEqual(applied[-1], newer.caption)
         self.assertIn("rasxod: 2", applied[-1])
+
+    async def test_sequential_newer_canonical_snapshot_replaces_old_write(self):
+        applied: list[str] = []
+
+        async def record_edit(**kwargs):
+            applied.append(kwargs["caption"])
+            return True
+
+        bot = SimpleNamespace(
+            edit_message_caption=AsyncMock(side_effect=record_edit)
+        )
+        older = self.message(
+            "🛒💵: OLD\nrasxod: 1\n\n📞: 901234567\n\nНаличка"
+        )
+        newer = self.message(
+            "🛒💵: NEW\nrasxod: 2\n\n"
+            "📞: +998 91 111 22 33\n\nНаличка"
+        )
+
+        await self.service.handle_edited_photo(older, bot, update_id=300)
+        await self.service.handle_edited_photo(newer, bot, update_id=301)
+
+        self.assertEqual(applied[-1], newer.caption)
+        self.assertEqual(len(applied), 2)
+
+    async def test_sequential_older_snapshot_is_rejected_by_watermark(self):
+        applied: list[str] = []
+
+        async def record_edit(**kwargs):
+            applied.append(kwargs["caption"])
+            return True
+
+        bot = SimpleNamespace(
+            edit_message_caption=AsyncMock(side_effect=record_edit)
+        )
+        newer = self.message(
+            "🛒💵: NEW\nrasxod: 2\n\n📞: 911112233\n\nНаличка"
+        )
+        older = self.message(
+            "🛒💵: OLD\nrasxod: 1\n\n📞: 901234567\n\nНаличка"
+        )
+
+        await self.service.handle_edited_photo(newer, bot, update_id=301)
+        await self.service.handle_edited_photo(older, bot, update_id=300)
+
+        self.assertEqual(len(applied), 1)
+        self.assertIn("🛒💵: NEW", applied[0])
+        self.assertIn("📞: +998 91 111 22 33", applied[0])
+
+    async def test_expired_watermark_allows_telegram_revision_reset(self):
+        bot = self.bot()
+        first = self.message(
+            "🛒💵: FIRST\nrasxod:\n\n📞: 901234567\n\nНаличка"
+        )
+        after_reset = self.message(
+            "🛒💵: RESET\nrasxod:\n\n📞: 911112233\n\nНаличка"
+        )
+
+        with patch(
+            "sales_photo_bot.service.time.monotonic",
+            side_effect=(1000.0, 1701.0),
+        ):
+            await self.service.handle_edited_photo(first, bot, update_id=300)
+            await self.service.handle_edited_photo(after_reset, bot, update_id=10)
+
+        self.assertEqual(bot.edit_message_caption.await_count, 2)
+        self.assertIn(
+            "🛒💵: RESET",
+            bot.edit_message_caption.await_args.kwargs["caption"],
+        )
 
 
 class ManagerCallbackTests(unittest.IsolatedAsyncioTestCase):
@@ -1113,14 +1651,21 @@ class ManagerCallbackTests(unittest.IsolatedAsyncioTestCase):
         await service.on_manager_callback(
             SimpleNamespace(callback_query=second), self.context(admin=False)
         )
-        second.edit_message_reply_markup.assert_not_awaited()
+        second.edit_message_reply_markup.assert_awaited_once()
+        repaired = second.edit_message_reply_markup.await_args.kwargs[
+            "reply_markup"
+        ].to_dict()
+        self.assertEqual(
+            repaired["inline_keyboard"][0][0]["text"],
+            "👤 Ali · ↩️ Назад",
+        )
         second.answer.assert_awaited_once_with(
-            "Кнопка устарела",
+            "Клавиатура обновлена. Нажмите ещё раз.",
             show_alert=True,
         )
         self.assertEqual(self.repo.selected_manager(CHAT_ID, 200), "Ali")
 
-    async def test_post_edit_database_failure_still_blocks_stale_click(self):
+    async def test_database_failure_prevents_ui_change_and_releases_button(self):
         service = SalesPhotoService(
             settings(self.root, allowed=frozenset({50})),
             self.repo,
@@ -1136,27 +1681,21 @@ class ManagerCallbackTests(unittest.IsolatedAsyncioTestCase):
                 SimpleNamespace(callback_query=first),
                 self.context(admin=False),
             )
-        back_markup = first.edit_message_reply_markup.await_args.kwargs["reply_markup"]
-
-        stale = self.query(self.callback("m:abbos", 0), self.base)
-        await service.on_manager_callback(
-            SimpleNamespace(callback_query=stale),
-            self.context(admin=False),
+        first.edit_message_reply_markup.assert_not_awaited()
+        first.answer.assert_awaited_once_with(
+            "Не удалось обновить карточку", show_alert=True
         )
-        stale.edit_message_reply_markup.assert_not_awaited()
-        stale.answer.assert_awaited_once_with("Кнопка устарела", show_alert=True)
+        self.assertEqual(self.repo.ui_generation_for_replacement(CHAT_ID, 200), 0)
+        self.assertIsNone(self.repo.selected_manager(CHAT_ID, 200))
 
-        repair = self.query(
-            self.callback("b", 1),
-            self.base,
-            reply_markup=back_markup,
-        )
+        repair = self.query(self.callback("m:ali", 0), self.base)
         await service.on_manager_callback(
             SimpleNamespace(callback_query=repair),
             self.context(admin=False),
         )
         repair.edit_message_reply_markup.assert_awaited_once()
-        self.assertEqual(self.repo.ui_generation_for_replacement(CHAT_ID, 200), 2)
+        self.assertEqual(self.repo.ui_generation_for_replacement(CHAT_ID, 200), 1)
+        self.assertEqual(self.repo.selected_manager(CHAT_ID, 200), "Ali")
 
     async def test_ambiguous_manager_edit_invalidates_old_buttons_durably(self):
         first_service = SalesPhotoService(
@@ -1182,8 +1721,134 @@ class ManagerCallbackTests(unittest.IsolatedAsyncioTestCase):
             SimpleNamespace(callback_query=stale),
             self.context(admin=False),
         )
-        stale.edit_message_reply_markup.assert_not_awaited()
-        stale.answer.assert_awaited_once_with("Кнопка устарела", show_alert=True)
+        stale.edit_message_reply_markup.assert_awaited_once()
+        repaired = stale.edit_message_reply_markup.await_args.kwargs[
+            "reply_markup"
+        ].to_dict()
+        self.assertEqual(
+            repaired["inline_keyboard"][0][0]["text"],
+            "👤 Ali · ↩️ Назад",
+        )
+        stale.answer.assert_awaited_once_with(
+            "Клавиатура обновлена. Нажмите ещё раз.",
+            show_alert=True,
+        )
+
+    async def test_ambiguous_manager_edit_retries_idempotently(self):
+        service = SalesPhotoService(
+            settings(self.root, allowed=frozenset({50})),
+            self.repo,
+            StaticRecognizer(),
+        )
+        query = self.query(self.callback("m:ali", 0), self.base)
+        query.edit_message_reply_markup.side_effect = (
+            NetworkError("response lost"),
+            BadRequest("Message is not modified"),
+        )
+
+        await service.on_manager_callback(
+            SimpleNamespace(callback_query=query), self.context(admin=False)
+        )
+
+        self.assertEqual(query.edit_message_reply_markup.await_count, 2)
+        self.assertEqual(self.repo.selected_manager(CHAT_ID, 200), "Ali")
+        self.assertEqual(self.repo.ui_generation_for_replacement(CHAT_ID, 200), 1)
+        query.answer.assert_awaited_once_with("Выбран менеджер: Ali")
+
+    async def test_definite_bad_request_rolls_back_manager_state(self):
+        service = SalesPhotoService(
+            settings(self.root, allowed=frozenset({50})),
+            self.repo,
+            StaticRecognizer(),
+        )
+        failed = self.query(self.callback("m:ali", 0), self.base)
+        failed.edit_message_reply_markup.side_effect = BadRequest(
+            "BUTTON_DATA_INVALID"
+        )
+
+        await service.on_manager_callback(
+            SimpleNamespace(callback_query=failed), self.context(admin=False)
+        )
+
+        failed.edit_message_reply_markup.assert_awaited_once()
+        self.assertEqual(self.repo.ui_generation_for_replacement(CHAT_ID, 200), 0)
+        self.assertIsNone(self.repo.selected_manager(CHAT_ID, 200))
+
+        retry = self.query(self.callback("m:ali", 0), self.base)
+        await service.on_manager_callback(
+            SimpleNamespace(callback_query=retry), self.context(admin=False)
+        )
+        retry.edit_message_reply_markup.assert_awaited_once()
+        self.assertEqual(self.repo.selected_manager(CHAT_ID, 200), "Ali")
+
+    async def test_cancelled_manager_edit_is_repaired_by_stale_button(self):
+        entered = asyncio.Event()
+
+        async def blocked_edit(**kwargs):
+            entered.set()
+            await asyncio.Event().wait()
+
+        service = SalesPhotoService(
+            settings(self.root, allowed=frozenset({50})),
+            self.repo,
+            StaticRecognizer(),
+        )
+        first = self.query(self.callback("m:ali", 0), self.base)
+        first.edit_message_reply_markup.side_effect = blocked_edit
+        task = asyncio.create_task(
+            service.on_manager_callback(
+                SimpleNamespace(callback_query=first),
+                self.context(admin=False),
+            )
+        )
+        await entered.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertEqual(self.repo.selected_manager(CHAT_ID, 200), "Ali")
+        self.assertEqual(self.repo.ui_generation_for_replacement(CHAT_ID, 200), 1)
+
+        restarted = SalesPhotoService(
+            settings(self.root, allowed=frozenset({50})),
+            self.repo,
+            StaticRecognizer(),
+        )
+        stale = self.query(self.callback("m:ali", 0), self.base)
+        await restarted.on_manager_callback(
+            SimpleNamespace(callback_query=stale),
+            self.context(admin=False),
+        )
+        stale.edit_message_reply_markup.assert_awaited_once()
+        repaired = stale.edit_message_reply_markup.await_args.kwargs[
+            "reply_markup"
+        ].to_dict()
+        self.assertEqual(
+            repaired["inline_keyboard"][0][0]["text"],
+            "👤 Ali · ↩️ Назад",
+        )
+
+    async def test_ambiguous_back_edit_retries_idempotently(self):
+        self.assertTrue(self.repo.apply_manager_selection(CHAT_ID, 200, "Ali", 0))
+        service = SalesPhotoService(
+            settings(self.root, allowed=frozenset({50})),
+            self.repo,
+            StaticRecognizer(),
+        )
+        query = self.query(self.callback("b", 1), self.base)
+        query.edit_message_reply_markup.side_effect = (
+            NetworkError("response lost"),
+            True,
+        )
+
+        await service.on_manager_callback(
+            SimpleNamespace(callback_query=query), self.context(admin=False)
+        )
+
+        self.assertEqual(query.edit_message_reply_markup.await_count, 2)
+        self.assertIsNone(self.repo.selected_manager(CHAT_ID, 200))
+        self.assertEqual(self.repo.ui_generation_for_replacement(CHAT_ID, 200), 2)
+        query.answer.assert_awaited_once_with()
 
     async def test_definite_manager_edit_failure_releases_reservation(self):
         service = SalesPhotoService(
@@ -1218,6 +1883,7 @@ class ApplicationWiringTests(unittest.TestCase):
                 repository=repo,
                 recognizer=StaticRecognizer(),
             )
+            self.assertIsInstance(app.bot, StartupDrainBot)
             self.assertEqual(len(app.handlers[0]), 3)
             self.assertEqual(app.update_processor.max_concurrent_updates, 4)
             keyboard = manager_keyboard().to_dict()
@@ -1244,10 +1910,21 @@ class ApplicationWiringTests(unittest.TestCase):
             )
             channel_post = Update(update_id=1, channel_post=message)
             edited_post = Update(update_id=2, edited_channel_post=message)
+            edited_text_message = Message(
+                message_id=10,
+                date=datetime.now(timezone.utc),
+                chat=chat,
+                text="photo replaced",
+            )
+            edited_text_post = Update(
+                update_id=3,
+                edited_channel_post=edited_text_message,
+            )
             self.assertTrue(app.handlers[0][0].check_update(channel_post))
             self.assertFalse(app.handlers[0][0].check_update(edited_post))
             self.assertFalse(app.handlers[0][1].check_update(channel_post))
             self.assertTrue(app.handlers[0][1].check_update(edited_post))
+            self.assertTrue(app.handlers[0][1].check_update(edited_text_post))
 
     def test_polling_subscribes_to_edited_channel_posts(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1260,6 +1937,244 @@ class ApplicationWiringTests(unittest.TestCase):
 
         kwargs = fake_app.run_polling.call_args.kwargs
         self.assertIn("edited_channel_post", kwargs["allowed_updates"])
+
+
+class StartupDrainBotTests(unittest.IsolatedAsyncioTestCase):
+    async def test_only_successful_empty_long_poll_opens_startup_gate(self):
+        bot = StartupDrainBot(TOKEN)
+        update = Update(update_id=1)
+        mocked_get_updates = AsyncMock(
+            side_effect=[(update,), (), (), NetworkError("offline")]
+        )
+        with patch.object(ExtBot, "get_updates", new=mocked_get_updates):
+            self.assertEqual(
+                await bot.get_updates(timeout=timedelta(seconds=10)),
+                (update,),
+            )
+            self.assertFalse(bot.startup_updates_drained.is_set())
+
+            self.assertEqual(await bot.get_updates(timeout=0), ())
+            self.assertFalse(bot.startup_updates_drained.is_set())
+
+            self.assertEqual(await bot.get_updates(timeout=10), ())
+            self.assertTrue(bot.startup_updates_drained.is_set())
+
+            with self.assertRaises(NetworkError):
+                await bot.get_updates(timeout=10)
+
+    async def test_edited_source_tombstone_blocks_later_original_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SalesPhotoRepository(root / "db.sqlite")
+            service = SalesPhotoService(settings(root), repo, StaticRecognizer())
+            bot = telegram_bot()
+
+            await service.handle_edited_photo(
+                photo_message(caption="+998 91 765 43 21"),
+                bot,
+                update_id=90,
+            )
+
+            self.assertFalse(
+                repo.claim_photo(
+                    CHAT_ID,
+                    10,
+                    "unique-large",
+                    source_file_id="large",
+                )
+            )
+            with sqlite3.connect(repo.path) as db:
+                status, error = db.execute(
+                    "SELECT status,last_error_code FROM sales_photo_jobs "
+                    "WHERE chat_id=? AND source_message_id=?",
+                    (CHAT_ID, 10),
+                ).fetchone()
+            self.assertEqual(
+                (status, error),
+                ("complete", "source_edited_before_claim"),
+            )
+
+    async def test_startup_barrier_applies_edits_before_old_retry_or_delete(self):
+        for job_kind in ("failed", "delete_pending"):
+            with self.subTest(job_kind=job_kind), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo = SalesPhotoRepository(root / "db.sqlite")
+                old = utc_now() - timedelta(minutes=10)
+                repo.claim_photo(
+                    CHAT_ID,
+                    10,
+                    "unique-large",
+                    source_file_id="large",
+                    at=old,
+                )
+                if job_kind == "failed":
+                    repo.mark_failed(CHAT_ID, 10, "temporary", at=old)
+                else:
+                    repo.record_replacement(CHAT_ID, 10, 200, at=old)
+                    repo.mark_delete_pending(CHAT_ID, 10, "offline", at=old)
+
+                service = SalesPhotoService(
+                    settings(root),
+                    repo,
+                    StaticRecognizer(),
+                )
+                bot = telegram_bot()
+                ready = False
+                update_queue = SimpleNamespace(join=AsyncMock())
+                barrier = asyncio.create_task(
+                    service._wait_for_startup_drain(
+                        lambda: ready,
+                        update_queue,
+                    )
+                )
+                await asyncio.sleep(0)
+                bot.send_photo.assert_not_awaited()
+                bot.delete_message.assert_not_awaited()
+
+                await service.handle_edited_photo(
+                    photo_message(caption="+998 91 765 43 21"),
+                    bot,
+                    update_id=91,
+                )
+                ready = True
+                await asyncio.wait_for(barrier, timeout=2)
+
+                await service.retry_failed_photos(bot)
+                await service.retry_pending_deletions(bot)
+                bot.send_photo.assert_not_awaited()
+                bot.delete_message.assert_not_awaited()
+                self.assertEqual(repo.retryable_photos(CHAT_ID), ())
+                self.assertEqual(repo.pending_deletions(CHAT_ID), ())
+                self.assertEqual(update_queue.join.await_count, 2)
+
+    async def test_startup_backlog_photo_is_deferred_until_queued_edit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SalesPhotoRepository(root / "db.sqlite")
+            service = SalesPhotoService(settings(root), repo, StaticRecognizer())
+            bot = telegram_bot()
+            ready = False
+            update_queue = SimpleNamespace(join=AsyncMock())
+            service.start_maintenance(
+                bot,
+                startup_ready=lambda: ready,
+                update_queue=update_queue,
+            )
+
+            await service.on_photo(
+                SimpleNamespace(effective_message=photo_message()),
+                SimpleNamespace(bot=bot),
+            )
+            self.assertEqual(
+                [job.source_message_id for job in repo.retryable_photos(CHAT_ID)],
+                [10],
+            )
+            self.assertEqual(service._photo_tasks, set())
+            bot.send_photo.assert_not_awaited()
+            bot.delete_message.assert_not_awaited()
+
+            await service.handle_edited_photo(
+                photo_message(caption="+998 91 765 43 21"),
+                bot,
+                update_id=92,
+            )
+            ready = True
+            for _ in range(30):
+                if not service._startup_gate_active:
+                    break
+                await asyncio.sleep(0.05)
+            self.assertFalse(service._startup_gate_active)
+            await service.stop()
+
+            bot.send_photo.assert_not_awaited()
+            bot.delete_message.assert_not_awaited()
+            self.assertEqual(repo.retryable_photos(CHAT_ID), ())
+            self.assertEqual(repo.pending_deletions(CHAT_ID), ())
+
+    async def test_startup_generated_marker_defers_source_delete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SalesPhotoRepository(root / "db.sqlite")
+            repo.claim_photo(
+                CHAT_ID,
+                10,
+                "unique-large",
+                source_file_id="large",
+            )
+            service = SalesPhotoService(settings(root), repo, StaticRecognizer())
+            bot = telegram_bot()
+            service.start_maintenance(
+                bot,
+                startup_ready=lambda: False,
+                update_queue=SimpleNamespace(join=AsyncMock()),
+            )
+            marker = photo_message(
+                message_id=200,
+                caption=BOT_CARD_MARKER + build_caption(None, ProductIdentifiers()),
+            )
+            marker.reply_markup = manager_keyboard(
+                10,
+                0,
+                repo.callback_signature(CHAT_ID, 10, 0),
+            )
+
+            await service.on_photo(
+                SimpleNamespace(effective_message=marker),
+                SimpleNamespace(bot=bot),
+            )
+
+            self.assertTrue(repo.is_replacement(CHAT_ID, 200))
+            bot.delete_message.assert_not_awaited()
+            self.assertEqual(
+                [job.source_message_id for job in repo.pending_deletions(CHAT_ID)],
+                [10],
+            )
+            await service.stop()
+
+    async def test_startup_deferred_photo_runs_immediately_after_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SalesPhotoRepository(root / "db.sqlite")
+            service = SalesPhotoService(settings(root), repo, StaticRecognizer())
+            bot = telegram_bot()
+            ready = False
+            service.start_maintenance(
+                bot,
+                startup_ready=lambda: ready,
+                update_queue=SimpleNamespace(join=AsyncMock()),
+            )
+            await service.on_photo(
+                SimpleNamespace(effective_message=photo_message()),
+                SimpleNamespace(bot=bot),
+            )
+            bot.send_photo.assert_not_awaited()
+
+            ready = True
+            for _ in range(40):
+                if bot.send_photo.await_count:
+                    break
+                await asyncio.sleep(0.05)
+            await service.stop()
+
+            bot.send_photo.assert_awaited_once()
+            bot.delete_message.assert_awaited_once_with(CHAT_ID, 10)
+
+    async def test_stop_cancels_startup_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = SalesPhotoService(
+                settings(root),
+                SalesPhotoRepository(root / "db.sqlite"),
+                StaticRecognizer(),
+            )
+            service.start_maintenance(
+                telegram_bot(),
+                startup_ready=lambda: False,
+                update_queue=SimpleNamespace(join=AsyncMock()),
+            )
+            await asyncio.sleep(0)
+            await service.stop()
+            self.assertIsNone(service._maintenance_task)
 
 
 class StartupSafetyTests(unittest.IsolatedAsyncioTestCase):
@@ -1284,7 +2199,7 @@ class StartupSafetyTests(unittest.IsolatedAsyncioTestCase):
             await _prepare_polling(settings(root), repo, service, bot)
             self.assertTrue(repo.is_bootstrapped(BOT_ID, CHAT_ID))
             bot.delete_webhook.assert_awaited_with(drop_pending_updates=True)
-            service.start_maintenance.assert_called_once_with(bot)
+            service.start_maintenance.assert_not_called()
 
 
 if __name__ == "__main__":
