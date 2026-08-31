@@ -579,7 +579,7 @@ LEAD_SOURCES = {
 
 CALL_SOURCE_PROFILES = {
     "texnikach@gmail.com": {
-        "device_name": "texnikach@gmail.com",
+        "device_name": "Poco",
         "default_manager_code": "abbos",
         # Android reports slots from zero in the webhooks received
         # for this account: 0 = SIM 1, 1 = SIM 2.
@@ -596,11 +596,22 @@ CALL_SOURCE_PROFILES = {
         },
     },
     "texnikacholx@gmail.com": {
-        "device_name": "Techno",
-        "default_manager_code": None,
+        "device_name": "Tecno",
+        "default_manager_code": "otabek",
         "slot_numbers": {},
         "sim_labels": {},
-        "default_source_code": "olx",
+        "source_by_slot": {
+            0: "olx",
+        },
+    },
+    "aashshdjdjdjsj@gmail.com": {
+        "device_name": "Redmi",
+        "default_manager_code": "olmas",
+        "slot_numbers": {},
+        "sim_labels": {},
+        "source_by_slot": {
+            0: "olx",
+        },
     },
 }
 
@@ -752,14 +763,22 @@ def resolve_call_device(
     source_confidence = None
 
     if profile:
-        source_code = (
-            profile.get(
-                "source_by_number",
-                {},
-            ).get(
-                number_key
-            )
+        source_code = profile.get(
+            "source_by_slot",
+            {},
+        ).get(
+            slot
         )
+
+        if not source_code:
+            source_code = (
+                profile.get(
+                    "source_by_number",
+                    {},
+                ).get(
+                    number_key
+                )
+            )
 
         if source_code:
             source_method = "sim"
