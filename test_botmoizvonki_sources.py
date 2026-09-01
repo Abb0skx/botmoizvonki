@@ -147,6 +147,9 @@ class CallSourceTests(unittest.TestCase):
         call = bot.get_call(saved["call_id"])
 
         self.assertEqual(call["device_name"], "Tecno")
+        self.assertEqual(call["src_number"], "+998908456162")
+        self.assertEqual(call["provider_src_number"], "+998977777777")
+        self.assertEqual(call["src_slot"], 0)
         self.assertEqual(call["talk_manager_code"], "otabek")
         self.assertEqual(call["effective_lead_source_code"], "olx")
 
@@ -184,6 +187,9 @@ class CallSourceTests(unittest.TestCase):
         call_two = bot.get_call(second["call_id"])
 
         self.assertEqual(call_one["device_name"], "Redmi")
+        self.assertEqual(call_one["src_number"], "+998908534466")
+        self.assertEqual(call_one["provider_src_number"], "+998955555551")
+        self.assertEqual(call_one["src_slot"], 0)
         self.assertEqual(call_one["talk_manager_code"], "olmas")
         self.assertEqual(call_one["effective_lead_source_code"], "olx")
         self.assertEqual(call_two["talk_manager_code"], "olmas")
