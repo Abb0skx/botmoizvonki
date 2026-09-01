@@ -15,6 +15,9 @@ MANAGER_LINE_RE = re.compile(
 MANAGER_NAME_RE = re.compile(
     r"(?:^|\n)👤 Менеджер: <b>([^<>\r\n]{1,64})</b>\s*\Z"
 )
+PRODUCT_LINE_RE = re.compile(
+    r"(?:^|\n)📦[ \t]+(?P<product>[^\r\n]{1,120})(?:\n|$)"
+)
 
 
 def _compact(value: object, limit: int) -> str:
@@ -103,3 +106,13 @@ def selected_manager_from_caption(caption_html: str) -> str | None:
     if not match:
         return None
     return html.unescape(match.group(1))
+
+
+def product_label_from_card(caption_html: str) -> str | None:
+    """Return the optional product line from a generated sales card."""
+
+    match = PRODUCT_LINE_RE.search(str(caption_html or ""))
+    if not match:
+        return None
+    product = html.unescape(match.group("product")).strip()
+    return product[:120] or None

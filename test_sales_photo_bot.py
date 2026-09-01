@@ -25,6 +25,7 @@ from sales_photo_bot.config import ConfigError, Settings
 from sales_photo_bot.formatting import (
     add_manager_selection,
     build_caption,
+    product_label_from_card,
     remove_manager_selection,
     selected_manager_from_caption,
 )
@@ -316,8 +317,60 @@ class CaptionFormattingTests(unittest.TestCase):
         self.assertEqual(selected_manager_from_caption(selected), "Olmas")
         self.assertEqual(remove_manager_selection(selected), base)
 
+    def test_product_label_is_optional_and_read_from_card(self):
+        with_product = build_caption(
+            "901234567",
+            ProductIdentifiers(),
+            product_label="A16 <8/256>",
+        )
+        without_product = build_caption("901234567", ProductIdentifiers())
+
+        self.assertEqual(product_label_from_card(with_product), "A16 <8/256>")
+        self.assertIsNone(product_label_from_card(without_product))
+
 
 class RepositoryTests(unittest.TestCase):
+    def test_sale_phone_manager_and_optional_product_are_durable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sales.db"
+            repo = SalesPhotoRepository(path)
+            repo.claim_photo(
+                CHAT_ID,
+                10,
+                "file",
+                sale_date=date(2026, 9, 2),
+            )
+            repo.mark_reposted(CHAT_ID, 10, 200)
+            self.assertTrue(
+                repo.sync_sale_details(
+                    CHAT_ID,
+                    200,
+                    (
+                        "+998 90 123 45 67",
+                        "+998 91 765 43 21",
+                    ),
+                    None,
+                )
+            )
+            self.assertTrue(repo.set_manager(CHAT_ID, 200, "Abbos"))
+
+            with sqlite3.connect(path) as db:
+                row = db.execute(
+                    """SELECT client_phone,client_phone_2,product_label,manager
+                       FROM sales_photo_jobs WHERE chat_id=? AND source_message_id=?""",
+                    (CHAT_ID, 10),
+                ).fetchone()
+
+            self.assertEqual(
+                row,
+                (
+                    "+998 90 123 45 67",
+                    "+998 91 765 43 21",
+                    None,
+                    "Abbos",
+                ),
+            )
+
     def test_obsolete_model_cache_is_removed_during_migration(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "sales.db"

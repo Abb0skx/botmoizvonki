@@ -364,6 +364,9 @@ class SalesPhotoRepository:
                     encrypted_payload BLOB,
                     replacement_message_id INTEGER,
                     manager TEXT,
+                    client_phone TEXT,
+                    client_phone_2 TEXT,
+                    product_label TEXT,
                     ui_generation INTEGER NOT NULL DEFAULT 0,
                     sale_date TEXT,
                     daily_order_id INTEGER,
@@ -461,6 +464,18 @@ class SalesPhotoRepository:
             }
             if "manager" not in columns:
                 db.execute("ALTER TABLE sales_photo_jobs ADD COLUMN manager TEXT")
+            if "client_phone" not in columns:
+                db.execute(
+                    "ALTER TABLE sales_photo_jobs ADD COLUMN client_phone TEXT"
+                )
+            if "client_phone_2" not in columns:
+                db.execute(
+                    "ALTER TABLE sales_photo_jobs ADD COLUMN client_phone_2 TEXT"
+                )
+            if "product_label" not in columns:
+                db.execute(
+                    "ALTER TABLE sales_photo_jobs ADD COLUMN product_label TEXT"
+                )
             if "ui_generation" not in columns:
                 db.execute(
                     "ALTER TABLE sales_photo_jobs ADD COLUMN "
@@ -504,6 +519,14 @@ class SalesPhotoRepository:
                     "ALTER TABLE sales_photo_jobs ADD COLUMN "
                     "order_removed INTEGER NOT NULL DEFAULT 0"
                 )
+            db.execute(
+                """CREATE INDEX IF NOT EXISTS idx_sales_photo_jobs_client_phone
+                   ON sales_photo_jobs(client_phone,sale_date,order_removed)"""
+            )
+            db.execute(
+                """CREATE INDEX IF NOT EXISTS idx_sales_photo_jobs_client_phone_2
+                   ON sales_photo_jobs(client_phone_2,sale_date,order_removed)"""
+            )
             legacy_rows = db.execute(
                 """SELECT chat_id,source_message_id,created_at
                    FROM sales_photo_jobs
@@ -2936,6 +2959,48 @@ class SalesPhotoRepository:
         if row is None or not row["manager"]:
             return None
         return str(row["manager"])
+
+    def sync_sale_details(
+        self,
+        chat_id: int,
+        replacement_message_id: int,
+        phones: tuple[str, ...],
+        product_label: str | None,
+        at: datetime | None = None,
+    ) -> bool:
+        """Persist customer identity for call and sales analytics.
+
+        A product name is optional: a card with a valid phone remains a sale
+        even when the product line is empty.
+        """
+
+        distinct_phones = tuple(
+            dict.fromkeys(
+                str(phone or "").strip()[:32]
+                for phone in phones[:2]
+                if str(phone or "").strip()
+            )
+        )
+        first_phone = distinct_phones[0] if distinct_phones else None
+        second_phone = distinct_phones[1] if len(distinct_phones) > 1 else None
+        product = str(product_label or "").strip()[:120] or None
+        with self._connect() as db:
+            cursor = db.execute(
+                """UPDATE sales_photo_jobs
+                   SET client_phone=?,client_phone_2=?,product_label=?,updated_at=?
+                   WHERE chat_id=? AND replacement_message_id=?
+                     AND status IN ('reposted','delete_pending','complete')""",
+                (
+                    first_phone,
+                    second_phone,
+                    product,
+                    _iso(at or utc_now()),
+                    int(chat_id),
+                    int(replacement_message_id),
+                ),
+            )
+            db.commit()
+            return cursor.rowcount == 1
 
     def ui_generation_for_replacement(
         self,

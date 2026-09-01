@@ -38,7 +38,7 @@ from .delivery import (
     DeliverySalesBridge,
     normalize_delivery_block,
 )
-from .formatting import build_caption
+from .formatting import build_caption, product_label_from_card
 from .keyboards import (
     BACK_CALLBACK,
     MANAGER_CALLBACK_PREFIX,
@@ -960,6 +960,7 @@ class SalesPhotoService:
                         message_id,
                     )
                 self._mark_price_applied_for_replacement(chat_id, message_id)
+                self._sync_sale_details(chat_id, message_id, final.body)
                 if final.changed:
                     logger.info(
                         "sales_photo_card_normalized_from_edit chat_id=%s "
@@ -977,6 +978,7 @@ class SalesPhotoService:
                             message_id,
                         )
                     self._mark_price_applied_for_replacement(chat_id, message_id)
+                    self._sync_sale_details(chat_id, message_id, final.body)
                     return
                 logger.warning(
                     "sales_photo_phone_normalize_failed chat_id=%s message_id=%s "
@@ -1032,6 +1034,28 @@ class SalesPhotoService:
             generation=generation,
             signature=signature,
         )
+
+    def _sync_sale_details(
+        self,
+        chat_id: int,
+        replacement_message_id: int,
+        body: str,
+    ) -> None:
+        try:
+            self.repository.sync_sale_details(
+                chat_id,
+                replacement_message_id,
+                extract_caption_phones(body),
+                product_label_from_card(body),
+            )
+        except Exception as exc:
+            logger.warning(
+                "sales_photo_sale_details_sync_failed chat_id=%s "
+                "message_id=%s error_type=%s",
+                chat_id,
+                replacement_message_id,
+                _error_code(exc),
+            )
 
     def _mark_order_applied_for_replacement(
         self,
@@ -1637,6 +1661,12 @@ class SalesPhotoService:
                 replacement_message_id,
             )
             return
+
+        self._sync_sale_details(
+            chat_id,
+            replacement_message_id,
+            caption,
+        )
 
         if outcome == "recorded":
             self._auto_correction_wake.set()
@@ -2248,6 +2278,11 @@ class SalesPhotoService:
                     int(chat_id),
                     int(message_id),
                 )
+                self._sync_sale_details(
+                    int(chat_id),
+                    int(message_id),
+                    final.body,
+                )
             return
 
         for attempt in range(2):
@@ -2280,6 +2315,11 @@ class SalesPhotoService:
                         int(chat_id),
                         int(message_id),
                     )
+                    self._sync_sale_details(
+                        int(chat_id),
+                        int(message_id),
+                        final.body,
+                    )
                 return
             except BadRequest as exc:
                 if "message is not modified" in str(exc).casefold():
@@ -2292,6 +2332,11 @@ class SalesPhotoService:
                         self._mark_price_applied_for_replacement(
                             int(chat_id),
                             int(message_id),
+                        )
+                        self._sync_sale_details(
+                            int(chat_id),
+                            int(message_id),
+                            final.body,
                         )
                     return
                 raise
@@ -3066,6 +3111,11 @@ class SalesPhotoService:
                             delivery_final.body,
                             delivery_final.entities,
                             final.changed or delivery_final.changed,
+                        )
+                        self._sync_sale_details(
+                            candidate.chat_id,
+                            candidate.replacement_message_id,
+                            final.body,
                         )
                         if final.changed or force_rewrite or manager_changed:
                             edit_kwargs: dict[str, Any] = {
