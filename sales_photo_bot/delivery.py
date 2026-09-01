@@ -155,7 +155,10 @@ class DeliveryReader:
             order_number=int(row["order_number"]),
             phones=phones,
             created_date=created_at.date(),
-            manager_name=_single_line(row["manager_name"]),
+            # manager_name identifies the Telegram account that created the
+            # delivery (often the generic "Texnikach" account). seller_name is
+            # the actual sales manager used by the sales-card buttons.
+            manager_name=_single_line(row["seller_name"]),
             courier_name=_single_line(
                 row["courier_name"] or row["assigned_courier_name"]
             ),
@@ -171,7 +174,7 @@ class DeliveryReader:
         with self._connect() as db:
             rows = db.execute(
                 """SELECT id,order_number,client_phone,client_phone_2,
-                          manager_name,assigned_courier_name,courier_name,
+                          manager_name,seller_name,assigned_courier_name,courier_name,
                           status,created_at,updated_at,delivered_at
                    FROM orders ORDER BY id DESC LIMIT 10000"""
             ).fetchall()
@@ -190,7 +193,7 @@ class DeliveryReader:
         with self._connect() as db:
             rows = db.execute(
                 f"""SELECT id,order_number,client_phone,client_phone_2,
-                           manager_name,assigned_courier_name,courier_name,
+                           manager_name,seller_name,assigned_courier_name,courier_name,
                            status,created_at,updated_at,delivered_at
                     FROM orders WHERE id IN ({placeholders})""",
                 values,

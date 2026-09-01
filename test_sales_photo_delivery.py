@@ -53,6 +53,7 @@ def create_delivery_db(path: Path) -> None:
                 client_phone TEXT,
                 client_phone_2 TEXT,
                 manager_name TEXT,
+                seller_name TEXT,
                 assigned_courier_name TEXT,
                 courier_name TEXT,
                 status TEXT,
@@ -77,10 +78,11 @@ class DeliveryReaderTests(unittest.TestCase):
             create_delivery_db(path)
             with sqlite3.connect(path) as db:
                 db.execute(
-                    "INSERT INTO orders VALUES(1,11,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO orders VALUES(1,11,?,?,?,?,?,?,?,?,?,?)",
                     (
                         "+998901234567",
                         None,
+                        "Texnikach",
                         "Abbos",
                         "Muzrob Oka",
                         None,
@@ -104,10 +106,11 @@ class DeliveryReaderTests(unittest.TestCase):
 
             with sqlite3.connect(path) as db:
                 db.execute(
-                    "INSERT INTO orders VALUES(2,12,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO orders VALUES(2,12,?,?,?,?,?,?,?,?,?,?)",
                     (
                         "+998901234567",
                         None,
+                        "Texnikach",
                         "Ali",
                         "Courier 2",
                         None,
@@ -135,10 +138,11 @@ class DeliveryReaderTests(unittest.TestCase):
             create_delivery_db(path)
             with sqlite3.connect(path) as db:
                 db.execute(
-                    "INSERT INTO orders VALUES(1,11,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO orders VALUES(1,11,?,?,?,?,?,?,?,?,?,?)",
                     (
                         "+998901234567",
                         None,
+                        "Texnikach",
                         "Abbos",
                         None,
                         "Muzrob Oka",
@@ -232,10 +236,11 @@ class DeliveryServiceTests(unittest.IsolatedAsyncioTestCase):
             create_delivery_db(delivery_path)
             with sqlite3.connect(delivery_path) as db:
                 db.execute(
-                    "INSERT INTO orders VALUES(1,11,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO orders VALUES(1,11,?,?,?,?,?,?,?,?,?,?)",
                     (
                         "+998901234567",
                         None,
+                        "Texnikach",
                         "Abbos",
                         "Muzrob Oka",
                         None,
@@ -300,10 +305,11 @@ class DeliveryServiceTests(unittest.IsolatedAsyncioTestCase):
 
             with sqlite3.connect(delivery_path) as db:
                 db.execute(
-                    "INSERT INTO orders VALUES(2,12,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO orders VALUES(2,12,?,?,?,?,?,?,?,?,?,?)",
                     (
                         "+998901234567",
                         None,
+                        "Texnikach",
                         "Ali",
                         "Courier 2",
                         None,
@@ -334,10 +340,11 @@ class DeliveryServiceTests(unittest.IsolatedAsyncioTestCase):
             create_delivery_db(delivery_path)
             with sqlite3.connect(delivery_path) as db:
                 db.execute(
-                    "INSERT INTO orders VALUES(1,11,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO orders VALUES(1,11,?,?,?,?,?,?,?,?,?,?)",
                     (
                         "+998901234567",
                         None,
+                        "Texnikach",
                         "Abbos",
                         "Muzrob Oka",
                         None,
