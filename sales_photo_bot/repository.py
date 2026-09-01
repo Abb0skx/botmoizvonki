@@ -879,27 +879,19 @@ class SalesPhotoRepository:
         ).fetchone()
         if row is None:
             raise RuntimeError("Не найдена карточка для ежедневного номера")
-        if row["sale_date"] is not None and row["daily_order_id"] is not None:
-            return date.fromisoformat(str(row["sale_date"])), int(
-                row["daily_order_id"]
-            )
-
-        sale_day = sale_date.isoformat()
-        maximum = db.execute(
-            """SELECT COALESCE(MAX(daily_order_id),0) FROM sales_photo_jobs
-               WHERE chat_id=? AND sale_date=? AND order_removed=0""",
-            (int(chat_id), sale_day),
-        ).fetchone()[0]
-        order_id = int(maximum) + 1
+        effective_date = (
+            date.fromisoformat(str(row["sale_date"]))
+            if row["sale_date"] is not None
+            else sale_date
+        )
+        sale_day = effective_date.isoformat()
         cursor = db.execute(
             """UPDATE sales_photo_jobs
-               SET sale_date=?,daily_order_id=?
+               SET sale_date=?
                WHERE chat_id=? AND source_message_id=?
-                 AND daily_order_id IS NULL
                  AND (sale_date IS NULL OR sale_date=?)""",
             (
                 sale_day,
-                order_id,
                 int(chat_id),
                 int(source_message_id),
                 sale_day,
@@ -907,7 +899,69 @@ class SalesPhotoRepository:
         )
         if cursor.rowcount != 1:
             raise RuntimeError("Не удалось назначить ежедневный номер")
-        return sale_date, order_id
+
+        # Failed/unpublished attempts are not sold items and must never reserve
+        # a visible number for the next successful card.
+        db.execute(
+            """UPDATE sales_photo_jobs
+               SET daily_order_id=NULL,order_card_applied=0
+               WHERE chat_id=? AND sale_date=? AND order_removed=0
+                 AND replacement_message_id IS NULL AND status<>'processing'
+                 AND daily_order_id IS NOT NULL""",
+            (int(chat_id), sale_day),
+        )
+        active_rows = db.execute(
+            """SELECT source_message_id,daily_order_id,order_card_applied
+               FROM sales_photo_jobs
+               WHERE chat_id=? AND sale_date=? AND order_removed=0
+                 AND (replacement_message_id IS NOT NULL OR status='processing')
+               ORDER BY CASE WHEN daily_order_id IS NULL THEN 1 ELSE 0 END,
+                        daily_order_id,created_at,source_message_id""",
+            (int(chat_id), sale_day),
+        ).fetchall()
+        target_order: int | None = None
+        needs_compaction = any(
+            active_row["daily_order_id"] is None
+            or int(active_row["daily_order_id"]) != expected
+            for expected, active_row in enumerate(active_rows, start=1)
+        )
+        if needs_compaction:
+            db.execute(
+                """UPDATE sales_photo_jobs
+                   SET daily_order_id=NULL
+                   WHERE chat_id=? AND sale_date=? AND order_removed=0
+                     AND (replacement_message_id IS NOT NULL OR status='processing')""",
+                (int(chat_id), sale_day),
+            )
+            for expected, active_row in enumerate(active_rows, start=1):
+                db.execute(
+                    """UPDATE sales_photo_jobs
+                       SET daily_order_id=?,order_card_applied=?
+                       WHERE chat_id=? AND source_message_id=?
+                         AND order_removed=0
+                         AND (replacement_message_id IS NOT NULL OR status='processing')""",
+                    (
+                        expected,
+                        (
+                            0
+                            if active_row["daily_order_id"] is None
+                            or int(active_row["daily_order_id"]) != expected
+                            else int(active_row["order_card_applied"])
+                        ),
+                        int(chat_id),
+                        int(active_row["source_message_id"]),
+                    ),
+                )
+                if int(active_row["source_message_id"]) == int(source_message_id):
+                    target_order = expected
+        else:
+            for expected, active_row in enumerate(active_rows, start=1):
+                if int(active_row["source_message_id"]) == int(source_message_id):
+                    target_order = expected
+                    break
+        if target_order is None:
+            raise RuntimeError("Не удалось включить карточку в дневной счётчик")
+        return effective_date, target_order
 
     def ensure_daily_order(
         self,
@@ -1187,7 +1241,8 @@ class SalesPhotoRepository:
                        FROM sales_photo_jobs
                        WHERE chat_id=? AND sale_date=? AND order_removed=0
                          AND replacement_message_id IS NOT NULL
-                       ORDER BY created_at,source_message_id""",
+                       ORDER BY CASE WHEN daily_order_id IS NULL THEN 1 ELSE 0 END,
+                                daily_order_id,created_at,source_message_id""",
                     (int(chat_id), sale_day),
                 ).fetchall()
                 if all(
@@ -1266,7 +1321,7 @@ class SalesPhotoRepository:
                    WHERE chat_id=? AND sale_date=? AND order_removed=0
                      AND replacement_message_id IS NOT NULL
                      AND daily_order_id IS NOT NULL
-                   ORDER BY created_at,source_message_id""",
+                   ORDER BY daily_order_id,created_at,source_message_id""",
                 (int(chat_id), sale_day.isoformat()),
             ).fetchall()
             changed = 0
@@ -1436,7 +1491,7 @@ class SalesPhotoRepository:
             if cursor.rowcount != 1:
                 db.rollback()
                 return "conflict"
-            if row["sale_date"] is not None and row["daily_order_id"] is None:
+            if row["sale_date"] is not None:
                 self._ensure_daily_order_locked(
                     db,
                     int(chat_id),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import tempfile
 import unittest
 from datetime import date, datetime, time, timedelta, timezone
@@ -198,6 +199,21 @@ class AutoCorrectionRepositoryTests(unittest.TestCase):
                 sale_date=sale_day,
             )
             repo.mark_reposted(CHAT_ID, 11, 201)
+
+            # Simulate the legacy production state that existed before
+            # creation-time reservation cleanup was introduced.
+            with sqlite3.connect(repo.path) as db:
+                db.execute(
+                    "UPDATE sales_photo_jobs SET daily_order_id=2 "
+                    "WHERE chat_id=? AND source_message_id=11",
+                    (CHAT_ID,),
+                )
+                db.execute(
+                    "UPDATE sales_photo_jobs SET daily_order_id=1 "
+                    "WHERE chat_id=? AND source_message_id=10",
+                    (CHAT_ID,),
+                )
+                db.commit()
 
             released, changed = repo.compact_recent_daily_orders(
                 CHAT_ID,

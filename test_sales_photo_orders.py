@@ -118,6 +118,107 @@ class DailyOrderRepositoryTests(unittest.TestCase):
                 (date(2026, 8, 31), 3),
             )
 
+    def test_backdated_tenth_sale_does_not_change_today_first_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = SalesPhotoRepository(Path(directory) / "sales.db")
+            yesterday = date(2026, 8, 31)
+            today = date(2026, 9, 1)
+            published_today = datetime(2026, 9, 1, 7, 0, tzinfo=timezone.utc)
+            for source_id in range(10, 20):
+                repo.claim_photo(
+                    CHAT_ID,
+                    source_id,
+                    f"yesterday-{source_id}",
+                    source_file_id=f"file-{source_id}",
+                    sale_date=yesterday,
+                    at=published_today,
+                )
+                repo.mark_reposted(
+                    CHAT_ID,
+                    source_id,
+                    source_id + 190,
+                    at=published_today,
+                )
+
+            repo.claim_photo(
+                CHAT_ID,
+                20,
+                "today-first",
+                source_file_id="today-file",
+                sale_date=today,
+                at=published_today,
+            )
+
+            self.assertEqual(
+                repo.daily_order_for_source(CHAT_ID, 19),
+                (yesterday, 10),
+            )
+            self.assertEqual(
+                repo.daily_order_for_source(CHAT_ID, 20),
+                (today, 1),
+            )
+
+    def test_failed_reservations_are_removed_before_new_card_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = SalesPhotoRepository(Path(directory) / "sales.db")
+            sale_day = date(2026, 9, 1)
+            for source_id in (10, 11):
+                repo.claim_photo(
+                    CHAT_ID,
+                    source_id,
+                    f"failed-{source_id}",
+                    source_file_id=f"file-{source_id}",
+                    sale_date=sale_day,
+                )
+                repo.mark_failed(CHAT_ID, source_id, "TimedOut")
+
+            repo.claim_photo(
+                CHAT_ID,
+                12,
+                "successful",
+                source_file_id="successful-file",
+                sale_date=sale_day,
+            )
+
+            self.assertIsNone(repo.daily_order_for_source(CHAT_ID, 10))
+            self.assertIsNone(repo.daily_order_for_source(CHAT_ID, 11))
+            self.assertEqual(
+                repo.daily_order_for_source(CHAT_ID, 12),
+                (sale_day, 1),
+            )
+
+    def test_processing_reservations_compact_after_older_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = SalesPhotoRepository(Path(directory) / "sales.db")
+            sale_day = date(2026, 9, 1)
+            for source_id in (10, 11):
+                repo.claim_photo(
+                    CHAT_ID,
+                    source_id,
+                    f"processing-{source_id}",
+                    source_file_id=f"file-{source_id}",
+                    sale_date=sale_day,
+                )
+            repo.mark_failed(CHAT_ID, 10, "TimedOut")
+
+            repo.claim_photo(
+                CHAT_ID,
+                12,
+                "next",
+                source_file_id="next-file",
+                sale_date=sale_day,
+            )
+
+            self.assertIsNone(repo.daily_order_for_source(CHAT_ID, 10))
+            self.assertEqual(
+                repo.daily_order_for_source(CHAT_ID, 11),
+                (sale_day, 1),
+            )
+            self.assertEqual(
+                repo.daily_order_for_source(CHAT_ID, 12),
+                (sale_day, 2),
+            )
+
     def test_existing_cards_are_numbered_by_tashkent_creation_day(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "sales.db"
