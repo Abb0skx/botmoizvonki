@@ -55,6 +55,7 @@ PROCESSING_STALE_SECONDS = 180
 ALBUM_SETTLE_SECONDS = 1.0
 ORDER_AUDIT_INTERVAL_SECONDS = 60.0
 AUTO_CORRECTION_RETRY_SECONDS = 60.0
+AUTO_CORRECTION_CARD_INTERVAL_SECONDS = 1.1
 TEXT_SOURCE_FILE_ID = "sales-photo:text"
 _SOURCE_CALLBACK_RE = re.compile(
     r"^sp:(?:m:[a-z]+|b):(\d+):(\d+):([0-9a-f]{12})$"
@@ -2683,6 +2684,13 @@ class SalesPhotoService:
 
         async with self._auto_correction_lock:
             sale_date_from, sale_date_to = _recent_sale_window(reference_date)
+            released_orders, renumbered_orders = (
+                self.repository.compact_recent_daily_orders(
+                    self.settings.chat_id,
+                    sale_date_from,
+                    sale_date_to,
+                )
+            )
             candidates = self.repository.auto_correction_candidates(
                 self.settings.chat_id,
                 sale_date_from,
@@ -2692,7 +2700,7 @@ class SalesPhotoService:
             corrected = 0
             removed = 0
             failures = 0
-            for candidate in candidates:
+            for candidate_index, candidate in enumerate(candidates):
                 forwarded = None
                 key = (candidate.chat_id, candidate.replacement_message_id)
                 try:
@@ -2747,24 +2755,20 @@ class SalesPhotoService:
                                     caption=final.body,
                                     caption_entities=final.entities,
                                 )
-                                await bot.edit_message_caption(**edit_kwargs)
+                                await self._send_with_retry(
+                                    bot.edit_message_caption,
+                                    edit_kwargs,
+                                )
                             else:
                                 edit_kwargs.update(
                                     text=final.body,
                                     entities=final.entities,
                                 )
-                                await bot.edit_message_text(**edit_kwargs)
+                                await self._send_with_retry(
+                                    bot.edit_message_text,
+                                    edit_kwargs,
+                                )
                             corrected += 1
-                        else:
-                            await bot.edit_message_reply_markup(
-                                chat_id=candidate.chat_id,
-                                message_id=candidate.replacement_message_id,
-                                reply_markup=self._current_card_markup(
-                                    candidate.chat_id,
-                                    candidate.replacement_message_id,
-                                    forwarded,
-                                ),
-                            )
                         self.repository.mark_order_card_applied(
                             candidate.chat_id,
                             candidate.source_message_id,
@@ -2821,10 +2825,15 @@ class SalesPhotoService:
                                 int(temporary_message_id),
                             )
                     self._safe_touch_heartbeat()
+                    if candidate_index + 1 < len(candidates):
+                        await asyncio.sleep(
+                            AUTO_CORRECTION_CARD_INTERVAL_SECONDS
+                        )
             logger.info(
                 "sales_photo_auto_correction_complete reason=%s "
                 "sale_date_from=%s sale_date_to=%s candidates=%s checked=%s "
-                "corrected=%s removed=%s failures=%s",
+                "corrected=%s removed=%s released_orders=%s "
+                "renumbered_orders=%s failures=%s",
                 reason,
                 sale_date_from.isoformat(),
                 sale_date_to.isoformat(),
@@ -2832,6 +2841,8 @@ class SalesPhotoService:
                 checked,
                 corrected,
                 removed,
+                released_orders,
+                renumbered_orders,
                 failures,
             )
             # A per-card Telegram failure must not turn one requested trigger

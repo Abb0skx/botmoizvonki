@@ -178,6 +178,51 @@ class AutoCorrectionRepositoryTests(unittest.TestCase):
                 state.completed_event_generation,
             )
 
+    def test_unpublished_failures_do_not_consume_sold_order_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = SalesPhotoRepository(Path(directory) / "sales.db")
+            sale_day = date(2026, 9, 1)
+            repo.claim_photo(
+                CHAT_ID,
+                10,
+                "failed",
+                source_file_id="failed-file",
+                sale_date=sale_day,
+            )
+            repo.mark_failed(CHAT_ID, 10, "TimedOut")
+            repo.claim_photo(
+                CHAT_ID,
+                11,
+                "published",
+                source_file_id="published-file",
+                sale_date=sale_day,
+            )
+            repo.mark_reposted(CHAT_ID, 11, 201)
+
+            released, changed = repo.compact_recent_daily_orders(
+                CHAT_ID,
+                sale_day - timedelta(days=2),
+                sale_day,
+            )
+
+            self.assertEqual((released, changed), (1, 1))
+            self.assertIsNone(repo.daily_order_for_source(CHAT_ID, 10))
+            self.assertEqual(
+                repo.daily_order_for_replacement(CHAT_ID, 201),
+                (sale_day, 1),
+            )
+
+            # A late successful retry receives the next ID atomically instead
+            # of restoring the old gap-producing reservation.
+            self.assertEqual(
+                repo.record_replacement(CHAT_ID, 10, 200),
+                "recorded",
+            )
+            self.assertEqual(
+                repo.daily_order_for_replacement(CHAT_ID, 200),
+                (sale_day, 2),
+            )
+
 
 class RecentCardCorrectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_repairs_only_today_yesterday_and_day_before(self):

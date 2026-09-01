@@ -1136,6 +1136,97 @@ class SalesPhotoRepository:
             sale_date_to=sale_date_to,
         )
 
+    def compact_recent_daily_orders(
+        self,
+        chat_id: int,
+        sale_date_from: date,
+        sale_date_to: date,
+        at: datetime | None = None,
+    ) -> tuple[int, int]:
+        """Release unpublished reservations and compact published card IDs.
+
+        An unsuccessful send is not a sold item and must not leave a visible
+        gap. A processing job can safely lose its reservation here: if its
+        Telegram send later succeeds, ``record_replacement`` assigns the next
+        authoritative ID in the same transaction and the debounce sweep repairs
+        the already-sent caption when necessary.
+        """
+
+        now = _iso(at or utc_now())
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            released = db.execute(
+                """UPDATE sales_photo_jobs
+                   SET daily_order_id=NULL,order_card_applied=0,updated_at=?
+                   WHERE chat_id=? AND replacement_message_id IS NULL
+                     AND order_removed=0 AND daily_order_id IS NOT NULL
+                     AND sale_date>=? AND sale_date<=?""",
+                (
+                    now,
+                    int(chat_id),
+                    sale_date_from.isoformat(),
+                    sale_date_to.isoformat(),
+                ),
+            ).rowcount
+            days = db.execute(
+                """SELECT DISTINCT sale_date FROM sales_photo_jobs
+                   WHERE chat_id=? AND replacement_message_id IS NOT NULL
+                     AND order_removed=0 AND sale_date>=? AND sale_date<=?
+                   ORDER BY sale_date""",
+                (
+                    int(chat_id),
+                    sale_date_from.isoformat(),
+                    sale_date_to.isoformat(),
+                ),
+            ).fetchall()
+            changed = 0
+            for day_row in days:
+                sale_day = str(day_row["sale_date"])
+                rows = db.execute(
+                    """SELECT source_message_id,daily_order_id
+                       FROM sales_photo_jobs
+                       WHERE chat_id=? AND sale_date=? AND order_removed=0
+                         AND replacement_message_id IS NOT NULL
+                       ORDER BY created_at,source_message_id""",
+                    (int(chat_id), sale_day),
+                ).fetchall()
+                if all(
+                    row["daily_order_id"] is not None
+                    and int(row["daily_order_id"]) == expected
+                    for expected, row in enumerate(rows, start=1)
+                ):
+                    continue
+                changed += sum(
+                    row["daily_order_id"] is None
+                    or int(row["daily_order_id"]) != expected
+                    for expected, row in enumerate(rows, start=1)
+                )
+                # NULL first avoids unique-index collisions for arbitrary gaps
+                # or reordered legacy rows while the transaction stays atomic.
+                db.execute(
+                    """UPDATE sales_photo_jobs
+                       SET daily_order_id=NULL,order_card_applied=0,updated_at=?
+                       WHERE chat_id=? AND sale_date=? AND order_removed=0
+                         AND replacement_message_id IS NOT NULL""",
+                    (now, int(chat_id), sale_day),
+                )
+                for expected, row in enumerate(rows, start=1):
+                    db.execute(
+                        """UPDATE sales_photo_jobs
+                           SET daily_order_id=?,order_card_applied=0,updated_at=?
+                           WHERE chat_id=? AND source_message_id=?
+                             AND replacement_message_id IS NOT NULL
+                             AND order_removed=0""",
+                        (
+                            expected,
+                            now,
+                            int(chat_id),
+                            int(row["source_message_id"]),
+                        ),
+                    )
+            db.commit()
+        return int(released), int(changed)
+
     def mark_order_card_removed(
         self,
         chat_id: int,
@@ -1269,7 +1360,8 @@ class SalesPhotoRepository:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
-                """SELECT replacement_message_id,status FROM sales_photo_jobs
+                """SELECT replacement_message_id,status,sale_date,daily_order_id
+                   FROM sales_photo_jobs
                    WHERE chat_id=? AND source_message_id=?""",
                 (int(chat_id), int(source_message_id)),
             ).fetchone()
@@ -1344,6 +1436,13 @@ class SalesPhotoRepository:
             if cursor.rowcount != 1:
                 db.rollback()
                 return "conflict"
+            if row["sale_date"] is not None and row["daily_order_id"] is None:
+                self._ensure_daily_order_locked(
+                    db,
+                    int(chat_id),
+                    int(source_message_id),
+                    date.fromisoformat(str(row["sale_date"])),
+                )
             self._note_auto_correction_new_card_locked(
                 db,
                 int(chat_id),
