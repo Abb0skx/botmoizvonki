@@ -8,8 +8,16 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 from app.database import OrderRepository
+from app.models import Order, OrderEvent
+from app.utils.couriers import COURIERS, COURIERS_BY_ID
 from app.utils.geocoding import extract_text_address, normalize_district
-from app.stats_service import TASHKENT, _courier_id, _status_changed, local_datetime
+from app.stats_service import (
+    TASHKENT,
+    _courier_color,
+    _courier_id,
+    _status_changed,
+    local_datetime,
+)
 
 
 MONTH_RE = re.compile(r"^(\d{4})-(\d{2})$")
@@ -68,6 +76,48 @@ def _month_shift(value: date, delta: int) -> date:
 def _week_value(monday: date) -> str:
     iso = monday.isocalendar()
     return f"{iso.year}-W{iso.week:02d}"
+
+
+def _final_delivery(
+    order: Order,
+    events: list[OrderEvent],
+) -> tuple[datetime, int | None, str] | None:
+    """Return the current valid completion and its immutable courier snapshot."""
+    if order.status != "completed":
+        return None
+    completion = next(
+        (
+            event
+            for event in reversed(events)
+            if _status_changed(event) and event.to_status == "completed"
+        ),
+        None,
+    )
+    completed_at = local_datetime(order.delivered_at)
+    if completed_at is None and completion is not None:
+        completed_at = local_datetime(completion.created_at)
+    if completed_at is None:
+        return None
+
+    courier_id: int | None = None
+    courier_name: str | None = None
+    if completion is not None:
+        if completion.courier_id is not None:
+            courier_id = completion.courier_id
+            courier_name = completion.courier_name
+        elif completion.actor_role == "courier" and completion.actor_id is not None:
+            courier_id = completion.actor_id
+            courier_name = completion.actor_name
+    if courier_id is None:
+        courier_id = _courier_id(order)
+        courier_name = order.courier_name or order.assigned_courier_name
+    configured = COURIERS_BY_ID.get(courier_id)
+    courier_name = (
+        courier_name
+        or (configured.name if configured else None)
+        or (f"Курьер {courier_id}" if courier_id is not None else "Не назначен")
+    )
+    return completed_at, courier_id, courier_name
 
 
 def _forecast(
@@ -130,17 +180,17 @@ def build_delivery_analytics(
     today = datetime.now(TASHKENT).date()
     month_start = parse_month(month, today=today)
     week_start = parse_week(week, today=today)
-    orders = repo.list_all()
-    events_by_order = defaultdict(list)
-    if courier_id is not None:
-        for event in repo.list_all_events():
-            events_by_order[event.order_id].append(event)
+    orders, events = repo.list_orders_with_events()
+    events_by_order: dict[int, list[OrderEvent]] = defaultdict(list)
+    for event in events:
+        events_by_order[event.order_id].append(event)
 
     def analytics_courier(order) -> int | None:
         events = [
             event
             for event in events_by_order.get(order.id, [])
-            if event.actor_role == "courier" and event.actor_id is not None
+            if event.courier_id is not None
+            or (event.actor_role == "courier" and event.actor_id is not None)
         ]
         completed = [
             event
@@ -150,17 +200,22 @@ def build_delivery_analytics(
         if completed:
             # The first actual fulfilment is immutable attribution for the
             # order's creation-period analytics, even if it is later reopened.
-            return completed[0].actor_id
+            return completed[0].courier_id or completed[0].actor_id
         lifecycle = [
             event
             for event in events
-            if event.event_type == "courier_read"
+            if "assigned_courier_id" in event.changed_fields
+            or event.event_type == "courier_read"
             or (
                 _status_changed(event)
                 and event.to_status in {"picked_up", "on_way", "cancelled"}
             )
         ]
-        return lifecycle[-1].actor_id if lifecycle else _courier_id(order)
+        return (
+            lifecycle[-1].courier_id or lifecycle[-1].actor_id
+            if lifecycle
+            else _courier_id(order)
+        )
 
     created_orders = [
         (order, created.date())
@@ -194,6 +249,60 @@ def build_delivery_analytics(
 
     previous_month = _month_shift(month_start, -1)
     next_month = _month_shift(month_start, 1)
+
+    completed_by_courier: dict[int | None, Counter[date]] = {
+        courier.user_id: Counter() for courier in COURIERS
+    }
+    courier_names: dict[int | None, str] = {
+        courier.user_id: courier.name for courier in COURIERS
+    }
+    for order in orders:
+        delivery = _final_delivery(order, events_by_order.get(order.id, []))
+        if delivery is None:
+            continue
+        completed_at, completed_courier_id, completed_courier_name = delivery
+        completed_day = completed_at.date()
+        if not month_start <= completed_day < next_month or completed_day > today:
+            continue
+        completed_by_courier.setdefault(completed_courier_id, Counter())[completed_day] += 1
+        courier_names.setdefault(completed_courier_id, completed_courier_name)
+
+    configured_ids = [courier.user_id for courier in COURIERS]
+    extra_ids = sorted(
+        (value for value in completed_by_courier if value not in configured_ids),
+        key=lambda value: (value is None, courier_names[value].casefold()),
+    )
+    courier_delivery_rows = []
+    for completed_courier_id in [*configured_ids, *extra_ids]:
+        counts = completed_by_courier[completed_courier_id]
+        completed_total = sum(counts.values())
+        courier_delivery_rows.append({
+            "id": completed_courier_id,
+            "name": courier_names[completed_courier_id],
+            "color": _courier_color(completed_courier_id),
+            "completed": completed_total,
+            "active_days": sum(1 for count in counts.values() if count),
+            "daily": [
+                {
+                    "date": day.isoformat(),
+                    "day": day.day,
+                    "weekday": day.weekday(),
+                    "completed": counts[day],
+                    "future": day > today,
+                }
+                for day in month_dates
+            ],
+        })
+    monthly_delivery_total = sum(
+        row["completed"] for row in courier_delivery_rows
+    )
+    for row in courier_delivery_rows:
+        row["share"] = (
+            round(row["completed"] / monthly_delivery_total * 100, 1)
+            if monthly_delivery_total
+            else 0
+        )
+
     previous_month_days = calendar.monthrange(previous_month.year, previous_month.month)[1]
     is_current_month = (
         month_start.year == today.year and month_start.month == today.month
@@ -317,6 +426,10 @@ def build_delivery_analytics(
             "comparison_label": comparison_label,
             "series": month_series,
             "districts": district_rows,
+            "courier_deliveries": {
+                "total": monthly_delivery_total,
+                "couriers": courier_delivery_rows,
+            },
         },
         "week": {
             "value": _week_value(week_start),

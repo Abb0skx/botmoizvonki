@@ -91,18 +91,30 @@ class CourierWorkflowKeyboardTests(unittest.TestCase):
         pending = Order(
             id=7, order_number=7, manager_id=1, manager_name="Manager",
             client_phone="+998901333999", product="A57", status="pending",
+            assigned_courier_id=202134293, assigned_courier_name="Abbos",
         )
         picked = Order(
             id=8, order_number=8, manager_id=1, manager_name="Manager",
             client_phone="+998901333999", product="A58", status="picked_up",
+            assigned_courier_id=202134293, assigned_courier_name="Abbos",
         )
 
-        self.assertEqual(self._callbacks(courier_keyboard(pending)), ["read:7", "cancel:7"])
-        self.assertEqual(self._callbacks(courier_keyboard(picked)), ["onway:8", "cancel:8"])
+        self.assertEqual(
+            self._callbacks(courier_keyboard(pending)),
+            ["group_pickup:7", "onway:7", "cancel:7"],
+        )
+        self.assertEqual(
+            self._callbacks(courier_keyboard(picked)),
+            ["group_undo_pickup:8", "onway:8", "cancel:8"],
+        )
         self.assertEqual(
             self._callbacks(on_way_keyboard(picked)),
             ["undo_onway:8", "complete:8", "cancel:8"],
         )
+
+        pending.assigned_courier_id = None
+        pending.assigned_courier_name = None
+        self.assertEqual(self._callbacks(courier_keyboard(pending)), ["cancel:7"])
 
     def test_courier_selection_is_filtered_by_environment_allowlist(self):
         order = Order(

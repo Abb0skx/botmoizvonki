@@ -8,7 +8,7 @@ from typing import Any
 
 from app.models import Order, OrderEvent
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 4
 SQLITE_INT_MAX = 2**63 - 1
 KNOWN_STATUSES = frozenset({
     "draft",
@@ -79,6 +79,11 @@ CREATE TABLE IF NOT EXISTS orders (
     delivery_time TEXT,
     comment TEXT,
     status TEXT NOT NULL DEFAULT 'draft',
+    cancelled_by_id INTEGER,
+    cancelled_by_name TEXT,
+    cancelled_by_username TEXT,
+    cancelled_at TEXT,
+    cancelled_from_status TEXT,
     assigned_courier_id INTEGER,
     assigned_courier_name TEXT,
     courier_id INTEGER,
@@ -132,7 +137,10 @@ CREATE TABLE IF NOT EXISTS order_events (
     event_type TEXT NOT NULL,
     actor_id INTEGER,
     actor_name TEXT,
+    actor_username TEXT,
     actor_role TEXT,
+    courier_id INTEGER,
+    courier_name TEXT,
     from_status TEXT,
     to_status TEXT,
     changed_fields TEXT NOT NULL DEFAULT '[]',
@@ -164,6 +172,12 @@ CREATE TABLE IF NOT EXISTS telegram_cleanup_queue (
 );
 CREATE INDEX IF NOT EXISTS idx_cleanup_queue_retry
 ON telegram_cleanup_queue(attempts, id);
+CREATE TABLE IF NOT EXISTS periodic_job_claims (
+    job_name TEXT NOT NULL,
+    slot INTEGER NOT NULL CHECK(slot >= 0),
+    claimed_at TEXT NOT NULL,
+    PRIMARY KEY(job_name, slot)
+) WITHOUT ROWID;
 """
 
 MIGRATION_COLUMNS = {
@@ -208,6 +222,17 @@ MIGRATION_COLUMNS = {
     "sales_card_source_message_id": "INTEGER",
     "sales_card_message_id": "INTEGER",
     "sales_card_error": "TEXT",
+    "cancelled_by_id": "INTEGER",
+    "cancelled_by_name": "TEXT",
+    "cancelled_by_username": "TEXT",
+    "cancelled_at": "TEXT",
+    "cancelled_from_status": "TEXT",
+}
+
+ORDER_EVENT_MIGRATION_COLUMNS = {
+    "actor_username": "TEXT",
+    "courier_id": "INTEGER",
+    "courier_name": "TEXT",
 }
 
 CLEANUP_MIGRATION_COLUMNS = {
@@ -242,6 +267,8 @@ class OrderRepository:
         "second_location_url", "second_latitude", "second_longitude",
         "second_address_text", "second_district", "second_mahalla",
         "delivery_time", "comment", "status",
+        "cancelled_by_id", "cancelled_by_name", "cancelled_by_username",
+        "cancelled_at", "cancelled_from_status",
         "assigned_courier_id", "assigned_courier_name",
         "courier_id", "courier_name", "delivery_photo", "received_usd",
         "received_uzs", "delivered_at", "courier_read_at", "picked_up_at", "time_started", "delivery_chat_id",
@@ -301,6 +328,17 @@ class OrderRepository:
             for column, definition in MIGRATION_COLUMNS.items():
                 if column not in existing:
                     self._add_column_if_missing(db, "orders", column, definition)
+            event_existing = {
+                row[1] for row in db.execute("PRAGMA table_info(order_events)")
+            }
+            for column, definition in ORDER_EVENT_MIGRATION_COLUMNS.items():
+                if column not in event_existing:
+                    self._add_column_if_missing(
+                        db,
+                        "order_events",
+                        column,
+                        definition,
+                    )
             cleanup_existing = {
                 row[1] for row in db.execute("PRAGMA table_info(telegram_cleanup_queue)")
             }
@@ -350,6 +388,23 @@ class OrderRepository:
             if current_version < SCHEMA_VERSION:
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
+    def claim_periodic_job(self, job_name: str, slot: int) -> bool:
+        """Atomically claim one wall-clock slot across all bot processes."""
+        clean_name = job_name.strip() if isinstance(job_name, str) else ""
+        if not clean_name:
+            raise ValueError("job_name cannot be empty")
+        if isinstance(slot, bool) or not isinstance(slot, int) or slot < 0:
+            raise ValueError("slot must be a non-negative integer")
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            cursor = db.execute(
+                """INSERT INTO periodic_job_claims(job_name, slot, claimed_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(job_name, slot) DO NOTHING""",
+                (clean_name, slot, now()),
+            )
+        return cursor.rowcount == 1
+
     @staticmethod
     def _validate_money(field: str, value: Any) -> None:
         if value is None:
@@ -371,6 +426,15 @@ class OrderRepository:
         """Validate writes without rejecting untouched values in legacy rows."""
         if "status" in fields and fields["status"] not in KNOWN_STATUSES:
             raise ValueError(f"Unknown order status: {fields['status']!r}")
+        if (
+            "cancelled_from_status" in fields
+            and fields["cancelled_from_status"] is not None
+            and fields["cancelled_from_status"] not in KNOWN_STATUSES
+        ):
+            raise ValueError(
+                "Unknown cancellation source status: "
+                f"{fields['cancelled_from_status']!r}"
+            )
         if (
             "payment_status" in fields
             and fields["payment_status"] not in KNOWN_PAYMENT_STATUSES
@@ -425,7 +489,10 @@ class OrderRepository:
         event_type: str,
         actor_id: int | None = None,
         actor_name: str | None = None,
+        actor_username: str | None = None,
         actor_role: str | None = None,
+        courier_id: int | None = None,
+        courier_name: str | None = None,
         from_status: str | None = None,
         to_status: str | None = None,
         changed_fields: set[str] | list[str] | tuple[str, ...] = (),
@@ -440,16 +507,19 @@ class OrderRepository:
         )
         cursor = db.execute(
             """INSERT INTO order_events
-               (order_id, order_number, event_type, actor_id, actor_name, actor_role,
-                from_status, to_status, changed_fields, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (order_id, order_number, event_type, actor_id, actor_name, actor_username, actor_role,
+                courier_id, courier_name, from_status, to_status, changed_fields, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 order_id,
                 order_number,
                 event_type,
                 actor_id,
                 actor_name,
+                actor_username,
                 actor_role,
+                courier_id,
+                courier_name,
                 from_status,
                 to_status,
                 serialized_fields,
@@ -729,6 +799,38 @@ class OrderRepository:
             row = db.execute(query, parameters).fetchone()
         return Order.from_row(row) if row else None
 
+    @staticmethod
+    def _event_courier_snapshot(
+        row: sqlite3.Row,
+        *,
+        event_courier_id: int | None,
+        event_courier_name: str | None,
+        actor_id: int | None,
+        actor_name: str | None,
+        actor_role: str | None,
+    ) -> tuple[int | None, str | None]:
+        """Keep the business courier separate from the event's human actor."""
+        courier_id = (
+            event_courier_id
+            if event_courier_id is not None
+            else (row["courier_id"] or row["assigned_courier_id"])
+        )
+        courier_name = event_courier_name
+        if courier_name is None and courier_id is not None:
+            if row["courier_id"] is not None and courier_id == row["courier_id"]:
+                courier_name = row["courier_name"]
+            elif (
+                row["assigned_courier_id"] is not None
+                and courier_id == row["assigned_courier_id"]
+            ):
+                courier_name = row["assigned_courier_name"]
+        if actor_role == "courier" and actor_id is not None:
+            if courier_id is None:
+                courier_id = actor_id
+            if courier_name is None and courier_id == actor_id:
+                courier_name = actor_name
+        return courier_id, courier_name
+
     def update(
         self,
         order_id: int,
@@ -736,7 +838,10 @@ class OrderRepository:
         expected_updated_at: str | None = None,
         actor_id: int | None = None,
         actor_name: str | None = None,
+        actor_username: str | None = None,
         actor_role: str | None = None,
+        event_courier_id: int | None = None,
+        event_courier_name: str | None = None,
         **fields: Any,
     ) -> Order | None:
         invalid = set(fields) - self.editable_fields
@@ -772,6 +877,16 @@ class OrderRepository:
                 return None
             row = db.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
             if not publication_only:
+                effective_courier_id, effective_courier_name = (
+                    self._event_courier_snapshot(
+                        row,
+                        event_courier_id=event_courier_id,
+                        event_courier_name=event_courier_name,
+                        actor_id=actor_id,
+                        actor_name=actor_name,
+                        actor_role=actor_role,
+                    )
+                )
                 self._insert_event(
                     db,
                     order_id=order_id,
@@ -783,7 +898,10 @@ class OrderRepository:
                     ),
                     actor_id=actor_id,
                     actor_name=actor_name,
+                    actor_username=actor_username,
                     actor_role=actor_role,
+                    courier_id=effective_courier_id,
+                    courier_name=effective_courier_name,
                     from_status=previous["status"],
                     to_status=row["status"],
                     changed_fields=changed_fields,
@@ -797,11 +915,15 @@ class OrderRepository:
         *,
         guard_courier_id: int | None = None,
         require_unassigned_or_same: bool = False,
+        require_assigned_to_courier: bool = False,
         require_no_other_on_way_for_courier: bool = False,
         expected_updated_at: str | None = None,
         actor_id: int | None = None,
         actor_name: str | None = None,
+        actor_username: str | None = None,
         actor_role: str | None = None,
+        event_courier_id: int | None = None,
+        event_courier_name: str | None = None,
         event_type: str | None = None,
         cleanup_messages: list[tuple[int, int]] | tuple[tuple[int, int], ...] = (),
         **fields: Any,
@@ -812,8 +934,15 @@ class OrderRepository:
             raise ValueError(f"Unsupported fields: {invalid}")
         if not from_statuses:
             raise ValueError("from_statuses cannot be empty")
+        if require_unassigned_or_same and require_assigned_to_courier:
+            raise ValueError(
+                "require_unassigned_or_same and require_assigned_to_courier "
+                "are mutually exclusive"
+            )
         if (
-            require_unassigned_or_same or require_no_other_on_way_for_courier
+            require_unassigned_or_same
+            or require_assigned_to_courier
+            or require_no_other_on_way_for_courier
         ) and guard_courier_id is None:
             raise ValueError("guard_courier_id is required")
         cleanups = [
@@ -842,6 +971,16 @@ class OrderRepository:
                 " AND (courier_id IS NULL OR courier_id=?)"
             )
             params.extend((guard_courier_id, guard_courier_id))
+        elif require_assigned_to_courier:
+            # Starting a trip is allowed only for the courier who is still
+            # assigned at the instant of the UPDATE. Unlike the more general
+            # guard above, an unassigned row cannot be claimed from a stale
+            # courier-group button.
+            where += (
+                " AND assigned_courier_id=?"
+                " AND (courier_id IS NULL OR courier_id=?)"
+            )
+            params.extend((guard_courier_id, guard_courier_id))
         if require_no_other_on_way_for_courier:
             where += (
                 " AND NOT EXISTS ("
@@ -867,7 +1006,7 @@ class OrderRepository:
             if expected_updated_at is not None and previous["updated_at"] != expected_updated_at:
                 return None
             self._validate_domain_fields(fields, current=previous)
-            if require_unassigned_or_same:
+            if require_unassigned_or_same or require_assigned_to_courier:
                 for courier_field in ("assigned_courier_id", "courier_id"):
                     # Validate only values this call is trying to write. An
                     # already-reassigned row is a normal stale-button race;
@@ -902,6 +1041,16 @@ class OrderRepository:
             if event_actor_name is None and previous and event_actor_id == previous["courier_id"]:
                 event_actor_name = previous["courier_name"]
             event_actor_role = actor_role or ("courier" if event_actor_id is not None else None)
+            effective_courier_id, effective_courier_name = (
+                self._event_courier_snapshot(
+                    row,
+                    event_courier_id=event_courier_id,
+                    event_courier_name=event_courier_name,
+                    actor_id=event_actor_id,
+                    actor_name=event_actor_name,
+                    actor_role=event_actor_role,
+                )
+            )
             self._insert_event(
                 db,
                 order_id=order_id,
@@ -912,7 +1061,10 @@ class OrderRepository:
                 ),
                 actor_id=event_actor_id,
                 actor_name=event_actor_name,
+                actor_username=actor_username,
                 actor_role=event_actor_role,
+                courier_id=effective_courier_id,
+                courier_name=effective_courier_name,
                 from_status=previous["status"],
                 to_status=row["status"],
                 changed_fields=changed_fields,
@@ -1146,18 +1298,33 @@ class OrderRepository:
         *,
         actor_id: int | None = None,
         actor_name: str | None = None,
+        actor_username: str | None = None,
         actor_role: str | None = None,
+        event_courier_id: int | None = None,
+        event_courier_name: str | None = None,
         changed_fields: set[str] | list[str] | tuple[str, ...] = (),
     ) -> OrderEvent | None:
         """Append an explicit audit event without changing the order."""
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             order = db.execute(
-                "SELECT order_number, status FROM orders WHERE id=?",
+                """SELECT order_number, status, courier_id, courier_name,
+                          assigned_courier_id, assigned_courier_name
+                   FROM orders WHERE id=?""",
                 (order_id,),
             ).fetchone()
             if not order:
                 return None
+            effective_courier_id, effective_courier_name = (
+                self._event_courier_snapshot(
+                    order,
+                    event_courier_id=event_courier_id,
+                    event_courier_name=event_courier_name,
+                    actor_id=actor_id,
+                    actor_name=actor_name,
+                    actor_role=actor_role,
+                )
+            )
             row = self._insert_event(
                 db,
                 order_id=order_id,
@@ -1165,7 +1332,10 @@ class OrderRepository:
                 event_type=event_type,
                 actor_id=actor_id,
                 actor_name=actor_name,
+                actor_username=actor_username,
                 actor_role=actor_role,
+                courier_id=effective_courier_id,
+                courier_name=effective_courier_name,
                 from_status=order["status"],
                 to_status=order["status"],
                 changed_fields=changed_fields,
@@ -1187,6 +1357,21 @@ class OrderRepository:
                 "SELECT * FROM order_events ORDER BY created_at, id"
             ).fetchall()
         return [OrderEvent.from_row(row) for row in rows]
+
+    def list_orders_with_events(self) -> tuple[list[Order], list[OrderEvent]]:
+        """Read orders and their audit stream from one consistent SQLite snapshot."""
+        with self.connect() as db:
+            db.execute("BEGIN")
+            order_rows = db.execute(
+                "SELECT * FROM orders ORDER BY order_number DESC"
+            ).fetchall()
+            event_rows = db.execute(
+                "SELECT * FROM order_events ORDER BY created_at, id"
+            ).fetchall()
+        return (
+            [Order.from_row(row) for row in order_rows],
+            [OrderEvent.from_row(row) for row in event_rows],
+        )
 
     def list_events_between(
         self,

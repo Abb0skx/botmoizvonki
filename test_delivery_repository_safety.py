@@ -203,6 +203,17 @@ class DeliveryRepositorySafetyTests(unittest.TestCase):
         self.assertEqual(current.updated_at, reassigned.updated_at)
         self.assertEqual(current.status, "pending")
         self.assertEqual(current.assigned_courier_id, 11)
+        stale_start = self.repo.transition(
+            order.id,
+            {"pending"},
+            status="on_way",
+            courier_id=10,
+            courier_name="Courier A",
+            guard_courier_id=10,
+            require_assigned_to_courier=True,
+            require_no_other_on_way_for_courier=True,
+        )
+        self.assertIsNone(stale_start)
         with self.assertRaisesRegex(ValueError, "must match"):
             self.repo.transition(
                 order.id,
@@ -211,6 +222,24 @@ class DeliveryRepositorySafetyTests(unittest.TestCase):
                 require_no_other_on_way_for_courier=True,
                 status="on_way",
             )
+
+    def test_unassigned_order_cannot_be_started_by_courier(self) -> None:
+        order = self.create_order()
+        order = self.repo.transition(order.id, {"draft"}, status="pending")
+
+        started = self.repo.transition(
+            order.id,
+            {"pending"},
+            status="on_way",
+            courier_id=10,
+            courier_name="Courier A",
+            guard_courier_id=10,
+            require_assigned_to_courier=True,
+            require_no_other_on_way_for_courier=True,
+        )
+
+        self.assertIsNone(started)
+        self.assertEqual(self.repo.get(order.id).status, "pending")
 
     def test_cleanup_retry_is_due_only_after_backoff_and_eventually_terminal(self) -> None:
         base = datetime(2026, 8, 24, tzinfo=timezone.utc)
@@ -328,6 +357,39 @@ class DeliveryRepositorySafetyTests(unittest.TestCase):
         self.assertIn("client_phone_2", order_columns)
         self.assertIn("next_attempt_at", cleanup_columns)
         self.assertIn("terminal", cleanup_columns)
+
+    def test_periodic_job_claim_table_is_initialized_at_schema_v4(self) -> None:
+        with self.repo.connect() as db:
+            version = db.execute("PRAGMA user_version").fetchone()[0]
+            table = db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                ("periodic_job_claims",),
+            ).fetchone()
+
+        self.assertEqual(SCHEMA_VERSION, 4)
+        self.assertEqual(version, 4)
+        self.assertIsNotNone(table)
+
+    def test_periodic_job_claim_is_idempotent_per_job_and_slot(self) -> None:
+        self.assertTrue(self.repo.claim_periodic_job("pickup_reminder", 100))
+        self.assertFalse(self.repo.claim_periodic_job("pickup_reminder", 100))
+        self.assertTrue(self.repo.claim_periodic_job("pickup_reminder", 101))
+        self.assertTrue(self.repo.claim_periodic_job("another_job", 100))
+
+    def test_concurrent_repositories_claim_periodic_slot_exactly_once(self) -> None:
+        workers = 8
+        barrier = threading.Barrier(workers)
+
+        def claim(_: int) -> bool:
+            repository = OrderRepository(self.path)
+            barrier.wait(timeout=5)
+            return repository.claim_periodic_job("pickup_reminder", 202608251230)
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            results = list(executor.map(claim, range(workers)))
+
+        self.assertEqual(results.count(True), 1)
+        self.assertEqual(results.count(False), workers - 1)
 
 
 if __name__ == "__main__":

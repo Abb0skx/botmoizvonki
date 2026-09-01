@@ -183,6 +183,8 @@ class OrdersChannelTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_preflight_requires_orders_channel_admin_rights(self):
         async def member(chat_id, user_id):
+            if chat_id == self.settings.delivery_group_id and user_id == 99:
+                return SimpleNamespace(status="administrator")
             if chat_id == ORDERS_CHANNEL_ID and user_id == 99:
                 return SimpleNamespace(status="member")
             if chat_id == self.settings.location_channel_id and user_id == 99:
@@ -227,6 +229,8 @@ class OrdersChannelTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async def member(chat_id, user_id):
+            if (chat_id, user_id) == (courier_group_id, 99):
+                return SimpleNamespace(status="administrator")
             if (chat_id, user_id) == (courier_group_id, courier_id):
                 return SimpleNamespace(status="left")
             return SimpleNamespace(status="member")
@@ -266,6 +270,8 @@ class OrdersChannelTests(unittest.IsolatedAsyncioTestCase):
             )
 
         async def member(chat_id, user_id):
+            if (chat_id, user_id) == (courier_group_id, 99):
+                return SimpleNamespace(status="administrator")
             if (chat_id, user_id) == (location_channel_id, courier_id):
                 return SimpleNamespace(status="left")
             if (chat_id, user_id) == (location_channel_id, 99):

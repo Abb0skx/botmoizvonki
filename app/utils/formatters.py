@@ -176,10 +176,10 @@ def daily_delivery_report(
                 f" заказа №{order.order_number}"
             )
             priority = 4
-        elif event.from_status == "cancelled" and event.to_status in {"pending", "picked_up"}:
+        elif event.from_status == "cancelled" and event.to_status in {"pending", "picked_up", "on_way"}:
             line = (
-                f"↩️ <b>{occurred:%H:%M}</b> · Заказ №{order.order_number}"
-                " возвращён в доставку"
+                f"↩️ <b>{occurred:%H:%M}</b> · {courier} вернул заказ"
+                f" №{order.order_number} в доставку"
             )
             priority = 4
         elif event.from_status == "picked_up" and event.to_status == "pending":
@@ -339,13 +339,9 @@ def _compact_order(
     ]
     if status:
         lines.append(f"🏷 {escape(status)}")
+    lines.extend(_cancellation_audit_lines(order))
     if order.assigned_courier_name:
         lines.append(f"🚚 Курьер: {escape(order.assigned_courier_name)}")
-    read_at = _local_time(order.courier_read_at)
-    if read_at:
-        lines.append(f"👀 Заказ прочитан {escape(read_at)}")
-        if order.status == "pending":
-            lines.append("🏬 Едет на склад за товаром")
     lines.extend([
         f"📦 {escape(order.product)}",
         amount_text(order),
@@ -396,6 +392,33 @@ def _local_time(value: str | None) -> str | None:
     return parsed.strftime("%H:%M")
 
 
+def _cancellation_audit_lines(order: Order) -> list[str]:
+    """Render the accountable actor for the current cancelled state only."""
+    if order.status != "cancelled":
+        return []
+    if not any((
+        order.cancelled_by_id,
+        order.cancelled_by_name,
+        order.cancelled_by_username,
+        order.cancelled_at,
+    )):
+        # Legacy cancelled rows predate accountable cancellation metadata.
+        return []
+
+    name = escape(order.cancelled_by_name or "Имя не указано")
+    username = (order.cancelled_by_username or "").strip().lstrip("@")
+    actor = f"👤 Отменил: <b>{name}</b>"
+    if username:
+        actor += f" (@{escape(username)})"
+    lines = [actor]
+    if order.cancelled_by_id is not None:
+        lines.append(f"🆔 Telegram ID: <code>{order.cancelled_by_id}</code>")
+    cancelled_at = _local_datetime(order.cancelled_at)
+    if cancelled_at:
+        lines.append(f"🕒 Время отмены: {escape(cancelled_at)}")
+    return lines
+
+
 def orders_channel_card(order: Order) -> str:
     """Full, durable manager overview shown in the shared order journal."""
     status = STATUS_LABELS.get(order.status, order.status)
@@ -434,6 +457,7 @@ def orders_channel_card(order: Order) -> str:
         lines.append(f"🚚 Назначен курьер: <b>{escape(order.assigned_courier_name)}</b>")
     if order.courier_name:
         lines.append(f"👤 Принял заказ: {escape(order.courier_name)}")
+    lines.extend(_cancellation_audit_lines(order))
     read_at = _local_time(order.courier_read_at)
     if read_at:
         lines.append(f"👀 Заказ прочитан {escape(read_at)}")
@@ -490,7 +514,7 @@ def completed_card(order: Order, local_time: str) -> str:
 
 STATUS_LABELS = {
     "draft": "📝 Черновик",
-    "pending": "🆕 Ожидает курьера",
+    "pending": "⏳ Ожидает забора товара",
     "picked_up": "📦 Товар у курьера",
     "on_way": "🚗 Курьер едет",
     "awaiting_photo": "📸 Подтверждается",

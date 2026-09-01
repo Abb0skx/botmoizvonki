@@ -100,6 +100,8 @@ def _courier_color(courier_id: int | None) -> str:
 
 
 def _event_courier_id(event: OrderEvent, order: Order) -> int | None:
+    if event.courier_id in COURIERS_BY_ID:
+        return event.courier_id
     if event.actor_role == "courier" and event.actor_id in COURIERS_BY_ID:
         return event.actor_id
     return _courier_id(order)
@@ -108,6 +110,8 @@ def _event_courier_id(event: OrderEvent, order: Order) -> int | None:
 def _event_courier_name(event: OrderEvent, order: Order) -> str:
     courier_id = _event_courier_id(event, order)
     configured = COURIERS_BY_ID.get(courier_id)
+    if event.courier_id == courier_id and event.courier_name:
+        return event.courier_name
     if event.actor_role == "courier" and event.actor_name:
         return event.actor_name
     return (configured.name if configured else None) or _courier_name(order)
@@ -134,9 +138,13 @@ def _report_courier(
     courier_events = [
         event
         for event in events
-        if event.actor_role == "courier" and event.actor_id in COURIERS_BY_ID
+        if (
+            event.courier_id in COURIERS_BY_ID
+            or (event.actor_role == "courier" and event.actor_id in COURIERS_BY_ID)
+        )
         and (
-            event.event_type == "courier_read"
+            "assigned_courier_id" in event.changed_fields
+            or event.event_type == "courier_read"
             or (
                 _status_changed(event)
                 and event.to_status in {"picked_up", "on_way", "completed", "cancelled"}
@@ -149,9 +157,18 @@ def _report_courier(
     ]
     if courier_events:
         event = courier_events[-1]
-        courier_id = event.actor_id
+        courier_id = (
+            event.courier_id
+            if event.courier_id in COURIERS_BY_ID
+            else event.actor_id
+        )
         configured = COURIERS_BY_ID.get(courier_id)
-        return courier_id, event.actor_name or configured.name
+        courier_name = (
+            event.courier_name
+            if event.courier_id == courier_id and event.courier_name
+            else event.actor_name
+        )
+        return courier_id, courier_name or configured.name
     if not is_current_report and events:
         # Do not retroactively assign an old report to today's courier merely
         # because an order was reopened/reassigned later.
@@ -183,7 +200,7 @@ def _activity_event(event: OrderEvent) -> bool:
         or (
             _status_changed(event)
             and event.from_status in {"picked_up", "on_way", "completed", "cancelled"}
-            and event.to_status in {"pending", "picked_up"}
+            and event.to_status in {"pending", "picked_up", "on_way"}
         )
     )
 
@@ -208,6 +225,7 @@ def _timeline_item(event: OrderEvent, order: Order) -> dict[str, Any] | None:
     if not occurred:
         return None
     courier_name = _event_courier_name(event, order)
+    actor_name = event.actor_name or courier_name
     address = short_address(order)
     base = {
         "timestamp": occurred.isoformat(),
@@ -250,12 +268,14 @@ def _timeline_item(event: OrderEvent, order: Order) -> dict[str, Any] | None:
             "icon": "↩️",
             "text": f"{courier_name} отменил выезд к заказу №{order.order_number}",
         }
-    if event.from_status == "cancelled" and event.to_status in {"pending", "picked_up"}:
+    if event.from_status == "cancelled" and event.to_status in {"pending", "picked_up", "on_way"}:
         return {
             **base,
             "kind": "restored",
             "icon": "↩️",
-            "text": f"Заказ №{order.order_number} возвращён в доставку",
+            "text": (
+                f"{actor_name} вернул заказ №{order.order_number} в доставку"
+            ),
         }
     if event.from_status == "picked_up" and event.to_status == "pending":
         return {
@@ -290,7 +310,7 @@ def _timeline_item(event: OrderEvent, order: Order) -> dict[str, Any] | None:
             **base,
             "kind": "cancelled",
             "icon": "❌",
-            "text": f"{courier_name} отменил заказ №{order.order_number}",
+            "text": f"{actor_name} отменил заказ №{order.order_number}",
         }
     return None
 
@@ -410,6 +430,7 @@ def build_delivery_stats(
     pickup_durations: list[int] = []
     response_durations: list[int] = []
     warehouse_durations: list[int] = []
+    assignment_pickup_durations: list[int] = []
     created_usd = created_uzs = delivered_usd = delivered_uzs = 0
     received_usd = received_uzs = paid_usd = paid_uzs = 0
     paid_at_assembly_count = missing_received_confirmation = 0
@@ -461,11 +482,23 @@ def build_delivery_stats(
             and read_at
             and occurred <= read_at
         ]
+        pickup_assignment_times = [
+            occurred
+            for event in day_events
+            if "assigned_courier_id" in event.changed_fields
+            and (occurred := _event_time(event))
+            and picked_up
+            and occurred <= picked_up
+        ]
         response_duration = _duration_minutes(
             assignment_times[-1] if assignment_times else None,
             read_at,
         )
         warehouse_duration = _duration_minutes(read_at, picked_up)
+        assignment_pickup_duration = _duration_minutes(
+            pickup_assignment_times[-1] if pickup_assignment_times else None,
+            picked_up,
+        )
         if duration is not None:
             durations.append(duration)
         if pickup_duration is not None:
@@ -474,6 +507,8 @@ def build_delivery_stats(
             response_durations.append(response_duration)
         if warehouse_duration is not None:
             warehouse_durations.append(warehouse_duration)
+        if assignment_pickup_duration is not None:
+            assignment_pickup_durations.append(assignment_pickup_duration)
 
         if created_today:
             created_usd += order.amount_usd or 0
@@ -526,6 +561,7 @@ def build_delivery_stats(
             "pickup_duration_minutes": pickup_duration,
             "response_minutes": response_duration,
             "warehouse_minutes": warehouse_duration,
+            "assignment_pickup_minutes": assignment_pickup_duration,
             "amount_usd": order.amount_usd or 0,
             "amount_uzs": order.amount_uzs or 0,
             "amount_text": _money_text(order.amount_usd or 0, order.amount_uzs or 0),
@@ -615,8 +651,12 @@ def build_delivery_stats(
         last_completed: datetime | None = None
         last_point = warehouse_point
         for row in completed_rows:
-            pickup = local_datetime(row["picked_up_at"])
-            if last_completed and pickup and pickup > last_completed:
+            # Use the persisted business timestamp, not the day-scoped display
+            # value. A direct pending→on_way trip has no pickup timestamp and
+            # therefore begins a fresh warehouse leg instead of drawing an
+            # impossible customer→customer segment.
+            pickup = local_datetime(order_by_id[row["id"]].picked_up_at)
+            if last_completed and (pickup is None or pickup > last_completed):
                 if completed_path[-1] != warehouse_point:
                     completed_path.append(warehouse_point)
                 if len(completed_path) > 1:
@@ -636,9 +676,9 @@ def build_delivery_stats(
         current_row = current_rows[-1] if current_rows else None
         current_path: list[list[float]] = []
         if current_row:
-            pickup = local_datetime(current_row["picked_up_at"])
+            pickup = local_datetime(order_by_id[current_row["id"]].picked_up_at)
             current_origin = last_point
-            if not last_completed or (pickup and pickup > last_completed):
+            if not last_completed or pickup is None or pickup > last_completed:
                 current_origin = warehouse_point
                 if completed_paths and completed_paths[-1][-1] != warehouse_point:
                     completed_paths[-1].append(warehouse_point)
@@ -845,6 +885,11 @@ def build_delivery_stats(
             for row in courier_rows
             if row["warehouse_minutes"] is not None
         ]
+        courier_assignment_pickup_durations = [
+            row["assignment_pickup_minutes"]
+            for row in courier_rows
+            if row["assignment_pickup_minutes"] is not None
+        ]
         courier_summaries.append({
             "id": courier.user_id,
             "name": courier.name,
@@ -868,6 +913,14 @@ def build_delivery_stats(
             "average_warehouse_minutes": (
                 round(sum(courier_warehouse_durations) / len(courier_warehouse_durations))
                 if courier_warehouse_durations
+                else None
+            ),
+            "average_assignment_pickup_minutes": (
+                round(
+                    sum(courier_assignment_pickup_durations)
+                    / len(courier_assignment_pickup_durations)
+                )
+                if courier_assignment_pickup_durations
                 else None
             ),
         })
@@ -902,6 +955,14 @@ def build_delivery_stats(
             "average_warehouse_minutes": (
                 round(sum(warehouse_durations) / len(warehouse_durations))
                 if warehouse_durations
+                else None
+            ),
+            "average_assignment_pickup_minutes": (
+                round(
+                    sum(assignment_pickup_durations)
+                    / len(assignment_pickup_durations)
+                )
+                if assignment_pickup_durations
                 else None
             ),
             # Backwards-compatible amount fields now have one precise meaning:

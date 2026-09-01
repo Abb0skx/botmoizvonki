@@ -195,7 +195,6 @@ def manager_sent_keyboard(order: Order, *, expanded: bool = False) -> InlineKeyb
         edit_rows.append([InlineKeyboardButton("↩️ Назад", callback_data=f"edit_close:{order.id}")])
     return InlineKeyboardMarkup(
         _location_rows(order)
-        + _pickup_rows(order)
         + [[InlineKeyboardButton("🚚 Изменить курьера", callback_data=f"courier_menu:{order.id}")]]
         + edit_rows
         + [[InlineKeyboardButton("🔄 Синхронизировать", callback_data=f"sync:{order.id}")]]
@@ -266,16 +265,15 @@ def _pickup_rows(order: Order) -> list[list[InlineKeyboardButton]]:
     if (
         order.status == "pending"
         and order.assigned_courier_id
-        and order.courier_read_at
     ):
         return [[InlineKeyboardButton(
             f"📦 {courier_name} забрал товар",
-            callback_data=f"pickup:{order.id}",
+            callback_data=f"group_pickup:{order.id}",
         )]]
     if order.status == "picked_up":
         return [[InlineKeyboardButton(
             f"↩️ Отменить: {courier_name} забрал товар",
-            callback_data=f"undo_pickup:{order.id}",
+            callback_data=f"group_undo_pickup:{order.id}",
         )]]
     return []
 
@@ -319,27 +317,8 @@ def log_order_keyboard(order: Order) -> InlineKeyboardMarkup | None:
 
 
 def log_read_keyboard(order: Order) -> InlineKeyboardMarkup | None:
-    """Log read notification with a warehouse hand-over action.
-
-    The callback carries the currently assigned courier ID, so an old
-    notification cannot mark an order picked up after reassignment.
-    """
-    rows: list[list[InlineKeyboardButton]] = []
-    if order.courier_read_at and order.assigned_courier_id and order.status in {"pending", "picked_up"}:
-        courier_name = order.assigned_courier_name or order.courier_name or "Курьер"
-        undo = order.status == "picked_up"
-        rows.append([InlineKeyboardButton(
-            f"↩️ Отменить: {courier_name} забрал товар"
-            if undo else f"📦 {courier_name} забрал товар",
-            callback_data=(
-                f"{'undo_pickup_log' if undo else 'pickup_log'}:"
-                f"{order.id}:{order.assigned_courier_id}"
-            ),
-        )])
-    navigation = log_order_keyboard(order)
-    if navigation:
-        rows.extend(navigation.inline_keyboard)
-    return InlineKeyboardMarkup(rows) if rows else None
+    """Retire legacy read notifications into plain Log navigation."""
+    return log_order_keyboard(order)
 
 
 def log_location_keyboard(order: Order) -> InlineKeyboardMarkup | None:
@@ -348,7 +327,7 @@ def log_location_keyboard(order: Order) -> InlineKeyboardMarkup | None:
 
 
 def orders_channel_keyboard(order: Order) -> InlineKeyboardMarkup:
-    rows = _location_rows(order) + _pickup_rows(order)
+    rows = _location_rows(order)
     delivery_url = delivery_order_message_url(order)
     if delivery_url:
         rows.append([InlineKeyboardButton("📦 Карточка в группе курьера", url=delivery_url)])
@@ -424,14 +403,12 @@ def location_channel_keyboard(
 
 
 def courier_keyboard(order: Order) -> InlineKeyboardMarkup:
-    rows = _location_rows(order)
+    rows = _location_rows(order) + _pickup_rows(order)
     if order.status == "pending":
-        read_text = (
-            "✅ Прочитано · еду на склад"
-            if order.courier_read_at
-            else "👀 Заказ прочитан"
-        )
-        rows.append([InlineKeyboardButton(read_text, callback_data=f"read:{order.id}")])
+        if order.assigned_courier_id:
+            rows.append([
+                InlineKeyboardButton("🚗 Еду к заказу", callback_data=f"onway:{order.id}"),
+            ])
         rows.append([InlineKeyboardButton("❌ Отменён", callback_data=f"cancel:{order.id}")])
     elif order.status == "picked_up":
         rows += [

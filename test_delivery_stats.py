@@ -438,8 +438,58 @@ class DeliveryStatsServiceTests(unittest.TestCase):
 
         self.assertEqual(row["response_minutes"], 5)
         self.assertEqual(row["warehouse_minutes"], 20)
+        self.assertEqual(row["assignment_pickup_minutes"], 25)
         self.assertEqual(report["summary"]["average_response_minutes"], 5)
         self.assertEqual(report["summary"]["average_warehouse_minutes"], 20)
+        self.assertEqual(report["summary"]["average_assignment_pickup_minutes"], 25)
+
+    def test_assignment_to_pickup_metric_does_not_require_read_confirmation(self):
+        start = datetime.combine(
+            self.today,
+            datetime.min.time(),
+            TASHKENT,
+        ) + timedelta(hours=11)
+
+        def utc_text(value):
+            return value.astimezone(timezone.utc).isoformat(timespec="microseconds")
+
+        with patch("app.database.repository.now", return_value=utc_text(start)):
+            order = self._order("No read button", 41.34, 69.30)
+        with patch(
+            "app.database.repository.now",
+            return_value=utc_text(start + timedelta(minutes=2)),
+        ):
+            order = self.repo.transition(
+                order.id,
+                {"draft"},
+                status="pending",
+                assigned_courier_id=ABBOS_ID,
+                assigned_courier_name="Abbos",
+                actor_id=11,
+                actor_name="Manager",
+                actor_role="manager",
+            )
+        with patch(
+            "app.database.repository.now",
+            return_value=utc_text(start + timedelta(minutes=17)),
+        ):
+            self.repo.transition(
+                order.id,
+                {"pending"},
+                status="picked_up",
+                courier_id=ABBOS_ID,
+                courier_name="Abbos",
+                picked_up_at=(start + timedelta(minutes=17)).isoformat(),
+                actor_id=11,
+                actor_name="Warehouse",
+                actor_role="staff",
+            )
+
+        report = build_delivery_stats(self.repo, self.today)
+        row = next(item for item in report["orders"] if item["id"] == order.id)
+
+        self.assertIsNone(row["read_time"])
+        self.assertEqual(row["assignment_pickup_minutes"], 15)
 
     def test_past_delivery_keeps_historical_courier_after_reassignment(self):
         day = self.today - timedelta(days=1)
@@ -485,6 +535,90 @@ class DeliveryStatsServiceTests(unittest.TestCase):
         self.assertEqual(abbos["summary"]["completed"], 1)
         self.assertEqual(abbos["orders"][0]["courier_id"], ABBOS_ID)
         self.assertEqual(muzrob["summary"]["orders"], 0)
+
+    def test_past_group_member_cancellation_keeps_assigned_courier(self):
+        day = self.today - timedelta(days=1)
+        start = datetime.combine(day, datetime.min.time(), TASHKENT) + timedelta(hours=9)
+
+        def utc_text(value):
+            return value.astimezone(timezone.utc).isoformat(timespec="microseconds")
+
+        with patch("app.database.repository.now", return_value=utc_text(start)):
+            order = self._order("Cancelled by staff", 41.35, 69.31)
+        with patch(
+            "app.database.repository.now",
+            return_value=utc_text(start + timedelta(minutes=2)),
+        ):
+            order = self.repo.transition(
+                order.id,
+                {"draft"},
+                status="pending",
+                assigned_courier_id=ABBOS_ID,
+                assigned_courier_name="Abbos",
+                actor_id=11,
+                actor_name="Manager",
+                actor_role="manager",
+            )
+        with patch(
+            "app.database.repository.now",
+            return_value=utc_text(start + timedelta(minutes=8)),
+        ):
+            self.repo.transition(
+                order.id,
+                {"pending"},
+                status="cancelled",
+                cancelled_by_id=900,
+                cancelled_by_name="Warehouse",
+                cancelled_at=(start + timedelta(minutes=8)).isoformat(),
+                cancelled_from_status="pending",
+                actor_id=900,
+                actor_name="Warehouse",
+                actor_role="group_member",
+                event_type="order_cancelled",
+            )
+
+        report = build_delivery_stats(self.repo, day)
+        row = next(item for item in report["orders"] if item["id"] == order.id)
+        filtered = build_delivery_stats(self.repo, day, courier_id=ABBOS_ID)
+
+        self.assertTrue(row["cancelled_today"])
+        self.assertEqual(row["courier_id"], ABBOS_ID)
+        self.assertEqual(row["courier_name"], "Abbos")
+        self.assertEqual([item["id"] for item in filtered["orders"]], [order.id])
+
+    def test_past_pending_order_without_read_keeps_assigned_courier(self):
+        day = self.today - timedelta(days=1)
+        start = datetime.combine(day, datetime.min.time(), TASHKENT) + timedelta(hours=14)
+
+        def utc_text(value):
+            return value.astimezone(timezone.utc).isoformat(timespec="microseconds")
+
+        with patch("app.database.repository.now", return_value=utc_text(start)):
+            order = self._order("Pending without read", 41.36, 69.32)
+        with patch(
+            "app.database.repository.now",
+            return_value=utc_text(start + timedelta(minutes=3)),
+        ):
+            self.repo.transition(
+                order.id,
+                {"draft"},
+                status="pending",
+                assigned_courier_id=ABBOS_ID,
+                assigned_courier_name="Abbos",
+                actor_id=11,
+                actor_name="Manager",
+                actor_role="manager",
+            )
+
+        report = build_delivery_stats(self.repo, day)
+        row = next(item for item in report["orders"] if item["id"] == order.id)
+        filtered = build_delivery_stats(self.repo, day, courier_id=ABBOS_ID)
+
+        self.assertEqual(row["status"], "pending")
+        self.assertIsNone(row["read_time"])
+        self.assertEqual(row["courier_id"], ABBOS_ID)
+        self.assertEqual(row["courier_name"], "Abbos")
+        self.assertEqual([item["id"] for item in filtered["orders"]], [order.id])
 
     def test_stats_plan_keeps_carried_goods_at_last_customer(self):
         now = datetime.now(TASHKENT).replace(microsecond=0)

@@ -64,7 +64,7 @@ class DeliveryMonitorRegressionTests(unittest.TestCase):
         self.assertEqual(missing[0]["location_number"], 2)
         self.assertIn("Вторая точка", missing[0]["address"])
 
-    def test_pending_and_draft_states_have_non_overlapping_counts(self):
+    def test_all_pending_orders_wait_for_pickup_regardless_of_historical_read(self):
         self._pending("Новый")
         self._pending("Прочитан", read=True)
         self.repo.create(
@@ -76,9 +76,16 @@ class DeliveryMonitorRegressionTests(unittest.TestCase):
         monitor = build_delivery_monitor(self.repo)
 
         self.assertEqual(monitor["summary"]["active"], 3)
-        self.assertEqual(monitor["summary"]["new_orders"], 1)
-        self.assertEqual(monitor["summary"]["waiting_pickup"], 1)
+        self.assertNotIn("new_orders", monitor["summary"])
+        self.assertEqual(monitor["summary"]["waiting_pickup"], 2)
         self.assertEqual(monitor["summary"]["unassigned"], 1)
+        courier = next(item for item in monitor["couriers"] if item["id"] == ABBOS_ID)
+        self.assertNotIn("new_orders", courier)
+        self.assertNotIn("heading_to_warehouse", courier)
+        self.assertEqual(courier["waiting_pickup"], 2)
+        route = next(item for item in monitor["routes"] if item["courier_id"] == ABBOS_ID)
+        self.assertIsNone(route["movement_kind"])
+        self.assertNotIn("warehouse_started_at", route)
         draft = next(item for item in monitor["active_orders"] if item["status"] == "draft")
         self.assertTrue(draft["urgent"])
         self.assertIsNotNone(draft["deadline_at"])

@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
-from app.bot.keyboards import manager_sent_keyboard, orders_channel_keyboard
+from app.bot.keyboards import courier_keyboard, manager_sent_keyboard, orders_channel_keyboard
 from app.database import OrderRepository
 from app.handlers.orders import courier_action, manager_pickup_action
 from app.monitor_service import WAREHOUSE, build_delivery_monitor
@@ -51,9 +51,6 @@ class PickupWorkflowTests(unittest.IsolatedAsyncioTestCase):
             status="pending",
             assigned_courier_id=ABBOS_ID,
             assigned_courier_name="Abbos",
-            courier_id=ABBOS_ID,
-            courier_name="Abbos",
-            courier_read_at=datetime.now(TASHKENT).isoformat(timespec="seconds"),
             manager_chat_id=11,
             manager_message_id=90 + order.id,
             delivery_chat_id=-5216093690,
@@ -63,9 +60,12 @@ class PickupWorkflowTests(unittest.IsolatedAsyncioTestCase):
     async def test_manager_marks_and_undoes_goods_pickup(self):
         order = self.assigned_order()
         query = SimpleNamespace(
-            data=f"pickup:{order.id}",
+            data=f"group_pickup:{order.id}",
             from_user=SimpleNamespace(id=11, full_name="Otabek", username=None),
-            message=SimpleNamespace(chat_id=11, message_id=order.manager_message_id),
+            message=SimpleNamespace(
+                chat_id=order.delivery_chat_id,
+                message_id=order.delivery_message_id,
+            ),
             answer=AsyncMock(),
         )
         context = SimpleNamespace(
@@ -76,10 +76,10 @@ class PickupWorkflowTests(unittest.IsolatedAsyncioTestCase):
             bot=SimpleNamespace(),
         )
 
-        async def synchronized(_context, order_id):
-            return self.repo.get(order_id), True
-
-        with patch("app.handlers.orders._sync_order", side_effect=synchronized):
+        with patch(
+            "app.handlers.orders._finish_status_change_locked",
+            new=AsyncMock(return_value=True),
+        ):
             await manager_pickup_action(SimpleNamespace(callback_query=query), context)
 
         picked_up = self.repo.get(order.id)
@@ -88,9 +88,12 @@ class PickupWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(picked_up.courier_id, ABBOS_ID)
         self.assertIn("Товар у курьера", query.answer.await_args.args[0])
 
-        query.data = f"undo_pickup:{order.id}"
+        query.data = f"group_undo_pickup:{order.id}"
         query.answer.reset_mock()
-        with patch("app.handlers.orders._sync_order", side_effect=synchronized):
+        with patch(
+            "app.handlers.orders._finish_status_change_locked",
+            new=AsyncMock(return_value=True),
+        ):
             await manager_pickup_action(SimpleNamespace(callback_query=query), context)
 
         pending = self.repo.get(order.id)
@@ -133,24 +136,141 @@ class PickupWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(f"№{first.order_number}", query.answer.await_args.args[0])
         self.assertTrue(query.answer.await_args.kwargs["show_alert"])
 
+    async def test_courier_starts_pending_order_without_fake_pickup_and_can_undo(self):
+        order = self.assigned_order("A58")
+        query = SimpleNamespace(
+            data=f"onway:{order.id}",
+            from_user=SimpleNamespace(id=ABBOS_ID, full_name="Abbos", username=None),
+            message=SimpleNamespace(
+                chat_id=order.delivery_chat_id,
+                message_id=order.delivery_message_id,
+            ),
+            answer=AsyncMock(),
+        )
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={
+                "settings": SimpleNamespace(courier_ids=frozenset({ABBOS_ID})),
+                "repo": self.repo,
+            }),
+            bot=SimpleNamespace(),
+        )
+        finish = AsyncMock(return_value=True)
+        on_way_log = AsyncMock()
+        with (
+            patch("app.handlers.orders._finish_status_change", new=finish),
+            patch("app.handlers.orders._notify_on_way_log", new=on_way_log),
+        ):
+            await courier_action(SimpleNamespace(callback_query=query), context)
+            # A repeated tap is idempotent and cannot duplicate the event or Log.
+            await courier_action(SimpleNamespace(callback_query=query), context)
+
+        started = self.repo.get(order.id)
+        self.assertEqual(started.status, "on_way")
+        self.assertEqual(started.courier_id, ABBOS_ID)
+        self.assertEqual(started.courier_name, "Abbos")
+        self.assertIsNotNone(started.time_started)
+        self.assertIsNone(started.picked_up_at)
+        callbacks = [
+            button.callback_data
+            for row in finish.await_args.args[4].inline_keyboard
+            for button in row
+            if button.callback_data
+        ]
+        self.assertEqual(
+            callbacks,
+            [f"undo_onway:{order.id}", f"complete:{order.id}", f"cancel:{order.id}"],
+        )
+        events = self.repo.list_events(order.id)
+        departures = [event for event in events if event.to_status == "on_way"]
+        self.assertEqual(len(departures), 1)
+        self.assertEqual(departures[0].from_status, "pending")
+        self.assertEqual(departures[0].actor_id, ABBOS_ID)
+        self.assertEqual(departures[0].actor_role, "courier")
+        self.assertFalse(any(event.to_status == "picked_up" for event in events))
+        on_way_log.assert_awaited_once()
+
+        query.data = f"undo_onway:{order.id}"
+        query.answer.reset_mock()
+        undo_finish = AsyncMock(return_value=True)
+        with (
+            patch("app.handlers.orders._finish_status_change", new=undo_finish),
+            patch("app.handlers.orders._notify_log", new=AsyncMock()),
+        ):
+            await courier_action(SimpleNamespace(callback_query=query), context)
+
+        restored = self.repo.get(order.id)
+        self.assertEqual(restored.status, "pending")
+        self.assertEqual(restored.assigned_courier_id, ABBOS_ID)
+        self.assertIsNone(restored.courier_id)
+        self.assertIsNone(restored.time_started)
+        self.assertIsNone(restored.picked_up_at)
+        restored_callbacks = [
+            button.callback_data
+            for row in undo_finish.await_args.args[4].inline_keyboard
+            for button in row
+            if button.callback_data
+        ]
+        self.assertEqual(
+            restored_callbacks,
+            [f"group_pickup:{order.id}", f"onway:{order.id}", f"cancel:{order.id}"],
+        )
+
+    async def test_unassigned_pending_order_cannot_be_started(self):
+        order = self.repo.create(
+            manager_id=11,
+            manager_name="Otabek",
+            data=order_data("A59"),
+        )
+        order = self.repo.transition(
+            order.id,
+            {"draft"},
+            status="pending",
+            delivery_chat_id=-5216093690,
+            delivery_message_id=299,
+        )
+        query = SimpleNamespace(
+            data=f"onway:{order.id}",
+            from_user=SimpleNamespace(id=ABBOS_ID, full_name="Abbos", username=None),
+            message=SimpleNamespace(chat_id=-5216093690, message_id=299),
+            answer=AsyncMock(),
+        )
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={
+                "settings": SimpleNamespace(courier_ids=frozenset({ABBOS_ID})),
+                "repo": self.repo,
+            }),
+            bot=SimpleNamespace(),
+        )
+
+        await courier_action(SimpleNamespace(callback_query=query), context)
+
+        self.assertEqual(self.repo.get(order.id).status, "pending")
+        query.answer.assert_awaited_once_with("Сначала назначьте курьера", show_alert=True)
+
     def test_pickup_buttons_follow_order_state(self):
         pending = self.assigned_order()
-        callbacks = [
+        group_callbacks = [
+            button.callback_data
+            for row in courier_keyboard(pending).inline_keyboard
+            for button in row
+            if button.callback_data
+        ]
+        self.assertEqual(group_callbacks.count(f"group_pickup:{pending.id}"), 1)
+        pickup_button = next(
+            button
+            for row in courier_keyboard(pending).inline_keyboard
+            for button in row
+            if button.callback_data == f"group_pickup:{pending.id}"
+        )
+        self.assertEqual(pickup_button.text, "📦 Abbos забрал товар")
+        outside_callbacks = [
             button.callback_data
             for keyboard in (manager_sent_keyboard(pending), orders_channel_keyboard(pending))
             for row in keyboard.inline_keyboard
             for button in row
             if button.callback_data
         ]
-        self.assertEqual(callbacks.count(f"pickup:{pending.id}"), 2)
-        labels = [
-            button.text
-            for keyboard in (manager_sent_keyboard(pending), orders_channel_keyboard(pending))
-            for row in keyboard.inline_keyboard
-            for button in row
-            if button.callback_data == f"pickup:{pending.id}"
-        ]
-        self.assertEqual(labels, ["📦 Abbos забрал товар", "📦 Abbos забрал товар"])
+        self.assertNotIn(f"group_pickup:{pending.id}", outside_callbacks)
 
         picked = self.repo.transition(
             pending.id,
@@ -160,18 +280,26 @@ class PickupWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
         callbacks = [
             button.callback_data
-            for row in manager_sent_keyboard(picked).inline_keyboard
+            for row in courier_keyboard(picked).inline_keyboard
             for button in row
             if button.callback_data
         ]
-        self.assertIn(f"undo_pickup:{picked.id}", callbacks)
+        self.assertIn(f"group_undo_pickup:{picked.id}", callbacks)
         undo_button = next(
             button
-            for row in manager_sent_keyboard(picked).inline_keyboard
+            for row in courier_keyboard(picked).inline_keyboard
             for button in row
-            if button.callback_data == f"undo_pickup:{picked.id}"
+            if button.callback_data == f"group_undo_pickup:{picked.id}"
         )
         self.assertEqual(undo_button.text, "↩️ Отменить: Abbos забрал товар")
+        outside_callbacks = [
+            button.callback_data
+            for keyboard in (manager_sent_keyboard(picked), orders_channel_keyboard(picked))
+            for row in keyboard.inline_keyboard
+            for button in row
+            if button.callback_data
+        ]
+        self.assertNotIn(f"group_undo_pickup:{picked.id}", outside_callbacks)
 
 
 class DeliveryMonitorServiceTests(unittest.TestCase):
@@ -257,8 +385,8 @@ class DeliveryMonitorServiceTests(unittest.TestCase):
         route = next(item for item in monitor["routes"] if item["courier_id"] == ABBOS_ID)
 
         self.assertEqual(monitor["summary"]["active"], 2)
-        self.assertEqual(monitor["summary"]["new_orders"], 1)
-        self.assertEqual(monitor["summary"]["waiting_pickup"], 0)
+        self.assertNotIn("new_orders", monitor["summary"])
+        self.assertEqual(monitor["summary"]["waiting_pickup"], 1)
         self.assertEqual(monitor["summary"]["on_way"], 1)
         self.assertEqual(monitor["manager_counts"], [{"name": "Otabek", "orders": 3}])
         self.assertEqual(route["current_target"]["order_number"], current.order_number)
@@ -274,6 +402,73 @@ class DeliveryMonitorServiceTests(unittest.TestCase):
         current_row = next(row for row in report["orders"] if row["id"] == current.id)
         self.assertIsNotNone(current_row["picked_up_time"])
         self.assertTrue(any(item["kind"] == "picked_up" for item in report["timeline"]))
+
+    def test_direct_departure_without_pickup_starts_both_maps_at_warehouse(self):
+        now = datetime.now(TASHKENT).replace(second=0, microsecond=0)
+        completed = self._assigned("A60", 41.320)
+        completed = self.repo.transition(
+            completed.id,
+            {"pending"},
+            status="on_way",
+            courier_id=ABBOS_ID,
+            courier_name="Abbos",
+            time_started=(now - timedelta(minutes=80)).isoformat(),
+        )
+        self.repo.transition(
+            completed.id,
+            {"on_way"},
+            status="completed",
+            delivered_at=(now - timedelta(minutes=70)).isoformat(),
+        )
+        second_completed = self._assigned("A61", 41.335)
+        second_completed = self.repo.transition(
+            second_completed.id,
+            {"pending"},
+            status="on_way",
+            courier_id=ABBOS_ID,
+            courier_name="Abbos",
+            time_started=(now - timedelta(minutes=45)).isoformat(),
+        )
+        self.repo.transition(
+            second_completed.id,
+            {"on_way"},
+            status="completed",
+            delivered_at=(now - timedelta(minutes=20)).isoformat(),
+        )
+        current = self._assigned("A62", 41.350)
+        self.repo.transition(
+            current.id,
+            {"pending"},
+            status="on_way",
+            courier_id=ABBOS_ID,
+            courier_name="Abbos",
+            time_started=(now - timedelta(minutes=5)).isoformat(),
+        )
+
+        monitor = build_delivery_monitor(self.repo)
+        monitor_route = next(
+            route for route in monitor["routes"] if route["courier_id"] == ABBOS_ID
+        )
+        report = build_delivery_stats(self.repo, now.date())
+        stats_route = next(
+            route for route in report["routes"] if route["courier_id"] == ABBOS_ID
+        )
+        current_row = next(row for row in report["orders"] if row["id"] == current.id)
+        warehouse = [WAREHOUSE["latitude"], WAREHOUSE["longitude"]]
+
+        self.assertEqual(monitor_route["current_path"][0], warehouse)
+        self.assertEqual(stats_route["current_path"][0], warehouse)
+        self.assertEqual(len(monitor_route["dark_paths"]), 2)
+        self.assertEqual(len(stats_route["completed_paths"]), 2)
+        self.assertTrue(all(path[0] == warehouse for path in monitor_route["dark_paths"]))
+        self.assertTrue(all(path[0] == warehouse for path in stats_route["completed_paths"]))
+        self.assertEqual(
+            monitor_route["movement_started_at"],
+            self.repo.get(current.id).time_started,
+        )
+        self.assertIsNone(current_row["picked_up_at"])
+        self.assertIsNone(current_row["picked_up_time"])
+        self.assertIsNotNone(current_row["started_time"])
 
     def test_monitor_exposes_text_only_orders_and_optional_map_details(self):
         mapped = self._assigned("A59", 41.355)
@@ -400,6 +595,22 @@ class DeliveryMonitorWebTests(unittest.TestCase):
         self.assertIn("Расчётная позиция", page.text)
         self.assertIn("Нет координат", page.text)
         self.assertIn("movementMarkers", page.text)
+        self.assertIn('id="movementSlider"', page.text)
+        self.assertIn('type="range"', page.text)
+        self.assertIn('for="movementSlider"', page.text)
+        self.assertIn('id="movementStatus"', page.text)
+        self.assertIn('aria-live="polite"', page.text)
+        self.assertIn('id="movementLive"', page.text)
+        self.assertIn('aria-pressed="true"', page.text)
+        self.assertIn('addEventListener("input"', page.text)
+        self.assertIn("movementPreviewTime", page.text)
+        self.assertIn("movementProgress", page.text)
+        self.assertIn("movementBounds", page.text)
+        self.assertIn("visibleTimedMovements", page.text)
+        self.assertIn("startedCount", page.text)
+        self.assertNotIn("movementPreviewTime=selected", page.text)
+        self.assertIn("if(movementPreviewTime===null)tickMovement()", page.text)
+        self.assertIn("touch-action:pan-y", page.text)
         self.assertIn("AbortController", page.text)
         self.assertEqual(page.headers["cache-control"], "no-store")
 

@@ -34,6 +34,11 @@ class Order:
     delivery_time: str | None = None
     comment: str | None = None
     status: str = "draft"
+    cancelled_by_id: int | None = None
+    cancelled_by_name: str | None = None
+    cancelled_by_username: str | None = None
+    cancelled_at: str | None = None
+    cancelled_from_status: str | None = None
     assigned_courier_id: int | None = None
     assigned_courier_name: str | None = None
     courier_id: int | None = None
@@ -86,7 +91,10 @@ class OrderEvent:
     event_type: str
     actor_id: int | None = None
     actor_name: str | None = None
+    actor_username: str | None = None
     actor_role: str | None = None
+    courier_id: int | None = None
+    courier_name: str | None = None
     from_status: str | None = None
     to_status: str | None = None
     changed_fields: tuple[str, ...] = field(default_factory=tuple)

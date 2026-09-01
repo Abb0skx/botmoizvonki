@@ -1,3 +1,4 @@
+import asyncio
 import tempfile
 import unittest
 from datetime import datetime, timedelta
@@ -62,7 +63,7 @@ class CourierReadWorkflowTests(unittest.IsolatedAsyncioTestCase):
             delivery_message_id=77,
         )
 
-    async def test_courier_confirms_read_once_and_card_visibly_changes(self):
+    async def test_legacy_read_button_is_retired_without_recording_read(self):
         order = self.assigned_order()
         query = SimpleNamespace(
             data=f"read:{order.id}",
@@ -71,14 +72,7 @@ class CourierReadWorkflowTests(unittest.IsolatedAsyncioTestCase):
             answer=AsyncMock(),
             edit_message_text=AsyncMock(),
         )
-        bot = SimpleNamespace(
-            send_message=AsyncMock(side_effect=[
-                SimpleNamespace(chat_id=-1004459657817, message_id=88),
-                SimpleNamespace(chat_id=-1004459657817, message_id=89),
-            ]),
-            edit_message_text=AsyncMock(),
-            set_message_reaction=AsyncMock(),
-        )
+        bot = SimpleNamespace()
         context = SimpleNamespace(
             application=SimpleNamespace(bot_data={
                 "settings": SimpleNamespace(
@@ -90,71 +84,41 @@ class CourierReadWorkflowTests(unittest.IsolatedAsyncioTestCase):
             bot=bot,
         )
 
-        await courier_action(SimpleNamespace(callback_query=query), context)
+        finish = AsyncMock(return_value=True)
+        with patch("app.handlers.orders._finish_status_change", new=finish):
+            await courier_action(SimpleNamespace(callback_query=query), context)
 
         read = self.repo.get(order.id)
         self.assertEqual(read.status, "pending")
-        self.assertIsNotNone(read.courier_read_at)
-        self.assertEqual(read.courier_id, ABBOS_ID)
-        self.assertEqual(read.courier_name, "Abbos")
-        query.answer.assert_awaited_once_with("✅ Прочитано · еду на склад 🏬")
-        bot.set_message_reaction.assert_awaited_once_with(
-            chat_id=ABBOS_GROUP_ID,
-            message_id=77,
-            reaction="👀",
-            is_big=True,
-        )
-        changed_text = query.edit_message_text.await_args.args[0]
-        read_time = datetime.fromisoformat(read.courier_read_at).astimezone(TASHKENT).strftime("%H:%M")
-        self.assertIn(f"Заказ прочитан {read_time}", changed_text)
-        self.assertIn("Курьер едет на склад", changed_text)
+        self.assertIsNone(read.courier_read_at)
+        self.assertIsNone(read.courier_id)
+        self.assertIsNone(read.courier_name)
+        query.answer.assert_awaited_once_with("Кнопка прочтения больше не используется")
+        finish.assert_awaited_once()
         callbacks = [
             button.callback_data
-            for row in query.edit_message_text.await_args.kwargs["reply_markup"].inline_keyboard
+            for row in finish.await_args.args[4].inline_keyboard
             for button in row
+            if button.callback_data
         ]
-        self.assertIn(f"read:{order.id}", callbacks)
-        self.assertTrue(any(
-            "Заказ №1 прочитан" in call.kwargs["text"]
-            and "едет на склад" in call.kwargs["text"]
-            and call.kwargs["chat_id"] == -1004459657817
-            for call in bot.send_message.await_args_list
-        ))
-        log_markup = next(
-            call.kwargs["reply_markup"]
-            for call in bot.send_message.await_args_list
-            if "Заказ №1 прочитан" in call.kwargs.get("text", "")
-        )
-        self.assertTrue(any(
-            button.callback_data == f"pickup_log:{order.id}:{ABBOS_ID}"
-            for row in log_markup.inline_keyboard
-            for button in row
-        ))
-        self.assertFalse(any(call.args and call.args[0] == 11 for call in bot.send_message.await_args_list))
+        self.assertNotIn(f"read:{order.id}", callbacks)
+        self.assertIn(f"cancel:{order.id}", callbacks)
         events = self.repo.list_events(order.id)
         read_events = [event for event in events if event.event_type == "courier_read"]
-        self.assertEqual(len(read_events), 1)
-        self.assertEqual(read_events[0].actor_role, "courier")
+        self.assertEqual(read_events, [])
 
-        query.answer.reset_mock()
-        query.edit_message_text.reset_mock()
-        await courier_action(SimpleNamespace(callback_query=query), context)
-        self.assertIn("Уже прочитано", query.answer.await_args.args[0])
-        query.edit_message_text.assert_not_awaited()
-        self.assertEqual(
-            len([event for event in self.repo.list_events(order.id) if event.event_type == "courier_read"]),
-            1,
-        )
-
-    def test_keyboard_and_cards_show_read_confirmation(self):
+    def test_keyboard_has_no_read_action_but_historical_log_keeps_time(self):
         order = self.assigned_order()
-        unread_button = next(
-            button
+        callbacks = [
+            button.callback_data
             for row in courier_keyboard(order).inline_keyboard
             for button in row
-            if button.callback_data == f"read:{order.id}"
+            if button.callback_data
+        ]
+        self.assertEqual(
+            callbacks,
+            [f"group_pickup:{order.id}", f"onway:{order.id}", f"cancel:{order.id}"],
         )
-        self.assertEqual(unread_button.text, "👀 Заказ прочитан")
 
         order = self.repo.update(
             order.id,
@@ -162,14 +126,18 @@ class CourierReadWorkflowTests(unittest.IsolatedAsyncioTestCase):
             courier_id=ABBOS_ID,
             courier_name="Abbos",
         )
-        read_button = next(
-            button
+        callbacks = [
+            button.callback_data
             for row in courier_keyboard(order).inline_keyboard
             for button in row
-            if button.callback_data == f"read:{order.id}"
+            if button.callback_data
+        ]
+        self.assertEqual(
+            callbacks,
+            [f"group_pickup:{order.id}", f"onway:{order.id}", f"cancel:{order.id}"],
         )
-        self.assertEqual(read_button.text, "✅ Прочитано · еду на склад")
-        self.assertIn("🏬 Едет на склад за товаром", courier_card(order))
+        self.assertNotIn("Заказ прочитан", courier_card(order))
+        self.assertNotIn("Едет на склад", courier_card(order))
         read_time = datetime.fromisoformat(order.courier_read_at).astimezone(TASHKENT).strftime("%H:%M")
         self.assertIn(f"👀 Заказ прочитан {read_time}", orders_channel_card(order))
 
@@ -195,6 +163,8 @@ class ManagerListAndLogTests(unittest.IsolatedAsyncioTestCase):
             courier_read_at=datetime.now(TASHKENT).isoformat(timespec="seconds"),
             manager_chat_id=11,
             manager_message_id=55,
+            delivery_chat_id=ABBOS_GROUP_ID,
+            delivery_message_id=77,
             orders_channel_chat_id=-1004459657817,
             orders_channel_message_id=66,
         )
@@ -259,21 +229,18 @@ class ManagerListAndLogTests(unittest.IsolatedAsyncioTestCase):
             reply_markup=None,
         )
 
-    async def test_log_channel_member_can_mark_goods_picked_up(self):
+    async def test_manager_can_mark_goods_picked_up_from_courier_group(self):
         query = SimpleNamespace(
-            data=f"pickup:{self.order.id}",
-            from_user=SimpleNamespace(id=777, full_name="Сотрудник склада", username=None),
-            message=SimpleNamespace(chat_id=-1004459657817, message_id=66),
+            data=f"group_pickup:{self.order.id}",
+            from_user=SimpleNamespace(id=11, full_name="Otabek", username=None),
+            message=SimpleNamespace(chat_id=ABBOS_GROUP_ID, message_id=77),
             answer=AsyncMock(),
         )
-        bot = SimpleNamespace(
-            get_chat_member=AsyncMock(return_value=SimpleNamespace(status="member")),
-            send_message=AsyncMock(),
-        )
+        bot = SimpleNamespace(send_message=AsyncMock())
         context = SimpleNamespace(
             application=SimpleNamespace(bot_data={
                 "settings": SimpleNamespace(
-                    manager_ids=frozenset(),
+                    manager_ids=frozenset({11}),
                     orders_channel_id=-1004459657817,
                 ),
                 "repo": self.repo,
@@ -281,16 +248,19 @@ class ManagerListAndLogTests(unittest.IsolatedAsyncioTestCase):
             bot=bot,
         )
 
-        async def synchronized(_context, order_id):
-            return self.repo.get(order_id), True
-
-        with patch("app.handlers.orders._sync_order", side_effect=synchronized):
+        with patch(
+            "app.handlers.orders._finish_status_change_locked",
+            new=AsyncMock(return_value=True),
+        ):
             await manager_pickup_action(SimpleNamespace(callback_query=query), context)
 
         picked = self.repo.get(self.order.id)
         self.assertEqual(picked.status, "picked_up")
         self.assertEqual(picked.courier_id, ABBOS_ID)
-        bot.get_chat_member.assert_awaited_once_with(-1004459657817, 777)
+        pickup_event = self.repo.list_events(self.order.id)[-1]
+        self.assertEqual(pickup_event.actor_id, 11)
+        self.assertEqual(pickup_event.actor_role, "manager")
+        self.assertEqual(pickup_event.courier_id, ABBOS_ID)
         self.assertTrue(any(
             call.kwargs.get("chat_id") == -1004459657817
             and "товар забран" in call.kwargs.get("text", "")
@@ -299,16 +269,16 @@ class ManagerListAndLogTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_assigned_courier_cannot_mark_own_goods_as_picked_up(self):
         query = SimpleNamespace(
-            data=f"pickup:{self.order.id}",
+            data=f"group_pickup:{self.order.id}",
             from_user=SimpleNamespace(id=ABBOS_ID, full_name="Abbos", username=None),
-            message=SimpleNamespace(chat_id=-1004459657817, message_id=66),
+            message=SimpleNamespace(chat_id=ABBOS_GROUP_ID, message_id=77),
             answer=AsyncMock(),
         )
-        bot = SimpleNamespace(get_chat_member=AsyncMock(), send_message=AsyncMock())
+        bot = SimpleNamespace(send_message=AsyncMock())
         context = SimpleNamespace(
             application=SimpleNamespace(bot_data={
                 "settings": SimpleNamespace(
-                    manager_ids=frozenset(),
+                    manager_ids=frozenset({ABBOS_ID}),
                     orders_channel_id=-1004459657817,
                 ),
                 "repo": self.repo,
@@ -320,97 +290,188 @@ class ManagerListAndLogTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(self.repo.get(self.order.id).status, "pending")
         query.answer.assert_awaited_once_with(
-            "Эту отметку ставит сотрудник склада, не курьер.",
+            "Назначенный курьер не может ставить эту отметку.",
             show_alert=True,
         )
-        bot.get_chat_member.assert_not_awaited()
 
-    async def test_log_pickup_button_roundtrip_restores_pending_action(self):
+    async def test_non_manager_in_courier_group_cannot_mark_pickup(self):
         query = SimpleNamespace(
-            data=f"pickup_log:{self.order.id}:{ABBOS_ID}",
-            from_user=SimpleNamespace(
-                id=777,
-                full_name="Сотрудник склада",
-                username=None,
-            ),
-            message=SimpleNamespace(chat_id=-1004459657817, message_id=91),
+            data=f"group_pickup:{self.order.id}",
+            from_user=SimpleNamespace(id=777, full_name="Участник", username=None),
+            message=SimpleNamespace(chat_id=ABBOS_GROUP_ID, message_id=77),
             answer=AsyncMock(),
-            edit_message_reply_markup=AsyncMock(),
-        )
-        bot = SimpleNamespace(
-            get_chat_member=AsyncMock(return_value=SimpleNamespace(status="member")),
-            send_message=AsyncMock(),
         )
         context = SimpleNamespace(
             application=SimpleNamespace(bot_data={
                 "settings": SimpleNamespace(
-                    manager_ids=frozenset(),
+                    manager_ids=frozenset({11}),
                     orders_channel_id=-1004459657817,
                 ),
                 "repo": self.repo,
             }),
-            bot=bot,
+            bot=SimpleNamespace(send_message=AsyncMock()),
         )
 
-        async def synchronized(_context, order_id):
-            return self.repo.get(order_id), True
+        await manager_pickup_action(SimpleNamespace(callback_query=query), context)
 
-        with patch("app.handlers.orders._sync_order", side_effect=synchronized):
+        self.assertEqual(self.repo.get(self.order.id).status, "pending")
+        query.answer.assert_awaited_once_with(
+            "Только менеджеры могут отметить получение товара.",
+            show_alert=True,
+        )
+
+    async def test_group_pickup_button_roundtrip_restores_pending_action(self):
+        query = SimpleNamespace(
+            data=f"group_pickup:{self.order.id}",
+            from_user=SimpleNamespace(id=11, full_name="Otabek", username=None),
+            message=SimpleNamespace(chat_id=ABBOS_GROUP_ID, message_id=77),
+            answer=AsyncMock(),
+        )
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={
+                "settings": SimpleNamespace(
+                    manager_ids=frozenset({11}),
+                    orders_channel_id=-1004459657817,
+                ),
+                "repo": self.repo,
+            }),
+            bot=SimpleNamespace(send_message=AsyncMock()),
+        )
+
+        with patch(
+            "app.handlers.orders._finish_status_change_locked",
+            new=AsyncMock(return_value=True),
+        ):
             await manager_pickup_action(SimpleNamespace(callback_query=query), context)
             picked = self.repo.get(self.order.id)
             self.assertEqual(picked.status, "picked_up")
             self.assertIsNotNone(picked.picked_up_at)
-            pickup_markup = query.edit_message_reply_markup.await_args.kwargs["reply_markup"]
-            self.assertTrue(any(
-                button.callback_data == f"undo_pickup_log:{self.order.id}:{ABBOS_ID}"
-                for row in pickup_markup.inline_keyboard
+            picked_callbacks = [
+                button.callback_data
+                for row in courier_keyboard(picked).inline_keyboard
                 for button in row
-            ))
+                if button.callback_data
+            ]
+            self.assertIn(f"group_undo_pickup:{self.order.id}", picked_callbacks)
 
-            query.data = f"undo_pickup_log:{self.order.id}:{ABBOS_ID}"
+            query.data = f"group_undo_pickup:{self.order.id}"
             await manager_pickup_action(SimpleNamespace(callback_query=query), context)
 
         restored = self.repo.get(self.order.id)
         self.assertEqual(restored.status, "pending")
         self.assertIsNone(restored.picked_up_at)
         self.assertIsNone(restored.courier_id)
-        restored_markup = query.edit_message_reply_markup.await_args.kwargs["reply_markup"]
-        self.assertTrue(any(
-            button.callback_data == f"pickup_log:{self.order.id}:{ABBOS_ID}"
-            for row in restored_markup.inline_keyboard
+        restored_callbacks = [
+            button.callback_data
+            for row in courier_keyboard(restored).inline_keyboard
             for button in row
-        ))
+            if button.callback_data
+        ]
+        self.assertIn(f"group_pickup:{self.order.id}", restored_callbacks)
 
-    async def test_assigned_courier_is_denied_on_log_pickup_button(self):
+    async def test_old_log_pickup_button_is_retired_without_changing_status(self):
         query = SimpleNamespace(
             data=f"pickup_log:{self.order.id}:{ABBOS_ID}",
-            from_user=SimpleNamespace(id=ABBOS_ID, full_name="Abbos", username=None),
+            from_user=SimpleNamespace(id=11, full_name="Otabek", username=None),
             message=SimpleNamespace(chat_id=-1004459657817, message_id=91),
             answer=AsyncMock(),
             edit_message_reply_markup=AsyncMock(),
         )
-        bot = SimpleNamespace(get_chat_member=AsyncMock(), send_message=AsyncMock())
         context = SimpleNamespace(
             application=SimpleNamespace(bot_data={
                 "settings": SimpleNamespace(
-                    manager_ids=frozenset(),
+                    manager_ids=frozenset({11}),
                     orders_channel_id=-1004459657817,
                 ),
                 "repo": self.repo,
             }),
-            bot=bot,
+            bot=SimpleNamespace(send_message=AsyncMock()),
         )
 
         await manager_pickup_action(SimpleNamespace(callback_query=query), context)
 
         self.assertEqual(self.repo.get(self.order.id).status, "pending")
         query.answer.assert_awaited_once_with(
-            "Эту отметку ставит сотрудник склада, не курьер.",
+            "Кнопка перенесена в группу назначенного курьера.",
             show_alert=True,
         )
-        query.edit_message_reply_markup.assert_not_awaited()
-        bot.get_chat_member.assert_not_awaited()
-        bot.send_message.assert_not_awaited()
+        query.edit_message_reply_markup.assert_awaited_once()
+        callbacks = [
+            button.callback_data
+            for row in query.edit_message_reply_markup.await_args.kwargs["reply_markup"].inline_keyboard
+            for button in row
+            if button.callback_data
+        ]
+        self.assertFalse(any("pickup" in callback for callback in callbacks))
+
+    async def test_pickup_from_wrong_group_or_stale_message_is_denied(self):
+        for chat_id, message_id in (
+            (-1004459657817, 66),
+            (ABBOS_GROUP_ID, 999),
+        ):
+            with self.subTest(chat_id=chat_id, message_id=message_id):
+                query = SimpleNamespace(
+                    data=f"group_pickup:{self.order.id}",
+                    from_user=SimpleNamespace(id=11, full_name="Otabek", username=None),
+                    message=SimpleNamespace(chat_id=chat_id, message_id=message_id),
+                    answer=AsyncMock(),
+                )
+                context = SimpleNamespace(
+                    application=SimpleNamespace(bot_data={
+                        "settings": SimpleNamespace(
+                            manager_ids=frozenset({11}),
+                            orders_channel_id=-1004459657817,
+                        ),
+                        "repo": self.repo,
+                    }),
+                    bot=SimpleNamespace(send_message=AsyncMock()),
+                )
+
+                await manager_pickup_action(SimpleNamespace(callback_query=query), context)
+
+                self.assertEqual(self.repo.get(self.order.id).status, "pending")
+                self.assertTrue(query.answer.await_args.kwargs["show_alert"])
+                self.assertIn("актуальную карточку", query.answer.await_args.args[0])
+
+    async def test_concurrent_group_pickup_creates_only_one_transition(self):
+        def make_query():
+            return SimpleNamespace(
+                data=f"group_pickup:{self.order.id}",
+                from_user=SimpleNamespace(id=11, full_name="Otabek", username=None),
+                message=SimpleNamespace(chat_id=ABBOS_GROUP_ID, message_id=77),
+                answer=AsyncMock(),
+            )
+
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={
+                "settings": SimpleNamespace(
+                    manager_ids=frozenset({11}),
+                    orders_channel_id=-1004459657817,
+                ),
+                "repo": self.repo,
+            }),
+            bot=SimpleNamespace(send_message=AsyncMock()),
+        )
+        first, second = make_query(), make_query()
+
+        with patch(
+            "app.handlers.orders._finish_status_change_locked",
+            new=AsyncMock(return_value=True),
+        ):
+            await asyncio.gather(
+                manager_pickup_action(SimpleNamespace(callback_query=first), context),
+                manager_pickup_action(SimpleNamespace(callback_query=second), context),
+            )
+
+        self.assertEqual(self.repo.get(self.order.id).status, "picked_up")
+        pickup_events = [
+            event
+            for event in self.repo.list_events(self.order.id)
+            if event.from_status == "pending" and event.to_status == "picked_up"
+        ]
+        self.assertEqual(len(pickup_events), 1)
+        answers = [first.answer.await_args.args[0], second.answer.await_args.args[0]]
+        self.assertEqual(sum("Товар у курьера" in value for value in answers), 1)
 
     async def test_on_way_log_contains_eta_customer_and_location_button(self):
         started = datetime.now(TASHKENT).replace(second=0, microsecond=0)
@@ -482,7 +543,7 @@ class CourierWarehouseMovementTests(unittest.IsolatedAsyncioTestCase):
             assigned_courier_name="Abbos",
         )
 
-    def test_read_after_delivery_starts_estimated_trip_to_warehouse(self):
+    def test_historical_read_does_not_change_estimated_return_to_warehouse(self):
         now = datetime.now(TASHKENT).replace(microsecond=0)
         completed = self.assigned("A56", 41.320)
         completed = self.repo.transition(
@@ -513,12 +574,13 @@ class CourierWarehouseMovementTests(unittest.IsolatedAsyncioTestCase):
         monitor = build_delivery_monitor(self.repo)
         route = next(route for route in monitor["routes"] if route["courier_id"] == ABBOS_ID)
         courier = next(item for item in monitor["couriers"] if item["id"] == ABBOS_ID)
-        self.assertEqual(route["movement_kind"], "warehouse")
+        self.assertEqual(route["movement_kind"], "return")
         self.assertEqual(route["return_path"][0], [completed.latitude, completed.longitude])
         self.assertEqual(route["return_path"][-1], [WAREHOUSE["latitude"], WAREHOUSE["longitude"]])
-        self.assertEqual(route["movement_started_at"], read_at.isoformat())
-        self.assertTrue(courier["heading_to_warehouse"])
-        self.assertEqual(monitor["summary"]["heading_to_warehouse"], 1)
+        self.assertEqual(route["movement_started_at"], completed.delivered_at)
+        self.assertNotIn("heading_to_warehouse", courier)
+        self.assertNotIn("heading_to_warehouse", monitor["summary"])
+        self.assertEqual(courier["waiting_pickup"], 1)
 
         report = build_delivery_stats(self.repo, now.date())
         read_row = next(row for row in report["orders"] if row["id"] == waiting.id)
@@ -537,7 +599,7 @@ class CourierWarehouseMovementTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("прочитал заказ", telegram_log)
         self.assertIn("выехал на склад", telegram_log)
 
-    async def test_warehouse_movement_gets_road_eta_and_return_layer(self):
+    async def test_return_movement_gets_road_eta_and_return_layer(self):
         started = (datetime.now(TASHKENT) - timedelta(minutes=5)).isoformat()
         points = [[41.320, 69.279], [WAREHOUSE["latitude"], WAREHOUSE["longitude"]]]
         routing = Mock()
@@ -555,14 +617,14 @@ class CourierWarehouseMovementTests(unittest.IsolatedAsyncioTestCase):
                 "dark_paths": [],
                 "current_path": [],
                 "return_path": points,
-                "movement_kind": "warehouse",
+                "movement_kind": "return",
                 "movement_started_at": started,
             }],
         }
 
         result = await enrich_monitor_routes(state, routing)
         route = result["routes"][0]
-        self.assertEqual(route["movement"]["kind"], "warehouse")
+        self.assertEqual(route["movement"]["kind"], "return")
         self.assertEqual(route["return_road_path"], points)
         self.assertEqual(route["movement"]["distance_km"], 4.2)
         self.assertIsNotNone(route["movement"]["eta_at"])

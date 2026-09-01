@@ -5,6 +5,7 @@ import logging
 import os
 from pathlib import Path
 import tempfile
+import time
 from types import SimpleNamespace
 
 from telegram import Update
@@ -21,8 +22,10 @@ from app.config import Settings
 from app.database import OrderRepository
 from app.handlers import register_handlers
 from app.handlers.orders import (
+    _notify_log,
     _process_cleanup_messages,
     _sync_order,
+    _waiting_pickup_reminder_messages,
     reconcile_orders_on_start,
     validate_delivery_configuration,
 )
@@ -35,6 +38,8 @@ SYNC_RECONCILIATION_INTERVAL = 30
 FULL_RECONCILIATION_EVERY = 10
 SYNC_RECONCILIATION_BATCH_SIZE = 100
 SYNC_WORKER_TASK_KEY = "delivery_sync_worker_task"
+PICKUP_REMINDER_INTERVAL = 30 * 60
+PICKUP_REMINDER_TASK_KEY = "pickup_reminder_worker_task"
 HEALTH_SIGNAL_FILENAME = "delivery-heartbeat"
 
 
@@ -291,6 +296,78 @@ def _start_delivery_sync_worker(application: Application) -> None:
     task.add_done_callback(worker_finished)
 
 
+def _pickup_reminder_slot(timestamp: float | None = None) -> int:
+    """Return the absolute 30-minute UTC slot for cross-process deduplication."""
+    current = time.time() if timestamp is None else timestamp
+    return int(current // PICKUP_REMINDER_INTERVAL)
+
+
+def _seconds_until_next_pickup_reminder(timestamp: float | None = None) -> float:
+    """Align reminders to the next wall-clock :00/:30 boundary."""
+    current = time.time() if timestamp is None else timestamp
+    next_boundary = (_pickup_reminder_slot(current) + 1) * PICKUP_REMINDER_INTERVAL
+    return max(0.1, next_boundary - current)
+
+
+async def send_waiting_pickup_reminders(
+    application: Application,
+    *,
+    slot: int,
+) -> int:
+    """Publish one deduplicated uncollected-order snapshot to the shared Log."""
+    repo: OrderRepository = application.bot_data["repo"]
+    settings: Settings = application.bot_data["settings"]
+    job_name = f"waiting_pickup:{settings.orders_channel_id}"
+    if not repo.claim_periodic_job(job_name, slot):
+        return 0
+    context = SimpleNamespace(application=application, bot=application.bot)
+    messages = _waiting_pickup_reminder_messages(repo)
+    for message in messages:
+        await _notify_log(context, message)
+    return len(messages)
+
+
+async def _pickup_reminder_worker(application: Application) -> None:
+    """Ask about all uncollected products at every :00/:30 boundary."""
+    while True:
+        await asyncio.sleep(_seconds_until_next_pickup_reminder())
+        try:
+            await send_waiting_pickup_reminders(
+                application,
+                slot=_pickup_reminder_slot(),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Reminder failures are secondary and must not stop Telegram
+            # polling; the next interval reads a fresh SQLite snapshot.
+            logger.exception("Could not publish waiting-pickup reminder")
+
+
+def _start_pickup_reminder_worker(application: Application) -> None:
+    existing = application.bot_data.get(PICKUP_REMINDER_TASK_KEY)
+    if existing and not existing.done():
+        return
+    task = asyncio.create_task(
+        _pickup_reminder_worker(application),
+        name="pickup-reminder-worker",
+    )
+    application.bot_data[PICKUP_REMINDER_TASK_KEY] = task
+
+    def worker_finished(finished: asyncio.Task) -> None:
+        if finished.cancelled():
+            return
+        error = finished.exception()
+        if error is not None:
+            logger.critical(
+                "Pickup reminder worker stopped unexpectedly",
+                exc_info=(type(error), error, error.__traceback__),
+            )
+            application.stop_running()
+
+    task.add_done_callback(worker_finished)
+
+
 async def initialize_delivery_runtime(application: Application) -> None:
     """Run startup checks without turning a temporary outage into a crash loop."""
     try:
@@ -314,15 +391,20 @@ async def initialize_delivery_runtime(application: Application) -> None:
     else:
         application.bot_data["delivery_preflight_validated"] = True
     _start_delivery_sync_worker(application)
+    _start_pickup_reminder_worker(application)
 
 
 async def shutdown_delivery_runtime(application: Application) -> None:
-    task = application.bot_data.pop(SYNC_WORKER_TASK_KEY, None)
-    if task is None:
-        return
-    task.cancel()
-    with suppress(asyncio.CancelledError):
-        await task
+    tasks = [
+        task
+        for key in (SYNC_WORKER_TASK_KEY, PICKUP_REMINDER_TASK_KEY)
+        if (task := application.bot_data.pop(key, None)) is not None
+    ]
+    for task in tasks:
+        task.cancel()
+    for task in tasks:
+        with suppress(asyncio.CancelledError):
+            await task
 
 
 def build_application(settings: Settings) -> Application:
