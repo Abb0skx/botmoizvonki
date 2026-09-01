@@ -31,6 +31,12 @@ from .dates import (
     remove_sale_date,
     tashkent_today,
 )
+from .delivery import (
+    DeliveryIndex,
+    DeliveryOrder,
+    DeliveryReader,
+    normalize_delivery_block,
+)
 from .formatting import build_caption
 from .keyboards import (
     BACK_CALLBACK,
@@ -41,7 +47,11 @@ from .keyboards import (
 )
 from .models import EMPTY_IDENTIFIERS, ProductIdentifiers
 from .orders import card_order_id, ensure_card_order_id
-from .phones import extract_product_label, normalize_caption_phone_field
+from .phones import (
+    extract_caption_phones,
+    extract_product_label,
+    normalize_caption_phone_field,
+)
 from .prices import normalize_card_prices
 from .repository import SalesPhotoRepository, utc_now
 
@@ -248,6 +258,11 @@ class SalesPhotoService:
         self.settings = settings
         self.repository = repository
         self.recognizer = recognizer
+        self.delivery_reader = (
+            DeliveryReader(settings.delivery_db_path)
+            if settings.delivery_db_path is not None
+            else None
+        )
         self.bot_id: int | None = None
         self._photo_locks: dict[tuple[int, int], asyncio.Lock] = {}
         self._photo_lock_users: dict[tuple[int, int], int] = {}
@@ -273,6 +288,7 @@ class SalesPhotoService:
         self._startup_gate_active = False
         self._maintenance_task: asyncio.Task[None] | None = None
         self._auto_correction_task: asyncio.Task[None] | None = None
+        self._delivery_sync_task: asyncio.Task[None] | None = None
 
     async def preflight(self, bot: Bot) -> int:
         me = await bot.get_me()
@@ -302,8 +318,95 @@ class SalesPhotoService:
         provider_preflight = getattr(self.recognizer, "preflight", None)
         if provider_preflight is not None:
             await provider_preflight()
+        if self.delivery_reader is not None:
+            try:
+                self.delivery_reader.validate()
+            except Exception as exc:
+                logger.warning(
+                    "sales_photo_delivery_preflight_failed error_type=%s",
+                    _error_code(exc),
+                )
         logger.info("sales_photo_preflight_ok chat_id=%s chat_type=%s", actual_id, chat_type)
         return self.bot_id
+
+    @staticmethod
+    def _sales_manager_name(value: object) -> str | None:
+        candidate = str(value or "").strip().casefold()
+        return next(
+            (
+                manager
+                for manager in SELLER_BY_KEY.values()
+                if manager.casefold() == candidate
+            ),
+            None,
+        )
+
+    def _delivery_index(
+        self,
+        sale_date_from: date,
+        sale_date_to: date,
+    ) -> DeliveryIndex | None:
+        if self.delivery_reader is None:
+            return None
+        try:
+            return self.delivery_reader.index(sale_date_from, sale_date_to)
+        except Exception as exc:
+            logger.warning(
+                "sales_photo_delivery_read_failed error_type=%s",
+                _error_code(exc),
+            )
+            return None
+
+    def _apply_delivery_match(
+        self,
+        *,
+        chat_id: int,
+        source_message_id: int,
+        body: str,
+        entities: tuple[Any, ...],
+        sale_date: date,
+        delivery_index: DeliveryIndex | None,
+        max_length: int,
+    ) -> tuple[_CardNormalization, bool]:
+        if delivery_index is None:
+            return _CardNormalization(body, entities), False
+        phones = extract_caption_phones(body)
+        match_count = delivery_index.match_count(phones, sale_date)
+        order = delivery_index.match(phones, sale_date) if match_count == 1 else None
+        manager_changed = False
+        if order is not None:
+            self.repository.upsert_delivery_link(
+                chat_id,
+                source_message_id,
+                delivery_order_id=order.id,
+                delivery_order_number=order.order_number,
+                matched_phone=phones[0],
+                sale_date=sale_date,
+            )
+            _, manager_changed = self.repository.sync_auto_delivery_manager(
+                chat_id,
+                source_message_id,
+                self._sales_manager_name(order.manager_name),
+            )
+        else:
+            _, manager_changed = self.repository.unlink_delivery(
+                chat_id,
+                source_message_id,
+            )
+        normalized = normalize_delivery_block(
+            body,
+            entities,
+            order,
+            max_length=max_length,
+        )
+        return (
+            _CardNormalization(
+                normalized.body,
+                normalized.entities,
+                normalized.changed,
+            ),
+            manager_changed,
+        )
 
     async def on_photo(
         self,
@@ -785,6 +888,24 @@ class SalesPhotoService:
                     priced.body,
                     priced.entities,
                     phoned.changed or priced.changed,
+                )
+            source_id = self.repository.source_for_replacement(chat_id, message_id)
+            if daily_order is not None and source_id is not None:
+                delivery_final, _ = self._apply_delivery_match(
+                    chat_id=chat_id,
+                    source_message_id=source_id,
+                    body=final.body,
+                    entities=final.entities,
+                    sale_date=daily_order[0],
+                    delivery_index=self._delivery_index(
+                        daily_order[0], daily_order[0]
+                    ),
+                    max_length=max_length,
+                )
+                final = _CardNormalization(
+                    delivery_final.body,
+                    delivery_final.entities,
+                    final.changed or delivery_final.changed,
                 )
             try:
                 edit_kwargs: dict[str, Any] = {
@@ -1517,6 +1638,24 @@ class SalesPhotoService:
             round((time.monotonic() - started) * 1000),
         )
 
+        if self.delivery_reader is not None:
+            try:
+                await self._sync_new_delivery_card(
+                    bot,
+                    source_message_id=source_message_id,
+                    replacement=replacement,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "sales_photo_new_delivery_sync_failed chat_id=%s "
+                    "source_message_id=%s error_type=%s",
+                    chat_id,
+                    source_message_id,
+                    _error_code(exc),
+                )
+
         # Keep the original briefly so Telegram can dispatch a source edit that
         # happened while card creation or sendPhoto was running. on_photo runs this
         # work in a background task, leaving update-processor slots available.
@@ -1544,6 +1683,52 @@ class SalesPhotoService:
 
     async def _send_message(self, bot: Bot | Any, kwargs: dict[str, Any]) -> Any:
         return await self._send_with_retry(bot.send_message, kwargs)
+
+    async def _sync_new_delivery_card(
+        self,
+        bot: Bot | Any,
+        *,
+        source_message_id: int,
+        replacement: object,
+    ) -> None:
+        content = _message_content(replacement)
+        message_id = getattr(replacement, "message_id", None)
+        if content is None or message_id is None:
+            return
+        daily_order = self.repository.daily_order_for_source(
+            self.settings.chat_id,
+            source_message_id,
+        )
+        if daily_order is None:
+            return
+        content_kind, body, entities = content
+        max_length = 1024 if content_kind == "caption" else 4096
+        final, manager_changed = self._apply_delivery_match(
+            chat_id=self.settings.chat_id,
+            source_message_id=source_message_id,
+            body=body,
+            entities=entities,
+            sale_date=daily_order[0],
+            delivery_index=self._delivery_index(daily_order[0], daily_order[0]),
+            max_length=max_length,
+        )
+        if not final.changed and not manager_changed:
+            return
+        kwargs: dict[str, Any] = {
+            "chat_id": self.settings.chat_id,
+            "message_id": int(message_id),
+            "reply_markup": self._current_card_markup(
+                self.settings.chat_id,
+                int(message_id),
+                replacement,
+            ),
+        }
+        if content_kind == "caption":
+            kwargs.update(caption=final.body, caption_entities=final.entities)
+            await self._send_with_retry(bot.edit_message_caption, kwargs)
+        else:
+            kwargs.update(text=final.body, entities=final.entities)
+            await self._send_with_retry(bot.edit_message_text, kwargs)
 
     async def _send_media_group(
         self,
@@ -1958,6 +2143,8 @@ class SalesPhotoService:
         query: Any,
         message: Any,
         reply_markup: Any,
+        *,
+        apply_delivery: bool = True,
     ) -> None:
         """Refresh a card's keyboard and normalize its current editable fields.
 
@@ -2003,6 +2190,26 @@ class SalesPhotoService:
                 priced.body,
                 priced.entities,
                 phoned.changed or priced.changed,
+            )
+        source_id = (
+            self.repository.source_for_replacement(chat_id, int(message_id))
+            if chat_id is not None and message_id is not None
+            else None
+        )
+        if apply_delivery and daily_order is not None and source_id is not None:
+            delivery_final, _ = self._apply_delivery_match(
+                chat_id=int(chat_id),
+                source_message_id=source_id,
+                body=final.body,
+                entities=final.entities,
+                sale_date=daily_order[0],
+                delivery_index=self._delivery_index(daily_order[0], daily_order[0]),
+                max_length=max_length,
+            )
+            final = _CardNormalization(
+                delivery_final.body,
+                delivery_final.entities,
+                final.changed or delivery_final.changed,
             )
         if not final.changed:
             await self._edit_callback_markup(query, reply_markup)
@@ -2145,7 +2352,12 @@ class SalesPhotoService:
             manager=manager,
         )
         try:
-            await self._edit_callback_card(query, message, desired_markup)
+            await self._edit_callback_card(
+                query,
+                message,
+                desired_markup,
+                apply_delivery=False,
+            )
         except Exception as exc:
             ambiguous = isinstance(exc, NetworkError) and not isinstance(
                 exc, BadRequest
@@ -2175,6 +2387,7 @@ class SalesPhotoService:
                 _error_code(exc),
             )
             return
+        self.repository.mark_delivery_manager_manual(chat_id, message_id)
         self._ui_generations.pop(callback_key, None)
         self._pending_managers.pop(callback_key, None)
         await query.answer(f"Выбран менеджер: {manager}")
@@ -2251,7 +2464,12 @@ class SalesPhotoService:
             signature=next_signature,
         )
         try:
-            await self._edit_callback_card(query, message, desired_markup)
+            await self._edit_callback_card(
+                query,
+                message,
+                desired_markup,
+                apply_delivery=False,
+            )
         except Exception as exc:
             ambiguous = isinstance(exc, NetworkError) and not isinstance(
                 exc, BadRequest
@@ -2278,6 +2496,7 @@ class SalesPhotoService:
                 _error_code(exc),
             )
             return
+        self.repository.mark_delivery_manager_manual(chat_id, message_id)
         self._ui_generations.pop(callback_key, None)
         self._pending_managers.pop(callback_key, None)
         await query.answer()
@@ -2742,6 +2961,7 @@ class SalesPhotoService:
 
         async with self._auto_correction_lock:
             sale_date_from, sale_date_to = _recent_sale_window(reference_date)
+            delivery_index = self._delivery_index(sale_date_from, sale_date_to)
             recovered = 0
             if scan_until_message_id is not None:
                 recovered = await self._recover_untracked_generated_cards(
@@ -2806,7 +3026,23 @@ class SalesPhotoService:
                                 1024 if content_kind == "caption" else 4096
                             ),
                         )
-                        if final.changed or force_rewrite:
+                        delivery_final, manager_changed = self._apply_delivery_match(
+                            chat_id=candidate.chat_id,
+                            source_message_id=candidate.source_message_id,
+                            body=final.body,
+                            entities=final.entities,
+                            sale_date=current_order[0],
+                            delivery_index=delivery_index,
+                            max_length=(
+                                1024 if content_kind == "caption" else 4096
+                            ),
+                        )
+                        final = _CardNormalization(
+                            delivery_final.body,
+                            delivery_final.entities,
+                            final.changed or delivery_final.changed,
+                        )
+                        if final.changed or force_rewrite or manager_changed:
                             edit_kwargs: dict[str, Any] = {
                                 "chat_id": candidate.chat_id,
                                 "message_id": candidate.replacement_message_id,
@@ -3129,6 +3365,189 @@ class SalesPhotoService:
                 max(0.1, (next_due - now).total_seconds())
             )
 
+    async def _sync_linked_delivery_cards(
+        self,
+        bot: Bot | Any,
+        order_ids: set[int],
+    ) -> None:
+        if self.delivery_reader is None or not order_ids:
+            return
+        orders = self.delivery_reader.orders_by_ids(order_ids)
+        links = self.repository.delivery_links_for_orders(
+            self.settings.chat_id,
+            order_ids,
+        )
+        for index, link in enumerate(links):
+            forwarded = None
+            key = (link.chat_id, link.replacement_message_id)
+            try:
+                async with self._card_lock(key):
+                    self._order_backfill_forward_sources[
+                        link.replacement_message_id
+                    ] = time.monotonic() + 600
+                    forwarded = await self._send_with_retry(
+                        bot.forward_message,
+                        {
+                            "chat_id": link.chat_id,
+                            "from_chat_id": link.chat_id,
+                            "message_id": link.replacement_message_id,
+                            "disable_notification": True,
+                        },
+                    )
+                    self._track_maintenance_forward(
+                        link.replacement_message_id,
+                        forwarded,
+                    )
+                    content = _message_content(forwarded)
+                    if content is None:
+                        continue
+                    content_kind, body, entities = content
+                    order = orders.get(link.delivery_order_id)
+                    manager_changed = False
+                    if order is None:
+                        _, manager_changed = self.repository.unlink_delivery(
+                            link.chat_id,
+                            link.source_message_id,
+                        )
+                    else:
+                        _, manager_changed = (
+                            self.repository.sync_auto_delivery_manager(
+                                link.chat_id,
+                                link.source_message_id,
+                                self._sales_manager_name(order.manager_name),
+                            )
+                        )
+                    final = normalize_delivery_block(
+                        body,
+                        entities,
+                        order,
+                        max_length=(
+                            1024 if content_kind == "caption" else 4096
+                        ),
+                    )
+                    if not final.changed and not manager_changed:
+                        continue
+                    kwargs: dict[str, Any] = {
+                        "chat_id": link.chat_id,
+                        "message_id": link.replacement_message_id,
+                        "reply_markup": self._current_card_markup(
+                            link.chat_id,
+                            link.replacement_message_id,
+                            forwarded,
+                        ),
+                    }
+                    if content_kind == "caption":
+                        kwargs.update(
+                            caption=final.body,
+                            caption_entities=final.entities,
+                        )
+                        await self._send_with_retry(
+                            bot.edit_message_caption,
+                            kwargs,
+                        )
+                    else:
+                        kwargs.update(text=final.body, entities=final.entities)
+                        await self._send_with_retry(
+                            bot.edit_message_text,
+                            kwargs,
+                        )
+            except asyncio.CancelledError:
+                raise
+            except BadRequest as exc:
+                if _message_to_forward_missing(exc) or _message_to_edit_missing(exc):
+                    self.repository.mark_order_card_removed(
+                        link.chat_id,
+                        link.source_message_id,
+                    )
+                elif "message is not modified" not in str(exc).casefold():
+                    logger.warning(
+                        "sales_photo_delivery_card_sync_failed chat_id=%s "
+                        "message_id=%s error_type=%s",
+                        link.chat_id,
+                        link.replacement_message_id,
+                        _error_code(exc),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "sales_photo_delivery_card_sync_failed chat_id=%s "
+                    "message_id=%s error_type=%s",
+                    link.chat_id,
+                    link.replacement_message_id,
+                    _error_code(exc),
+                )
+            finally:
+                if forwarded is not None:
+                    temporary_id = getattr(forwarded, "message_id", None)
+                    if temporary_id is not None:
+                        await self._delete_duplicate(
+                            bot,
+                            link.chat_id,
+                            int(temporary_id),
+                        )
+                if index + 1 < len(links):
+                    await asyncio.sleep(0.2)
+
+    async def _delivery_sync_loop(self, bot: Bot | Any) -> None:
+        if self.delivery_reader is None:
+            return
+        cursor = self.repository.delivery_event_cursor(self.settings.chat_id)
+        if cursor is None:
+            latest = await asyncio.to_thread(self.delivery_reader.latest_event_id)
+            await self.auto_correct_recent_cards(
+                bot,
+                reason="delivery:startup",
+                reference_date=tashkent_today(),
+            )
+            self.repository.set_delivery_event_cursor(self.settings.chat_id, latest)
+            cursor = latest
+        rematch_fields = {"client_phone", "client_phone_2", "created_at"}
+        while True:
+            await asyncio.sleep(self.settings.delivery_sync_seconds)
+            try:
+                events = await asyncio.to_thread(
+                    self.delivery_reader.events_after,
+                    cursor,
+                )
+                if not events:
+                    continue
+                order_ids = {event.order_id for event in events}
+                needs_rematch = any(
+                    event.event_type == "order_created"
+                    or bool(event.changed_fields.intersection(rematch_fields))
+                    for event in events
+                )
+                if needs_rematch:
+                    await self.auto_correct_recent_cards(
+                        bot,
+                        reason="delivery:match-change",
+                        reference_date=tashkent_today(),
+                    )
+                else:
+                    await self._sync_linked_delivery_cards(bot, order_ids)
+                cursor = events[-1].id
+                self.repository.set_delivery_event_cursor(
+                    self.settings.chat_id,
+                    cursor,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "sales_photo_delivery_sync_failed error_type=%s",
+                    _error_code(exc),
+                )
+
+    def _ensure_delivery_sync(self, bot: Bot | Any) -> None:
+        if self.delivery_reader is None:
+            return
+        task = self._delivery_sync_task
+        if task is not None and not task.done():
+            return
+        self._delivery_sync_task = asyncio.create_task(
+            self._delivery_sync_loop(bot),
+            name="sales-photo-delivery-sync",
+        )
+
     async def retry_duplicate_cleanups(self, bot: Bot | Any) -> None:
         now = utc_now()
         for job in self.repository.pending_duplicate_cleanups(
@@ -3216,9 +3635,11 @@ class SalesPhotoService:
             )
         self._startup_gate_active = False
         self._ensure_auto_correction_scheduler(bot)
+        self._ensure_delivery_sync(bot)
         while True:
             self._safe_touch_heartbeat()
             self._ensure_auto_correction_scheduler(bot)
+            self._ensure_delivery_sync(bot)
             try:
                 stale_before = utc_now() - timedelta(
                     seconds=PROCESSING_STALE_SECONDS
@@ -3312,6 +3733,14 @@ class SalesPhotoService:
             except asyncio.CancelledError:
                 pass
             self._auto_correction_task = None
+        delivery_sync_task = self._delivery_sync_task
+        if delivery_sync_task is not None:
+            delivery_sync_task.cancel()
+            try:
+                await delivery_sync_task
+            except asyncio.CancelledError:
+                pass
+            self._delivery_sync_task = None
         album_tasks = tuple(self._album_tasks.values())
         for album_task in album_tasks:
             album_task.cancel()

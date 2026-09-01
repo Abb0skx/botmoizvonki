@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import Iterable, Iterator
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -88,6 +88,17 @@ class UnreconciledPhoto:
     chat_id: int
     source_message_id: int
     source_file_unique_id: str
+
+
+@dataclass(frozen=True)
+class DeliveryLink:
+    chat_id: int
+    source_message_id: int
+    replacement_message_id: int
+    delivery_order_id: int
+    delivery_order_number: int
+    auto_manager_name: str | None
+    manager_manual_override: bool
 
 
 @dataclass(frozen=True)
@@ -389,6 +400,26 @@ class SalesPhotoRepository:
                     PRIMARY KEY(chat_id,source_message_id,message_id),
                     UNIQUE(chat_id,message_id)
                 );
+
+                CREATE TABLE IF NOT EXISTS sales_photo_delivery_links (
+                    chat_id INTEGER NOT NULL,
+                    source_message_id INTEGER NOT NULL,
+                    delivery_order_id INTEGER NOT NULL,
+                    delivery_order_number INTEGER NOT NULL,
+                    matched_phone TEXT NOT NULL,
+                    sale_date TEXT NOT NULL,
+                    auto_manager_name TEXT,
+                    manager_manual_override INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(chat_id,source_message_id),
+                    FOREIGN KEY(chat_id,source_message_id)
+                        REFERENCES sales_photo_jobs(chat_id,source_message_id)
+                        ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_sales_photo_delivery_order
+                ON sales_photo_delivery_links(chat_id,delivery_order_id);
 
                 DROP TABLE IF EXISTS sales_photo_name_cache;
                 """
@@ -709,6 +740,33 @@ class SalesPhotoRepository:
                 chat_id,
                 schedule_done_through,
             )
+
+    def delivery_event_cursor(self, chat_id: int) -> int | None:
+        key = f"delivery:last_event_id:{int(chat_id)}"
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT value FROM sales_photo_meta WHERE key=?", (key,)
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            return max(0, int(row["value"]))
+        except (TypeError, ValueError):
+            return None
+
+    def set_delivery_event_cursor(self, chat_id: int, event_id: int) -> None:
+        key = f"delivery:last_event_id:{int(chat_id)}"
+        with self._connect() as db:
+            db.execute(
+                """INSERT INTO sales_photo_meta(key,value,updated_at)
+                   VALUES(?,?,?)
+                   ON CONFLICT(key) DO UPDATE SET
+                       value=excluded.value,updated_at=excluded.updated_at
+                   WHERE CAST(sales_photo_meta.value AS INTEGER)
+                         < CAST(excluded.value AS INTEGER)""",
+                (key, str(max(0, int(event_id))), _iso(utc_now())),
+            )
+            db.commit()
 
     def is_bootstrapped(self, bot_id: int, chat_id: int) -> bool:
         with self._connect() as db:
@@ -1252,6 +1310,287 @@ class SalesPhotoRepository:
                 (int(chat_id), int(chat_id), int(chat_id), int(chat_id)),
             ).fetchall()
         return frozenset(int(row["message_id"]) for row in rows)
+
+    def upsert_delivery_link(
+        self,
+        chat_id: int,
+        source_message_id: int,
+        *,
+        delivery_order_id: int,
+        delivery_order_number: int,
+        matched_phone: str,
+        sale_date: date,
+        at: datetime | None = None,
+    ) -> None:
+        now = _iso(at or utc_now())
+        with self._connect() as db:
+            db.execute(
+                """INSERT INTO sales_photo_delivery_links(
+                       chat_id,source_message_id,delivery_order_id,
+                       delivery_order_number,matched_phone,sale_date,
+                       created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?)
+                   ON CONFLICT(chat_id,source_message_id) DO UPDATE SET
+                       delivery_order_id=excluded.delivery_order_id,
+                       delivery_order_number=excluded.delivery_order_number,
+                       matched_phone=excluded.matched_phone,
+                       sale_date=excluded.sale_date,
+                       updated_at=excluded.updated_at""",
+                (
+                    int(chat_id),
+                    int(source_message_id),
+                    int(delivery_order_id),
+                    int(delivery_order_number),
+                    str(matched_phone)[:32],
+                    sale_date.isoformat(),
+                    now,
+                    now,
+                ),
+            )
+            db.commit()
+
+    def sync_auto_delivery_manager(
+        self,
+        chat_id: int,
+        source_message_id: int,
+        desired_manager: str | None,
+        at: datetime | None = None,
+    ) -> tuple[int | None, bool]:
+        """Apply a delivery manager unless a human has taken ownership."""
+
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                """SELECT job.replacement_message_id,job.manager,
+                          job.ui_generation,link.auto_manager_name,
+                          link.manager_manual_override
+                   FROM sales_photo_jobs AS job
+                   JOIN sales_photo_delivery_links AS link
+                     ON link.chat_id=job.chat_id
+                    AND link.source_message_id=job.source_message_id
+                   WHERE job.chat_id=? AND job.source_message_id=?""",
+                (int(chat_id), int(source_message_id)),
+            ).fetchone()
+            if row is None or row["replacement_message_id"] is None:
+                db.rollback()
+                return None, False
+            replacement_id = int(row["replacement_message_id"])
+            if int(row["manager_manual_override"]):
+                db.rollback()
+                return replacement_id, False
+            current = str(row["manager"]) if row["manager"] else None
+            previous_auto = (
+                str(row["auto_manager_name"])
+                if row["auto_manager_name"]
+                else None
+            )
+            if current is not None and previous_auto is None:
+                db.execute(
+                    """UPDATE sales_photo_delivery_links
+                       SET manager_manual_override=1,updated_at=?
+                       WHERE chat_id=? AND source_message_id=?""",
+                    (_iso(at or utc_now()), int(chat_id), int(source_message_id)),
+                )
+                db.commit()
+                return replacement_id, False
+            if previous_auto is not None and current not in {None, previous_auto}:
+                db.execute(
+                    """UPDATE sales_photo_delivery_links
+                       SET auto_manager_name=NULL,manager_manual_override=1,
+                           updated_at=?
+                       WHERE chat_id=? AND source_message_id=?""",
+                    (_iso(at or utc_now()), int(chat_id), int(source_message_id)),
+                )
+                db.commit()
+                return replacement_id, False
+            desired = str(desired_manager or "").strip() or None
+            if desired is None:
+                generation = int(row["ui_generation"])
+                clear_manager = previous_auto is not None and current == previous_auto
+                choices_generation = (
+                    generation if generation % 2 == 0 else generation + 1
+                )
+                if clear_manager:
+                    db.execute(
+                        """UPDATE sales_photo_jobs
+                           SET manager=NULL,ui_generation=?,updated_at=?
+                           WHERE chat_id=? AND source_message_id=?""",
+                        (
+                            choices_generation,
+                            _iso(at or utc_now()),
+                            int(chat_id),
+                            int(source_message_id),
+                        ),
+                    )
+                db.execute(
+                    """UPDATE sales_photo_delivery_links
+                       SET auto_manager_name=NULL,updated_at=?
+                       WHERE chat_id=? AND source_message_id=?""",
+                    (
+                        _iso(at or utc_now()),
+                        int(chat_id),
+                        int(source_message_id),
+                    ),
+                )
+                db.commit()
+                return replacement_id, clear_manager
+            generation = int(row["ui_generation"])
+            selected_generation = generation if generation % 2 else generation + 1
+            changed = current != desired or generation != selected_generation
+            db.execute(
+                """UPDATE sales_photo_jobs
+                   SET manager=?,ui_generation=?,updated_at=?
+                   WHERE chat_id=? AND source_message_id=?""",
+                (
+                    desired[:64],
+                    selected_generation,
+                    _iso(at or utc_now()),
+                    int(chat_id),
+                    int(source_message_id),
+                ),
+            )
+            db.execute(
+                """UPDATE sales_photo_delivery_links
+                   SET auto_manager_name=?,updated_at=?
+                   WHERE chat_id=? AND source_message_id=?""",
+                (
+                    desired[:64],
+                    _iso(at or utc_now()),
+                    int(chat_id),
+                    int(source_message_id),
+                ),
+            )
+            db.commit()
+            return replacement_id, changed
+
+    def unlink_delivery(
+        self,
+        chat_id: int,
+        source_message_id: int,
+        at: datetime | None = None,
+    ) -> tuple[int | None, bool]:
+        """Remove an automatic link and only undo its automatic manager."""
+
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                """SELECT job.replacement_message_id,job.manager,
+                          job.ui_generation,link.auto_manager_name,
+                          link.manager_manual_override
+                   FROM sales_photo_delivery_links AS link
+                   JOIN sales_photo_jobs AS job
+                     ON job.chat_id=link.chat_id
+                    AND job.source_message_id=link.source_message_id
+                   WHERE link.chat_id=? AND link.source_message_id=?""",
+                (int(chat_id), int(source_message_id)),
+            ).fetchone()
+            if row is None:
+                db.rollback()
+                return None, False
+            replacement_id = (
+                int(row["replacement_message_id"])
+                if row["replacement_message_id"] is not None
+                else None
+            )
+            auto_manager = (
+                str(row["auto_manager_name"])
+                if row["auto_manager_name"]
+                else None
+            )
+            current = str(row["manager"]) if row["manager"] else None
+            clear_manager = bool(
+                not int(row["manager_manual_override"])
+                and auto_manager is not None
+                and current == auto_manager
+            )
+            if clear_manager:
+                generation = int(row["ui_generation"])
+                choices_generation = generation if generation % 2 == 0 else generation + 1
+                db.execute(
+                    """UPDATE sales_photo_jobs
+                       SET manager=NULL,ui_generation=?,updated_at=?
+                       WHERE chat_id=? AND source_message_id=?""",
+                    (
+                        choices_generation,
+                        _iso(at or utc_now()),
+                        int(chat_id),
+                        int(source_message_id),
+                    ),
+                )
+            db.execute(
+                """DELETE FROM sales_photo_delivery_links
+                   WHERE chat_id=? AND source_message_id=?""",
+                (int(chat_id), int(source_message_id)),
+            )
+            db.commit()
+            return replacement_id, clear_manager
+
+    def mark_delivery_manager_manual(
+        self,
+        chat_id: int,
+        replacement_message_id: int,
+        at: datetime | None = None,
+    ) -> bool:
+        with self._connect() as db:
+            cursor = db.execute(
+                """UPDATE sales_photo_delivery_links
+                   SET auto_manager_name=NULL,manager_manual_override=1,
+                       updated_at=?
+                   WHERE chat_id=? AND source_message_id=(
+                       SELECT source_message_id FROM sales_photo_jobs
+                       WHERE chat_id=? AND replacement_message_id=?
+                   )""",
+                (
+                    _iso(at or utc_now()),
+                    int(chat_id),
+                    int(chat_id),
+                    int(replacement_message_id),
+                ),
+            )
+            db.commit()
+            return cursor.rowcount == 1
+
+    def delivery_links_for_orders(
+        self,
+        chat_id: int,
+        delivery_order_ids: Iterable[int],
+    ) -> tuple[DeliveryLink, ...]:
+        values = tuple(sorted({int(value) for value in delivery_order_ids}))
+        if not values:
+            return ()
+        placeholders = ",".join("?" for _ in values)
+        with self._connect() as db:
+            rows = db.execute(
+                f"""SELECT link.chat_id,link.source_message_id,
+                           job.replacement_message_id,link.delivery_order_id,
+                           link.delivery_order_number,link.auto_manager_name,
+                           link.manager_manual_override
+                    FROM sales_photo_delivery_links AS link
+                    JOIN sales_photo_jobs AS job
+                      ON job.chat_id=link.chat_id
+                     AND job.source_message_id=link.source_message_id
+                    WHERE link.chat_id=?
+                      AND link.delivery_order_id IN ({placeholders})
+                      AND job.replacement_message_id IS NOT NULL
+                      AND job.order_removed=0""",
+                (int(chat_id), *values),
+            ).fetchall()
+        return tuple(
+            DeliveryLink(
+                chat_id=int(row["chat_id"]),
+                source_message_id=int(row["source_message_id"]),
+                replacement_message_id=int(row["replacement_message_id"]),
+                delivery_order_id=int(row["delivery_order_id"]),
+                delivery_order_number=int(row["delivery_order_number"]),
+                auto_manager_name=(
+                    str(row["auto_manager_name"])
+                    if row["auto_manager_name"]
+                    else None
+                ),
+                manager_manual_override=bool(row["manager_manual_override"]),
+            )
+            for row in rows
+        )
 
     def compact_recent_daily_orders(
         self,

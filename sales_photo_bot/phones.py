@@ -185,6 +185,29 @@ def extract_uzbek_phones(value: object, limit: int = 2) -> tuple[str, ...]:
     return result if len(result) <= maximum else ()
 
 
+def extract_caption_phones(value: object) -> tuple[str, ...]:
+    """Extract only the generated card's canonical phone field."""
+
+    caption = str(value or "")
+    span = _canonical_phone_span(caption)
+    if span is None:
+        return ()
+    start, end, match = span
+    field_value = caption[start + match.end() : end]
+    phones, accepted_spans = _scan_uzbek_phones(field_value, stop_after=3)
+    if not phones or len(phones) > 2:
+        return ()
+    residual = []
+    previous_end = 0
+    for span_start, span_end in accepted_spans:
+        residual.append(field_value[previous_end:span_start])
+        previous_end = span_end
+    residual.append(field_value[previous_end:])
+    if _PHONE_FIELD_SEPARATORS_RE.fullmatch("".join(residual)) is None:
+        return ()
+    return phones
+
+
 def extract_product_label(value: object, limit: int = 120) -> str | None:
     """Return manually typed product text with phone numbers removed.
 

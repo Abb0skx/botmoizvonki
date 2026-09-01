@@ -76,6 +76,8 @@ class Settings:
     concurrent_updates: int = 4
     drop_pending_on_first_start: bool = True
     log_level: str = "INFO"
+    delivery_db_path: Path | None = None
+    delivery_sync_seconds: int = 15
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> "Settings":
@@ -132,4 +134,12 @@ class Settings:
                 values, "SALES_PHOTO_DROP_PENDING_ON_FIRST_START", True
             ),
             log_level=log_level,
+            delivery_db_path=(
+                Path(str(values["SALES_PHOTO_DELIVERY_DB_PATH"]).strip()).expanduser()
+                if str(values.get("SALES_PHOTO_DELIVERY_DB_PATH", "")).strip()
+                else None
+            ),
+            delivery_sync_seconds=_bounded_int(
+                values, "SALES_PHOTO_DELIVERY_SYNC_SECONDS", 15, 5, 300
+            ),
         )
