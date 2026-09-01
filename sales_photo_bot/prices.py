@@ -60,11 +60,6 @@ def _group_thousands(value: str) -> str:
     return " ".join(reversed(groups))
 
 
-def _suffix(value: str | None) -> str:
-    compact = str(value or "").strip()
-    return f" {compact}" if compact else ""
-
-
 @dataclass(frozen=True)
 class _Replacement:
     start: int
@@ -153,17 +148,21 @@ def normalize_card_prices(
             digits = _digits(amount_match.group("amount"))
             if not digits:
                 continue
-            suffix = _suffix(amount_match.group("suffix"))
             if usd_match is not None:
-                normalized_value = f"{int(digits)}${suffix}"
+                normalized_value = f"{int(digits)}$"
                 bold_spans: tuple[tuple[int, int], ...] = ()
             else:
                 grouped = _group_thousands(digits)
-                normalized_value = f"{grouped} So'm{suffix}"
+                normalized_value = f"{grouped} So'm"
                 token_start = len(grouped) + 1
                 bold_spans = ((token_start, token_start + len("So'm")),)
             start = line_start + field_match.start("value")
-            end = line_start + field_match.end("value")
+            suffix_start = amount_match.start("suffix")
+            end = (
+                line_start + field_match.start("value") + suffix_start
+                if suffix_start >= 0
+                else line_start + field_match.end("value")
+            )
             replacement = _Replacement(start, end, normalized_value, bold_spans)
         else:
             continue

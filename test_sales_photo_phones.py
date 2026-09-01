@@ -174,6 +174,23 @@ class ProductLabelTests(unittest.TestCase):
 
 
 class CaptionPhoneFieldTests(unittest.TestCase):
+    def test_text_card_can_use_telegram_4096_character_limit(self):
+        caption = (
+            BOT_CARD_MARKER
+            + "🛒💵:\nrasxod:\n\n📞: 901234567\n\n"
+            + "x" * 1200
+        )
+
+        caption_result = normalize_caption_phone_field(caption)
+        text_result = normalize_caption_phone_field(
+            caption,
+            max_length=4096,
+        )
+
+        self.assertFalse(caption_result.changed)
+        self.assertTrue(text_result.changed)
+        self.assertIn("📞: +998 90 123 45 67", text_result.caption)
+
     def test_normalizes_card_with_date_and_product_before_header(self):
         caption = (
             BOT_CARD_MARKER

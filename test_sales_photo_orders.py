@@ -69,6 +69,22 @@ class CardOrderFormattingTests(unittest.TestCase):
         self.assertEqual(card_order_id(restored.body), 20)
         self.assertEqual(restored.body.count("🆔:"), 1)
 
+    def test_invalid_and_duplicate_id_rows_are_replaced_not_appended(self):
+        body = (
+            BOT_CARD_MARKER
+            + "📆: 31/08/2026\n"
+            + "🆔: abc\n"
+            + "🆔: 99\n\n"
+            + "🛒💵:\nrasxod:\n\n📞:"
+        )
+
+        result = ensure_card_order_id(body, (), 4, max_length=1024)
+
+        self.assertTrue(result.changed)
+        self.assertEqual(result.body.count("🆔:"), 1)
+        self.assertIn("📆: 31/08/2026\n🆔: 4\n", result.body)
+        self.assertEqual(card_order_id(result.body), 4)
+
 
 class DailyOrderRepositoryTests(unittest.TestCase):
     def test_each_day_has_an_independent_durable_sequence(self):

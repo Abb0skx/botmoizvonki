@@ -959,6 +959,23 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("<blockquote>S/N:", sent["caption"])
         bot.delete_message.assert_awaited_once_with(CHAT_ID, 10)
 
+    async def test_new_model_does_not_start_immediate_existing_card_scan(self):
+        repo = SalesPhotoRepository(self.root / "db.sqlite")
+        service = SalesPhotoService(settings(self.root), repo)
+        service.audit_deleted_order_cards = AsyncMock(
+            side_effect=AssertionError("must wait for quiet-period trigger")
+        )
+        service.backfill_order_cards = AsyncMock(
+            side_effect=AssertionError("must wait for unified trigger")
+        )
+        bot = telegram_bot()
+
+        await service.handle_photo(photo_message(caption=None), bot)
+
+        service.audit_deleted_order_cards.assert_not_awaited()
+        service.backfill_order_cards.assert_not_awaited()
+        bot.send_photo.assert_awaited_once()
+
     async def test_source_edit_during_optional_recognizer_cancels_repost(self):
         entered = asyncio.Event()
         release = asyncio.Event()

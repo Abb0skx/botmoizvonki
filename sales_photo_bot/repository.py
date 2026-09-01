@@ -84,6 +84,14 @@ class OrderAuditCandidate:
 
 
 @dataclass(frozen=True)
+class AutoCorrectionState:
+    last_new_at: datetime | None = None
+    event_generation: int = 0
+    completed_event_generation: int = 0
+    schedule_done_through: datetime | None = None
+
+
+@dataclass(frozen=True)
 class PendingDuplicate:
     chat_id: int
     message_id: int
@@ -532,6 +540,9 @@ class SalesPhotoRepository:
 
                 CREATE INDEX IF NOT EXISTS idx_sales_photo_price_backfill
                 ON sales_photo_jobs(price_card_applied,price_backfill_attempts,updated_at);
+
+                CREATE INDEX IF NOT EXISTS idx_sales_photo_recent_cards
+                ON sales_photo_jobs(chat_id,sale_date,order_removed,daily_order_id);
                 """
             )
             db.commit()
@@ -539,6 +550,158 @@ class SalesPhotoRepository:
     @staticmethod
     def _bootstrap_key(bot_id: int, chat_id: int) -> str:
         return f"polling_bootstrapped:{int(bot_id)}:{int(chat_id)}"
+
+    @staticmethod
+    def _auto_correction_key(kind: str, chat_id: int) -> str:
+        return f"auto_correction:{str(kind)}:{int(chat_id)}"
+
+    @staticmethod
+    def _state_datetime(value: object) -> datetime | None:
+        if value is None:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value))
+        except (TypeError, ValueError):
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+
+    def auto_correction_state(self, chat_id: int) -> AutoCorrectionState:
+        keys = {
+            "last_new": self._auto_correction_key("last_new", chat_id),
+            "event_generation": self._auto_correction_key(
+                "event_generation", chat_id
+            ),
+            "completed_event_generation": self._auto_correction_key(
+                "completed_event_generation", chat_id
+            ),
+            "schedule_done": self._auto_correction_key("schedule_done", chat_id),
+        }
+        placeholders = ",".join("?" for _ in keys)
+        with self._connect() as db:
+            rows = db.execute(
+                f"SELECT key,value FROM sales_photo_meta WHERE key IN ({placeholders})",
+                tuple(keys.values()),
+            ).fetchall()
+        by_key = {str(row["key"]): row["value"] for row in rows}
+        try:
+            event_generation = max(
+                0,
+                int(by_key.get(keys["event_generation"], 0)),
+            )
+        except (TypeError, ValueError):
+            event_generation = 0
+        try:
+            completed_event_generation = max(
+                0,
+                int(by_key.get(keys["completed_event_generation"], 0)),
+            )
+        except (TypeError, ValueError):
+            completed_event_generation = 0
+        return AutoCorrectionState(
+            last_new_at=self._state_datetime(by_key.get(keys["last_new"])),
+            event_generation=event_generation,
+            completed_event_generation=completed_event_generation,
+            schedule_done_through=self._state_datetime(
+                by_key.get(keys["schedule_done"])
+            ),
+        )
+
+    def _advance_auto_correction_state(
+        self,
+        kind: str,
+        chat_id: int,
+        value: datetime,
+    ) -> None:
+        canonical = _iso(value)
+        key = self._auto_correction_key(kind, chat_id)
+        with self._connect() as db:
+            db.execute(
+                """INSERT INTO sales_photo_meta(key,value,updated_at)
+                   VALUES(?,?,?)
+                   ON CONFLICT(key) DO UPDATE SET
+                       value=excluded.value,updated_at=excluded.updated_at
+                   WHERE sales_photo_meta.value < excluded.value""",
+                (key, canonical, _iso(utc_now())),
+            )
+            db.commit()
+
+    def note_auto_correction_new_card(
+        self,
+        chat_id: int,
+        at: datetime | None = None,
+    ) -> datetime:
+        event_at = at or utc_now()
+        if event_at.tzinfo is None:
+            event_at = event_at.replace(tzinfo=UTC)
+        event_at = event_at.astimezone(UTC)
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._note_auto_correction_new_card_locked(db, chat_id, event_at)
+            db.commit()
+        return event_at
+
+    def _note_auto_correction_new_card_locked(
+        self,
+        db: sqlite3.Connection,
+        chat_id: int,
+        event_at: datetime,
+    ) -> None:
+        now = _iso(utc_now())
+        db.execute(
+            """INSERT INTO sales_photo_meta(key,value,updated_at)
+               VALUES(?,?,?)
+               ON CONFLICT(key) DO UPDATE SET
+                   value=excluded.value,updated_at=excluded.updated_at""",
+            (
+                self._auto_correction_key("last_new", chat_id),
+                _iso(event_at),
+                now,
+            ),
+        )
+        db.execute(
+            """INSERT INTO sales_photo_meta(key,value,updated_at)
+               VALUES(?, '1', ?)
+               ON CONFLICT(key) DO UPDATE SET
+                   value=CAST(sales_photo_meta.value AS INTEGER)+1,
+                   updated_at=excluded.updated_at""",
+            (
+                self._auto_correction_key("event_generation", chat_id),
+                now,
+            ),
+        )
+
+    def mark_auto_correction_complete(
+        self,
+        chat_id: int,
+        *,
+        completed_event_generation: int | None = None,
+        schedule_done_through: datetime | None = None,
+    ) -> None:
+        if completed_event_generation is not None:
+            generation = max(0, int(completed_event_generation))
+            key = self._auto_correction_key(
+                "completed_event_generation",
+                chat_id,
+            )
+            with self._connect() as db:
+                db.execute(
+                    """INSERT INTO sales_photo_meta(key,value,updated_at)
+                       VALUES(?,?,?)
+                       ON CONFLICT(key) DO UPDATE SET
+                           value=excluded.value,updated_at=excluded.updated_at
+                       WHERE CAST(sales_photo_meta.value AS INTEGER)
+                             < CAST(excluded.value AS INTEGER)""",
+                    (key, str(generation), _iso(utc_now())),
+                )
+                db.commit()
+        if schedule_done_through is not None:
+            self._advance_auto_correction_state(
+                "schedule_done",
+                chat_id,
+                schedule_done_through,
+            )
 
     def is_bootstrapped(self, bot_id: int, chat_id: int) -> bool:
         with self._connect() as db:
@@ -819,6 +982,9 @@ class SalesPhotoRepository:
         self,
         chat_id: int,
         limit: int = 50,
+        *,
+        sale_date_from: date | None = None,
+        sale_date_to: date | None = None,
     ) -> tuple[PendingOrderBackfill, ...]:
         with self._connect() as db:
             rows = db.execute(
@@ -829,9 +995,18 @@ class SalesPhotoRepository:
                      AND sale_date IS NOT NULL AND daily_order_id IS NOT NULL
                      AND order_removed=0
                      AND order_card_applied=0 AND order_backfill_attempts<8
+                     AND (? IS NULL OR sale_date>=?)
+                     AND (? IS NULL OR sale_date<=?)
                    ORDER BY created_at,source_message_id
                    LIMIT ?""",
-                (int(chat_id), max(1, min(int(limit), 200))),
+                (
+                    int(chat_id),
+                    sale_date_from.isoformat() if sale_date_from else None,
+                    sale_date_from.isoformat() if sale_date_from else None,
+                    sale_date_to.isoformat() if sale_date_to else None,
+                    sale_date_to.isoformat() if sale_date_to else None,
+                    max(1, min(int(limit), 200)),
+                ),
             ).fetchall()
         return tuple(
             PendingOrderBackfill(
@@ -871,6 +1046,9 @@ class SalesPhotoRepository:
         self,
         chat_id: int,
         limit: int = 50,
+        *,
+        sale_date_from: date | None = None,
+        sale_date_to: date | None = None,
     ) -> tuple[PendingPriceBackfill, ...]:
         with self._connect() as db:
             rows = db.execute(
@@ -880,9 +1058,18 @@ class SalesPhotoRepository:
                    WHERE chat_id=? AND replacement_message_id IS NOT NULL
                      AND order_removed=0
                      AND price_card_applied=0 AND price_backfill_attempts<8
+                     AND (? IS NULL OR sale_date>=?)
+                     AND (? IS NULL OR sale_date<=?)
                    ORDER BY created_at,source_message_id
                    LIMIT ?""",
-                (int(chat_id), max(1, min(int(limit), 200))),
+                (
+                    int(chat_id),
+                    sale_date_from.isoformat() if sale_date_from else None,
+                    sale_date_from.isoformat() if sale_date_from else None,
+                    sale_date_to.isoformat() if sale_date_to else None,
+                    sale_date_to.isoformat() if sale_date_to else None,
+                    max(1, min(int(limit), 200)),
+                ),
             ).fetchall()
         return tuple(
             PendingPriceBackfill(
@@ -899,6 +1086,9 @@ class SalesPhotoRepository:
         self,
         chat_id: int,
         limit: int = 500,
+        *,
+        sale_date_from: date | None = None,
+        sale_date_to: date | None = None,
     ) -> tuple[OrderAuditCandidate, ...]:
         with self._connect() as db:
             rows = db.execute(
@@ -908,9 +1098,18 @@ class SalesPhotoRepository:
                    WHERE chat_id=? AND replacement_message_id IS NOT NULL
                      AND sale_date IS NOT NULL AND daily_order_id IS NOT NULL
                      AND order_removed=0
+                     AND (? IS NULL OR sale_date>=?)
+                     AND (? IS NULL OR sale_date<=?)
                    ORDER BY sale_date,daily_order_id,created_at,source_message_id
                    LIMIT ?""",
-                (int(chat_id), max(1, min(int(limit), 2000))),
+                (
+                    int(chat_id),
+                    sale_date_from.isoformat() if sale_date_from else None,
+                    sale_date_from.isoformat() if sale_date_from else None,
+                    sale_date_to.isoformat() if sale_date_to else None,
+                    sale_date_to.isoformat() if sale_date_to else None,
+                    max(1, min(int(limit), 2000)),
+                ),
             ).fetchall()
         return tuple(
             OrderAuditCandidate(
@@ -921,6 +1120,20 @@ class SalesPhotoRepository:
                 order_id=int(row["daily_order_id"]),
             )
             for row in rows
+        )
+
+    def auto_correction_candidates(
+        self,
+        chat_id: int,
+        sale_date_from: date,
+        sale_date_to: date,
+        limit: int = 2000,
+    ) -> tuple[OrderAuditCandidate, ...]:
+        return self.order_audit_candidates(
+            chat_id,
+            limit=limit,
+            sale_date_from=sale_date_from,
+            sale_date_to=sale_date_to,
         )
 
     def mark_order_card_removed(
@@ -1110,6 +1323,10 @@ class SalesPhotoRepository:
                 )
                 db.commit()
                 return "conflict"
+            recorded_at = at or utc_now()
+            if recorded_at.tzinfo is None:
+                recorded_at = recorded_at.replace(tzinfo=UTC)
+            recorded_at = recorded_at.astimezone(UTC)
             cursor = db.execute(
                 """UPDATE sales_photo_jobs
                    SET replacement_message_id=?,status='reposted',
@@ -1119,7 +1336,7 @@ class SalesPhotoRepository:
                      AND status IN ('processing','failed')""",
                 (
                     int(replacement_message_id),
-                    _iso(at or utc_now()),
+                    _iso(recorded_at),
                     int(chat_id),
                     int(source_message_id),
                 ),
@@ -1127,6 +1344,11 @@ class SalesPhotoRepository:
             if cursor.rowcount != 1:
                 db.rollback()
                 return "conflict"
+            self._note_auto_correction_new_card_locked(
+                db,
+                int(chat_id),
+                recorded_at,
+            )
             now = _iso(at or utc_now())
             db.executemany(
                 """INSERT INTO sales_photo_output_members(

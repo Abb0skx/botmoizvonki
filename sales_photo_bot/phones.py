@@ -281,6 +281,8 @@ class PhoneCaptionNormalization:
 def normalize_caption_phone_field(
     caption: object,
     entities: Sequence[MessageEntity] | None = None,
+    *,
+    max_length: int = 1024,
 ) -> PhoneCaptionNormalization:
     """Normalize the one exact ``📞:`` field and preserve all other entities.
 
@@ -334,7 +336,7 @@ def normalize_caption_phone_field(
         return PhoneCaptionNormalization(original, original_entities)
 
     normalized_caption = original[:start] + replacement + original[end:]
-    if len(normalized_caption) > 1024:
+    if len(normalized_caption) > max(1, int(max_length)):
         return PhoneCaptionNormalization(original, original_entities)
     return PhoneCaptionNormalization(
         normalized_caption,

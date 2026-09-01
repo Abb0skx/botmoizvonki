@@ -149,6 +149,30 @@ class PriceCardFormattingTests(unittest.TestCase):
         self.assertEqual(first.entities[0].type, MessageEntity.BOLD)
         self.assertFalse(second.changed)
 
+    def test_suffix_entity_is_preserved_when_amount_is_replaced(self):
+        body = (
+            "🛒💵:\nrasxod:\n\n📞:\n\n"
+            "Card/Terminal/Paynet\n🇺🇿:200000 paynet Abbos"
+        )
+        note = MessageEntity(
+            type=MessageEntity.ITALIC,
+            offset=utf16_offset(body, "paynet Abbos"),
+            length=len("paynet Abbos"),
+        )
+
+        result = normalize_card_prices(body, (note,), max_length=1024)
+
+        italic = next(
+            entity
+            for entity in result.entities
+            if entity.type == MessageEntity.ITALIC
+        )
+        self.assertEqual(
+            int(italic.offset),
+            utf16_offset(result.body, "paynet Abbos"),
+        )
+        self.assertIn("🇺🇿:200 000 So'm paynet Abbos", result.body)
+
     def test_fails_closed_if_an_entity_crosses_a_replaced_value(self):
         body = "🛒💵: ACME 87\nrasxod:\n\n📞:"
         crossing = MessageEntity(

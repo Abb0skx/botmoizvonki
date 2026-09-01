@@ -3,7 +3,13 @@ from __future__ import annotations
 import unittest
 from datetime import date
 
-from sales_photo_bot.dates import extract_sale_date, remove_sale_date
+from telegram import MessageEntity
+
+from sales_photo_bot.dates import (
+    extract_sale_date,
+    normalize_card_sale_date,
+    remove_sale_date,
+)
 
 
 class SaleDateTests(unittest.TestCase):
@@ -48,6 +54,41 @@ class SaleDateTests(unittest.TestCase):
             remove_sale_date(raw, match),
             "A16 8/256 901234567",
         )
+
+    def test_existing_card_date_is_repaired_without_adding_missing_date(self):
+        body = "\u2063\u2063📆: 31/8/2025\n🆔: 4\n\n🛒💵:\nНаличка"
+        heading_offset = len(
+            body[: body.index("Наличка")].encode("utf-16-le")
+        ) // 2
+        heading = MessageEntity(
+            type=MessageEntity.BOLD,
+            offset=heading_offset,
+            length=len("Наличка"),
+        )
+
+        result = normalize_card_sale_date(
+            body,
+            (heading,),
+            date(2026, 8, 31),
+            max_length=1024,
+        )
+
+        self.assertTrue(result.changed)
+        self.assertIn("📆: 31/08/2026", result.body)
+        expected_offset = len(
+            result.body[: result.body.index("Наличка")].encode("utf-16-le")
+        ) // 2
+        self.assertEqual(int(result.entities[0].offset), expected_offset)
+
+        no_date = "\u2063\u2063🆔: 1\n\n🛒💵:"
+        unchanged = normalize_card_sale_date(
+            no_date,
+            (),
+            date(2026, 8, 31),
+            max_length=1024,
+        )
+        self.assertFalse(unchanged.changed)
+        self.assertEqual(unchanged.body, no_date)
 
 
 if __name__ == "__main__":
