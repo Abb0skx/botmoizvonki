@@ -18,6 +18,7 @@ from telegram.error import BadRequest, NetworkError, RetryAfter
 from telegram.ext import ContextTypes
 
 from .config import Settings
+from .dates import extract_sale_date, remove_sale_date
 from .formatting import build_caption
 from .keyboards import (
     BACK_CALLBACK,
@@ -678,11 +679,13 @@ class SalesPhotoService:
         chat_id = _chat_id(message)
         source_message_id = getattr(message, "message_id", None)
         text = str(getattr(message, "text", "") or "").strip()
+        sale_date = extract_sale_date(text)
+        product_text = remove_sale_date(text, sale_date)
         if (
             chat_id != self.settings.chat_id
             or source_message_id is None
             or not text
-            or extract_product_label(text) is None
+            or extract_product_label(product_text) is None
         ):
             return None
         source_message_id = int(source_message_id)
@@ -923,15 +926,18 @@ class SalesPhotoService:
                 _error_code(exc),
             )
             return
+        sale_date_match = extract_sale_date(client_caption)
+        cleaned_caption = remove_sale_date(client_caption, sale_date_match)
         product_label = (
-            extract_product_label(client_caption)
+            extract_product_label(cleaned_caption)
             if claim.source_kind == "text"
             else None
         )
         caption = BOT_CARD_MARKER + build_caption(
-            client_caption,
+            cleaned_caption,
             identifiers,
             product_label=product_label,
+            sale_date=(sale_date_match.value if sale_date_match else None),
         )
         initial_generation = 0
         source_signature = self.repository.callback_signature(

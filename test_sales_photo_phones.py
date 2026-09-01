@@ -174,6 +174,19 @@ class ProductLabelTests(unittest.TestCase):
 
 
 class CaptionPhoneFieldTests(unittest.TestCase):
+    def test_normalizes_card_with_date_and_product_before_header(self):
+        caption = (
+            BOT_CARD_MARKER
+            + "📆: 31/08/2026\n\n"
+            "📦 A16 8/256\n\n"
+            "🛒💵:\nrasxod:\n\n📞: 901234567\n\nНаличка"
+        )
+
+        result = normalize_caption_phone_field(caption)
+
+        self.assertTrue(result.changed)
+        self.assertIn("📞: +998 90 123 45 67", result.caption)
+
     def test_normalizes_only_the_canonical_phone_field(self):
         caption = (
             BOT_CARD_MARKER

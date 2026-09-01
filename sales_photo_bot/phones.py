@@ -249,7 +249,7 @@ def _canonical_phone_span(
     header_index = next(
         (
             index
-            for index, (_, _, line) in enumerate(lines[:4])
+            for index, (_, _, line) in enumerate(lines[:8])
             if _CARD_HEADER_RE.match(line) is not None
         ),
         None,

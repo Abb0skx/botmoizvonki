@@ -5,7 +5,7 @@ import sqlite3
 import tempfile
 import unittest
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -257,6 +257,20 @@ class CaptionFormattingTests(unittest.TestCase):
         )
         self.assertTrue(caption.startswith("📦 A16 &lt;8/256&gt;\n\n🛒💵:"))
         self.assertIn("📞: +998 90 123 45 67", caption)
+
+    def test_sale_date_is_the_first_card_field(self):
+        caption = build_caption(
+            "901234567",
+            ProductIdentifiers(),
+            product_label="A16",
+            sale_date=date(2026, 8, 31),
+        )
+
+        self.assertTrue(
+            caption.startswith(
+                "📆: 31/08/2026\n\n📦 A16\n\n🛒💵:"
+            )
+        )
 
     def test_only_two_normalized_phones_survive_the_source_caption(self):
         caption = build_caption(
@@ -680,6 +694,24 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
         bot.send_photo.assert_not_awaited()
         bot.delete_message.assert_not_awaited()
 
+    async def test_date_only_text_message_is_ignored(self):
+        repo = SalesPhotoRepository(self.root / "db.sqlite")
+        service = SalesPhotoService(settings(self.root), repo)
+        bot = telegram_bot()
+
+        with patch(
+            "sales_photo_bot.dates.tashkent_today",
+            return_value=date(2026, 9, 1),
+        ):
+            await service.on_text(
+                SimpleNamespace(effective_message=text_message("31/08")),
+                SimpleNamespace(bot=bot),
+            )
+
+        self.assertEqual(service._photo_tasks, set())
+        bot.send_message.assert_not_awaited()
+        bot.delete_message.assert_not_awaited()
+
     async def test_short_model_text_becomes_one_text_card(self):
         repo = SalesPhotoRepository(self.root / "db.sqlite")
         service = SalesPhotoService(settings(self.root), repo)
@@ -702,6 +734,57 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(sent["reply_markup"])
         bot.delete_message.assert_awaited_once_with(CHAT_ID, 10)
         self.assertTrue(repo.is_replacement(CHAT_ID, 300))
+
+    async def test_text_model_with_date_gets_a_normalized_date(self):
+        repo = SalesPhotoRepository(self.root / "db.sqlite")
+        service = SalesPhotoService(settings(self.root), repo)
+        bot = telegram_bot()
+
+        with patch(
+            "sales_photo_bot.dates.tashkent_today",
+            return_value=date(2026, 9, 1),
+        ):
+            await service.on_text(
+                SimpleNamespace(
+                    effective_message=text_message(
+                        "31/08 A16 8/256 901234567"
+                    )
+                ),
+                SimpleNamespace(bot=bot),
+            )
+            await asyncio.gather(*tuple(service._photo_tasks))
+
+        sent = bot.send_message.await_args.kwargs["text"]
+        self.assertTrue(
+            sent.startswith(
+                BOT_CARD_MARKER
+                + "📆: 31/08/2026\n\n📦 A16 8/256\n\n🛒💵:"
+            )
+        )
+        self.assertIn("📞: +998 90 123 45 67", sent)
+        self.assertNotIn("31/08 A16", sent)
+
+    async def test_photo_caption_with_date_gets_a_normalized_date(self):
+        repo = SalesPhotoRepository(self.root / "db.sqlite")
+        service = SalesPhotoService(settings(self.root), repo)
+        bot = telegram_bot()
+
+        with patch(
+            "sales_photo_bot.dates.tashkent_today",
+            return_value=date(2026, 9, 1),
+        ):
+            await service.handle_photo(
+                photo_message(caption="31/08 901234567"),
+                bot,
+            )
+
+        caption = bot.send_photo.await_args.kwargs["caption"]
+        self.assertTrue(
+            caption.startswith(
+                BOT_CARD_MARKER + "📆: 31/08/2026\n\n🛒💵:"
+            )
+        )
+        self.assertIn("📞: +998 90 123 45 67", caption)
 
     async def test_text_card_retry_remains_text_only(self):
         repo = SalesPhotoRepository(self.root / "db.sqlite")
@@ -773,6 +856,31 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(repo.is_replacement(CHAT_ID, 300))
         self.assertEqual(repo.output_message_ids(CHAT_ID, 10), (200, 201, 300))
+
+    async def test_album_date_is_added_to_the_shared_card(self):
+        repo = SalesPhotoRepository(self.root / "db.sqlite")
+        service = SalesPhotoService(settings(self.root), repo)
+        bot = telegram_bot()
+        claim = service._claim_album(
+            (
+                album_photo_message(10, caption="31/08 901234567"),
+                album_photo_message(11),
+            ),
+            "album-1",
+        )
+
+        with patch(
+            "sales_photo_bot.dates.tashkent_today",
+            return_value=date(2026, 9, 1),
+        ):
+            await service._run_photo_claim(claim, bot)
+
+        card = bot.send_message.await_args.kwargs["text"]
+        self.assertTrue(
+            card.startswith(
+                BOT_CARD_MARKER + "📆: 31/08/2026\n\n🛒💵:"
+            )
+        )
 
     async def test_album_card_failure_removes_copied_album_and_keeps_sources(self):
         repo = SalesPhotoRepository(self.root / "db.sqlite")

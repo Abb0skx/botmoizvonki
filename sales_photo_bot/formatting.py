@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import re
+from datetime import date
 
 from .models import ProductIdentifiers
 from .phones import extract_uzbek_phones, phone_line
@@ -32,11 +33,14 @@ def build_caption(
     identifiers: ProductIdentifiers,
     manager: str | None = None,
     product_label: str | None = None,
+    sale_date: date | None = None,
 ) -> str:
     """Build the sales card, retaining only verified phones and identifiers."""
 
     phones = extract_uzbek_phones(client_caption)
     lines: list[str] = []
+    if sale_date:
+        lines.extend([f"📆: {sale_date:%d/%m/%Y}", ""])
     if product_label:
         lines.extend([f"📦 {_safe(product_label, 120)}", ""])
     lines.extend([
