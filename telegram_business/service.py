@@ -38,7 +38,7 @@ from .products import (
 )
 from .repository import BusinessRepository
 from .request_coordinator import NightRequestCoordinator
-from .request_inputs import selection_fields
+from .request_inputs import normalize_phone, selection_fields
 from .sheets import BusinessSheets
 from .telegram_api import TelegramAPIError, TelegramBusinessAPI
 from .templates import TEMPLATES, normalize_template_code, render
@@ -57,6 +57,9 @@ USER_MESSAGE_FIELDS = {
     "audio", "document", "paid_media", "sticker", "story", "video",
     "video_note", "voice", "dice", "game", "poll",
 }
+LOCATION_PHONE_TEMPLATES = frozenset(
+    {"location_phone_value", "location_phone_label", "location_phone_request"}
+)
 PRODUCT_HINTS = {
     "iphone", "ipad", "airpods", "macbook", "apple", "samsung", "galaxy",
     "redmi", "xiaomi", "poco", "honor", "huawei", "dyson", "watch",
@@ -780,6 +783,178 @@ class BusinessService:
         except (TypeError, ValueError):
             return False
 
+    @staticmethod
+    def _verified_own_contact(message: Mapping[str, Any]) -> tuple[str, str] | None:
+        contact = message.get("contact")
+        sender = message.get("from")
+        if not isinstance(contact, Mapping) or not isinstance(sender, Mapping):
+            return None
+        sender_id = sender.get("id")
+        owner_id = contact.get("user_id")
+        phone = normalize_phone(contact.get("phone_number"))
+        if (
+            not phone
+            or sender_id is None
+            or owner_id is None
+            or str(sender_id) != str(owner_id)
+        ):
+            return None
+        return phone, str(owner_id)
+
+    def _location_phone_language(
+        self, chat_id: str, message: Mapping[str, Any], text: str, now: datetime
+    ) -> str:
+        client = self.repo.client(chat_id)
+        language, confidence = detect_language(
+            text,
+            _value(client, "language"),
+            _value(message.get("from") or {}, "language_code"),
+        )
+        if language in {"ru", "uz"}:
+            self.repo.update_language(chat_id, language, confidence, now)
+        return language
+
+    def _send_location_phone_confirmation(
+        self,
+        connection_id: str,
+        chat_id: str,
+        session_id: str,
+        phone: str,
+        language: str,
+        message_id: int,
+        now: datetime,
+    ) -> bool:
+        phone_text = (
+            phone
+            if language == "bi"
+            else self._render_message(
+                "location_phone_value", language, now, phone=phone
+            )
+        )
+        value_sent = self.send(
+            connection_id,
+            chat_id,
+            session_id,
+            phone_text,
+            "location_phone_value",
+            now,
+            delivery_key=f"location-phone:{message_id}:value",
+            location_phone_override=True,
+        )
+        label_sent = self.send(
+            connection_id,
+            chat_id,
+            session_id,
+            self._render_message("location_phone_label", language, now),
+            "location_phone_label",
+            now,
+            delivery_key=f"location-phone:{message_id}:label",
+            location_phone_override=True,
+        )
+        if value_sent and label_sent:
+            self.repo.set_location_phone_pending(chat_id, False, now)
+            return True
+        return False
+
+    def _schedule_location_phone_action(
+        self,
+        connection_id: str,
+        chat_id: str,
+        session_id: str,
+        message_id: int,
+        language: str,
+        operation: str,
+        now: datetime,
+    ) -> None:
+        self.repo.schedule(
+            f"location-phone:{chat_id}:{message_id}",
+            chat_id,
+            session_id,
+            "location_phone",
+            now,
+            {
+                "connection_id": connection_id,
+                "message_id": int(message_id),
+                "language": language,
+                "operation": operation,
+            },
+            now,
+        )
+
+    def _handle_location_phone_flow(
+        self,
+        connection_id: str,
+        chat_id: str,
+        session_id: str,
+        message: Mapping[str, Any],
+        text: str,
+        location_received: bool,
+        now: datetime,
+    ) -> None:
+        """Run the location/contact flow even while a manager lock is active."""
+
+        verified = self._verified_own_contact(message)
+        if verified:
+            phone, owner_id = verified
+            self.repo.save_verified_client_phone(chat_id, phone, owner_id, now)
+
+        if self.repo.is_bot_paused(chat_id):
+            return
+
+        language = self._location_phone_language(chat_id, message, text, now)
+        message_id = int(message["message_id"])
+        pending = self.repo.location_phone_pending(chat_id)
+        if location_received:
+            phone = self.repo.verified_client_phone(chat_id)
+            if phone:
+                self._schedule_location_phone_action(
+                    connection_id,
+                    chat_id,
+                    session_id,
+                    message_id,
+                    language,
+                    "confirm",
+                    now,
+                )
+                return
+            self.repo.set_location_phone_pending(chat_id, True, now)
+            self._schedule_location_phone_action(
+                connection_id,
+                chat_id,
+                session_id,
+                message_id,
+                language,
+                "request",
+                now,
+            )
+            return
+
+        if not isinstance(message.get("contact"), Mapping) or not pending:
+            return
+        phone = self.repo.verified_client_phone(chat_id) if verified else None
+        if phone:
+            self._schedule_location_phone_action(
+                connection_id,
+                chat_id,
+                session_id,
+                message_id,
+                language,
+                "confirm",
+                now,
+            )
+            return
+        # A foreign contact or a contact without user_id is not proof that the
+        # number belongs to this Telegram account.
+        self._schedule_location_phone_action(
+            connection_id,
+            chat_id,
+            session_id,
+            message_id,
+            language,
+            "request",
+            now,
+        )
+
     def _manager_fence_active(
         self, chat_id: str, now: datetime, policy: RuntimePolicy
     ) -> bool:
@@ -1106,6 +1281,27 @@ class BusinessService:
                     details["preferred_time"] = preferred_time
                 if details:
                     self.repo.patch_session(session_id, now, **details)
+                location_for_phone_flow = bool(location_url)
+                if (
+                    location_for_phone_flow
+                    and not isinstance(message.get("location"), Mapping)
+                    and "active_order" in classify(effective_text)
+                    and not re.search(r"[:\d]", effective_text)
+                    and not MAP_URL_RE.search(effective_text)
+                    and not COORD_RE.search(effective_text)
+                ):
+                    # "Измените адрес доставки в заказе" contains the word
+                    # "адрес" but no actual location value.
+                    location_for_phone_flow = False
+                self._handle_location_phone_flow(
+                    connection_id,
+                    chat_id,
+                    session_id,
+                    message,
+                    effective_text,
+                    location_for_phone_flow,
+                    now,
+                )
                 manager_covers = getattr(self.repo, "manager_replied_after", None)
                 stale_client_event = bool(
                     manager_covers
@@ -1187,6 +1383,7 @@ class BusinessService:
         preview_url: str | None = None, reply_markup: dict | None = None,
         discriminator: str = "", delivery_key: str = "",
         return_message_id: bool = False,
+        location_phone_override: bool = False,
     ) -> bool | int | None:
         if not text:
             return False
@@ -1203,24 +1400,32 @@ class BusinessService:
         policy = self._runtime_policy(now)
         if not self._connection_allows_reply(connection_id):
             return False
-        if self._manager_fence_active(chat_id, now, policy):
-            return False
-        if not self.repo.may_automate(chat_id, now) or not self._within_reply_window(chat_id, session_id, now):
-            return False
-        session_allowed = getattr(self.repo, "session_may_automate", None)
-        if session_allowed and not session_allowed(session_id):
-            return False
-        ten, session_count = self.repo.bot_message_count(chat_id, session_id, now)
-        if ten >= policy.max_messages_10m or session_count >= policy.max_messages_session:
-            stop = getattr(self.repo, "stop_session_automation", None)
-            if stop:
-                stop(session_id, now, "anti_spam_limit")
-            else:
-                self.repo.patch_session(
-                    session_id, now, priority=1, needs_manager_reply=1,
-                    handoff_reason="anti_spam_limit", search_disabled=1, status="human_handoff",
-                )
-            return False
+        if location_phone_override:
+            if template not in LOCATION_PHONE_TEMPLATES:
+                raise ValueError("location phone override is limited to approved templates")
+            if self.repo.is_bot_paused(chat_id) or not self._within_reply_window(
+                chat_id, session_id, now
+            ):
+                return False
+        else:
+            if self._manager_fence_active(chat_id, now, policy):
+                return False
+            if not self.repo.may_automate(chat_id, now) or not self._within_reply_window(chat_id, session_id, now):
+                return False
+            session_allowed = getattr(self.repo, "session_may_automate", None)
+            if session_allowed and not session_allowed(session_id):
+                return False
+            ten, session_count = self.repo.bot_message_count(chat_id, session_id, now)
+            if ten >= policy.max_messages_10m or session_count >= policy.max_messages_session:
+                stop = getattr(self.repo, "stop_session_automation", None)
+                if stop:
+                    stop(session_id, now, "anti_spam_limit")
+                else:
+                    self.repo.patch_session(
+                        session_id, now, priority=1, needs_manager_reply=1,
+                        handoff_reason="anti_spam_limit", search_disabled=1, status="human_handoff",
+                    )
+                return False
         outbound_key = None
         greeting_templates = {"greeting_model", "greeting_no_model"}
         ledger_template = "greeting" if template in greeting_templates else template
@@ -1395,6 +1600,38 @@ class BusinessService:
                 "scheduled_action_rejected_unallowed_connection id=%s chat_id=%s",
                 action["action_id"],
                 chat_id,
+            )
+            return
+        if action["action_type"] == "location_phone":
+            if self.repo.is_bot_paused(chat_id) or not self._within_reply_window(
+                chat_id, session_id, now
+            ):
+                return
+            connection_id = str(payload["connection_id"])
+            language = str(payload.get("language") or "bi")
+            message_id = int(payload["message_id"])
+            if payload.get("operation") == "confirm":
+                phone = self.repo.verified_client_phone(chat_id)
+                if phone:
+                    self._send_location_phone_confirmation(
+                        connection_id,
+                        chat_id,
+                        session_id,
+                        phone,
+                        language,
+                        message_id,
+                        now,
+                    )
+                return
+            self.send(
+                connection_id,
+                chat_id,
+                session_id,
+                self._render_message("location_phone_request", language, now),
+                "location_phone_request",
+                now,
+                delivery_key=f"location-phone:{message_id}:request",
+                location_phone_override=True,
             )
             return
         if not self.repo.may_automate(chat_id, now):

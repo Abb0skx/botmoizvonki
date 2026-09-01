@@ -3,6 +3,7 @@ from telegram_business.request_inputs import (
     masked_phone,
     missing_request_fields,
     normalize_phone,
+    phone_from_message,
     request_summary,
 )
 
@@ -31,6 +32,24 @@ def test_phone_is_normalized_but_plain_card_like_number_is_not():
     assert normalize_phone("+998 (90) 123-45-67") == "+998901234567"
     assert normalize_phone("8600123456789012") is None
     assert masked_phone("+998901234567").endswith("67")
+
+
+def test_native_contact_is_accepted_only_when_it_belongs_to_sender():
+    own = {
+        "from": {"id": 42},
+        "contact": {"user_id": 42, "phone_number": "+998 90 123 45 67"},
+    }
+    foreign = {
+        "from": {"id": 42},
+        "contact": {"user_id": 99, "phone_number": "+998 90 123 45 67"},
+    }
+    unverifiable = {
+        "from": {"id": 42},
+        "contact": {"phone_number": "+998 90 123 45 67"},
+    }
+    assert phone_from_message(own) == ("+998901234567", "telegram_contact")
+    assert phone_from_message(foreign) == (None, None)
+    assert phone_from_message(unverifiable) == (None, None)
 
 
 def test_explicit_address_step_accepts_short_address_without_opening_links():

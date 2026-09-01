@@ -78,8 +78,16 @@ def phone_from_message(message: Mapping[str, Any] | None, text: str = "") -> tup
     message = message or {}
     contact = message.get("contact") if isinstance(message, Mapping) else None
     if isinstance(contact, Mapping):
+        sender = message.get("from") if isinstance(message, Mapping) else None
+        sender_id = sender.get("id") if isinstance(sender, Mapping) else None
+        owner_id = contact.get("user_id")
         phone = normalize_phone(contact.get("phone_number"))
-        if phone:
+        if (
+            phone
+            and sender_id is not None
+            and owner_id is not None
+            and str(sender_id) == str(owner_id)
+        ):
             return phone, "telegram_contact"
     phone = normalize_phone(text)
     if phone:
