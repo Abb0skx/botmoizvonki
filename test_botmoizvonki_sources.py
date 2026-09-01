@@ -24,6 +24,9 @@ class CallSourceTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         bot.DB_PATH = Path(self.tmp.name) / "calls.db"
+        bot.SALES_PHOTO_DB_PATH = (
+            Path(self.tmp.name) / "sales_photo.db"
+        )
         bot.init_db()
 
     def tearDown(self):
@@ -61,6 +64,59 @@ class CallSourceTests(unittest.TestCase):
             9,
             "api",
         )
+
+    def save_sales_cards(self, cards):
+        with bot.sqlite3.connect(
+            bot.SALES_PHOTO_DB_PATH
+        ) as conn:
+            conn.execute(
+                """
+                CREATE TABLE sales_photo_jobs (
+                    chat_id INTEGER NOT NULL,
+                    source_message_id INTEGER NOT NULL,
+                    replacement_message_id INTEGER,
+                    manager TEXT,
+                    client_phone TEXT,
+                    client_phone_2 TEXT,
+                    product_label TEXT,
+                    sale_date TEXT NOT NULL,
+                    created_at TEXT,
+                    status TEXT NOT NULL,
+                    order_removed INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            conn.executemany(
+                """
+                INSERT INTO sales_photo_jobs (
+                    chat_id,
+                    source_message_id,
+                    replacement_message_id,
+                    manager,
+                    client_phone,
+                    client_phone_2,
+                    product_label,
+                    sale_date,
+                    created_at,
+                    status,
+                    order_removed
+                )
+                VALUES (
+                    -100,
+                    :source_message_id,
+                    :replacement_message_id,
+                    :manager,
+                    :client_phone,
+                    :client_phone_2,
+                    :product_label,
+                    :sale_date,
+                    :created_at,
+                    'complete',
+                    0
+                )
+                """,
+                cards,
+            )
 
     def test_main_account_corrects_both_sim_slots_and_assigns_abbos(self):
         first = self.save(
@@ -356,6 +412,155 @@ class CallSourceTests(unittest.TestCase):
         self.assertNotIn("Почему не купили", html)
         self.assertNotIn("<th>Результат</th>", html)
         self.assertNotIn("<h2 class=\"section-title\">\n    Продажи", html)
+
+    def test_real_sales_count_buyers_without_prior_calls(self):
+        called_phone = "+998 90 111 22 33"
+        no_call_phone = "+998902223344"
+
+        self.save(
+            "texnikach@gmail.com",
+            self.event(30, called_phone, 0),
+        )
+        self.save_sales_cards(
+            [
+                {
+                    "source_message_id": 100,
+                    "replacement_message_id": 1100,
+                    "manager": "Abbos",
+                    "client_phone": called_phone,
+                    "client_phone_2": None,
+                    "product_label": None,
+                    "sale_date": "2027-01-20",
+                    "created_at": "2027-01-20T10:00:00+05:00",
+                },
+                {
+                    "source_message_id": 101,
+                    "replacement_message_id": 1101,
+                    "manager": "Otabek",
+                    "client_phone": no_call_phone,
+                    "client_phone_2": "+998903334455",
+                    "product_label": "📦 iPhone 15",
+                    "sale_date": "2027-01-20",
+                    "created_at": "2027-01-20T11:00:00+05:00",
+                },
+                {
+                    "source_message_id": 102,
+                    "replacement_message_id": 1102,
+                    "manager": "Olmas",
+                    "client_phone": None,
+                    "client_phone_2": None,
+                    "product_label": None,
+                    "sale_date": "2027-01-20",
+                    "created_at": "2027-01-20T12:00:00+05:00",
+                },
+            ]
+        )
+
+        period = {
+            "period": "custom",
+            "date_from": "2027-01-01",
+            "date_to": "2027-01-31",
+        }
+        summary = bot.stats(**period)["stats"]
+        customers = bot.stats_sales_customers(
+            **period
+        )
+        managers = {
+            row["manager_code"]: row
+            for row in bot.stats_managers(
+                **period
+            )["results"]
+        }
+
+        self.assertTrue(customers["configured"])
+        self.assertEqual(summary["real_sales_total"], 3)
+        self.assertEqual(summary["real_sales_without_phone"], 1)
+        self.assertEqual(summary["real_buyers_total"], 2)
+        self.assertEqual(
+            summary["real_buyers_called_before_purchase"],
+            1,
+        )
+        self.assertEqual(
+            summary["real_buyers_without_prior_call"],
+            1,
+        )
+        self.assertEqual(
+            managers["otabek"][
+                "real_buyers_without_prior_call"
+            ],
+            1,
+        )
+        self.assertEqual(
+            managers["otabek"]["calls"],
+            0,
+        )
+        self.assertIn(
+            "📦 iPhone 15",
+            {
+                row["product_label"]
+                for row in customers["results"]
+            },
+        )
+        self.assertIn(
+            "—",
+            {
+                row["product_label"]
+                for row in customers["results"]
+            },
+        )
+
+    def test_real_sales_merge_phone_aliases_and_ignore_later_calls(self):
+        first_phone = "+998904445566"
+        second_phone = "+998905556677"
+        self.save_sales_cards(
+            [
+                {
+                    "source_message_id": 200,
+                    "replacement_message_id": 1200,
+                    "manager": "Olmas",
+                    "client_phone": first_phone,
+                    "client_phone_2": second_phone,
+                    "product_label": None,
+                    "sale_date": "2027-01-10",
+                    "created_at": "2027-01-10T10:00:00+05:00",
+                },
+                {
+                    "source_message_id": 201,
+                    "replacement_message_id": 1201,
+                    "manager": "Olmas",
+                    "client_phone": second_phone,
+                    "client_phone_2": None,
+                    "product_label": None,
+                    "sale_date": "2027-01-11",
+                    "created_at": "2027-01-11T10:00:00+05:00",
+                },
+            ]
+        )
+        later_event = self.event(
+            31,
+            first_phone,
+            0,
+        )
+        later_event["start_time"] = 1_900_000_000
+        later_event["answer_time"] = 1_900_000_001
+        later_event["end_time"] = 1_900_000_010
+        self.save(
+            "texnikach@gmail.com",
+            later_event,
+        )
+
+        summary = bot.stats(
+            period="custom",
+            date_from="2027-01-01",
+            date_to="2027-01-31",
+        )["stats"]
+
+        self.assertEqual(summary["real_sales_total"], 2)
+        self.assertEqual(summary["real_buyers_total"], 1)
+        self.assertEqual(
+            summary["real_buyers_without_prior_call"],
+            1,
+        )
 
     def test_known_sim_conflict_is_visible_but_slot_mapping_wins(self):
         resolved = bot.resolve_call_device(

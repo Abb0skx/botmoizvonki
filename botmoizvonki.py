@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
 from urllib.parse import urlparse
@@ -522,6 +522,13 @@ DB_PATH.parent.mkdir(
     exist_ok=True,
 )
 
+SALES_PHOTO_DB_PATH = Path(
+    os.getenv(
+        "SALES_PHOTO_DB_PATH",
+        "/app/sales-data/sales_photo.db",
+    )
+)
+
 HTTP = requests.Session()
 
 
@@ -969,6 +976,22 @@ def normalize_phone(
         for char in str(phone)
         if char.isdigit()
     )
+
+
+def normalize_sales_manager_code(
+    manager_name: str | None,
+) -> str:
+
+    candidate = str(
+        manager_name
+        or ""
+    ).strip().casefold()
+
+    for code, name in MANAGERS.items():
+        if candidate == name.casefold():
+            return code
+
+    return "unmarked"
 
 
 def get_internal_contact_name(
@@ -10572,6 +10595,518 @@ def get_period(
 
 
 # =========================================================
+# REAL SALES FROM SALES PHOTO BOT
+# =========================================================
+
+def get_sale_timestamp(
+    sale_date_value: str,
+    created_at_value: str | None,
+) -> int:
+
+    sale_day = date.fromisoformat(
+        sale_date_value
+    )
+
+    try:
+        created_at = datetime.fromisoformat(
+            str(
+                created_at_value
+                or ""
+            ).replace(
+                "Z",
+                "+00:00",
+            )
+        )
+
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(
+                tzinfo=timezone.utc
+            )
+
+        if created_at.astimezone(
+            UZ_TZ
+        ).date() == sale_day:
+            return int(
+                created_at.timestamp()
+            )
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+        pass
+
+    return int(
+        datetime(
+            sale_day.year,
+            sale_day.month,
+            sale_day.day,
+            23,
+            59,
+            59,
+            tzinfo=UZ_TZ,
+        ).timestamp()
+    )
+
+
+def load_external_sales(
+    start_date: str,
+    end_date: str,
+) -> tuple[bool, list[dict]]:
+
+    if not SALES_PHOTO_DB_PATH.is_file():
+        return False, []
+
+    try:
+        sales_conn = sqlite3.connect(
+            SALES_PHOTO_DB_PATH.resolve().as_uri()
+            + "?mode=ro",
+            uri=True,
+            timeout=5,
+        )
+        sales_conn.row_factory = sqlite3.Row
+        sales_conn.execute(
+            "PRAGMA query_only = ON"
+        )
+
+        columns = {
+            row["name"]
+            for row in sales_conn.execute(
+                "PRAGMA table_info(sales_photo_jobs)"
+            ).fetchall()
+        }
+
+        required_columns = {
+            "chat_id",
+            "source_message_id",
+            "replacement_message_id",
+            "manager",
+            "client_phone",
+            "client_phone_2",
+            "product_label",
+            "sale_date",
+            "created_at",
+            "status",
+            "order_removed",
+        }
+
+        if not required_columns.issubset(
+            columns
+        ):
+            sales_conn.close()
+            return False, []
+
+        rows = sales_conn.execute(
+            """
+            SELECT
+                chat_id,
+                source_message_id,
+                replacement_message_id,
+                manager,
+                client_phone,
+                client_phone_2,
+                product_label,
+                sale_date,
+                created_at
+
+            FROM sales_photo_jobs
+
+            WHERE
+                sale_date >= ?
+                AND sale_date <= ?
+                AND replacement_message_id
+                    IS NOT NULL
+                AND order_removed = 0
+                AND status IN (
+                    'reposted',
+                    'delete_pending',
+                    'complete'
+                )
+
+            ORDER BY
+                sale_date,
+                created_at,
+                source_message_id
+            """,
+            (
+                start_date,
+                end_date,
+            ),
+        ).fetchall()
+
+        sales_conn.close()
+
+    except (
+        OSError,
+        sqlite3.Error,
+        ValueError,
+    ) as exc:
+        print(
+            "SALES ANALYTICS UNAVAILABLE:",
+            type(exc).__name__,
+        )
+        return False, []
+
+    results = []
+
+    for row in rows:
+        phones = tuple(
+            dict.fromkeys(
+                phone_key
+                for phone_key in (
+                    normalize_phone(
+                        row["client_phone"]
+                    ),
+                    normalize_phone(
+                        row["client_phone_2"]
+                    ),
+                )
+                if phone_key
+            )
+        )
+
+        results.append(
+            {
+                "sale_id": (
+                    f"{row['chat_id']}:"
+                    f"{row['source_message_id']}"
+                ),
+                "source_message_id": row[
+                    "source_message_id"
+                ],
+                "replacement_message_id": row[
+                    "replacement_message_id"
+                ],
+                "sale_date": row[
+                    "sale_date"
+                ],
+                "sold_at": get_sale_timestamp(
+                    row["sale_date"],
+                    row["created_at"],
+                ),
+                "phones": phones,
+                "phone": (
+                    " / ".join(
+                        phone
+                        for phone in (
+                            row["client_phone"],
+                            row["client_phone_2"],
+                        )
+                        if phone
+                    )
+                ),
+                "manager": (
+                    row["manager"]
+                    or "Не указан"
+                ),
+                "manager_code": (
+                    normalize_sales_manager_code(
+                        row["manager"]
+                    )
+                ),
+                "product_label": (
+                    row["product_label"]
+                    or None
+                ),
+            }
+        )
+
+    return True, results
+
+
+def build_real_sales_analytics(
+    calls_conn: sqlite3.Connection,
+    period_data: dict,
+) -> dict:
+
+    configured, sales = load_external_sales(
+        period_data["start_date"],
+        period_data["end_date"],
+    )
+
+    valid_sales = [
+        sale
+        for sale in sales
+        if sale["phones"]
+    ]
+
+    all_phones = sorted(
+        {
+            phone
+            for sale in valid_sales
+            for phone in sale["phones"]
+        }
+    )
+
+    first_call_by_phone = {}
+
+    if all_phones:
+        placeholders = ",".join(
+            "?"
+            for _ in all_phones
+        )
+
+        call_rows = calls_conn.execute(
+            f"""
+            SELECT
+                client_key,
+                MIN(start_time) AS first_call_time
+
+            FROM reporting_calls
+
+            WHERE
+                client_key IN ({placeholders})
+                AND COALESCE(
+                    is_internal_contact,
+                    0
+                ) = 0
+
+            GROUP BY client_key
+            """,
+            all_phones,
+        ).fetchall()
+
+        first_call_by_phone = {
+            row["client_key"]: row[
+                "first_call_time"
+            ]
+            for row in call_rows
+        }
+
+    parent = {
+        phone: phone
+        for phone in all_phones
+    }
+
+    def find(phone: str) -> str:
+        while parent[phone] != phone:
+            parent[phone] = parent[
+                parent[phone]
+            ]
+            phone = parent[phone]
+        return phone
+
+    def union(first: str, second: str):
+        first_root = find(first)
+        second_root = find(second)
+        if first_root != second_root:
+            parent[second_root] = first_root
+
+    for sale in valid_sales:
+        for phone in sale["phones"][1:]:
+            union(
+                sale["phones"][0],
+                phone,
+            )
+
+    buyers = {}
+
+    for sale in valid_sales:
+        buyer_key = find(
+            sale["phones"][0]
+        )
+        buyer = buyers.setdefault(
+            buyer_key,
+            {
+                "phones": set(),
+                "sales": [],
+            },
+        )
+        buyer["phones"].update(
+            sale["phones"]
+        )
+        buyer["sales"].append(sale)
+
+    buyer_rows = []
+
+    for buyer in buyers.values():
+        first_sale = min(
+            buyer["sales"],
+            key=lambda sale: (
+                sale["sold_at"],
+                sale["source_message_id"],
+            ),
+        )
+        call_times = [
+            first_call_by_phone[phone]
+            for phone in buyer["phones"]
+            if first_call_by_phone.get(
+                phone
+            ) is not None
+        ]
+        first_call_time = (
+            min(call_times)
+            if call_times
+            else None
+        )
+        called_before = (
+            first_call_time is not None
+            and first_call_time
+                <= first_sale["sold_at"]
+        )
+        buyer_rows.append(
+            {
+                "buyer_key": min(
+                    buyer["phones"]
+                ),
+                "manager": first_sale[
+                    "manager"
+                ],
+                "manager_code": first_sale[
+                    "manager_code"
+                ],
+                "called_before_purchase": (
+                    called_before
+                ),
+            }
+        )
+
+    manager_buyers = {}
+
+    for buyer in buyer_rows:
+        metrics = manager_buyers.setdefault(
+            buyer["manager_code"],
+            {
+                "manager": buyer[
+                    "manager"
+                ],
+                "buyers": 0,
+                "called_before_purchase": 0,
+                "without_prior_call": 0,
+            },
+        )
+        metrics["buyers"] += 1
+        if buyer["called_before_purchase"]:
+            metrics[
+                "called_before_purchase"
+            ] += 1
+        else:
+            metrics[
+                "without_prior_call"
+            ] += 1
+
+    customer_rows = []
+
+    for sale in reversed(sales):
+        call_times = [
+            first_call_by_phone[phone]
+            for phone in sale["phones"]
+            if first_call_by_phone.get(
+                phone
+            ) is not None
+        ]
+        first_call_time = (
+            min(call_times)
+            if call_times
+            else None
+        )
+        customer_rows.append(
+            {
+                "sale_id": sale["sale_id"],
+                "sale_date": sale[
+                    "sale_date"
+                ],
+                "phone": sale["phone"] or "—",
+                "manager": sale["manager"],
+                "product_label": (
+                    sale["product_label"]
+                    or "—"
+                ),
+                "called_before_purchase": (
+                    first_call_time is not None
+                    and first_call_time
+                        <= sale["sold_at"]
+                ),
+                "has_phone": bool(
+                    sale["phones"]
+                ),
+            }
+        )
+
+    buyers_total = len(
+        buyer_rows
+    )
+    buyers_called = sum(
+        buyer[
+            "called_before_purchase"
+        ]
+        for buyer in buyer_rows
+    )
+    buyers_without_call = (
+        buyers_total
+        - buyers_called
+    )
+
+    return {
+        "configured": configured,
+        "sales_total": len(sales),
+        "sales_without_phone": (
+            len(sales)
+            - len(valid_sales)
+        ),
+        "buyers_total": buyers_total,
+        "buyers_called_before_purchase": (
+            buyers_called
+        ),
+        "buyers_without_prior_call": (
+            buyers_without_call
+        ),
+        "buyers_without_prior_call_rate": (
+            round(
+                buyers_without_call
+                / buyers_total
+                * 100,
+                1,
+            )
+            if buyers_total
+            else 0
+        ),
+        "manager_buyers": manager_buyers,
+        "results": customer_rows,
+    }
+
+
+@app.get(
+    "/stats/sales/customers"
+)
+def stats_sales_customers(
+    period: str = "today",
+    date_from: str | None = None,
+    date_to: str | None = None,
+):
+
+    p = get_period(
+        period,
+        date_from,
+        date_to,
+    )
+
+    with connect_db() as conn:
+        analytics = build_real_sales_analytics(
+            conn,
+            p,
+        )
+
+    return {
+        "configured": analytics[
+            "configured"
+        ],
+        "stats": {
+            key: analytics[key]
+            for key in (
+                "sales_total",
+                "sales_without_phone",
+                "buyers_total",
+                "buyers_called_before_purchase",
+                "buyers_without_prior_call",
+                "buyers_without_prior_call_rate",
+            )
+        },
+        "results": analytics["results"],
+    }
+
+
+# =========================================================
 # CUSTOMER RATING PAGE
 # =========================================================
 
@@ -12471,6 +13006,11 @@ def stats(
             ),
         ).fetchone()
 
+        real_sales = build_real_sales_analytics(
+            conn,
+            p,
+        )
+
     incoming = (
         row["incoming"]
         or 0
@@ -12822,6 +13362,42 @@ def stats(
                 )
                 for score in range(1, 6)
             },
+
+            "real_sales_configured": (
+                real_sales["configured"]
+            ),
+
+            "real_sales_total": (
+                real_sales["sales_total"]
+            ),
+
+            "real_sales_without_phone": (
+                real_sales[
+                    "sales_without_phone"
+                ]
+            ),
+
+            "real_buyers_total": (
+                real_sales["buyers_total"]
+            ),
+
+            "real_buyers_called_before_purchase": (
+                real_sales[
+                    "buyers_called_before_purchase"
+                ]
+            ),
+
+            "real_buyers_without_prior_call": (
+                real_sales[
+                    "buyers_without_prior_call"
+                ]
+            ),
+
+            "real_buyers_without_prior_call_rate": (
+                real_sales[
+                    "buyers_without_prior_call_rate"
+                ]
+            ),
         },
     }
 
@@ -13750,6 +14326,11 @@ def stats_managers(
             ),
         ).fetchall()
 
+        real_sales = build_real_sales_analytics(
+            conn,
+            p,
+        )
+
     manager_outcomes = {
         row["manager_code"]: row
         for row in outcome_rows
@@ -13764,6 +14345,10 @@ def stats_managers(
         row["manager_code"]: row
         for row in internal_rating_rows
     }
+
+    manager_real_buyers = real_sales[
+        "manager_buyers"
+    ]
 
     results = []
 
@@ -13780,6 +14365,12 @@ def stats_managers(
             manager_internal_ratings.get(
                 manager_code
             )
+        )
+        real_buyer_metrics = (
+            manager_real_buyers.get(
+                manager_code
+            )
+            or {}
         )
 
         incoming = row["incoming"] or 0
@@ -13907,6 +14498,24 @@ def stats_managers(
                     if internal_rating
                     else 0
                 ) or 0,
+                "real_buyers": (
+                    real_buyer_metrics.get(
+                        "buyers",
+                        0,
+                    )
+                ),
+                "real_buyers_called_before_purchase": (
+                    real_buyer_metrics.get(
+                        "called_before_purchase",
+                        0,
+                    )
+                ),
+                "real_buyers_without_prior_call": (
+                    real_buyer_metrics.get(
+                        "without_prior_call",
+                        0,
+                    )
+                ),
                 "rating_invitations_sent": (
                     invitations
                 ),
@@ -13949,6 +14558,64 @@ def stats_managers(
                     ]
                     if missed_metrics else 0
                 ) or 0,
+            }
+        )
+
+    present_manager_codes = {
+        row["manager_code"]
+        for row in results
+    }
+
+    for manager_code, metrics in (
+        manager_real_buyers.items()
+    ):
+        if manager_code in present_manager_codes:
+            continue
+
+        results.append(
+            {
+                "manager_code": manager_code,
+                "manager": metrics["manager"],
+                "calls": 0,
+                "unique_clients": 0,
+                "incoming": 0,
+                "outgoing": 0,
+                "missed": 0,
+                "internal_calls": 0,
+                "answer_rate": 0,
+                "total_duration_seconds": 0,
+                "eligible_windows": 0,
+                "bought": 0,
+                "not_bought": 0,
+                "pending": 0,
+                "non_target": 0,
+                "sale_unmarked": 0,
+                "sale_conversion": 0,
+                "processed_sale_conversion": 0,
+                "average_rating": None,
+                "ratings_count": 0,
+                "manager_average_rating": None,
+                "manager_ratings_count": 0,
+                "real_buyers": metrics[
+                    "buyers"
+                ],
+                "real_buyers_called_before_purchase": (
+                    metrics[
+                        "called_before_purchase"
+                    ]
+                ),
+                "real_buyers_without_prior_call": (
+                    metrics[
+                        "without_prior_call"
+                    ]
+                ),
+                "rating_invitations_sent": 0,
+                "rating_response_rate": 0,
+                "missed_episodes": 0,
+                "missed_outgoing_attempted": 0,
+                "missed_outgoing_success": 0,
+                "missed_customer_called_back": 0,
+                "missed_not_processed": 0,
             }
         )
 
@@ -16292,6 +16959,75 @@ tbody tr:last-child td {
 
 
 <h2 class="section-title">
+    Реальные продажи
+</h2>
+
+
+<div class="grid">
+
+    <div class="card good">
+        <div class="label">Продаж</div>
+        <div class="value" id="real_sales_total">—</div>
+    </div>
+
+    <div class="card good">
+        <div class="label">Уникальных покупателей</div>
+        <div class="value" id="real_buyers_total">—</div>
+    </div>
+
+    <div class="card">
+        <div class="label">Звонили до покупки</div>
+        <div class="value" id="real_buyers_called_before_purchase">—</div>
+    </div>
+
+    <div class="card">
+        <div class="label">Купили без звонка</div>
+        <div class="value" id="real_buyers_without_prior_call">—</div>
+    </div>
+
+    <div class="card">
+        <div class="label">Доля без звонка</div>
+        <div class="value" id="real_buyers_without_prior_call_rate">—</div>
+    </div>
+
+    <div class="card">
+        <div class="label">Продаж без номера</div>
+        <div class="value" id="real_sales_without_phone">—</div>
+    </div>
+
+</div>
+
+
+<div class="panel">
+
+    <div class="panel-header">
+        <h2>Покупатели и продажи</h2>
+    </div>
+
+    <div class="table-wrap">
+
+        <table>
+
+            <thead>
+            <tr>
+                <th>Дата</th>
+                <th>Телефон</th>
+                <th>Менеджер</th>
+                <th>Модель</th>
+                <th>Звонил до покупки</th>
+            </tr>
+            </thead>
+
+            <tbody id="real_sales_body"></tbody>
+
+        </table>
+
+    </div>
+
+</div>
+
+
+<h2 class="section-title">
     Оценки менеджеров
 </h2>
 
@@ -16461,6 +17197,8 @@ tbody tr:last-child td {
                 <th>Менеджер</th>
                 <th>Звонки</th>
                 <th>Клиенты</th>
+                <th>Покупатели</th>
+                <th>Купили без звонка</th>
                 <th>Вход.</th>
                 <th>Исход.</th>
                 <th>Пропущ.</th>
@@ -16965,6 +17703,25 @@ async function loadStats() {
         missed_not_processed:
             s.missed_not_processed,
 
+        real_sales_total:
+            s.real_sales_total,
+
+        real_buyers_total:
+            s.real_buyers_total,
+
+        real_buyers_called_before_purchase:
+            s.real_buyers_called_before_purchase,
+
+        real_buyers_without_prior_call:
+            s.real_buyers_without_prior_call,
+
+        real_buyers_without_prior_call_rate:
+            s.real_buyers_without_prior_call_rate
+            + "%",
+
+        real_sales_without_phone:
+            s.real_sales_without_phone,
+
 
         manager_average_rating:
             s.manager_average_rating === null
@@ -17415,6 +18172,10 @@ async function loadManagers() {
 
                 row.unique_clients,
 
+                row.real_buyers,
+
+                row.real_buyers_without_prior_call,
+
                 row.incoming,
 
                 row.outgoing,
@@ -17479,6 +18240,73 @@ async function loadManagers() {
             body.appendChild(
                 tr
             );
+        }
+    );
+}
+
+
+async function loadRealSales() {
+
+    const data =
+        await getJson(
+            "/stats/sales/customers"
+        );
+
+    const body =
+        document.getElementById(
+            "real_sales_body"
+        );
+
+    body.innerHTML = "";
+
+    if (
+        !data.configured
+        || data.results.length === 0
+    ) {
+        const tr =
+            document.createElement("tr");
+        const td =
+            document.createElement("td");
+
+        td.colSpan = 5;
+        td.className = "empty";
+        td.textContent = data.configured
+            ? "Пока нет продаж за выбранный период"
+            : "База бота продаж пока не подключена";
+
+        tr.appendChild(td);
+        body.appendChild(tr);
+        return;
+    }
+
+    data.results.forEach(
+        row => {
+            const tr =
+                document.createElement("tr");
+
+            const callStatus =
+                !row.has_phone
+                    ? "Нет номера"
+                    : row.called_before_purchase
+                        ? "Да"
+                        : "Нет";
+
+            [
+                row.sale_date,
+                row.phone,
+                row.manager,
+                row.product_label,
+                callStatus,
+            ].forEach(
+                value => {
+                    const td =
+                        document.createElement("td");
+                    td.textContent = value;
+                    tr.appendChild(td);
+                }
+            );
+
+            body.appendChild(tr);
         }
     );
 }
@@ -18321,6 +19149,8 @@ async function loadAll() {
                 loadStats(),
 
                 loadTimeline(),
+
+                loadRealSales(),
 
                 loadManagers(),
 
