@@ -240,12 +240,14 @@ class BotSettingsRegistryTests(unittest.TestCase):
             "1TrS6C4oHe6nzQTPTa_4se_upXBFF6rmbfnE7RqznR8U",
         )
         self.assertEqual(defaults.bot_settings_sheet_name, "bot_settings")
+        self.assertTrue(defaults.daily_post_refresh_enabled)
 
         with patch.dict(
             os.environ,
             {
                 "PRICE_BOT_SETTINGS_SHEET_ID": "separate-sheet",
                 "PRICE_BOT_SETTINGS_SHEET_NAME": "strict_settings",
+                "PRICE_DAILY_POST_REFRESH_ENABLED": "false",
             },
             clear=True,
         ):
@@ -256,6 +258,7 @@ class BotSettingsRegistryTests(unittest.TestCase):
         self.assertEqual(
             overridden.bot_settings_sheet_name, "strict_settings"
         )
+        self.assertFalse(overridden.daily_post_refresh_enabled)
 
 
 if __name__ == "__main__":

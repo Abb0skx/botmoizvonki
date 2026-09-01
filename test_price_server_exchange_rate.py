@@ -275,6 +275,7 @@ class ExchangeRateWorkflowTests(unittest.TestCase):
             self._channel_post(25, 251, "11900")
         ]
         self.service.sync_sheets_outbox = lambda **_kwargs: 0
+        self.service.process_quick_link_rotations = lambda _now: 0
         scheduler = PriceScheduler(
             self.settings,
             self.repository,

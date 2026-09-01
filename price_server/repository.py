@@ -45,6 +45,7 @@ _ACTION_ALIASES = {
 }
 _SCHEDULES = {"once", "daily", "weekly"}
 _TERMINAL_JOBS = {"done", "failed", "cancelled", "needs_review"}
+DAILY_POST_REFRESH_TIME = "00:00"
 
 
 class SnapshotValidationError(ValueError):
@@ -367,6 +368,24 @@ CREATE TABLE IF NOT EXISTS publication_edit_batches (
  FOREIGN KEY(snapshot_id) REFERENCES price_snapshots(snapshot_id));
 CREATE INDEX IF NOT EXISTS idx_publication_edit_batches_created
  ON publication_edit_batches(created_at DESC,batch_id);
+
+CREATE TABLE IF NOT EXISTS daily_post_refreshes (
+ local_date TEXT PRIMARY KEY,
+ batch_id TEXT NOT NULL UNIQUE,
+ status TEXT NOT NULL DEFAULT 'pending',
+ attempts INTEGER NOT NULL DEFAULT 0,
+ max_attempts INTEGER NOT NULL DEFAULT 8,
+ next_attempt_at TEXT,
+ lease_token TEXT,
+ lease_expires_at TEXT,
+ notification_message_id INTEGER,
+ last_error TEXT,
+ created_at TEXT NOT NULL,
+ updated_at TEXT NOT NULL,
+ completed_at TEXT,
+ FOREIGN KEY(batch_id) REFERENCES publication_edit_batches(batch_id));
+CREATE INDEX IF NOT EXISTS idx_daily_post_refreshes_due
+ ON daily_post_refreshes(status,next_attempt_at,local_date);
 
 CREATE TABLE IF NOT EXISTS scheduled_preview_posts (
  job_id INTEGER NOT NULL,
@@ -4626,6 +4645,18 @@ class PriceRepository:
                     "current snapshot is not available"
                 )
             snapshot_id = int(snapshot["snapshot_id"])
+            snapshot_rows = db.execute(
+                """SELECT section_key,position FROM price_sections
+                   WHERE snapshot_id=? ORDER BY position,section_key""",
+                (snapshot_id,),
+            ).fetchall()
+            snapshot_section_keys = {
+                str(row["section_key"]) for row in snapshot_rows
+            }
+            snapshot_positions = {
+                str(row["section_key"]): int(row["position"])
+                for row in snapshot_rows
+            }
             rows = db.execute(
                 """SELECT post.*,section.position AS section_position
                    FROM telegram_posts AS post
@@ -4640,7 +4671,7 @@ class PriceRepository:
             ).fetchall()
 
             by_section: dict[str, list[sqlite3.Row]] = {}
-            positions: dict[str, int] = {}
+            positions: dict[str, int] = dict(snapshot_positions)
             missing_snapshot_sections: set[str] = set()
             for row in rows:
                 key = str(row["section_key"])
@@ -4718,6 +4749,10 @@ class PriceRepository:
                 "active_job": [],
                 "invalid_binding": sorted(invalid_sections),
                 "quick_link_collision": [],
+                "missing_post": sorted(
+                    snapshot_section_keys - set(by_section),
+                    key=lambda key: (snapshot_positions[key], key),
+                ),
             }
             jobs: list[dict[str, Any]] = []
             ordered_groups = sorted(
@@ -4858,6 +4893,341 @@ class PriceRepository:
                 "duplicate": False,
                 "skipped": skipped,
             }
+
+    def ensure_daily_current_post_edit_batch(
+        self,
+        now_utc: datetime | str,
+    ) -> dict[str, Any] | None:
+        """Create today's idempotent 00:00 update-all batch."""
+
+        if (
+            self.settings is None
+            or not self.settings.telegram_channel_id
+            or not getattr(
+                self.settings, "daily_post_refresh_enabled", False
+            )
+        ):
+            return None
+        now = _dt(now_utc, "now_utc")
+        local = now.astimezone(ZoneInfo(self.settings.timezone))
+        local_date = local.date().isoformat()
+        batch_id = f"price-daily-edit-all:{local_date}"
+
+        with self._read() as db:
+            existing = db.execute(
+                """SELECT batch_id,status FROM daily_post_refreshes
+                   WHERE local_date=?""",
+                (local_date,),
+            ).fetchone()
+        if existing is not None:
+            return {
+                "local_date": local_date,
+                "batch_id": str(existing["batch_id"]),
+                "status": str(existing["status"]),
+                "created": False,
+            }
+
+        try:
+            batch = self.enqueue_current_post_edit_batch(
+                channel_id=self.settings.telegram_channel_id,
+                channel_key=self.settings.telegram_channel_username,
+                idempotency_key=batch_id,
+                now=now,
+            )
+        except CurrentSnapshotUnavailableError:
+            return None
+        with self._tx(True) as db:
+            cursor = db.execute(
+                """INSERT INTO daily_post_refreshes(
+                     local_date,batch_id,status,attempts,max_attempts,
+                     created_at,updated_at)
+                   VALUES(?,?,'pending',0,8,?,?)
+                   ON CONFLICT(local_date) DO NOTHING""",
+                (local_date, batch_id, _iso(now), _iso(now)),
+            )
+            created = cursor.rowcount == 1
+            if created:
+                self._audit(
+                    db,
+                    "daily_post_refresh_enqueued",
+                    "publication_batch",
+                    batch_id,
+                    {
+                        "local_date": local_date,
+                        "job_count": batch["job_count"],
+                        "section_count": batch["section_count"],
+                        "skipped": batch["skipped"],
+                    },
+                    now,
+                )
+        return {
+            **batch,
+            "local_date": local_date,
+            "status": "pending",
+            "created": created,
+        }
+
+    @staticmethod
+    def _missing_telegram_post_error(error: Any) -> bool:
+        normalized = str(error or "").casefold()
+        return any(
+            phrase in normalized
+            for phrase in (
+                "message to edit not found",
+                "message_id_invalid",
+                "message identifier is not specified",
+            )
+        )
+
+    def claim_daily_post_refresh_notification(
+        self,
+        now_utc: datetime | str,
+        *,
+        lease_seconds: int = 180,
+    ) -> dict[str, Any] | None:
+        """Claim one completed daily batch for a durable missing-post report."""
+
+        now = _dt(now_utc, "now_utc")
+        expires = now + timedelta(
+            seconds=min(3600, max(10, int(lease_seconds)))
+        )
+        with self._tx(True) as db:
+            db.execute(
+                """UPDATE daily_post_refreshes
+                   SET status='pending',lease_token=NULL,lease_expires_at=NULL,
+                       updated_at=?
+                   WHERE status='running'
+                     AND (lease_expires_at IS NULL OR lease_expires_at<=?)""",
+                (_iso(now), _iso(now)),
+            )
+            rows = db.execute(
+                """SELECT refresh.*,batch.snapshot_id,batch.job_ids_json,
+                          batch.skipped_json,batch.channel_key
+                   FROM daily_post_refreshes AS refresh
+                   JOIN publication_edit_batches AS batch
+                     ON batch.batch_id=refresh.batch_id
+                   WHERE refresh.status='pending'
+                     AND (refresh.next_attempt_at IS NULL
+                          OR refresh.next_attempt_at<=?)
+                   ORDER BY refresh.local_date LIMIT 20""",
+                (_iso(now),),
+            ).fetchall()
+            for row in rows:
+                job_ids = [
+                    int(job_id)
+                    for job_id in _load(row["job_ids_json"], [])
+                    if int(job_id) > 0
+                ]
+                jobs: list[sqlite3.Row] = []
+                if job_ids:
+                    marks = ",".join("?" for _ in job_ids)
+                    jobs = db.execute(
+                        f"""SELECT job_id,status,last_error,result_json,
+                                   payload_json
+                            FROM publication_jobs
+                            WHERE job_id IN ({marks}) ORDER BY job_id""",
+                        job_ids,
+                    ).fetchall()
+                    if len(jobs) != len(job_ids) or any(
+                        str(job["status"]) not in _TERMINAL_JOBS
+                        for job in jobs
+                    ):
+                        continue
+
+                skipped = _load(row["skipped_json"], {})
+                missing_groups: list[dict[str, Any]] = []
+                seen: set[tuple[tuple[str, ...], tuple[int, ...]]] = set()
+
+                for section_key in skipped.get("missing_post", []):
+                    key = str(section_key).strip()
+                    if key:
+                        identity = ((key,), ())
+                        if identity not in seen:
+                            seen.add(identity)
+                            missing_groups.append({
+                                "section_keys": [key],
+                                "message_ids": [],
+                                "reason": "message_id_not_registered",
+                            })
+
+                updated_job_count = 0
+                updated_section_count = 0
+                for job in jobs:
+                    payload = _load(job["payload_json"], {})
+                    section_keys = [
+                        str(item).strip()
+                        for item in payload.get("section_keys", [])
+                        if str(item).strip()
+                    ]
+                    result = _load(job["result_json"], {})
+                    if (
+                        str(job["status"]) == "done"
+                        and isinstance(result, Mapping)
+                        and result.get("status") == "updated"
+                    ):
+                        updated_job_count += 1
+                        updated_section_count += len(section_keys)
+                    if not self._missing_telegram_post_error(
+                        job["last_error"]
+                    ):
+                        continue
+                    message_ids = [
+                        int(item)
+                        for item in payload.get("expected_message_ids", [])
+                        if int(item) > 0
+                    ]
+                    identity = (tuple(section_keys), tuple(message_ids))
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    missing_groups.append({
+                        "section_keys": section_keys,
+                        "message_ids": message_ids,
+                        "reason": "telegram_message_not_found",
+                    })
+
+                all_keys = sorted({
+                    key
+                    for group in missing_groups
+                    for key in group["section_keys"]
+                })
+                titles: dict[str, str] = {}
+                if all_keys:
+                    marks = ",".join("?" for _ in all_keys)
+                    titles = {
+                        str(item["section_key"]): str(item["title"])
+                        for item in db.execute(
+                            f"""SELECT section_key,title FROM price_sections
+                                WHERE snapshot_id=?
+                                  AND section_key IN ({marks})""",
+                            (int(row["snapshot_id"]), *all_keys),
+                        ).fetchall()
+                    }
+                for group in missing_groups:
+                    group["section_names"] = [
+                        titles.get(key, key) for key in group["section_keys"]
+                    ]
+
+                token = secrets.token_urlsafe(24)
+                cursor = db.execute(
+                    """UPDATE daily_post_refreshes
+                       SET status='running',attempts=attempts+1,
+                           lease_token=?,lease_expires_at=?,updated_at=?
+                       WHERE local_date=? AND status='pending'""",
+                    (
+                        token,
+                        _iso(expires),
+                        _iso(now),
+                        str(row["local_date"]),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    continue
+                return {
+                    "local_date": str(row["local_date"]),
+                    "batch_id": str(row["batch_id"]),
+                    "lease_token": token,
+                    "channel_username": str(row["channel_key"] or ""),
+                    "missing": missing_groups,
+                    "updated_job_count": updated_job_count,
+                    "updated_section_count": updated_section_count,
+                }
+        return None
+
+    def complete_daily_post_refresh_notification(
+        self,
+        local_date: str,
+        lease_token: str,
+        now_utc: datetime | str,
+        *,
+        message_id: int | None = None,
+    ) -> bool:
+        now = _dt(now_utc, "now_utc")
+        with self._tx(True) as db:
+            cursor = db.execute(
+                """UPDATE daily_post_refreshes
+                   SET status='done',next_attempt_at=NULL,lease_token=NULL,
+                       lease_expires_at=NULL,notification_message_id=?,
+                       last_error=NULL,updated_at=?,completed_at=?
+                   WHERE local_date=? AND status='running' AND lease_token=?""",
+                (
+                    int(message_id) if message_id is not None else None,
+                    _iso(now),
+                    _iso(now),
+                    str(local_date),
+                    str(lease_token),
+                ),
+            )
+            return cursor.rowcount == 1
+
+    def retry_daily_post_refresh_notification(
+        self,
+        local_date: str,
+        lease_token: str,
+        now_utc: datetime | str,
+        error: Any,
+        *,
+        retry_after_seconds: float | int | None = None,
+        permanent: bool = False,
+        ambiguous: bool = False,
+    ) -> bool:
+        now = _dt(now_utc, "now_utc")
+        safe_error = str(error or "daily post refresh notification failed").replace(
+            "\n", " "
+        )[:1000]
+        with self._tx(True) as db:
+            row = db.execute(
+                """SELECT attempts,max_attempts FROM daily_post_refreshes
+                   WHERE local_date=? AND status='running' AND lease_token=?""",
+                (str(local_date), str(lease_token)),
+            ).fetchone()
+            if row is None:
+                return False
+            attempts = int(row["attempts"])
+            if ambiguous:
+                status = "needs_review"
+                next_attempt = None
+            else:
+                terminal = permanent or attempts >= int(row["max_attempts"])
+                status = "failed" if terminal else "pending"
+                delay = (
+                    2 ** min(attempts, 11)
+                    if retry_after_seconds is None
+                    else float(retry_after_seconds)
+                )
+                next_attempt = None if terminal else _iso(
+                    now + timedelta(seconds=min(86400, max(0, delay)))
+                )
+            cursor = db.execute(
+                """UPDATE daily_post_refreshes
+                   SET status=?,next_attempt_at=?,lease_token=NULL,
+                       lease_expires_at=NULL,last_error=?,updated_at=?,
+                       completed_at=?
+                   WHERE local_date=? AND status='running' AND lease_token=?""",
+                (
+                    status,
+                    next_attempt,
+                    safe_error,
+                    _iso(now),
+                    _iso(now) if status in {"failed", "needs_review"} else None,
+                    str(local_date),
+                    str(lease_token),
+                ),
+            )
+            return cursor.rowcount == 1
+
+    def list_daily_post_refreshes(
+        self,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        with self._read() as db:
+            rows = db.execute(
+                """SELECT * FROM daily_post_refreshes
+                   ORDER BY local_date DESC LIMIT ?""",
+                (min(500, max(1, int(limit))),),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def list_jobs_for_preview(
         self,

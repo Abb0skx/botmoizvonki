@@ -72,6 +72,15 @@ messages; changed, multipart, or quick-link bindings are skipped and reported.
 A durable batch envelope makes the UUID idempotency key effective even when a
 request creates zero jobs.
 
+With `PRICE_DAILY_POST_REFRESH_ENABLED=true`, the scheduler creates the same
+fenced update-all batch once per Tashkent calendar day at 00:00. The batch uses
+the current snapshot available when it is created and never publishes replacement
+messages. After every child edit reaches a terminal state, missing registered
+Telegram messages and snapshot sections without a current `message_id` are
+combined into one notification in the preview channel. A successful run with no
+missing posts stays silent. Both the daily occurrence and its notification lease
+are durable and idempotent across restarts.
+
 The main catalogue is published every Tuesday, Thursday and Saturday at 11:00
 Asia/Tashkent, after the 09:30 price publications. The new catalogue is pinned
 and the previous catalogue is recycled into one of eight second-level posts in

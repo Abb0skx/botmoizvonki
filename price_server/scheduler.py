@@ -126,6 +126,23 @@ class PriceScheduler:
         except Exception:
             LOG.exception("price_schedule_materialization_failed")
 
+    async def _materialize_daily_post_refresh(self, now: datetime) -> None:
+        try:
+            result = await self._repository_call(
+                "ensure_daily_current_post_edit_batch",
+                now,
+            )
+            if isinstance(result, Mapping) and result.get("created"):
+                LOG.info(
+                    "price_daily_post_refresh_enqueued date=%s batch_id=%s "
+                    "jobs=%s",
+                    result.get("local_date"),
+                    result.get("batch_id"),
+                    result.get("job_count", 0),
+                )
+        except Exception:
+            LOG.exception("price_daily_post_refresh_materialization_failed")
+
     async def _materialize_quick_link_rotations(self, now: datetime) -> None:
         try:
             await self._repository_call(
@@ -298,6 +315,7 @@ class PriceScheduler:
                 )
             except Exception:
                 LOG.exception("price_quick_link_catalog_date_failed")
+        await self._materialize_daily_post_refresh(now)
         await self._materialize_schedules(now)
         if quick_links_ready:
             await self._materialize_quick_link_rotations(now)
@@ -323,6 +341,16 @@ class PriceScheduler:
             except Exception:
                 LOG.exception("price_exchange_rate_update_failed")
         processed = await self._process_due_jobs() + exchange_rate_progress
+        try:
+            processed += int(
+                await self._service_call(
+                    "process_daily_post_refresh_notifications",
+                    self.clock(),
+                )
+                or 0
+            )
+        except Exception:
+            LOG.exception("price_daily_post_refresh_notification_failed")
         if processed:
             try:
                 await self._service_call("cleanup_terminal_previews")

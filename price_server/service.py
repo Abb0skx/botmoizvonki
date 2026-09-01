@@ -1623,6 +1623,94 @@ class PricePublicationService:
             processed += 1
         return processed
 
+    @staticmethod
+    def _daily_missing_posts_html(report: Mapping[str, Any]) -> str:
+        username = str(report.get("channel_username") or "").strip().lstrip("@")
+        lines = ["⚠️ <b>Не найдены посты прайса</b>", ""]
+        for group in report.get("missing", []):
+            names = " / ".join(
+                str(item).strip()
+                for item in group.get("section_names", [])
+                if str(item).strip()
+            ) or "Неизвестный раздел"
+            safe_names = html.escape(names)
+            message_ids = [
+                int(item)
+                for item in group.get("message_ids", [])
+                if int(item) > 0
+            ]
+            if username and message_ids:
+                url = html.escape(
+                    f"https://t.me/{username}/{message_ids[0]}",
+                    quote=True,
+                )
+                lines.append(f'• <a href="{url}"><b>{safe_names}</b></a>')
+            else:
+                lines.append(f"• <b>{safe_names}</b>")
+                lines.append("  <i>message_id не зарегистрирован</i>")
+        lines.extend([
+            "",
+            f"Обновлено постов: {int(report.get('updated_job_count') or 0)}",
+            f"Не найдено: {len(report.get('missing', []))}",
+        ])
+        return "\n".join(lines)
+
+    def process_daily_post_refresh_notifications(
+        self,
+        now_utc: datetime | str | None = None,
+    ) -> int:
+        """Send one durable preview-channel report after a daily edit batch."""
+
+        if not getattr(
+            self.settings, "daily_post_refresh_enabled", False
+        ):
+            return 0
+        now = now_utc if now_utc is not None else datetime.now(timezone.utc)
+        report = self.repository.claim_daily_post_refresh_notification(now)
+        if report is None:
+            return 0
+        local_date = str(report["local_date"])
+        token = str(report["lease_token"])
+        try:
+            message_id: int | None = None
+            if report["missing"]:
+                if not self.settings.preview_configured:
+                    raise PublicationError(
+                        "Telegram preview channel is not configured"
+                    )
+                sent = self.telegram.send_message(
+                    self.settings.telegram_preview_channel_id,
+                    self._daily_missing_posts_html(report),
+                )
+                message_id = int(sent.message_id)
+            if not self.repository.complete_daily_post_refresh_notification(
+                local_date,
+                token,
+                now,
+                message_id=message_id,
+            ):
+                raise PartialPublicationError(
+                    "Daily post refresh report was sent but not persisted"
+                )
+            return 1
+        except Exception as exc:
+            self.repository.retry_daily_post_refresh_notification(
+                local_date,
+                token,
+                now,
+                exc,
+                retry_after_seconds=getattr(exc, "retry_after", None),
+                permanent=self._external_error_is_permanent(exc),
+                ambiguous=bool(getattr(exc, "ambiguous", False)),
+            )
+            LOG.warning(
+                "price_daily_post_refresh_notification_failed "
+                "local_date=%s type=%s",
+                local_date,
+                type(exc).__name__,
+            )
+            return 0
+
     def execute_job(self, job: Any) -> dict[str, Any]:
         channel_id = str(
             _value(job, "channel_id", "")

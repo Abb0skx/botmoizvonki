@@ -17,6 +17,7 @@ from price_server.contracts import (
     validate_sync_payload,
 )
 from price_server.repository import (
+    DAILY_POST_REFRESH_TIME,
     IdempotencyConflictError,
     PriceRepository,
     QuickLinkRotationConflictError,
@@ -378,6 +379,7 @@ class PriceRepositoryTests(unittest.TestCase):
             channel_id=settings.telegram_channel_id,
         )
         service.sync_sheets_outbox = lambda **_: 0
+        service.ensure_quick_link_registry = lambda: 0
         scheduler = PriceScheduler(
             settings,
             self.repo,
@@ -710,6 +712,227 @@ class PriceRepositoryTests(unittest.TestCase):
         self.assertEqual(result["reason"], "current_binding_changed")
         self.assertEqual(fake.edited, [])
         self.assertEqual(fake.sent, [])
+
+    def test_daily_update_all_is_materialized_once_at_local_midnight(self):
+        due = datetime(2026, 8, 31, 19, 0, tzinfo=timezone.utc)
+        settings = PriceSettings(
+            enabled=True,
+            db_path=Path(self.temp.name) / "daily-price.db",
+            legacy_html_path=Path(self.temp.name) / "legacy.html",
+            admin_username="admin",
+            admin_password="secret",
+            sync_api_key="sync",
+            telegram_bot_token="fake-token",
+            telegram_channel_id="-1001234567890",
+            telegram_channel_username="testchannel",
+            product_sort_sheet_id="sheet",
+            posts_sheet_name="Telegram Posts",
+            timezone="Asia/Tashkent",
+            scheduler_poll_seconds=1,
+            sync_max_bytes=2_000_000,
+            telegram_preview_channel_id="-1003922029862",
+            daily_post_refresh_enabled=True,
+        )
+        repo = PriceRepository(settings)
+        repo.ingest_snapshot(snapshot_with_sections(
+            due - timedelta(minutes=1),
+            ["registered", "without-id"],
+        ))
+        repo.upsert_telegram_post({
+            "record_key": "legacy:registered:701",
+            "section_key": "registered",
+            "section_name": "Registered",
+            "channel_id": settings.telegram_channel_id,
+            "channel_username": settings.telegram_channel_username,
+            "message_id": 701,
+            "post_url": "https://t.me/testchannel/701",
+            "sent_at": due.isoformat(),
+            "status": "published",
+            "is_current": True,
+        })
+
+        first = repo.ensure_daily_current_post_edit_batch(due)
+        replay = repo.ensure_daily_current_post_edit_batch(
+            due + timedelta(hours=12)
+        )
+
+        self.assertEqual(DAILY_POST_REFRESH_TIME, "00:00")
+        self.assertTrue(first["created"])
+        self.assertEqual(first["local_date"], "2026-09-01")
+        self.assertEqual(first["job_count"], 1)
+        self.assertEqual(first["skipped"], {
+            "missing_post": ["without-id"],
+        })
+        self.assertFalse(replay["created"])
+        self.assertEqual(replay["batch_id"], first["batch_id"])
+        self.assertEqual(len(repo.list_daily_post_refreshes()), 1)
+
+    def test_daily_missing_post_report_is_sent_once_after_batch_finishes(self):
+        due = datetime(2026, 8, 31, 19, 0, tzinfo=timezone.utc)
+        settings = PriceSettings(
+            enabled=True,
+            db_path=Path(self.temp.name) / "daily-report.db",
+            legacy_html_path=Path(self.temp.name) / "legacy.html",
+            admin_username="admin",
+            admin_password="secret",
+            sync_api_key="sync",
+            telegram_bot_token="fake-token",
+            telegram_channel_id="-1001234567890",
+            telegram_channel_username="testchannel",
+            product_sort_sheet_id="sheet",
+            posts_sheet_name="Telegram Posts",
+            timezone="Asia/Tashkent",
+            scheduler_poll_seconds=1,
+            sync_max_bytes=2_000_000,
+            telegram_preview_channel_id="-1003922029862",
+            daily_post_refresh_enabled=True,
+        )
+        repo = PriceRepository(settings)
+        repo.ingest_snapshot(snapshot_with_sections(
+            due - timedelta(minutes=1),
+            ["updated-post", "deleted-post", "without-id"],
+        ))
+        for section_key, message_id in (
+            ("updated-post", 701),
+            ("deleted-post", 702),
+        ):
+            repo.upsert_telegram_post({
+                "record_key": f"legacy:{section_key}:{message_id}",
+                "section_key": section_key,
+                "section_name": section_key,
+                "channel_id": settings.telegram_channel_id,
+                "channel_username": settings.telegram_channel_username,
+                "message_id": message_id,
+                "post_url": f"https://t.me/testchannel/{message_id}",
+                "sent_at": due.isoformat(),
+                "status": "published",
+                "is_current": True,
+            })
+        fake = FakeTelegram()
+        fake.edit_failures[(settings.telegram_channel_id, 702)] = (
+            TelegramAPIError(
+                "Telegram editMessageText failed (400): "
+                "Bad Request: message to edit not found",
+                error_code=400,
+                retryable=False,
+            )
+        )
+        service = PricePublicationService(settings, repo, telegram=fake)
+        batch = repo.ensure_daily_current_post_edit_batch(due)
+
+        first = repo.claim_due_jobs(due, limit=20)[0]
+        first_result = service.execute_job(first)
+        self.assertTrue(repo.complete_job(
+            first["job_id"], first["lease_token"], due, first_result
+        ))
+        self.assertEqual(
+            service.process_daily_post_refresh_notifications(due),
+            0,
+        )
+
+        second_at = due + timedelta(seconds=2)
+        second = repo.claim_due_jobs(second_at, limit=20)[0]
+        with self.assertRaises(TelegramAPIError) as missing:
+            service.execute_job(second)
+        self.assertTrue(repo.retry_job(
+            second["job_id"],
+            second["lease_token"],
+            second_at,
+            missing.exception,
+            permanent=True,
+        ))
+
+        self.assertEqual(
+            service.process_daily_post_refresh_notifications(second_at),
+            1,
+        )
+        self.assertEqual(len(fake.sent), 1)
+        self.assertEqual(fake.sent[0][0], settings.telegram_preview_channel_id)
+        notification = fake.sent[0][1]
+        self.assertIn("Не найдены посты прайса", notification)
+        self.assertIn("deleted-post", notification)
+        self.assertIn("https://t.me/testchannel/702", notification)
+        self.assertIn("without-id", notification)
+        self.assertIn("message_id не зарегистрирован", notification)
+        self.assertIn("Обновлено постов: 1", notification)
+        self.assertIn("Не найдено: 2", notification)
+        self.assertEqual(
+            service.process_daily_post_refresh_notifications(second_at),
+            0,
+        )
+        refresh = repo.list_daily_post_refreshes()[0]
+        self.assertEqual(refresh["status"], "done")
+        self.assertEqual(refresh["notification_message_id"], 101)
+        self.assertEqual(batch["job_count"], 2)
+
+    def test_scheduler_runs_daily_update_all_without_http_button(self):
+        due = datetime(2026, 8, 31, 19, 0, tzinfo=timezone.utc)
+        settings = PriceSettings(
+            enabled=True,
+            db_path=Path(self.temp.name) / "daily-scheduler.db",
+            legacy_html_path=Path(self.temp.name) / "legacy.html",
+            admin_username="admin",
+            admin_password="secret",
+            sync_api_key="sync",
+            telegram_bot_token="fake-token",
+            telegram_channel_id="-1001234567890",
+            telegram_channel_username="testchannel",
+            product_sort_sheet_id="sheet",
+            posts_sheet_name="Telegram Posts",
+            timezone="Asia/Tashkent",
+            scheduler_poll_seconds=1,
+            sync_max_bytes=2_000_000,
+            telegram_preview_channel_id="-1003922029862",
+            daily_post_refresh_enabled=True,
+        )
+        repo = PriceRepository(settings)
+        repo.ingest_snapshot(snapshot_with_sections(
+            due - timedelta(minutes=1), ["registered"]
+        ))
+        repo.upsert_telegram_post({
+            "record_key": "legacy:registered:701",
+            "section_key": "registered",
+            "section_name": "registered",
+            "channel_id": settings.telegram_channel_id,
+            "channel_username": settings.telegram_channel_username,
+            "message_id": 701,
+            "post_url": "https://t.me/testchannel/701",
+            "sent_at": due.isoformat(),
+            "status": "published",
+            "is_current": True,
+        })
+
+        class DailyService:
+            def __init__(self):
+                self.executed = []
+
+            def execute_job(self, job):
+                self.executed.append(job)
+                return {"status": "updated"}
+
+            def process_daily_post_refresh_notifications(self, _now):
+                return 0
+
+        service = DailyService()
+        scheduler = PriceScheduler(
+            settings,
+            repo,
+            service,
+            clock=lambda: due,
+        )
+
+        self.assertEqual(asyncio.run(scheduler.run_once()), 1)
+        self.assertEqual(len(service.executed), 1)
+        self.assertEqual(
+            service.executed[0]["payload"]["source"],
+            "price_admin_edit_all",
+        )
+        self.assertEqual(asyncio.run(scheduler.run_once()), 0)
+        self.assertEqual(len(service.executed), 1)
+        self.assertEqual(
+            repo.list_daily_post_refreshes()[0]["local_date"],
+            "2026-09-01",
+        )
 
     def test_edit_all_zero_job_replay_preserves_original_decision(self):
         self.repo.ingest_snapshot(
