@@ -166,6 +166,9 @@ SMS_COOLDOWN_DAYS = 30
 
 RESULT_COOLDOWN_HOURS = 30
 
+# Only this Telegram user may set the internal 1–5 manager score.
+MANAGER_RATING_ADMIN_ID = 202134293
+
 AUTO_SMS_ENABLED = (
     os.getenv(
         "AUTO_SMS_ENABLED",
@@ -2039,6 +2042,59 @@ def init_db():
 
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS manager_ratings (
+
+                id INTEGER
+                    PRIMARY KEY
+                    AUTOINCREMENT,
+
+                client_key TEXT
+                    NOT NULL,
+
+                client_window_id INTEGER
+                    NOT NULL UNIQUE,
+
+                source_call_id INTEGER
+                    NOT NULL,
+
+                attribution_time INTEGER
+                    NOT NULL,
+
+                talk_manager_code TEXT
+                    NOT NULL,
+
+                talk_manager_name TEXT
+                    NOT NULL,
+
+                score INTEGER
+                    NOT NULL
+                    CHECK (score BETWEEN 1 AND 5),
+
+                marked_at INTEGER
+                    NOT NULL,
+
+                marked_by INTEGER
+                    NOT NULL,
+
+                marked_username TEXT,
+
+                created_at TIMESTAMP
+                    DEFAULT CURRENT_TIMESTAMP,
+
+                updated_at TIMESTAMP
+                    DEFAULT CURRENT_TIMESTAMP,
+
+                FOREIGN KEY(source_call_id)
+                    REFERENCES calls(id),
+
+                FOREIGN KEY(client_window_id)
+                    REFERENCES client_windows(id)
+            )
+            """
+        )
+
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS call_transcriptions (
 
                 call_id INTEGER
@@ -3473,6 +3529,18 @@ def init_db():
             idx_calls_talk_manager
 
             ON calls(talk_manager_code)
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_manager_ratings_time_manager
+
+            ON manager_ratings(
+                attribution_time,
+                talk_manager_code
+            )
             """
         )
 
@@ -8254,6 +8322,67 @@ def build_sale_keyboard(
     }
 
 
+def build_manager_rating_keyboard(
+    call_id: int,
+    manager_name: str,
+    selected_score: int | None = None,
+):
+
+    def rating_button(
+        score: int,
+    ):
+
+        selected = (
+            selected_score == score
+        )
+
+        return {
+            "text": (
+                f"✅ {score} ★"
+                if selected
+                else f"{score} ★"
+            ),
+            "callback_data": (
+                f"manager_rating:{score}:{call_id}"
+            ),
+        }
+
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": (
+                        f"👤 Менеджер: {manager_name}"
+                    ),
+                    "callback_data": (
+                        f"manager_selected:{call_id}"
+                    ),
+                }
+            ],
+            build_lead_source_control_row(
+                call_id
+            ),
+            [
+                rating_button(1),
+                rating_button(2),
+                rating_button(3),
+            ],
+            [
+                rating_button(4),
+                rating_button(5),
+            ],
+            [
+                {
+                    "text": "👤 Изменить менеджера",
+                    "callback_data": (
+                        f"manager_back:{call_id}"
+                    ),
+                }
+            ],
+        ]
+    }
+
+
 def build_selected_keyboard(
     call_id: int,
     manager_name: str,
@@ -8559,7 +8688,17 @@ def get_call(
                 result.no_sale_reason_code
                     AS effective_no_sale_reason_code,
                 result.result_category
-                    AS effective_result_category
+                    AS effective_result_category,
+                manager_rating.source_call_id
+                    AS effective_manager_rating_call_id,
+                manager_rating.score
+                    AS effective_manager_rating,
+                manager_rating.marked_at
+                    AS manager_rating_marked_at,
+                manager_rating.marked_by
+                    AS manager_rating_marked_by,
+                manager_rating.marked_username
+                    AS manager_rating_marked_username
 
             FROM calls
 
@@ -8568,6 +8707,10 @@ def get_call(
 
             LEFT JOIN client_results AS result
                 ON result.client_window_id =
+                    calls.client_window_id
+
+            LEFT JOIN manager_ratings AS manager_rating
+                ON manager_rating.client_window_id =
                     calls.client_window_id
 
             WHERE calls.id = ?
@@ -8637,21 +8780,10 @@ def build_call_state_keyboard(
         )
 
     if call["answered"]:
-
-        selected_text = get_selected_result_text(
-            call
-        )
-
-        if selected_text:
-            return build_selected_keyboard(
-                call["id"],
-                manager_name,
-                selected_text,
-            )
-
-        return build_sale_keyboard(
+        return build_manager_rating_keyboard(
             call["id"],
             manager_name,
+            call["effective_manager_rating"],
         )
 
     return build_missed_manager_keyboard(
@@ -8847,9 +8979,241 @@ def mark_talk_manager(
             ),
         )
 
+        conn.execute(
+            """
+            UPDATE manager_ratings
+
+            SET
+                talk_manager_code = ?,
+                talk_manager_name = ?,
+                updated_at = CURRENT_TIMESTAMP
+
+            WHERE source_call_id = ?
+            """,
+            (
+                manager_code,
+                manager_name,
+                call_id,
+            ),
+        )
+
         conn.commit()
 
     return manager_name
+
+
+# =========================================================
+# INTERNAL MANAGER RATING DATABASE
+# =========================================================
+
+def can_rate_manager(
+    telegram_user: dict,
+) -> bool:
+
+    try:
+        user_id = int(
+            telegram_user.get("id")
+            or 0
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return False
+
+    return (
+        user_id
+        == MANAGER_RATING_ADMIN_ID
+    )
+
+
+def mark_manager_rating(
+    call_id: int,
+    score: int,
+    telegram_user: dict,
+):
+
+    if not can_rate_manager(
+        telegram_user
+    ):
+        raise PermissionError(
+            "Нет права ставить оценку менеджеру"
+        )
+
+    try:
+        score = int(score)
+    except (
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise ValueError(
+            "Оценка должна быть от 1 до 5"
+        ) from exc
+
+    if score not in range(1, 6):
+        raise ValueError(
+            "Оценка должна быть от 1 до 5"
+        )
+
+    now_ts = int(
+        datetime.now(
+            UZ_TZ
+        ).timestamp()
+    )
+
+    with connect_db() as conn:
+
+        conn.execute(
+            "BEGIN IMMEDIATE"
+        )
+
+        call = conn.execute(
+            """
+            SELECT
+                id,
+                client_key,
+                client_number,
+                client_window_id,
+                is_internal_contact,
+                answered,
+                start_time,
+                talk_manager_code,
+                talk_manager_name
+
+            FROM calls
+
+            WHERE id = ?
+
+            LIMIT 1
+            """,
+            (call_id,),
+        ).fetchone()
+
+        if not call:
+            conn.rollback()
+            raise ValueError(
+                "Звонок не найден"
+            )
+
+        client_key = (
+            call["client_key"]
+            or normalize_phone(
+                call["client_number"]
+            )
+        )
+
+        if (
+            not client_key
+            or call["is_internal_contact"]
+        ):
+            conn.rollback()
+            raise ValueError(
+                "Оценка для этого номера недоступна"
+            )
+
+        if not call["answered"]:
+            conn.rollback()
+            raise ValueError(
+                "Оценить можно только отвеченный звонок"
+            )
+
+        if not call["talk_manager_code"]:
+            conn.rollback()
+            raise ValueError(
+                "Сначала выберите менеджера"
+            )
+
+        client_window_id = call[
+            "client_window_id"
+        ]
+
+        if not client_window_id:
+            client_window_id = (
+                assign_call_client_window(
+                    conn,
+                    call_id,
+                    client_key,
+                    call["start_time"],
+                    call["is_internal_contact"],
+                )
+            )
+
+        existing = conn.execute(
+            """
+            SELECT id
+            FROM manager_ratings
+            WHERE client_window_id = ?
+            LIMIT 1
+            """,
+            (client_window_id,),
+        ).fetchone()
+
+        values = (
+            call_id,
+            int(call["start_time"] or now_ts),
+            call["talk_manager_code"],
+            call["talk_manager_name"],
+            score,
+            now_ts,
+            int(telegram_user["id"]),
+            get_telegram_user_name(
+                telegram_user
+            ),
+        )
+
+        if existing:
+            conn.execute(
+                """
+                UPDATE manager_ratings
+
+                SET
+                    source_call_id = ?,
+                    attribution_time = ?,
+                    talk_manager_code = ?,
+                    talk_manager_name = ?,
+                    score = ?,
+                    marked_at = ?,
+                    marked_by = ?,
+                    marked_username = ?,
+                    updated_at = CURRENT_TIMESTAMP
+
+                WHERE id = ?
+                """,
+                values + (existing["id"],),
+            )
+            rating_id = existing["id"]
+        else:
+            cursor = conn.execute(
+                """
+                INSERT INTO manager_ratings (
+                    client_key,
+                    client_window_id,
+                    source_call_id,
+                    attribution_time,
+                    talk_manager_code,
+                    talk_manager_name,
+                    score,
+                    marked_at,
+                    marked_by,
+                    marked_username
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    client_key,
+                    client_window_id,
+                ) + values,
+            )
+            rating_id = cursor.lastrowid
+
+        conn.commit()
+
+    return {
+        "rating_id": rating_id,
+        "score": score,
+        "replaced": bool(existing),
+        "client_window_id": client_window_id,
+    }
 
 
 # =========================================================
@@ -9441,6 +9805,72 @@ async def telegram_webhook(
             }
 
         # =================================================
+        # INTERNAL MANAGER RATING
+        # =================================================
+
+        if callback_data.startswith(
+            "manager_rating:"
+        ):
+
+            parts = callback_data.split(
+                ":"
+            )
+
+            if len(parts) != 3:
+                answer_callback_query(
+                    callback_id,
+                    "Ошибка кнопки",
+                )
+                return {"ok": True}
+
+            if not can_rate_manager(
+                telegram_user
+            ):
+                answer_callback_query(
+                    callback_id,
+                    "Только Abbos может ставить оценку",
+                )
+                return {
+                    "ok": True,
+                    "forbidden": True,
+                }
+
+            score = int(parts[1])
+            call_id = int(parts[2])
+
+            saved_rating = mark_manager_rating(
+                call_id,
+                score,
+                telegram_user,
+            )
+
+            call = get_call(
+                call_id
+            )
+
+            edit_reply_markup(
+                chat_id,
+                message_id,
+                build_call_state_keyboard(
+                    call
+                ),
+            )
+
+            answer_callback_query(
+                callback_id,
+                f"Оценка менеджеру: {score} из 5",
+            )
+
+            return {
+                "ok": True,
+                "call_id": call_id,
+                "manager_rating": score,
+                "replaced": saved_rating[
+                    "replaced"
+                ],
+            }
+
+        # =================================================
         # MANAGER SELECTED
         # =================================================
 
@@ -9617,6 +10047,24 @@ async def telegram_webhook(
         # =================================================
         # CHANGE RESULT
         # =================================================
+
+        if callback_data.startswith(
+            (
+                "result:",
+                "result_back:",
+                "selected:",
+            )
+        ):
+
+            answer_callback_query(
+                callback_id,
+                "Выбор результата отключён",
+            )
+
+            return {
+                "ok": True,
+                "disabled": True,
+            }
 
         if callback_data.startswith(
             "result_back:"
@@ -11853,6 +12301,29 @@ def stats(
             ),
         ).fetchone()
 
+        manager_ratings_row = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS ratings_count,
+                AVG(score) AS average_rating,
+                SUM(CASE WHEN score = 1 THEN 1 ELSE 0 END) AS score_1,
+                SUM(CASE WHEN score = 2 THEN 1 ELSE 0 END) AS score_2,
+                SUM(CASE WHEN score = 3 THEN 1 ELSE 0 END) AS score_3,
+                SUM(CASE WHEN score = 4 THEN 1 ELSE 0 END) AS score_4,
+                SUM(CASE WHEN score = 5 THEN 1 ELSE 0 END) AS score_5
+
+            FROM manager_ratings
+
+            WHERE
+                attribution_time >= ?
+                AND attribution_time < ?
+            """,
+            (
+                start_ts,
+                end_ts,
+            ),
+        ).fetchone()
+
         ratings_row = conn.execute(
             """
             WITH rating_ranked AS (
@@ -12318,6 +12789,38 @@ def stats(
                     1,
                     6,
                 )
+            },
+
+            "manager_average_rating": (
+                round(
+                    float(
+                        manager_ratings_row[
+                            "average_rating"
+                        ]
+                    ),
+                    2,
+                )
+                if manager_ratings_row[
+                    "average_rating"
+                ] is not None
+                else None
+            ),
+
+            "manager_ratings_count": (
+                manager_ratings_row[
+                    "ratings_count"
+                ]
+                or 0
+            ),
+
+            "manager_rating_distribution": {
+                str(score): (
+                    manager_ratings_row[
+                        f"score_{score}"
+                    ]
+                    or 0
+                )
+                for score in range(1, 6)
             },
         },
     }
@@ -13223,6 +13726,30 @@ def stats_managers(
             ),
         ).fetchall()
 
+        internal_rating_rows = conn.execute(
+            """
+            SELECT
+                talk_manager_code AS manager_code,
+                talk_manager_name AS manager,
+                COUNT(*) AS ratings_count,
+                AVG(score) AS average_rating
+
+            FROM manager_ratings
+
+            WHERE
+                attribution_time >= ?
+                AND attribution_time < ?
+
+            GROUP BY
+                talk_manager_code,
+                talk_manager_name
+            """,
+            (
+                start_ts,
+                end_ts,
+            ),
+        ).fetchall()
+
     manager_outcomes = {
         row["manager_code"]: row
         for row in outcome_rows
@@ -13231,6 +13758,11 @@ def stats_managers(
     manager_missed = {
         row["manager_code"]: row
         for row in missed_rows
+    }
+
+    manager_internal_ratings = {
+        row["manager_code"]: row
+        for row in internal_rating_rows
     }
 
     results = []
@@ -13243,6 +13775,11 @@ def stats_managers(
         )
         missed_metrics = manager_missed.get(
             manager_code
+        )
+        internal_rating = (
+            manager_internal_ratings.get(
+                manager_code
+            )
         )
 
         incoming = row["incoming"] or 0
@@ -13348,6 +13885,28 @@ def stats_managers(
                     else None
                 ),
                 "ratings_count": ratings_count,
+                "manager_average_rating": (
+                    round(
+                        float(
+                            internal_rating[
+                                "average_rating"
+                            ]
+                        ),
+                        2,
+                    )
+                    if internal_rating
+                    and internal_rating[
+                        "average_rating"
+                    ] is not None
+                    else None
+                ),
+                "manager_ratings_count": (
+                    internal_rating[
+                        "ratings_count"
+                    ]
+                    if internal_rating
+                    else 0
+                ) or 0,
                 "rating_invitations_sent": (
                     invitations
                 ),
@@ -13626,6 +14185,85 @@ def stats_ratings_daily(
     return {
         "results":
             results
+    }
+
+
+# =========================================================
+# DAILY INTERNAL MANAGER RATINGS
+# =========================================================
+
+@app.get(
+    "/stats/manager-ratings/daily"
+)
+def stats_manager_ratings_daily(
+    period: str = "today",
+    date_from: str | None = None,
+    date_to: str | None = None,
+):
+
+    p = get_period(
+        period,
+        date_from,
+        date_to,
+    )
+
+    with connect_db() as conn:
+
+        rows = conn.execute(
+            """
+            SELECT
+                date(
+                    attribution_time,
+                    'unixepoch',
+                    '+5 hours'
+                ) AS rating_date,
+                talk_manager_code AS manager_code,
+                talk_manager_name AS manager,
+                COUNT(*) AS ratings_count,
+                AVG(score) AS average_rating
+
+            FROM manager_ratings
+
+            WHERE
+                attribution_time >= ?
+                AND attribution_time < ?
+
+            GROUP BY
+                rating_date,
+                talk_manager_code,
+                talk_manager_name
+
+            ORDER BY
+                rating_date DESC,
+                manager
+            """,
+            (
+                p["start_ts"],
+                p["end_ts"],
+            ),
+        ).fetchall()
+
+    return {
+        "results": [
+            {
+                "date": row["rating_date"],
+                "manager_code": row[
+                    "manager_code"
+                ],
+                "manager": row["manager"],
+                "average_rating": round(
+                    float(
+                        row["average_rating"]
+                    ),
+                    2,
+                ),
+                "ratings_count": (
+                    row["ratings_count"]
+                    or 0
+                ),
+            }
+            for row in rows
+        ]
     }
 
 
@@ -14142,6 +14780,9 @@ def stats_recent(
                 rating.score
                     AS customer_rating,
 
+                manager_rating.score
+                    AS manager_rating,
+
                 rating.sms_status
                     AS rating_sms_status
 
@@ -14154,6 +14795,12 @@ def stats_recent(
                 AS client_result
 
                 ON client_result.client_window_id =
+                    calls.client_window_id
+
+            LEFT JOIN manager_ratings
+                AS manager_rating
+
+                ON manager_rating.client_window_id =
                     calls.client_window_id
 
             LEFT JOIN client_windows
@@ -14309,6 +14956,11 @@ def stats_recent(
                         "customer_rating"
                     ],
 
+                "manager_rating":
+                    row[
+                        "manager_rating"
+                    ],
+
                 "rating_sms_status":
                     row[
                         "rating_sms_status"
@@ -14436,6 +15088,12 @@ def rating_details(
                     AS sale_marked_at,
                 client_result.marked_username
                     AS sale_marked_username,
+                manager_rating.score
+                    AS manager_rating,
+                manager_rating.marked_at
+                    AS manager_rating_marked_at,
+                manager_rating.marked_username
+                    AS manager_rating_marked_username,
                 call.created_at AS call_created_at,
 
                 rating.sender_user_login,
@@ -14493,6 +15151,12 @@ def rating_details(
                 ON client_window.id =
                     call.client_window_id
 
+            LEFT JOIN manager_ratings
+                AS manager_rating
+
+                ON manager_rating.client_window_id =
+                    call.client_window_id
+
             LEFT JOIN calls AS source_call
 
                 ON source_call.id =
@@ -14533,11 +15197,6 @@ def rating_details(
         else "Не отвечен"
     )
 
-    sale_labels = {
-        "bought": "Купил",
-        "not_bought": "Не купил",
-    }
-
     return {
         "call_id": row["id"],
         "score": row["score"],
@@ -14567,17 +15226,24 @@ def rating_details(
                 },
             },
             {
-                "title": "Менеджер и результат",
+                "title": "Менеджер и внутренняя оценка",
                 "items": {
                     "Менеджер": row["talk_manager_name"] or "—",
                     "Код менеджера": row["talk_manager_code"] or "—",
                     "Менеджер отмечен": format_uz_datetime(row["manager_marked_at"]),
                     "Кто отметил менеджера": row["manager_marked_username"] or "—",
-                    "Результат": sale_labels.get(row["sale_status"], "Не отмечено"),
-                    "Причина": row["no_sale_reason"] or "—",
-                    "Код причины": row["no_sale_reason_code"] or "—",
-                    "Результат отмечен": format_uz_datetime(row["sale_marked_at"]),
-                    "Кто отметил результат": row["sale_marked_username"] or "—",
+                    "Внутренняя оценка": (
+                        f'{row["manager_rating"]} из 5'
+                        if row["manager_rating"] is not None
+                        else "—"
+                    ),
+                    "Оценка поставлена": format_uz_datetime(
+                        row["manager_rating_marked_at"]
+                    ),
+                    "Кто поставил оценку": (
+                        row["manager_rating_marked_username"]
+                        or "—"
+                    ),
                 },
             },
             {
@@ -15626,132 +16292,47 @@ tbody tr:last-child td {
 
 
 <h2 class="section-title">
-    Продажи
+    Оценки менеджеров
 </h2>
 
 
 <div class="grid">
 
     <div class="card good">
-
         <div class="label">
-            ✅ Купил
+            Моя средняя оценка менеджеров
         </div>
 
         <div
             class="value"
-            id="bought"
+            id="manager_average_rating"
         >—</div>
-
-    </div>
-
-
-    <div class="card bad">
-
-        <div class="label">
-            ❌ Потерян
-        </div>
-
-        <div
-            class="value"
-            id="not_bought"
-        >—</div>
-
-    </div>
-
-
-    <div class="card warn">
-
-        <div class="label">
-            🕓 В работе / ожидает
-        </div>
-
-        <div
-            class="value"
-            id="pending"
-        >—</div>
-
     </div>
 
 
     <div class="card">
-
         <div class="label">
-            🚫 Не целевой
+            Поставлено моих оценок
         </div>
 
         <div
             class="value"
-            id="non_target"
+            id="manager_ratings_count"
         >—</div>
-
     </div>
 
 
-    <div class="card warn">
-
+    <div class="card">
         <div class="label">
-            Результат не отмечен
+            Мои оценки 1–5
         </div>
 
         <div
             class="value"
-            id="sale_unmarked"
+            id="manager_rating_distribution"
+            style="font-size: 18px"
         >—</div>
-
     </div>
-
-
-    <div class="card warn">
-
-        <div class="label">
-            Менеджер не указан
-        </div>
-
-        <div
-            class="value"
-            id="manager_unmarked"
-        >—</div>
-
-    </div>
-
-
-    <div class="card good">
-
-        <div class="label">
-            Общая конверсия
-        </div>
-
-        <div
-            class="value"
-            id="sale_conversion"
-        >—</div>
-
-    </div>
-
-
-    <div class="card good">
-
-        <div class="label">
-            Конверсия завершённых
-        </div>
-
-        <div
-            class="value"
-            id="processed_sale_conversion"
-        >—</div>
-
-    </div>
-
-</div>
-
-
-<h2 class="section-title">
-    Качество обслуживания
-</h2>
-
-
-<div class="grid">
 
     <div class="card good">
         <div class="label">
@@ -15864,45 +16445,6 @@ tbody tr:last-child td {
     <div class="panel-header">
 
         <h2>
-            Почему не купили
-        </h2>
-
-    </div>
-
-    <div class="table-wrap">
-
-        <table>
-
-            <thead>
-
-            <tr>
-                <th>
-                    Причина
-                </th>
-
-                <th>
-                    Количество
-                </th>
-            </tr>
-
-            </thead>
-
-            <tbody
-                id="reasons_body"
-            ></tbody>
-
-        </table>
-
-    </div>
-
-</div>
-
-
-<div class="panel">
-
-    <div class="panel-header">
-
-        <h2>
             Менеджеры
         </h2>
 
@@ -15927,16 +16469,10 @@ tbody tr:last-child td {
                 <th>Дозвонился за 30ч</th>
                 <th>Клиент перезвонил</th>
                 <th>Не обработано</th>
-                <th>Купил</th>
-                <th>Потерян</th>
-                <th>В работе</th>
-                <th>Не целевой</th>
-                <th>Не отмечен</th>
-                <th>Общая конв.</th>
-                <th>Заверш. конв.</th>
-                <th>Ср. оценка</th>
-                <th>Оценок</th>
-                <th>Ответили</th>
+                <th>Моя оценка</th>
+                <th>Моих оценок</th>
+                <th>Оценка клиентов</th>
+                <th>Оценок клиентов</th>
                 <th>Разговор</th>
 
             </tr>
@@ -15959,7 +16495,43 @@ tbody tr:last-child td {
     <div class="panel-header">
 
         <h2>
-            Оценки продавцов по дням
+            Мои оценки менеджеров по дням
+        </h2>
+
+    </div>
+
+    <div class="table-wrap">
+
+        <table>
+
+            <thead>
+
+            <tr>
+                <th>Дата</th>
+                <th>Менеджер</th>
+                <th>Средняя оценка</th>
+                <th>Оценок</th>
+            </tr>
+
+            </thead>
+
+            <tbody
+                id="manager_ratings_daily_body"
+            ></tbody>
+
+        </table>
+
+    </div>
+
+</div>
+
+
+<div class="panel">
+
+    <div class="panel-header">
+
+        <h2>
+            Оценки клиентов по дням
         </h2>
 
     </div>
@@ -16012,13 +16584,6 @@ tbody tr:last-child td {
                 <th>Источник</th>
                 <th>Группы 30 ч</th>
                 <th>Клиенты</th>
-                <th>Купил</th>
-                <th>Потерян</th>
-                <th>В работе</th>
-                <th>Не целевой</th>
-                <th>Не отмечен</th>
-                <th>Общая конв.</th>
-                <th>Заверш. конв.</th>
             </tr>
 
             </thead>
@@ -16104,8 +16669,8 @@ tbody tr:last-child td {
                 <th>Источник</th>
                 <th>SIM</th>
                 <th>Разговор</th>
-                <th>Результат</th>
-                <th>Оценка</th>
+                <th>Моя оценка</th>
+                <th>Оценка клиента</th>
                 <th>Все данные</th>
 
             </tr>
@@ -16400,31 +16965,33 @@ async function loadStats() {
         missed_not_processed:
             s.missed_not_processed,
 
-        bought:
-            s.bought,
 
-        not_bought:
-            s.not_bought,
+        manager_average_rating:
+            s.manager_average_rating === null
+                ? "—"
+                : Number(
+                    s.manager_average_rating
+                ).toFixed(2)
+                + " ★",
 
-        pending:
-            s.pending,
+        manager_ratings_count:
+            s.manager_ratings_count,
 
-        non_target:
-            s.non_target,
-
-        sale_unmarked:
-            s.sale_unmarked,
-
-        manager_unmarked:
-            s.manager_unmarked,
-
-        sale_conversion:
-            s.sale_conversion
-            + "%",
-
-        processed_sale_conversion:
-            s.processed_sale_conversion
-            + "%",
+        manager_rating_distribution:
+            [1, 2, 3, 4, 5]
+                .map(
+                    score => (
+                        score
+                        + "★: "
+                        + (
+                            s.manager_rating_distribution[
+                                String(score)
+                            ]
+                            || 0
+                        )
+                    )
+                )
+                .join(" · "),
 
         average_rating:
             s.average_rating === null
@@ -16865,21 +17432,14 @@ async function loadManagers() {
 
                 row.missed_not_processed,
 
-                row.bought,
+                row.manager_average_rating === null
+                    ? "—"
+                    : Number(
+                        row.manager_average_rating
+                    ).toFixed(2)
+                    + " ★",
 
-                row.not_bought,
-
-                row.pending,
-
-                row.non_target,
-
-                row.sale_unmarked,
-
-                row.sale_conversion
-                + "%",
-
-                row.processed_sale_conversion
-                + "%",
+                row.manager_ratings_count,
 
                 row.average_rating === null
                     ? "—"
@@ -16889,9 +17449,6 @@ async function loadManagers() {
                     + " ★",
 
                 row.ratings_count,
-
-                row.rating_response_rate
-                + "%",
 
                 formatDuration(
                     row.total_duration_seconds
@@ -17024,6 +17581,56 @@ async function loadRatingsDaily() {
 }
 
 
+async function loadManagerRatingsDaily() {
+
+    const data =
+        await getJson(
+            "/stats/manager-ratings/daily"
+        );
+
+    const body =
+        document.getElementById(
+            "manager_ratings_daily_body"
+        );
+
+    body.innerHTML = "";
+
+    if (data.results.length === 0) {
+        const tr = document.createElement("tr");
+        const td = document.createElement("td");
+        td.colSpan = 4;
+        td.className = "empty";
+        td.textContent = "Пока нет моих оценок";
+        tr.appendChild(td);
+        body.appendChild(tr);
+        return;
+    }
+
+    data.results.forEach(
+        row => {
+            const tr = document.createElement("tr");
+
+            [
+                row.date,
+                row.manager,
+                Number(
+                    row.average_rating
+                ).toFixed(2) + " ★",
+                row.ratings_count,
+            ].forEach(
+                value => {
+                    const td = document.createElement("td");
+                    td.textContent = value;
+                    tr.appendChild(td);
+                }
+            );
+
+            body.appendChild(tr);
+        }
+    );
+}
+
+
 async function loadSources() {
 
     const data =
@@ -17041,7 +17648,7 @@ async function loadSources() {
     if (data.results.length === 0) {
         const tr = document.createElement("tr");
         const td = document.createElement("td");
-        td.colSpan = 10;
+        td.colSpan = 3;
         td.className = "empty";
         td.textContent = "Пока нет данных";
         tr.appendChild(td);
@@ -17057,13 +17664,6 @@ async function loadSources() {
                 row.source,
                 row.client_windows,
                 row.unique_clients,
-                row.bought,
-                row.lost,
-                row.pending,
-                row.non_target,
-                row.unmarked,
-                row.overall_conversion + "%",
-                row.completed_conversion + "%",
             ];
 
             values.forEach(
@@ -17562,6 +18162,19 @@ async function loadRecent() {
             }
 
 
+            const managerRating =
+                document.createElement(
+                    "td"
+                );
+
+
+            managerRating.textContent =
+                row.manager_rating === null
+                    ? "—"
+                    : row.manager_rating
+                        + " ★";
+
+
             const sim =
                 document.createElement(
                     "td"
@@ -17590,94 +18203,6 @@ async function loadRecent() {
                 formatDuration(
                     row.duration
                 );
-
-
-            const sale =
-                document.createElement(
-                    "td"
-                );
-
-
-            if (
-                row.is_internal_contact
-            ) {
-
-                sale.className =
-                    "contact";
-
-
-                sale.textContent =
-                    "Контакт";
-
-            } else if (
-                row.sale_status
-                === "bought"
-            ) {
-
-                sale.className =
-                    "sale-bought";
-
-
-                sale.textContent =
-                    "✅ Купил";
-
-            } else if (
-                row.result_category
-                === "pending"
-            ) {
-
-                sale.className =
-                    "sale-pending";
-
-
-                sale.textContent =
-                    row.no_sale_reason
-                    || "🕓 В работе / ожидает";
-
-            } else if (
-                row.result_category
-                === "non_target"
-            ) {
-
-                sale.className =
-                    "sale-non-target";
-
-
-                sale.textContent =
-                    row.no_sale_reason
-                    || "🚫 Не целевой";
-
-            } else if (
-                row.result_category
-                === "lost"
-                || row.sale_status
-                    === "not_bought"
-            ) {
-
-                sale.className =
-                    "sale-not-bought";
-
-
-                sale.textContent =
-                    row.no_sale_reason
-                    || "Не купил";
-
-            } else if (
-                row.answered
-            ) {
-
-                sale.className =
-                    "sale-unmarked";
-
-
-                sale.textContent =
-                    "Не отмечено";
-
-            } else {
-
-                sale.textContent =
-                    "—";
-            }
 
 
             const details =
@@ -17764,7 +18289,7 @@ async function loadRecent() {
 
 
             tr.appendChild(
-                sale
+                managerRating
             );
 
 
@@ -17797,9 +18322,9 @@ async function loadAll() {
 
                 loadTimeline(),
 
-                loadReasons(),
-
                 loadManagers(),
+
+                loadManagerRatingsDaily(),
 
                 loadRatingsDaily(),
 

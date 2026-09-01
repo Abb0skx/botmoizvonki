@@ -92,7 +92,270 @@ class CallSourceTests(unittest.TestCase):
         }
         self.assertIn("👤 Менеджер: Abbos", button_texts)
         self.assertIn("📣 Источник: OLX", button_texts)
-        self.assertIn("✅ Купил", button_texts)
+        self.assertTrue(
+            {f"{score} ★" for score in range(1, 6)}
+            .issubset(button_texts)
+        )
+        self.assertNotIn("✅ Купил", button_texts)
+        self.assertNotIn("🕓 В работе / ожидает", button_texts)
+
+    def test_only_configured_admin_can_rate_manager(self):
+        saved = self.save(
+            "texnikach@gmail.com",
+            self.event(20, "+998900000020", 0),
+        )
+
+        with self.assertRaises(PermissionError):
+            bot.mark_manager_rating(
+                saved["call_id"],
+                5,
+                {"id": 999, "username": "other"},
+            )
+
+        with bot.connect_db() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM manager_ratings"
+            ).fetchone()[0]
+
+        self.assertEqual(count, 0)
+
+    def test_admin_rating_replaces_same_client_window_and_updates_stats(self):
+        first = self.save(
+            "texnikach@gmail.com",
+            self.event(21, "+998900000021", 0),
+        )
+        second = self.save(
+            "texnikach@gmail.com",
+            self.event(22, "+998900000021", 0),
+        )
+        admin = {
+            "id": bot.MANAGER_RATING_ADMIN_ID,
+            "username": "abbos",
+        }
+
+        created = bot.mark_manager_rating(
+            first["call_id"],
+            3,
+            admin,
+        )
+        replaced = bot.mark_manager_rating(
+            second["call_id"],
+            5,
+            admin,
+        )
+
+        self.assertFalse(created["replaced"])
+        self.assertTrue(replaced["replaced"])
+
+        first_call = bot.get_call(first["call_id"])
+        second_call = bot.get_call(second["call_id"])
+
+        self.assertEqual(first_call["effective_manager_rating"], 5)
+        self.assertEqual(second_call["effective_manager_rating"], 5)
+        self.assertEqual(
+            second_call["effective_manager_rating_call_id"],
+            second["call_id"],
+        )
+
+        with bot.connect_db() as conn:
+            rows = conn.execute(
+                "SELECT * FROM manager_ratings"
+            ).fetchall()
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["score"], 5)
+        self.assertEqual(
+            rows[0]["marked_by"],
+            bot.MANAGER_RATING_ADMIN_ID,
+        )
+
+        period = {
+            "period": "custom",
+            "date_from": "2027-01-01",
+            "date_to": "2027-02-01",
+        }
+        manager = bot.stats_managers(**period)["results"][0]
+        summary = bot.stats(**period)["stats"]
+        daily = bot.stats_manager_ratings_daily(
+            **period
+        )["results"]
+        recent = bot.stats_recent(
+            **period
+        )["results"]
+
+        self.assertEqual(manager["manager_average_rating"], 5.0)
+        self.assertEqual(manager["manager_ratings_count"], 1)
+        self.assertEqual(summary["manager_average_rating"], 5.0)
+        self.assertEqual(summary["manager_ratings_count"], 1)
+        self.assertEqual(daily[0]["average_rating"], 5.0)
+        self.assertEqual(daily[0]["ratings_count"], 1)
+        self.assertEqual(
+            {row["manager_rating"] for row in recent},
+            {5},
+        )
+
+        keyboard = bot.build_call_state_keyboard(
+            second_call
+        )
+        button_texts = {
+            button["text"]
+            for row in keyboard["inline_keyboard"]
+            for button in row
+        }
+        self.assertIn("✅ 5 ★", button_texts)
+
+    def test_changing_manager_updates_existing_internal_rating(self):
+        saved = self.save(
+            "texnikach@gmail.com",
+            self.event(23, "+998900000023", 0),
+        )
+        admin = {
+            "id": bot.MANAGER_RATING_ADMIN_ID,
+            "username": "abbos",
+        }
+
+        bot.mark_manager_rating(
+            saved["call_id"],
+            4,
+            admin,
+        )
+        bot.mark_talk_manager(
+            saved["call_id"],
+            "olmas",
+            admin,
+        )
+
+        with bot.connect_db() as conn:
+            rating = conn.execute(
+                "SELECT * FROM manager_ratings"
+            ).fetchone()
+
+        self.assertEqual(rating["talk_manager_code"], "olmas")
+        self.assertEqual(rating["talk_manager_name"], "Olmas")
+
+    def test_rating_callback_rejects_other_telegram_users(self):
+        saved = self.save(
+            "texnikach@gmail.com",
+            self.event(24, "+998900000024", 0),
+        )
+
+        class FakeRequest:
+            headers = {}
+
+            async def json(self):
+                return {
+                    "callback_query": {
+                        "id": "callback-24",
+                        "data": (
+                            "manager_rating:5:"
+                            f'{saved["call_id"]}'
+                        ),
+                        "from": {
+                            "id": 999,
+                            "username": "other",
+                        },
+                        "message": {
+                            "message_id": 24,
+                            "chat": {"id": -100},
+                        },
+                    }
+                }
+
+        with mock.patch.object(
+            bot,
+            "answer_callback_query",
+        ) as answer, mock.patch.object(
+            bot,
+            "edit_reply_markup",
+        ) as edit:
+            result = asyncio.run(
+                bot.telegram_webhook(
+                    FakeRequest()
+                )
+            )
+
+        self.assertTrue(result["forbidden"])
+        answer.assert_called_once_with(
+            "callback-24",
+            "Только Abbos может ставить оценку",
+        )
+        edit.assert_not_called()
+
+        with bot.connect_db() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM manager_ratings"
+            ).fetchone()[0]
+
+        self.assertEqual(count, 0)
+
+    def test_admin_rating_callback_saves_score_and_old_sales_button_is_disabled(self):
+        saved = self.save(
+            "texnikach@gmail.com",
+            self.event(25, "+998900000025", 0),
+        )
+
+        class FakeRequest:
+            headers = {}
+
+            def __init__(self, callback_data):
+                self.callback_data = callback_data
+
+            async def json(self):
+                return {
+                    "callback_query": {
+                        "id": "callback-25",
+                        "data": self.callback_data,
+                        "from": {
+                            "id": bot.MANAGER_RATING_ADMIN_ID,
+                            "username": "abbos",
+                        },
+                        "message": {
+                            "message_id": 25,
+                            "chat": {"id": -100},
+                        },
+                    }
+                }
+
+        with mock.patch.object(
+            bot,
+            "answer_callback_query",
+        ), mock.patch.object(
+            bot,
+            "edit_reply_markup",
+        ):
+            rated = asyncio.run(
+                bot.telegram_webhook(
+                    FakeRequest(
+                        "manager_rating:4:"
+                        f'{saved["call_id"]}'
+                    )
+                )
+            )
+            disabled = asyncio.run(
+                bot.telegram_webhook(
+                    FakeRequest(
+                        "result:bought:"
+                        f'{saved["call_id"]}'
+                    )
+                )
+            )
+
+        self.assertEqual(rated["manager_rating"], 4)
+        self.assertTrue(disabled["disabled"])
+
+        call = bot.get_call(saved["call_id"])
+        self.assertEqual(call["effective_manager_rating"], 4)
+        self.assertIsNone(call["effective_sale_status"])
+
+    def test_dashboard_replaces_sales_controls_with_manager_ratings(self):
+        html = bot.dashboard()
+
+        self.assertIn("Моя средняя оценка менеджеров", html)
+        self.assertIn("Мои оценки менеджеров по дням", html)
+        self.assertIn("<th>Моя оценка</th>", html)
+        self.assertNotIn("Почему не купили", html)
+        self.assertNotIn("<th>Результат</th>", html)
+        self.assertNotIn("<h2 class=\"section-title\">\n    Продажи", html)
 
     def test_known_sim_conflict_is_visible_but_slot_mapping_wins(self):
         resolved = bot.resolve_call_device(
