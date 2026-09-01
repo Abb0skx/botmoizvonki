@@ -598,8 +598,12 @@ CALL_SOURCE_PROFILES = {
     "texnikacholx@gmail.com": {
         "device_name": "Tecno",
         "default_manager_code": "otabek",
-        "slot_numbers": {},
-        "sim_labels": {},
+        "slot_numbers": {
+            0: "+998908456162",
+        },
+        "sim_labels": {
+            "998908456162": "SIM 1",
+        },
         "source_by_slot": {
             0: "olx",
         },
@@ -607,8 +611,12 @@ CALL_SOURCE_PROFILES = {
     "aashshdjdjdjsj@gmail.com": {
         "device_name": "Redmi",
         "default_manager_code": "olmas",
-        "slot_numbers": {},
-        "sim_labels": {},
+        "slot_numbers": {
+            0: "+998908534466",
+        },
+        "sim_labels": {
+            "998908534466": "SIM 1",
+        },
         "source_by_slot": {
             0: "olx",
         },
