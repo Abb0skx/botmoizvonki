@@ -758,7 +758,7 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             sent.startswith(
                 BOT_CARD_MARKER
-                + "📆: 31/08/2026\n\n📦 A16 8/256\n\n🛒💵:"
+                + "📆: 31/08/2026\n🆔: 1\n\n📦 A16 8/256\n\n🛒💵:"
             )
         )
         self.assertIn("📞: +998 90 123 45 67", sent)
@@ -781,7 +781,7 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
         caption = bot.send_photo.await_args.kwargs["caption"]
         self.assertTrue(
             caption.startswith(
-                BOT_CARD_MARKER + "📆: 31/08/2026\n\n🛒💵:"
+                BOT_CARD_MARKER + "📆: 31/08/2026\n🆔: 1\n\n🛒💵:"
             )
         )
         self.assertIn("📞: +998 90 123 45 67", caption)
@@ -878,7 +878,7 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
         card = bot.send_message.await_args.kwargs["text"]
         self.assertTrue(
             card.startswith(
-                BOT_CARD_MARKER + "📆: 31/08/2026\n\n🛒💵:"
+                BOT_CARD_MARKER + "📆: 31/08/2026\n🆔: 1\n\n🛒💵:"
             )
         )
 
@@ -1690,6 +1690,26 @@ class EditedCaptionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(kwargs["caption_entities"][0].type, MessageEntity.BOLD)
 
+    async def test_manual_edit_restores_the_persisted_order_id(self):
+        self.repo.ensure_daily_order(CHAT_ID, 10, date(2026, 8, 31))
+        caption = (
+            BOT_CARD_MARKER
+            + "🛒💵: ACME\nrasxod: $3\n\n📞:\n\nНаличка"
+        )
+        bot = self.bot()
+
+        await self.service.handle_edited_photo(
+            self.message(caption),
+            bot,
+            update_id=105,
+        )
+
+        normalized = bot.edit_message_caption.await_args.kwargs["caption"]
+        self.assertTrue(normalized.startswith(BOT_CARD_MARKER + "🆔: 1\n\n"))
+        self.assertIn("🛒💵: ACME", normalized)
+        self.assertIn("rasxod: $3", normalized)
+        self.assertEqual(self.repo.pending_order_backfills(CHAT_ID), ())
+
     async def test_manual_edit_normalizes_a_text_card(self):
         caption = (
             BOT_CARD_MARKER
@@ -2065,6 +2085,20 @@ class ManagerCallbackTests(unittest.IsolatedAsyncioTestCase):
             kwargs["reply_markup"].to_dict()["inline_keyboard"][0][0]["text"],
             "👤 Olmas · ↩️ Назад",
         )
+
+    async def test_manager_click_restores_missing_order_id(self):
+        self.repo.ensure_daily_order(CHAT_ID, 10, date(2026, 8, 31))
+        service = SalesPhotoService(settings(self.root), self.repo)
+        query = self.query(self.callback("m:olmas", 0), self.base)
+
+        await service.on_manager_callback(
+            SimpleNamespace(callback_query=query), self.context()
+        )
+
+        query.edit_message_reply_markup.assert_not_awaited()
+        query.edit_message_caption.assert_awaited_once()
+        caption = query.edit_message_caption.await_args.kwargs["caption"]
+        self.assertTrue(caption.startswith(BOT_CARD_MARKER + "🆔: 1\n\n"))
 
     async def test_manager_click_normalizes_a_text_card(self):
         service = SalesPhotoService(settings(self.root), self.repo)

@@ -34,13 +34,18 @@ def build_caption(
     manager: str | None = None,
     product_label: str | None = None,
     sale_date: date | None = None,
+    order_id: int | None = None,
 ) -> str:
     """Build the sales card, retaining only verified phones and identifiers."""
 
     phones = extract_uzbek_phones(client_caption)
     lines: list[str] = []
     if sale_date:
-        lines.extend([f"📆: {sale_date:%d/%m/%Y}", ""])
+        lines.append(f"📆: {sale_date:%d/%m/%Y}")
+    if order_id is not None:
+        lines.extend([f"🆔: {max(1, int(order_id))}", ""])
+    elif sale_date:
+        lines.append("")
     if product_label:
         lines.extend([f"📦 {_safe(product_label, 120)}", ""])
     lines.extend([

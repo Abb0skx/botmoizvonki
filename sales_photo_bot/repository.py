@@ -8,7 +8,7 @@ import os
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
 
@@ -16,6 +16,7 @@ from cryptography.fernet import Fernet, InvalidToken
 
 
 UTC = timezone.utc
+TASHKENT_TZ = timezone(timedelta(hours=5))
 logger = logging.getLogger(__name__)
 
 
@@ -48,6 +49,18 @@ class PendingPhoto:
     source_kind: str
     client_caption: str | None
     message_thread_id: int | None
+    attempts: int
+    updated_at: datetime
+    sale_date: date
+
+
+@dataclass(frozen=True)
+class PendingOrderBackfill:
+    chat_id: int
+    source_message_id: int
+    replacement_message_id: int
+    sale_date: date
+    order_id: int
     attempts: int
     updated_at: datetime
 
@@ -290,6 +303,10 @@ class SalesPhotoRepository:
                     replacement_message_id INTEGER,
                     manager TEXT,
                     ui_generation INTEGER NOT NULL DEFAULT 0,
+                    sale_date TEXT,
+                    daily_order_id INTEGER,
+                    order_card_applied INTEGER NOT NULL DEFAULT 0,
+                    order_backfill_attempts INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL CHECK(status IN (
                         'processing','reposted','delete_pending','complete','failed'
                     )),
@@ -358,6 +375,62 @@ class SalesPhotoRepository:
                     "ALTER TABLE sales_photo_jobs ADD COLUMN "
                     "processing_attempts INTEGER NOT NULL DEFAULT 1"
                 )
+            if "sale_date" not in columns:
+                db.execute("ALTER TABLE sales_photo_jobs ADD COLUMN sale_date TEXT")
+            if "daily_order_id" not in columns:
+                db.execute(
+                    "ALTER TABLE sales_photo_jobs ADD COLUMN daily_order_id INTEGER"
+                )
+            if "order_card_applied" not in columns:
+                db.execute(
+                    "ALTER TABLE sales_photo_jobs ADD COLUMN "
+                    "order_card_applied INTEGER NOT NULL DEFAULT 0"
+                )
+            if "order_backfill_attempts" not in columns:
+                db.execute(
+                    "ALTER TABLE sales_photo_jobs ADD COLUMN "
+                    "order_backfill_attempts INTEGER NOT NULL DEFAULT 0"
+                )
+            legacy_rows = db.execute(
+                """SELECT chat_id,source_message_id,created_at
+                   FROM sales_photo_jobs
+                   WHERE replacement_message_id IS NOT NULL
+                     AND (sale_date IS NULL OR daily_order_id IS NULL)
+                   ORDER BY created_at,source_message_id"""
+            ).fetchall()
+            counters = {
+                (int(row["chat_id"]), str(row["sale_date"])): int(row["maximum"])
+                for row in db.execute(
+                    """SELECT chat_id,sale_date,MAX(daily_order_id) AS maximum
+                       FROM sales_photo_jobs
+                       WHERE sale_date IS NOT NULL AND daily_order_id IS NOT NULL
+                       GROUP BY chat_id,sale_date"""
+                ).fetchall()
+            }
+            for legacy_row in legacy_rows:
+                try:
+                    created_at = datetime.fromisoformat(
+                        str(legacy_row["created_at"])
+                    )
+                except ValueError:
+                    created_at = utc_now()
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=UTC)
+                sale_day = created_at.astimezone(TASHKENT_TZ).date().isoformat()
+                counter_key = (int(legacy_row["chat_id"]), sale_day)
+                next_id = counters.get(counter_key, 0) + 1
+                counters[counter_key] = next_id
+                db.execute(
+                    """UPDATE sales_photo_jobs
+                       SET sale_date=?,daily_order_id=?,order_card_applied=0
+                       WHERE chat_id=? AND source_message_id=?""",
+                    (
+                        sale_day,
+                        next_id,
+                        int(legacy_row["chat_id"]),
+                        int(legacy_row["source_message_id"]),
+                    ),
+                )
             migration_time = _iso(utc_now())
             db.execute(
                 """INSERT OR IGNORE INTO sales_photo_source_members(
@@ -411,6 +484,13 @@ class SalesPhotoRepository:
 
                 CREATE INDEX IF NOT EXISTS idx_sales_photo_jobs_retry
                 ON sales_photo_jobs(status, processing_attempts, updated_at);
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_sales_photo_daily_order
+                ON sales_photo_jobs(chat_id,sale_date,daily_order_id)
+                WHERE sale_date IS NOT NULL AND daily_order_id IS NOT NULL;
+
+                CREATE INDEX IF NOT EXISTS idx_sales_photo_order_backfill
+                ON sales_photo_jobs(order_card_applied,order_backfill_attempts,updated_at);
                 """
             )
             db.commit()
@@ -457,6 +537,7 @@ class SalesPhotoRepository:
         source_file_ids: tuple[str, ...] | None = None,
         source_message_ids: tuple[int, ...] | None = None,
         source_kind: str = "photo",
+        sale_date: date | None = None,
     ) -> bool:
         now = _iso(at or utc_now())
         member_ids = tuple(
@@ -487,6 +568,7 @@ class SalesPhotoRepository:
             else None
         )
         with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             placeholders = ",".join("?" for _ in member_ids)
             conflicting_member = db.execute(
                 f"""SELECT 1 FROM sales_photo_source_members
@@ -535,6 +617,13 @@ class SalesPhotoRepository:
                 if cursor.rowcount != 1:
                     db.rollback()
                     return False
+            if sale_date is not None:
+                self._ensure_daily_order_locked(
+                    db,
+                    int(chat_id),
+                    int(source_message_id),
+                    sale_date,
+                )
             try:
                 db.executemany(
                     """INSERT INTO sales_photo_source_members(
@@ -559,6 +648,167 @@ class SalesPhotoRepository:
                 return False
             db.commit()
             return True
+
+    @staticmethod
+    def _ensure_daily_order_locked(
+        db: sqlite3.Connection,
+        chat_id: int,
+        source_message_id: int,
+        sale_date: date,
+    ) -> tuple[date, int]:
+        row = db.execute(
+            """SELECT sale_date,daily_order_id FROM sales_photo_jobs
+               WHERE chat_id=? AND source_message_id=?""",
+            (int(chat_id), int(source_message_id)),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("Не найдена карточка для ежедневного номера")
+        if row["sale_date"] is not None and row["daily_order_id"] is not None:
+            return date.fromisoformat(str(row["sale_date"])), int(
+                row["daily_order_id"]
+            )
+
+        sale_day = sale_date.isoformat()
+        maximum = db.execute(
+            """SELECT COALESCE(MAX(daily_order_id),0) FROM sales_photo_jobs
+               WHERE chat_id=? AND sale_date=?""",
+            (int(chat_id), sale_day),
+        ).fetchone()[0]
+        order_id = int(maximum) + 1
+        cursor = db.execute(
+            """UPDATE sales_photo_jobs
+               SET sale_date=?,daily_order_id=?
+               WHERE chat_id=? AND source_message_id=?
+                 AND sale_date IS NULL AND daily_order_id IS NULL""",
+            (
+                sale_day,
+                order_id,
+                int(chat_id),
+                int(source_message_id),
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("Не удалось назначить ежедневный номер")
+        return sale_date, order_id
+
+    def ensure_daily_order(
+        self,
+        chat_id: int,
+        source_message_id: int,
+        sale_date: date,
+    ) -> tuple[date, int]:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            result = self._ensure_daily_order_locked(
+                db,
+                int(chat_id),
+                int(source_message_id),
+                sale_date,
+            )
+            db.commit()
+        return result
+
+    def daily_order_for_source(
+        self,
+        chat_id: int,
+        source_message_id: int,
+    ) -> tuple[date, int] | None:
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT sale_date,daily_order_id FROM sales_photo_jobs
+                   WHERE chat_id=? AND source_message_id=?""",
+                (int(chat_id), int(source_message_id)),
+            ).fetchone()
+        if row is None or row["sale_date"] is None or row["daily_order_id"] is None:
+            return None
+        return date.fromisoformat(str(row["sale_date"])), int(row["daily_order_id"])
+
+    def daily_order_for_replacement(
+        self,
+        chat_id: int,
+        replacement_message_id: int,
+    ) -> tuple[date, int] | None:
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT sale_date,daily_order_id FROM sales_photo_jobs
+                   WHERE chat_id=? AND replacement_message_id=?""",
+                (int(chat_id), int(replacement_message_id)),
+            ).fetchone()
+        if row is None or row["sale_date"] is None or row["daily_order_id"] is None:
+            return None
+        return date.fromisoformat(str(row["sale_date"])), int(row["daily_order_id"])
+
+    def mark_order_card_applied(
+        self,
+        chat_id: int,
+        source_message_id: int,
+        at: datetime | None = None,
+    ) -> bool:
+        with self._connect() as db:
+            cursor = db.execute(
+                """UPDATE sales_photo_jobs
+                   SET order_card_applied=1,order_backfill_attempts=0,updated_at=?
+                   WHERE chat_id=? AND source_message_id=?
+                     AND replacement_message_id IS NOT NULL
+                     AND daily_order_id IS NOT NULL""",
+                (
+                    _iso(at or utc_now()),
+                    int(chat_id),
+                    int(source_message_id),
+                ),
+            )
+            db.commit()
+        return cursor.rowcount == 1
+
+    def pending_order_backfills(
+        self,
+        chat_id: int,
+        limit: int = 50,
+    ) -> tuple[PendingOrderBackfill, ...]:
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT chat_id,source_message_id,replacement_message_id,
+                          sale_date,daily_order_id,order_backfill_attempts,updated_at
+                   FROM sales_photo_jobs
+                   WHERE chat_id=? AND replacement_message_id IS NOT NULL
+                     AND sale_date IS NOT NULL AND daily_order_id IS NOT NULL
+                     AND order_card_applied=0 AND order_backfill_attempts<8
+                   ORDER BY created_at,source_message_id
+                   LIMIT ?""",
+                (int(chat_id), max(1, min(int(limit), 200))),
+            ).fetchall()
+        return tuple(
+            PendingOrderBackfill(
+                chat_id=int(row["chat_id"]),
+                source_message_id=int(row["source_message_id"]),
+                replacement_message_id=int(row["replacement_message_id"]),
+                sale_date=date.fromisoformat(str(row["sale_date"])),
+                order_id=int(row["daily_order_id"]),
+                attempts=int(row["order_backfill_attempts"]),
+                updated_at=datetime.fromisoformat(str(row["updated_at"])),
+            )
+            for row in rows
+        )
+
+    def mark_order_backfill_failed(
+        self,
+        chat_id: int,
+        source_message_id: int,
+        at: datetime | None = None,
+    ) -> None:
+        with self._connect() as db:
+            db.execute(
+                """UPDATE sales_photo_jobs
+                   SET order_backfill_attempts=order_backfill_attempts+1,updated_at=?
+                   WHERE chat_id=? AND source_message_id=?
+                     AND order_card_applied=0""",
+                (
+                    _iso(at or utc_now()),
+                    int(chat_id),
+                    int(source_message_id),
+                ),
+            )
+            db.commit()
 
     def record_replacement(
         self,
@@ -1172,7 +1422,7 @@ class SalesPhotoRepository:
         with self._connect() as db:
             rows = db.execute(
                 """SELECT chat_id,source_message_id,encrypted_payload,
-                          processing_attempts,updated_at
+                          processing_attempts,created_at,updated_at,sale_date
                    FROM sales_photo_jobs
                    WHERE chat_id=? AND status='failed'
                      AND replacement_message_id IS NULL
@@ -1210,6 +1460,14 @@ class SalesPhotoRepository:
                     int(row["source_message_id"]),
                 )
                 continue
+            created_at = datetime.fromisoformat(str(row["created_at"]))
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=UTC)
+            effective_sale_date = (
+                date.fromisoformat(str(row["sale_date"]))
+                if row["sale_date"] is not None
+                else created_at.astimezone(TASHKENT_TZ).date()
+            )
             jobs.append(
                 PendingPhoto(
                     chat_id=int(row["chat_id"]),
@@ -1229,6 +1487,7 @@ class SalesPhotoRepository:
                     message_thread_id=thread_id,
                     attempts=int(row["processing_attempts"]),
                     updated_at=datetime.fromisoformat(str(row["updated_at"])),
+                    sale_date=effective_sale_date,
                 )
             )
         return tuple(jobs)
