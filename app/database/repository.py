@@ -21,6 +21,7 @@ KNOWN_STATUSES = frozenset({
     "cancelled",
 })
 KNOWN_PAYMENT_STATUSES = frozenset({"collect_on_delivery", "paid_at_assembly"})
+KNOWN_SALES_CARD_STATUSES = frozenset({"none", "pending", "processing", "complete", "failed"})
 MONEY_FIELDS = frozenset({"amount_usd", "amount_uzs", "received_usd", "received_uzs"})
 COORDINATE_PAIRS = (
     ("latitude", "longitude"),
@@ -58,6 +59,9 @@ CREATE TABLE IF NOT EXISTS orders (
     client_phone TEXT NOT NULL,
     client_phone_2 TEXT,
     product TEXT NOT NULL,
+    product_photo_file_id TEXT,
+    product_photo_unique_id TEXT,
+    product_photo_path TEXT,
     amount_usd INTEGER,
     amount_uzs INTEGER,
     location_url TEXT,
@@ -104,7 +108,14 @@ CREATE TABLE IF NOT EXISTS orders (
     orders_channel_message_id INTEGER,
     creation_token TEXT,
     sync_needed INTEGER NOT NULL DEFAULT 0,
-    sync_attempted_at TEXT
+    sync_attempted_at TEXT,
+    sales_card_status TEXT NOT NULL DEFAULT 'none',
+    sales_card_requested_at TEXT,
+    sales_card_requested_by_id INTEGER,
+    sales_card_requested_by_name TEXT,
+    sales_card_source_message_id INTEGER,
+    sales_card_message_id INTEGER,
+    sales_card_error TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
 CREATE INDEX IF NOT EXISTS idx_orders_manager ON orders(manager_id, created_at);
@@ -187,6 +198,16 @@ MIGRATION_COLUMNS = {
     "sync_attempted_at": "TEXT",
     "courier_read_at": "TEXT",
     "picked_up_at": "TEXT",
+    "product_photo_file_id": "TEXT",
+    "product_photo_unique_id": "TEXT",
+    "product_photo_path": "TEXT",
+    "sales_card_status": "TEXT NOT NULL DEFAULT 'none'",
+    "sales_card_requested_at": "TEXT",
+    "sales_card_requested_by_id": "INTEGER",
+    "sales_card_requested_by_name": "TEXT",
+    "sales_card_source_message_id": "INTEGER",
+    "sales_card_message_id": "INTEGER",
+    "sales_card_error": "TEXT",
 }
 
 CLEANUP_MIGRATION_COLUMNS = {
@@ -216,6 +237,7 @@ def _retry_at(attempts: int) -> str:
 class OrderRepository:
     editable_fields = {
         "seller_name", "payment_status", "product", "client_phone", "client_phone_2", "amount_usd", "amount_uzs", "location_url",
+        "product_photo_file_id", "product_photo_unique_id", "product_photo_path",
         "latitude", "longitude", "address_text", "district", "mahalla",
         "second_location_url", "second_latitude", "second_longitude",
         "second_address_text", "second_district", "second_mahalla",
@@ -229,6 +251,9 @@ class OrderRepository:
         "second_location_details_message_id", "second_location_footer_message_id",
         "manager_chat_id", "manager_message_id", "orders_channel_chat_id",
         "orders_channel_message_id", "sync_needed",
+        "sales_card_status", "sales_card_requested_at", "sales_card_requested_by_id",
+        "sales_card_requested_by_name", "sales_card_source_message_id",
+        "sales_card_message_id", "sales_card_error",
     }
 
     def __init__(self, path: Path, *, read_only: bool = False):
@@ -351,6 +376,11 @@ class OrderRepository:
             and fields["payment_status"] not in KNOWN_PAYMENT_STATUSES
         ):
             raise ValueError(f"Unknown payment status: {fields['payment_status']!r}")
+        if (
+            "sales_card_status" in fields
+            and fields["sales_card_status"] not in KNOWN_SALES_CARD_STATUSES
+        ):
+            raise ValueError(f"Unknown sales card status: {fields['sales_card_status']!r}")
         for field in MONEY_FIELDS & fields.keys():
             cls._validate_money(field, fields[field])
 
@@ -456,16 +486,19 @@ class OrderRepository:
             cursor = db.execute(
                 """INSERT INTO orders
                 (order_number, manager_id, manager_name, seller_name, payment_status, client_phone, client_phone_2, product,
+                 product_photo_file_id, product_photo_unique_id, product_photo_path,
                  amount_usd, amount_uzs, location_url, latitude, longitude,
                  address_text, district, mahalla,
                  second_location_url, second_latitude, second_longitude,
                  second_address_text, second_district, second_mahalla,
                  delivery_time, comment,
                  creation_token, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (number, manager_id, manager_name, data.get("seller_name"),
                  data.get("payment_status", "collect_on_delivery"),
                  data["client_phone"], data.get("client_phone_2"), data["product"],
+                 data.get("product_photo_file_id"), data.get("product_photo_unique_id"),
+                 data.get("product_photo_path"),
                  data.get("amount_usd"), data.get("amount_uzs"), data.get("location_url"),
                  data.get("latitude"), data.get("longitude"), data.get("address_text"),
                  data.get("district"), data.get("mahalla"), data.get("second_location_url"),
@@ -485,6 +518,56 @@ class OrderRepository:
                 actor_role="manager",
                 to_status=row["status"],
                 changed_fields=set(data) | {"manager_id", "manager_name", "order_number"},
+            )
+        return Order.from_row(row)
+
+    def request_sales_card(
+        self,
+        order_id: int,
+        *,
+        actor_id: int,
+        actor_name: str,
+        product_photo_path: str | None = None,
+    ) -> Order | None:
+        """Queue one idempotent sales-card request for the exact delivery order."""
+        timestamp = now()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            previous = db.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+            if previous is None:
+                return None
+            if previous["sales_card_status"] in {"pending", "processing", "complete"}:
+                return Order.from_row(previous)
+            cursor = db.execute(
+                """UPDATE orders
+                   SET sales_card_status='pending',sales_card_requested_at=?,
+                       sales_card_requested_by_id=?,sales_card_requested_by_name=?,
+                       product_photo_path=?,sales_card_error=NULL,sync_needed=1,
+                       sync_attempted_at=NULL,updated_at=?
+                   WHERE id=? AND sales_card_status IN ('none','failed')""",
+                (
+                    timestamp,
+                    int(actor_id),
+                    str(actor_name)[:200],
+                    product_photo_path,
+                    timestamp,
+                    order_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return Order.from_row(db.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone())
+            row = db.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+            self._insert_event(
+                db,
+                order_id=order_id,
+                order_number=row["order_number"],
+                event_type="sales_card_creation_started",
+                actor_id=actor_id,
+                actor_name=actor_name,
+                actor_role="manager",
+                from_status=row["status"],
+                to_status=row["status"],
+                changed_fields={"sales_card_status", "product_photo_path"},
             )
         return Order.from_row(row)
 

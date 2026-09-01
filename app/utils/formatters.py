@@ -328,7 +328,12 @@ def phones_text(order: Order) -> str:
     return "\n".join(f"📱 {phone}" for phone in phones)
 
 
-def _compact_order(order: Order, *, status: str | None = None) -> str:
+def _compact_order(
+    order: Order,
+    *,
+    status: str | None = None,
+    include_management: bool = False,
+) -> str:
     lines = [
         f"🚚 <b>Заказ №{order.order_number}</b> · <b>{escape(order.seller_name or '—')}</b>",
     ]
@@ -346,6 +351,15 @@ def _compact_order(order: Order, *, status: str | None = None) -> str:
         amount_text(order),
         phones_text(order),
     ])
+    if include_management:
+        if order.product_photo_file_id:
+            lines.append("📸 Фото товара добавлено")
+        if order.sales_card_status == "complete":
+            lines.append("✅ Проданный товар добавлен")
+        elif order.sales_card_status in {"pending", "processing"}:
+            lines.append("🛒 Карточка продажи создаётся")
+        elif order.sales_card_status == "failed":
+            lines.append("⚠️ Карточка продажи не создана")
     if order.delivery_time:
         lines.append(f"🕒 {escape(order.delivery_time)}")
     if order.comment:
@@ -355,7 +369,7 @@ def _compact_order(order: Order, *, status: str | None = None) -> str:
 
 def manager_card(order: Order, *, sent: bool = False) -> str:
     status = STATUS_LABELS.get(order.status, order.status)
-    return _compact_order(order, status=status)
+    return _compact_order(order, status=status, include_management=True)
 
 
 def _local_datetime(value: str | None) -> str | None:
@@ -406,6 +420,14 @@ def orders_channel_card(order: Order) -> str:
         lines.append(f"🕒 Время доставки: {escape(order.delivery_time)}")
     if order.comment:
         lines.append(f"💬 Комментарий: {escape(order.comment)}")
+    if order.product_photo_file_id:
+        lines.append("📸 Фото товара: добавлено")
+    if order.sales_card_status == "complete":
+        lines.append("✅ Проданный товар: добавлен")
+    elif order.sales_card_status in {"pending", "processing"}:
+        lines.append("🛒 Проданный товар: создаётся")
+    elif order.sales_card_status == "failed":
+        lines.append("⚠️ Проданный товар: ошибка создания")
 
     lines.append("")
     if order.assigned_courier_name:

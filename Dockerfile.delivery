@@ -16,8 +16,8 @@ RUN pip install --no-cache-dir -r requirements-delivery.txt
 # even if its Dockerfile-specific ignore file is accidentally changed later.
 COPY app ./app
 
-RUN addgroup --system delivery \
-    && adduser --system --ingroup delivery delivery \
+RUN groupadd --system --gid 10001 delivery \
+    && useradd --system --uid 10001 --gid delivery --home-dir /app --shell /usr/sbin/nologin delivery \
     && mkdir -p /app/data /app/cache \
     && chown -R delivery:delivery /app/data /app/cache
 

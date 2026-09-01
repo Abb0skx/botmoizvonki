@@ -64,6 +64,12 @@ class DeliveryOrder:
     status: str
     delivered_at: datetime | None
     updated_at: str | None = None
+    product: str | None = None
+    client_phone: str | None = None
+    client_phone_2: str | None = None
+    product_photo_path: str | None = None
+    sales_card_status: str = "none"
+    sales_card_requested_at: str | None = None
 
     @property
     def status_text(self) -> str:
@@ -142,6 +148,7 @@ class DeliveryReader:
 
     @staticmethod
     def _order(row: sqlite3.Row) -> DeliveryOrder | None:
+        values = dict(row)
         created_at = _local_datetime(row["created_at"])
         if created_at is None:
             return None
@@ -165,6 +172,12 @@ class DeliveryReader:
             status=_single_line(row["status"]) or "",
             delivered_at=_local_datetime(row["delivered_at"]),
             updated_at=str(row["updated_at"] or "") or None,
+            product=_single_line(values.get("product")),
+            client_phone=_single_line(values.get("client_phone")),
+            client_phone_2=_single_line(values.get("client_phone_2")),
+            product_photo_path=_single_line(values.get("product_photo_path")),
+            sales_card_status=_single_line(values.get("sales_card_status")) or "none",
+            sales_card_requested_at=str(values.get("sales_card_requested_at") or "") or None,
         )
 
     def index(self, date_from: date, date_to: date) -> DeliveryIndex:
@@ -204,6 +217,116 @@ class DeliveryReader:
             if order is not None:
                 result[order.id] = order
         return result
+
+
+class DeliverySalesBridge(DeliveryReader):
+    """Narrow read/write bridge for delivery-initiated sales-card requests."""
+
+    def _connect_rw(self) -> sqlite3.Connection:
+        db = sqlite3.connect(self.path, timeout=15)
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA busy_timeout=15000")
+        return db
+
+    def pending_sales_requests(self, limit: int = 20) -> tuple[DeliveryOrder, ...]:
+        with self._connect_rw() as db:
+            rows = db.execute(
+                """SELECT id,order_number,client_phone,client_phone_2,product,
+                          product_photo_path,sales_card_status,sales_card_requested_at,
+                          manager_name,seller_name,assigned_courier_name,courier_name,
+                          status,created_at,updated_at,delivered_at
+                   FROM orders
+                   WHERE sales_card_status='pending'
+                   ORDER BY sales_card_requested_at,id LIMIT ?""",
+                (max(1, min(int(limit), 100)),),
+            ).fetchall()
+        return tuple(order for row in rows if (order := self._order(row)) is not None)
+
+    def recover_processing_requests(self) -> int:
+        """Release requests interrupted by a previous Sales Photo Bot process."""
+        with self._connect_rw() as db:
+            cursor = db.execute(
+                """UPDATE orders SET sales_card_status='pending'
+                   WHERE sales_card_status='processing'"""
+            )
+        return int(cursor.rowcount)
+
+    def claim_sales_request(self, order_id: int) -> DeliveryOrder | None:
+        with self._connect_rw() as db:
+            db.execute("BEGIN IMMEDIATE")
+            cursor = db.execute(
+                """UPDATE orders SET sales_card_status='processing',sales_card_error=NULL
+                   WHERE id=? AND sales_card_status='pending'""",
+                (int(order_id),),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = db.execute(
+                """SELECT id,order_number,client_phone,client_phone_2,product,
+                          product_photo_path,sales_card_status,sales_card_requested_at,
+                          manager_name,seller_name,assigned_courier_name,courier_name,
+                          status,created_at,updated_at,delivered_at
+                   FROM orders WHERE id=?""",
+                (int(order_id),),
+            ).fetchone()
+        return self._order(row) if row is not None else None
+
+    def release_sales_request(self, order_id: int) -> bool:
+        with self._connect_rw() as db:
+            cursor = db.execute(
+                """UPDATE orders SET sales_card_status='pending'
+                   WHERE id=? AND sales_card_status='processing'""",
+                (int(order_id),),
+            )
+        return cursor.rowcount == 1
+
+    def finish_sales_request(
+        self,
+        order: DeliveryOrder,
+        *,
+        source_message_id: int | None = None,
+        replacement_message_id: int | None = None,
+        error: str | None = None,
+    ) -> bool:
+        completed = replacement_message_id is not None and error is None
+        event_type = "sales_card_created" if completed else "sales_card_creation_failed"
+        timestamp = datetime.now(tz=ZoneInfo("UTC")).isoformat(timespec="microseconds")
+        with self._connect_rw() as db:
+            db.execute("BEGIN IMMEDIATE")
+            cursor = db.execute(
+                """UPDATE orders
+                   SET sales_card_status=?,sales_card_source_message_id=?,
+                       sales_card_message_id=?,sales_card_error=?,sync_needed=1,
+                       sync_attempted_at=NULL
+                   WHERE id=? AND sales_card_status='processing'""",
+                (
+                    "complete" if completed else "failed",
+                    source_message_id,
+                    replacement_message_id,
+                    (str(error)[:300] if error else None),
+                    order.id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return False
+            db.execute(
+                """INSERT INTO order_events(
+                       order_id,order_number,event_type,actor_name,actor_role,
+                       from_status,to_status,changed_fields,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (
+                    order.id,
+                    order.order_number,
+                    event_type,
+                    "Sales Photo Bot",
+                    "integration",
+                    order.status,
+                    order.status,
+                    '["sales_card_status"]',
+                    timestamp,
+                ),
+            )
+        return True
 
     def latest_event_id(self) -> int:
         with self._connect() as db:

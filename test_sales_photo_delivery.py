@@ -8,8 +8,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+from app.database import OrderRepository
+
 from sales_photo_bot.delivery import (
     DeliveryReader,
+    DeliverySalesBridge,
     normalize_delivery_block,
 )
 from sales_photo_bot.config import Settings
@@ -395,6 +398,83 @@ class DeliveryServiceTests(unittest.IsolatedAsyncioTestCase):
             caption = bot.edit_message_caption.await_args.kwargs["caption"]
             self.assertIn("Статус: ✅ Доставлено (18:42)", caption)
             self.assertNotIn("Будет", caption)
+
+
+class DeliverySalesBridgeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_delivery_request_publishes_once_and_links_exact_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            delivery_path = root / "delivery.db"
+            delivery_repo = OrderRepository(delivery_path)
+            delivery_repo.initialize()
+            delivery = delivery_repo.create(
+                manager_id=1,
+                manager_name="Telegram Manager",
+                data={
+                    "seller_name": "Ali",
+                    "client_phone": "+998901234567",
+                    "product": "A57 Pro",
+                },
+            )
+            delivery_repo.request_sales_card(
+                delivery.id,
+                actor_id=1,
+                actor_name="Manager",
+            )
+            bridge = DeliverySalesBridge(delivery_path)
+            pending = bridge.pending_sales_requests()
+            self.assertEqual([item.id for item in pending], [delivery.id])
+            claimed = bridge.claim_sales_request(delivery.id)
+            self.assertIsNotNone(claimed)
+
+            sales_repo = SalesPhotoRepository(root / "sales.db")
+            service_settings = settings(root, delivery_path)
+            service_settings = Settings(
+                **{
+                    **service_settings.__dict__,
+                    "source_edit_grace_seconds": 0,
+                    "startup_drain_seconds": 0,
+                }
+            )
+            service = SalesPhotoService(service_settings, sales_repo)
+            sent_ids = iter((100, 200))
+
+            async def send_message(**kwargs):
+                return SimpleNamespace(message_id=next(sent_ids))
+
+            bot = SimpleNamespace(
+                send_message=AsyncMock(side_effect=send_message),
+                delete_message=AsyncMock(return_value=True),
+            )
+            service._sync_new_delivery_card = AsyncMock()
+            service._sync_linked_delivery_cards = AsyncMock()
+
+            source_id, replacement_id = await service._publish_delivery_sales_request(
+                bot,
+                claimed,
+            )
+
+            self.assertEqual((source_id, replacement_id), (100, 200))
+            links = sales_repo.delivery_links_for_orders(CHAT_ID, {delivery.id})
+            self.assertEqual(len(links), 1)
+            self.assertEqual(links[0].delivery_order_number, delivery.order_number)
+            self.assertEqual(sales_repo.selected_manager(CHAT_ID, 200), "Ali")
+            self.assertTrue(
+                bridge.finish_sales_request(
+                    claimed,
+                    source_message_id=100,
+                    replacement_message_id=200,
+                )
+            )
+            completed = delivery_repo.get(delivery.id)
+            self.assertEqual(completed.sales_card_status, "complete")
+            self.assertEqual(completed.sales_card_message_id, 200)
+
+            # A retried/recovered request resolves the existing exact link
+            # instead of publishing a second Telegram card.
+            again = await service._publish_delivery_sales_request(bot, claimed)
+            self.assertEqual(again, (100, 200))
+            self.assertEqual(bot.send_message.await_count, 2)
 
 
 if __name__ == "__main__":

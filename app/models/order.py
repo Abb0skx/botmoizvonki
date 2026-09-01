@@ -11,6 +11,9 @@ class Order:
     manager_name: str
     client_phone: str
     product: str
+    product_photo_file_id: str | None = None
+    product_photo_unique_id: str | None = None
+    product_photo_path: str | None = None
     client_phone_2: str | None = None
     seller_name: str | None = None
     payment_status: str = "collect_on_delivery"
@@ -61,6 +64,13 @@ class Order:
     creation_token: str | None = None
     sync_needed: int = 0
     sync_attempted_at: str | None = None
+    sales_card_status: str = "none"
+    sales_card_requested_at: str | None = None
+    sales_card_requested_by_id: int | None = None
+    sales_card_requested_by_name: str | None = None
+    sales_card_source_message_id: int | None = None
+    sales_card_message_id: int | None = None
+    sales_card_error: str | None = None
 
     @classmethod
     def from_row(cls, row: Any) -> "Order":

@@ -24,6 +24,7 @@ class Settings:
     manager_ids: frozenset[int]
     courier_ids: frozenset[int]
     stats_url: str = "https://bot.texnikach.uz/delivery/stats"
+    sales_photo_chat_id: int = -1003917243944
 
     @classmethod
     def load(cls) -> "Settings":
@@ -77,6 +78,9 @@ class Settings:
             database_path=Path(os.getenv("DELIVERY_DB_PATH", "data/delivery.db")),
             manager_ids=manager_ids,
             courier_ids=courier_ids,
+            sales_photo_chat_id=int(
+                os.getenv("DELIVERY_SALES_PHOTO_CHAT_ID", "-1003917243944").strip()
+            ),
             stats_url=(
                 os.getenv(
                     "DELIVERY_STATS_URL",

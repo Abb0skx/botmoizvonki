@@ -1,5 +1,7 @@
 import asyncio
+import hashlib
 import logging
+from pathlib import Path
 from dataclasses import replace
 from datetime import datetime, timedelta
 from html import escape
@@ -25,7 +27,8 @@ from app.bot.keyboards import (
     main_keyboard,
     manager_cancelled_keyboard, manager_sent_keyboard, on_way_keyboard,
     orders_channel_keyboard, orders_page_keyboard, payment_keyboard, review_keyboard, seller_keyboard,
-    readonly_order_keyboard, skip_keyboard, statistics_keyboard, text_location_keyboard,
+    product_photo_keyboard, readonly_order_keyboard, sales_card_confirmation_keyboard,
+    sales_card_result_keyboard, skip_keyboard, statistics_keyboard, text_location_keyboard,
 )
 from app.config import Settings
 from app.database import OrderRepository
@@ -45,7 +48,7 @@ from app.utils.couriers import (
 from app.utils.parsers import display_phone
 
 logger = logging.getLogger(__name__)
-SELLER, PRODUCT, DETAILS, SECOND_LOCATION, PAYMENT, DELIVERY_TIME, COMMENT, EDIT_VALUE = range(8)
+SELLER, PRODUCT, PRODUCT_PHOTO, DETAILS, SECOND_LOCATION, PAYMENT, DELIVERY_TIME, COMMENT, EDIT_VALUE = range(9)
 MANAGER_EDITABLE_STATUSES = {"draft", "pending", "picked_up", "on_way"}
 DELIVERY_ACTIVE_STATUSES = {"pending", "picked_up", "on_way", "awaiting_photo", "awaiting_amount"}
 LOCATION_SEPARATOR = "\n".join(["📍" * 11] * 3)
@@ -229,6 +232,7 @@ _EDIT_FIELD_LABELS = {
     "seller": "владелец заказа",
     "payment_status": "оплата",
     "product": "товар",
+    "product_photo": "фото товара",
     "phone": "телефон клиента",
     "location": "основная локация",
     "second_location": "дополнительная локация",
@@ -1666,7 +1670,7 @@ async def new_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return ConversationHandler.END
     context.user_data["draft"] = {"creation_token": uuid4().hex}
-    await update.message.reply_text("1/6. Выберите, кому принадлежит заказ:", reply_markup=seller_keyboard())
+    await update.message.reply_text("1/7. Выберите, кому принадлежит заказ:", reply_markup=seller_keyboard())
     return SELLER
 
 
@@ -1683,7 +1687,7 @@ async def seller(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text(str(error), reply_markup=seller_keyboard())
         return SELLER
     draft["seller_name"] = value
-    await update.message.reply_text("2/6. Введите модель товара:", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text("2/7. Введите модель товара:", reply_markup=ReplyKeyboardRemove())
     return PRODUCT
 
 
@@ -1701,10 +1705,49 @@ async def product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return PRODUCT
     draft["product"] = value
     await update.message.reply_text(
-        "3/6. Отправьте:\n"
+        "3/7. 📸 Фото товара?\n\n"
+        "Отправьте фотографию или нажмите «Пропустить».",
+        reply_markup=product_photo_keyboard(),
+    )
+    return PRODUCT_PHOTO
+
+
+async def product_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await _require_manager_flow(update, context):
+        return ConversationHandler.END
+    draft = context.user_data.get("draft")
+    if draft is None:
+        await update.message.reply_text("Начните новый заказ заново.", reply_markup=main_keyboard())
+        return ConversationHandler.END
+    photos = tuple(update.message.photo or ())
+    text = (update.message.text or "").strip().casefold()
+    if photos:
+        photo = max(
+            photos,
+            key=lambda item: (
+                int(getattr(item, "file_size", 0) or 0),
+                int(getattr(item, "width", 0) or 0) * int(getattr(item, "height", 0) or 0),
+            ),
+        )
+        draft["product_photo_file_id"] = str(photo.file_id)
+        draft["product_photo_unique_id"] = str(
+            getattr(photo, "file_unique_id", "") or photo.file_id
+        )
+    elif text in {"пропустить", "⏭ пропустить"}:
+        draft["product_photo_file_id"] = None
+        draft["product_photo_unique_id"] = None
+    else:
+        await update.message.reply_text(
+            "Отправьте фотографию товара или нажмите «Пропустить».",
+            reply_markup=product_photo_keyboard(),
+        )
+        return PRODUCT_PHOTO
+    await update.message.reply_text(
+        "4/7. Отправьте:\n"
         "📍 Локацию\n"
         "📱 Номер\n"
-        "💰 Общую сумму"
+        "💰 Общую сумму",
+        reply_markup=ReplyKeyboardRemove(),
     )
     return DETAILS
 
@@ -1860,7 +1903,7 @@ async def details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return DETAILS
 
-    await update.message.reply_text("4/6. Выберите вариант оплаты:", reply_markup=payment_keyboard())
+    await update.message.reply_text("5/7. Выберите вариант оплаты:", reply_markup=payment_keyboard())
     return PAYMENT
 
 
@@ -1879,7 +1922,7 @@ async def second_location(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     text = (update.message.text or "").strip().casefold()
     if text == "продолжить без второй локации":
         await update.message.reply_text(
-            "4/6. Выберите вариант оплаты:",
+            "5/7. Выберите вариант оплаты:",
             reply_markup=payment_keyboard(),
         )
         return PAYMENT
@@ -1892,7 +1935,7 @@ async def second_location(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return SECOND_LOCATION
     await update.message.reply_text(
-        f"✅ Сохранено: {', '.join(recognized)}.\n\n4/6. Выберите вариант оплаты:",
+        f"✅ Сохранено: {', '.join(recognized)}.\n\n5/7. Выберите вариант оплаты:",
         reply_markup=payment_keyboard(),
     )
     return PAYMENT
@@ -1925,7 +1968,7 @@ async def payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return PAYMENT
     draft["payment_status"] = value
     await update.message.reply_text(
-        "5/6. Выберите время доставки или напишите свой вариант текстом:",
+        "6/7. Выберите время доставки или напишите свой вариант текстом:",
         reply_markup=delivery_time_keyboard(),
     )
     return DELIVERY_TIME
@@ -1944,7 +1987,7 @@ async def delivery_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await update.message.reply_text(str(error), reply_markup=delivery_time_keyboard())
         return DELIVERY_TIME
     draft["delivery_time"] = value
-    await update.message.reply_text("6/6. Добавьте комментарий или пропустите:", reply_markup=skip_keyboard())
+    await update.message.reply_text("7/7. Добавьте комментарий или пропустите:", reply_markup=skip_keyboard())
     return COMMENT
 
 
@@ -2055,6 +2098,7 @@ async def begin_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "seller": "Выберите нового владельца заказа:",
         "payment_status": "Выберите новый вариант оплаты:",
         "product": "Введите новую модель:",
+        "product_photo": "Отправьте новое фото товара или удалите текущее:",
         "phone": "Введите один или два новых номера:",
         "location": "Отправьте новую основную локацию или ссылку:",
         "second_location": "Отправьте дополнительную локацию или ссылку:",
@@ -2106,6 +2150,108 @@ async def toggle_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await query.answer()
 
 
+def _sales_card_preview(order) -> str:
+    phones = [display_phone(order.client_phone)]
+    if order.client_phone_2 and order.client_phone_2 != order.client_phone:
+        phones.append(display_phone(order.client_phone_2))
+    photo = "добавлено" if order.product_photo_file_id else "не добавлено"
+    return (
+        "🛒 <b>Проданный товар</b>\n\n"
+        f"🚚 Заказ №{order.order_number}\n"
+        f"📦 {escape(order.product)}\n"
+        f"👤 Продавец: {escape(order.seller_name or '—')}\n"
+        f"📱 {' / '.join(escape(phone) for phone in phones)}\n"
+        f"📸 Фото: {photo}\n\n"
+        "Сумма доставки не будет автоматически распределена между "
+        "наличными, картой и Paynet."
+    )
+
+
+async def sales_card_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    action, raw_id = query.data.split(":", 1)
+    settings: Settings = context.application.bot_data["settings"]
+    repo: OrderRepository = context.application.bot_data["repo"]
+    if not _allowed(query.from_user.id, settings.manager_ids):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    order = repo.get(int(raw_id))
+    if not order:
+        await query.answer("Заказ не найден", show_alert=True)
+        return
+    if action == "sales_cancel":
+        await query.answer()
+        try:
+            await query.message.delete()
+        except Exception:
+            await query.edit_message_text("Создание карточки отменено.")
+        return
+    if order.sales_card_status == "complete":
+        await query.answer("Товар уже добавлен", show_alert=True)
+        markup = sales_card_result_keyboard(order, settings.sales_photo_chat_id)
+        await query.message.reply_text(
+            f"✅ Товар заказа №{order.order_number} уже добавлен в канал продаж.",
+            reply_markup=markup,
+        )
+        return
+    if action == "sales_card":
+        await query.answer()
+        await query.message.reply_text(
+            _sales_card_preview(order),
+            parse_mode=ParseMode.HTML,
+            reply_markup=sales_card_confirmation_keyboard(order),
+        )
+        return
+    if order.sales_card_status in {"pending", "processing"}:
+        await query.answer("Карточка уже создаётся", show_alert=True)
+        return
+
+    photo_path: str | None = None
+    if order.product_photo_file_id:
+        photo_key = hashlib.sha256(
+            (order.product_photo_unique_id or order.product_photo_file_id).encode()
+        ).hexdigest()[:20]
+        relative = Path("product_photos") / (
+            f"order-{order.id}-{photo_key}.jpg"
+        )
+        destination = settings.database_path.parent / relative
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if not destination.is_file():
+                telegram_file = await context.bot.get_file(order.product_photo_file_id)
+                await telegram_file.download_to_drive(custom_path=destination)
+            photo_path = relative.as_posix()
+        except Exception:
+            logger.exception("Could not persist product photo for order %s", order.id)
+            await query.answer(
+                "Не удалось подготовить фото. Попробуйте ещё раз.",
+                show_alert=True,
+            )
+            return
+
+    queued = repo.request_sales_card(
+        order.id,
+        actor_id=query.from_user.id,
+        actor_name=_name(query.from_user),
+        product_photo_path=photo_path,
+    )
+    if not queued:
+        await query.answer("Заказ уже изменён. Попробуйте ещё раз.", show_alert=True)
+        return
+    await query.answer("Карточка поставлена в очередь")
+    _, synchronized = await _sync_order(context, order.id)
+    if not synchronized:
+        _schedule_sync_retry(context, order.id)
+    try:
+        await query.edit_message_text(
+            f"🛒 Карточка продажи для заказа №{order.order_number} создаётся.\n"
+            "Повторное нажатие не создаст дубль."
+        )
+    except Exception as error:
+        if not _message_is_not_modified(error):
+            logger.warning("Could not refresh sales-card preview for order %s", order.id)
+
+
 async def cancel_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not await _require_manager_flow(update, context):
         return ConversationHandler.END
@@ -2129,6 +2275,30 @@ async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     field, values = edit["field"], {}
     try:
         if field == "seller": values["seller_name"] = normalize_seller(update.message.text or "")
+        elif field == "product_photo":
+            if update.message.photo:
+                photo = max(
+                    update.message.photo,
+                    key=lambda item: (
+                        int(getattr(item, "file_size", 0) or 0),
+                        int(getattr(item, "width", 0) or 0) * int(getattr(item, "height", 0) or 0),
+                    ),
+                )
+                values.update(
+                    product_photo_file_id=str(photo.file_id),
+                    product_photo_unique_id=str(
+                        getattr(photo, "file_unique_id", "") or photo.file_id
+                    ),
+                    product_photo_path=None,
+                )
+            elif incoming_text == "🗑 Удалить фото":
+                values.update(
+                    product_photo_file_id=None,
+                    product_photo_unique_id=None,
+                    product_photo_path=None,
+                )
+            else:
+                raise ValueError("Отправьте фотографию или нажмите «Удалить фото»")
         elif field == "payment_status": values["payment_status"] = normalize_payment(update.message.text or "")
         elif field == "phone":
             phones = list(parse_order_details(update.message.text or "").get("client_phones") or [])
@@ -3341,6 +3511,11 @@ def register_handlers(application: Application) -> None:
         states={
             SELLER: [creation_menu, creation_stats, MessageHandler(filters.TEXT & ~filters.COMMAND, seller)],
             PRODUCT: [creation_menu, creation_stats, MessageHandler(filters.TEXT & ~filters.COMMAND, product)],
+            PRODUCT_PHOTO: [
+                creation_menu,
+                creation_stats,
+                MessageHandler((filters.PHOTO | filters.TEXT) & ~filters.COMMAND, product_photo),
+            ],
             DETAILS: [creation_menu, creation_stats, MessageHandler((filters.LOCATION | filters.TEXT) & ~filters.COMMAND, details)],
             SECOND_LOCATION: [creation_menu, creation_stats, MessageHandler((filters.LOCATION | filters.TEXT) & ~filters.COMMAND, second_location)],
             PAYMENT: [creation_menu, creation_stats, MessageHandler((filters.LOCATION | filters.TEXT) & ~filters.COMMAND, payment)],
@@ -3359,7 +3534,7 @@ def register_handlers(application: Application) -> None:
     edit_conversation = ConversationHandler(
         entry_points=[CallbackQueryHandler(begin_edit, pattern=r"^edit:\d+:")],
         states={
-            EDIT_VALUE: [MessageHandler((filters.LOCATION | filters.TEXT) & ~filters.COMMAND, save_edit)],
+            EDIT_VALUE: [MessageHandler((filters.LOCATION | filters.PHOTO | filters.TEXT) & ~filters.COMMAND, save_edit)],
         },
         fallbacks=[
             CommandHandler("start", _end_edit_on_global_command),
@@ -3370,6 +3545,7 @@ def register_handlers(application: Application) -> None:
                 _end_edit_on_global_command,
                 pattern=(
                     r"^(?:(?:edit_(?:menu|close)|send|manager_cancel|manager_restore|sync|pickup|undo_pickup):\d+"
+                    r"|sales_(?:card|confirm|cancel):\d+"
                     r"|courier_(?:menu|close|assign|force_assign):\d+(?::\d+)?"
                     r"|list_order:\d+"
                     r"|orders_page:(?:active|all):\d+)$"
@@ -3398,6 +3574,12 @@ def register_handlers(application: Application) -> None:
         pattern=r"^location_(?:label|order):\d+$",
     ))
     application.add_handler(CallbackQueryHandler(toggle_edit_menu, pattern=r"^edit_(?:menu|close):\d+$"))
+    application.add_handler(
+        CallbackQueryHandler(
+            sales_card_action,
+            pattern=r"^sales_(?:card|confirm|cancel):\d+$",
+        )
+    )
     application.add_handler(CallbackQueryHandler(manager_action, pattern=r"^(send|manager_cancel|manager_restore):\d+$"))
     application.add_handler(CallbackQueryHandler(
         courier_assignment_action,

@@ -1592,6 +1592,32 @@ class SalesPhotoRepository:
             for row in rows
         )
 
+    def delivery_source_for_order(
+        self,
+        chat_id: int,
+        delivery_order_id: int,
+    ) -> tuple[int, int | None] | None:
+        """Resolve an explicit link even while its Telegram card is unfinished."""
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT link.source_message_id,job.replacement_message_id
+                   FROM sales_photo_delivery_links AS link
+                   JOIN sales_photo_jobs AS job
+                     ON job.chat_id=link.chat_id
+                    AND job.source_message_id=link.source_message_id
+                   WHERE link.chat_id=? AND link.delivery_order_id=?
+                   ORDER BY link.updated_at DESC LIMIT 1""",
+                (int(chat_id), int(delivery_order_id)),
+            ).fetchone()
+        if row is None:
+            return None
+        return (
+            int(row["source_message_id"]),
+            int(row["replacement_message_id"])
+            if row["replacement_message_id"] is not None
+            else None,
+        )
+
     def compact_recent_daily_orders(
         self,
         chat_id: int,
@@ -2611,6 +2637,17 @@ class SalesPhotoRepository:
                 (int(chat_id), int(replacement_message_id)),
             ).fetchone()
         return int(row["source_message_id"]) if row is not None else None
+
+    def replacement_for_source(self, chat_id: int, source_message_id: int) -> int | None:
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT replacement_message_id FROM sales_photo_jobs
+                   WHERE chat_id=? AND source_message_id=?""",
+                (int(chat_id), int(source_message_id)),
+            ).fetchone()
+        if row is None or row["replacement_message_id"] is None:
+            return None
+        return int(row["replacement_message_id"])
 
     def pending_deletions(
         self,

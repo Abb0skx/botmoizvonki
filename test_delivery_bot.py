@@ -13,9 +13,9 @@ from app.bot.keyboards import (
 from app.database import OrderRepository
 from app.database.repository import MIGRATION_COLUMNS, SCHEMA
 from app.handlers.orders import (
-    DETAILS, PAYMENT, SECOND_LOCATION, _courier_waiting_pickup_text,
+    DETAILS, PAYMENT, PRODUCT_PHOTO, SECOND_LOCATION, _courier_waiting_pickup_text,
     _publish_location, courier_action, delivery_input, details,
-    location_label_action, product, save_edit, second_location,
+    location_label_action, product, product_photo, save_edit, second_location,
 )
 from app.utils.formatters import (
     all_locations_card, completed_card, courier_card, manager_card, short_address,
@@ -174,11 +174,42 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
 
         state = await product(update, self.context())
 
-        self.assertEqual(state, DETAILS)
-        self.assertEqual(
-            update.message.reply_text.await_args.args[0],
-            "3/6. Отправьте:\n📍 Локацию\n📱 Номер\n💰 Общую сумму",
+        self.assertEqual(state, PRODUCT_PHOTO)
+        self.assertIn("Фото товара", update.message.reply_text.await_args.args[0])
+
+    async def test_product_photo_can_be_saved_or_skipped(self):
+        context = self.context()
+        photo = SimpleNamespace(
+            file_id="large-photo",
+            file_unique_id="unique-photo",
+            file_size=500,
+            width=1000,
+            height=1000,
         )
+        message = SimpleNamespace(text=None, photo=[photo], reply_text=AsyncMock())
+        update = SimpleNamespace(
+            message=message,
+            effective_message=message,
+            effective_chat=SimpleNamespace(id=1, type="private"),
+            effective_user=SimpleNamespace(id=1, full_name="Manager", username=None),
+        )
+
+        state = await product_photo(update, context)
+
+        self.assertEqual(state, DETAILS)
+        self.assertEqual(context.user_data["draft"]["product_photo_file_id"], "large-photo")
+        self.assertIn("📍 Локацию", message.reply_text.await_args.args[0])
+
+        skip_context = self.context()
+        skip_message = SimpleNamespace(text="⏭ Пропустить", photo=[], reply_text=AsyncMock())
+        skip_update = SimpleNamespace(
+            message=skip_message,
+            effective_message=skip_message,
+            effective_chat=SimpleNamespace(id=1, type="private"),
+            effective_user=SimpleNamespace(id=1, full_name="Manager", username=None),
+        )
+        self.assertEqual(await product_photo(skip_update, skip_context), DETAILS)
+        self.assertIsNone(skip_context.user_data["draft"]["product_photo_file_id"])
 
     async def test_waiting_pickup_log_lists_only_pending_products_for_courier(self):
         with tempfile.TemporaryDirectory() as directory:

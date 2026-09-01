@@ -84,6 +84,14 @@ def payment_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+def product_photo_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("⏭ Пропустить")]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
 def text_location_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [[KeyboardButton("📝 Локация текстом")]],
@@ -108,6 +116,8 @@ def edit_input_keyboard(field: str | None = None) -> ReplyKeyboardMarkup:
         rows.append([KeyboardButton("📝 Локация текстом")])
         if field == "second_location":
             rows.append([KeyboardButton("🗑 Удалить доп. локацию")])
+    elif field == "product_photo":
+        rows.append([KeyboardButton("🗑 Удалить фото")])
     rows.append([KeyboardButton("❌ Отменить изменение")])
     return ReplyKeyboardMarkup(
         rows,
@@ -135,19 +145,50 @@ def manager_cancelled_keyboard(order_id: int) -> InlineKeyboardMarkup:
     ]])
 
 
-def _edit_rows(order_id: int) -> list[list[InlineKeyboardButton]]:
+def _edit_rows(order_or_id: Order | int) -> list[list[InlineKeyboardButton]]:
+    order = order_or_id if isinstance(order_or_id, Order) else None
+    order_id = order.id if order is not None else int(order_or_id)
     rows = [
         [("👤 Изменить владельца", "seller"), ("💳 Изменить оплату", "payment_status")],
         [("✏️ Изменить товар", "product"), ("📞 Изменить номер", "phone")],
+        [("📸 Фото товара", "product_photo")],
         [("📍 Основная локация", "location"), ("📍 Доп. локация", "second_location")],
         [("💰 Изменить сумму", "amount")],
         [("🕒 Изменить время", "delivery_time"), ("💬 Изменить комментарий", "comment")],
     ]
-    return [[InlineKeyboardButton(label, callback_data=f"edit:{order_id}:{field}") for label, field in row] for row in rows]
+    result = [
+        [InlineKeyboardButton(label, callback_data=f"edit:{order_id}:{field}") for label, field in row]
+        for row in rows
+    ]
+    sales_label = (
+        "✅ Проданный товар добавлен"
+        if order is not None and order.sales_card_status == "complete"
+        else "🛒 Проданный товар"
+    )
+    result.append([InlineKeyboardButton(sales_label, callback_data=f"sales_card:{order_id}")])
+    return result
+
+
+def sales_card_confirmation_keyboard(order: Order) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Добавить в проданные", callback_data=f"sales_confirm:{order.id}")],
+        [InlineKeyboardButton("↩️ Назад", callback_data=f"sales_cancel:{order.id}")],
+    ])
+
+
+def sales_card_result_keyboard(order: Order, chat_id: int | None = None) -> InlineKeyboardMarkup | None:
+    if order.sales_card_status != "complete" or not order.sales_card_message_id or not chat_id:
+        return None
+    url = telegram_message_url(chat_id, order.sales_card_message_id)
+    if not url:
+        return None
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔗 Открыть карточку продажи", url=url),
+    ]])
 
 
 def manager_sent_keyboard(order: Order, *, expanded: bool = False) -> InlineKeyboardMarkup:
-    edit_rows = _edit_rows(order.id) if expanded else [[
+    edit_rows = _edit_rows(order) if expanded else [[
         InlineKeyboardButton("✏️ Изменить", callback_data=f"edit_menu:{order.id}"),
     ]]
     if expanded:

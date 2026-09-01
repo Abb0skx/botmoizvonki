@@ -13,7 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Protocol
 
-from telegram import Bot, InputMediaPhoto, Message, Update
+from telegram import Bot, InputFile, InputMediaPhoto, Message, Update
 from telegram.constants import ChatType, ParseMode
 from telegram.error import BadRequest, NetworkError, RetryAfter
 from telegram.ext import ContextTypes
@@ -35,6 +35,7 @@ from .delivery import (
     DeliveryIndex,
     DeliveryOrder,
     DeliveryReader,
+    DeliverySalesBridge,
     normalize_delivery_block,
 )
 from .formatting import build_caption
@@ -84,6 +85,8 @@ class _PhotoClaim:
     client_caption: str | None
     message_thread_id: int | None
     sale_date: date
+    product_label: str | None = None
+    delivery_order_id: int | None = None
 
     @property
     def file_id(self) -> str:
@@ -136,6 +139,10 @@ def _normalize_card_fields(
 
 class _RetryWaitCancelled(asyncio.CancelledError):
     """Cancellation while Telegram has definitively rejected the last send."""
+
+
+class _DeliverySalesPending(RuntimeError):
+    """The durable Sales Photo job exists and is still retrying."""
 
 
 class IdentifierRecognizer(Protocol):
@@ -260,6 +267,11 @@ class SalesPhotoService:
         self.recognizer = recognizer
         self.delivery_reader = (
             DeliveryReader(settings.delivery_db_path)
+            if settings.delivery_db_path is not None
+            else None
+        )
+        self.delivery_sales_bridge = (
+            DeliverySalesBridge(settings.delivery_db_path)
             if settings.delivery_db_path is not None
             else None
         )
@@ -1313,7 +1325,7 @@ class SalesPhotoService:
             chat_id,
             source_message_id,
         )
-        if claim.source_kind == "text" or self.recognizer is None:
+        if claim.source_kind in {"text", "delivery_text"} or self.recognizer is None:
             identifiers = EMPTY_IDENTIFIERS
             logger.info(
                 "sales_photo_content_passthrough chat_id=%s source_message_id=%s "
@@ -1399,9 +1411,9 @@ class SalesPhotoService:
             return
         sale_date_match = extract_sale_date(client_caption)
         cleaned_caption = remove_sale_date(client_caption, sale_date_match)
-        product_label = (
+        product_label = claim.product_label or (
             extract_product_label(cleaned_caption)
-            if claim.source_kind == "text"
+            if claim.source_kind in {"text", "delivery_text", "delivery_photo"}
             else None
         )
         caption = BOT_CARD_MARKER + build_caption(
@@ -1470,7 +1482,7 @@ class SalesPhotoService:
                 if message_thread_id is not None:
                     card_kwargs["message_thread_id"] = int(message_thread_id)
                 replacement = await self._send_message(bot, card_kwargs)
-            elif claim.source_kind == "text":
+            elif claim.source_kind in {"text", "delivery_text"}:
                 text_kwargs: dict[str, Any] = {
                     "chat_id": chat_id,
                     "text": caption,
@@ -1638,7 +1650,7 @@ class SalesPhotoService:
             round((time.monotonic() - started) * 1000),
         )
 
-        if self.delivery_reader is not None:
+        if self.delivery_reader is not None and not claim.source_kind.startswith("delivery_"):
             try:
                 await self._sync_new_delivery_card(
                     bot,
@@ -3487,9 +3499,224 @@ class SalesPhotoService:
                 if index + 1 < len(links):
                     await asyncio.sleep(0.2)
 
+    def _delivery_photo_path(self, relative_path: str | None) -> Path | None:
+        if not relative_path or self.settings.delivery_db_path is None:
+            return None
+        root = self.settings.delivery_db_path.parent.resolve()
+        candidate = (root / relative_path).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            raise RuntimeError("delivery_photo_path_outside_data")
+        return candidate if candidate.is_file() else None
+
+    async def _publish_delivery_sales_request(
+        self,
+        bot: Bot | Any,
+        order: DeliveryOrder,
+    ) -> tuple[int, int]:
+        existing = self.repository.delivery_source_for_order(
+            self.settings.chat_id,
+            order.id,
+        )
+        if existing is not None:
+            source_id, replacement_id = existing
+            if replacement_id is None:
+                await self.retry_failed_photos(bot)
+                existing = self.repository.delivery_source_for_order(
+                    self.settings.chat_id,
+                    order.id,
+                )
+                replacement_id = existing[1] if existing is not None else None
+            if replacement_id is None:
+                raise _DeliverySalesPending("delivery_sales_card_retry_pending")
+            self.repository.sync_auto_delivery_manager(
+                self.settings.chat_id,
+                source_id,
+                self._sales_manager_name(order.manager_name),
+            )
+            await self._sync_linked_delivery_cards(bot, {order.id})
+            return source_id, replacement_id
+
+        product = order.product or f"Заказ №{order.order_number}"
+        phones = [value for value in (order.client_phone, order.client_phone_2) if value]
+        source_body = "\n".join((product, *phones))
+        source = None
+        source_message_id: int | None = None
+        try:
+            photo_path = self._delivery_photo_path(order.product_photo_path)
+            if photo_path is not None:
+                with photo_path.open("rb") as stream:
+                    source = await self._send_with_retry(
+                        bot.send_photo,
+                        {
+                            "chat_id": self.settings.chat_id,
+                            "photo": InputFile(stream, filename=photo_path.name),
+                            "caption": source_body[:1024],
+                            "disable_notification": True,
+                        },
+                    )
+                photos = tuple(getattr(source, "photo", None) or ())
+                if not photos:
+                    raise RuntimeError("delivery_source_photo_missing")
+                photo = max(
+                    photos,
+                    key=lambda item: (
+                        int(getattr(item, "file_size", 0) or 0),
+                        int(getattr(item, "width", 0) or 0)
+                        * int(getattr(item, "height", 0) or 0),
+                    ),
+                )
+                file_id = str(getattr(photo, "file_id", "") or "")
+                file_unique_id = str(
+                    getattr(photo, "file_unique_id", "")
+                    or f"delivery:{order.id}:{order.sales_card_requested_at or ''}"
+                )
+                source_kind = "delivery_photo"
+            else:
+                source = await self._send_with_retry(
+                    bot.send_message,
+                    {
+                        "chat_id": self.settings.chat_id,
+                        "text": source_body[:4096],
+                        "disable_notification": True,
+                    },
+                )
+                file_id = TEXT_SOURCE_FILE_ID
+                file_unique_id = "delivery:" + hashlib.sha256(
+                    f"{order.id}:{order.sales_card_requested_at or ''}".encode()
+                ).hexdigest()[:32]
+                source_kind = "delivery_text"
+            source_message_id = int(source.message_id)
+            claimed = self.repository.claim_photo(
+                self.settings.chat_id,
+                source_message_id,
+                file_unique_id,
+                source_file_id=file_id,
+                client_caption=source_body,
+                message_thread_id=None,
+                source_message_ids=(source_message_id,),
+                source_kind=source_kind,
+                sale_date=order.created_date,
+                allocate_order=False,
+            )
+            if not claimed:
+                raise RuntimeError("delivery_sales_source_not_claimed")
+            self.repository.upsert_delivery_link(
+                self.settings.chat_id,
+                source_message_id,
+                delivery_order_id=order.id,
+                delivery_order_number=order.order_number,
+                matched_phone=order.client_phone or "delivery-order",
+                sale_date=order.created_date,
+            )
+            claim = _PhotoClaim(
+                chat_id=self.settings.chat_id,
+                source_message_id=source_message_id,
+                source_message_ids=(source_message_id,),
+                file_ids=(file_id,),
+                source_kind=source_kind,
+                client_caption=source_body,
+                message_thread_id=None,
+                sale_date=order.created_date,
+                product_label=product,
+                delivery_order_id=order.id,
+            )
+            key = (self.settings.chat_id, source_message_id)
+            self._active_sources.add(key)
+            try:
+                await self._run_photo_claim(claim, bot)
+            finally:
+                self._active_sources.discard(key)
+                self._cancelled_sources.discard(key)
+            replacement_id = self.repository.replacement_for_source(
+                self.settings.chat_id,
+                source_message_id,
+            )
+            if replacement_id is None:
+                raise _DeliverySalesPending("delivery_sales_card_not_published")
+            self.repository.sync_auto_delivery_manager(
+                self.settings.chat_id,
+                source_message_id,
+                self._sales_manager_name(order.manager_name),
+            )
+            await self._sync_linked_delivery_cards(bot, {order.id})
+            return source_message_id, replacement_id
+        except Exception:
+            if source_message_id is not None and self.repository.replacement_for_source(
+                self.settings.chat_id,
+                source_message_id,
+            ) is None:
+                await self._delete_duplicate(
+                    bot,
+                    self.settings.chat_id,
+                    source_message_id,
+                )
+            raise
+
+    async def _process_delivery_sales_requests(self, bot: Bot | Any) -> None:
+        bridge = self.delivery_sales_bridge
+        if bridge is None:
+            return
+        await asyncio.to_thread(bridge.recover_processing_requests)
+        requests = await asyncio.to_thread(bridge.pending_sales_requests, 10)
+        for request in requests:
+            claimed = await asyncio.to_thread(bridge.claim_sales_request, request.id)
+            if claimed is None:
+                continue
+            try:
+                source_id, replacement_id = await self._publish_delivery_sales_request(
+                    bot,
+                    claimed,
+                )
+            except asyncio.CancelledError:
+                raise
+            except _DeliverySalesPending:
+                await asyncio.to_thread(
+                    bridge.release_sales_request,
+                    claimed.id,
+                )
+                logger.info("delivery_sales_card_retry_pending order_id=%s", claimed.id)
+            except Exception as exc:
+                await asyncio.to_thread(
+                    bridge.finish_sales_request,
+                    claimed,
+                    error=_error_code(exc),
+                )
+                logger.warning(
+                    "delivery_sales_card_failed order_id=%s error_type=%s",
+                    claimed.id,
+                    _error_code(exc),
+                )
+            else:
+                await asyncio.to_thread(
+                    bridge.finish_sales_request,
+                    claimed,
+                    source_message_id=source_id,
+                    replacement_message_id=replacement_id,
+                )
+                logger.info(
+                    "delivery_sales_card_created order_id=%s message_id=%s",
+                    claimed.id,
+                    replacement_id,
+                )
+
     async def _delivery_sync_loop(self, bot: Bot | Any) -> None:
         if self.delivery_reader is None:
             return
+        if self.delivery_sales_bridge is not None:
+            try:
+                recovered = await asyncio.to_thread(
+                    self.delivery_sales_bridge.recover_processing_requests
+                )
+            except Exception as exc:
+                logger.warning(
+                    "delivery_sales_request_recovery_failed error_type=%s",
+                    _error_code(exc),
+                )
+            else:
+                if recovered:
+                    logger.warning("delivery_sales_requests_recovered count=%s", recovered)
         cursor = self.repository.delivery_event_cursor(self.settings.chat_id)
         if cursor is None:
             latest = await asyncio.to_thread(self.delivery_reader.latest_event_id)
@@ -3504,6 +3731,7 @@ class SalesPhotoService:
         while True:
             await asyncio.sleep(self.settings.delivery_sync_seconds)
             try:
+                await self._process_delivery_sales_requests(bot)
                 events = await asyncio.to_thread(
                     self.delivery_reader.events_after,
                     cursor,

@@ -25,8 +25,8 @@ services:
       SALES_PHOTO_LOG_LEVEL: "${SALES_PHOTO_LOG_LEVEL:-INFO}"
     volumes:
       - sales-photo-data:/app/data
-      # The application opens delivery.db with SQLite mode=ro. The volume stays
-      # writable because a live WAL database may require shared-memory sidecars.
+      # Normal reads use SQLite mode=ro. A narrow integration bridge updates
+      # only sales-card request/result fields. Both images use UID/GID 10001.
       - texnikach-delivery-data:/app/delivery-data
     read_only: true
     tmpfs:
