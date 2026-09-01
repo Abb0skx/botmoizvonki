@@ -13,7 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Protocol
 
-from telegram import Bot, InputFile, InputMediaPhoto, Message, Update
+from telegram import Bot, InputFile, InputMediaPhoto, Message, ReplyParameters, Update
 from telegram.constants import ChatType, ParseMode
 from telegram.error import BadRequest, NetworkError, RetryAfter
 from telegram.ext import ContextTypes
@@ -55,6 +55,15 @@ from .phones import (
 )
 from .prices import normalize_card_prices
 from .repository import SalesPhotoRepository, utc_now
+from .reminders import (
+    CLEANUP_CLOCKS,
+    FILL_REMINDER_MARKER,
+    NOTICE_CLOCKS,
+    build_fill_reminder,
+    inspect_fill_fields,
+    latest_active_slot,
+    next_slot,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -295,12 +304,14 @@ class SalesPhotoService:
         self._maintenance_forward_message_ids: dict[int, float] = {}
         self._order_audit_lock = asyncio.Lock()
         self._auto_correction_lock = asyncio.Lock()
+        self._fill_reminder_lock = asyncio.Lock()
         self._auto_correction_wake = asyncio.Event()
         self._last_order_audit = 0.0
         self._startup_gate_active = False
         self._maintenance_task: asyncio.Task[None] | None = None
         self._auto_correction_task: asyncio.Task[None] | None = None
         self._delivery_sync_task: asyncio.Task[None] | None = None
+        self._fill_reminder_task: asyncio.Task[None] | None = None
 
     async def preflight(self, bot: Bot) -> int:
         me = await bot.get_me()
@@ -468,6 +479,8 @@ class SalesPhotoService:
         if content is None:
             return
         _, body, _ = content
+        if body.startswith(FILL_REMINDER_MARKER):
+            return
         if self._is_order_backfill_forward(message):
             chat_id = _chat_id(message)
             message_id = getattr(message, "message_id", None)
@@ -3377,6 +3390,222 @@ class SalesPhotoService:
                 max(0.1, (next_due - now).total_seconds())
             )
 
+    async def run_fill_reminder_check(
+        self,
+        bot: Bot | Any,
+        *,
+        publish: bool,
+        reference_date: date | None = None,
+    ) -> None:
+        """Remove obsolete reminders and optionally refresh missing-field notices."""
+
+        async with self._fill_reminder_lock:
+            sale_date_from, sale_date_to = _recent_sale_window(reference_date)
+            for stale in self.repository.fill_reminders_outside_window(
+                self.settings.chat_id,
+                sale_date_from,
+                sale_date_to,
+            ):
+                if await self._delete_duplicate(
+                    bot,
+                    stale.chat_id,
+                    stale.reminder_message_id,
+                ):
+                    self.repository.clear_fill_reminder(
+                        stale.chat_id,
+                        stale.source_message_id,
+                        stale.reminder_message_id,
+                    )
+            candidates = self.repository.fill_reminder_candidates(
+                self.settings.chat_id,
+                sale_date_from,
+                sale_date_to,
+            )
+            checked = sent = deleted = failures = 0
+            for candidate_index, candidate in enumerate(candidates):
+                forwarded = None
+                try:
+                    self._order_backfill_forward_sources[
+                        candidate.replacement_message_id
+                    ] = time.monotonic() + 600
+                    forwarded = await self._send_with_retry(
+                        bot.forward_message,
+                        {
+                            "chat_id": candidate.chat_id,
+                            "from_chat_id": candidate.chat_id,
+                            "message_id": candidate.replacement_message_id,
+                            "disable_notification": True,
+                        },
+                    )
+                    self._track_maintenance_forward(
+                        candidate.replacement_message_id,
+                        forwarded,
+                    )
+                    content = _message_content(forwarded)
+                    if content is None:
+                        raise RuntimeError("forwarded_card_has_no_content")
+                    check = inspect_fill_fields(content[1], candidate.manager)
+                    checked += 1
+                    if check.complete or publish:
+                        old_id = candidate.reminder_message_id
+                        if old_id is not None:
+                            removed = await self._delete_duplicate(
+                                bot,
+                                candidate.chat_id,
+                                old_id,
+                            )
+                            if not removed:
+                                failures += 1
+                                continue
+                            self.repository.clear_fill_reminder(
+                                candidate.chat_id,
+                                candidate.source_message_id,
+                                old_id,
+                            )
+                            deleted += 1
+                    if check.complete or not publish:
+                        continue
+                    reminder = await self._send_with_retry(
+                        bot.send_message,
+                        {
+                            "chat_id": candidate.chat_id,
+                            "text": build_fill_reminder(check),
+                            "reply_parameters": ReplyParameters(
+                                message_id=candidate.replacement_message_id,
+                                allow_sending_without_reply=False,
+                            ),
+                        },
+                    )
+                    reminder_id = getattr(reminder, "message_id", None)
+                    if reminder_id is None:
+                        raise RuntimeError("reminder_message_has_no_id")
+                    try:
+                        self.repository.record_fill_reminder(
+                            candidate.chat_id,
+                            candidate.source_message_id,
+                            int(reminder_id),
+                        )
+                    except Exception:
+                        await self._delete_duplicate(
+                            bot,
+                            candidate.chat_id,
+                            int(reminder_id),
+                        )
+                        raise
+                    sent += 1
+                except asyncio.CancelledError:
+                    raise
+                except BadRequest as exc:
+                    failures += 1
+                    if _message_to_forward_missing(exc):
+                        self.repository.mark_order_card_removed(
+                            candidate.chat_id,
+                            candidate.source_message_id,
+                        )
+                        if candidate.reminder_message_id is not None:
+                            if await self._delete_duplicate(
+                                bot,
+                                candidate.chat_id,
+                                candidate.reminder_message_id,
+                            ):
+                                self.repository.clear_fill_reminder(
+                                    candidate.chat_id,
+                                    candidate.source_message_id,
+                                    candidate.reminder_message_id,
+                                )
+                    else:
+                        logger.warning(
+                            "sales_photo_fill_reminder_failed message_id=%s "
+                            "error_type=%s",
+                            candidate.replacement_message_id,
+                            _error_code(exc),
+                        )
+                except Exception as exc:
+                    failures += 1
+                    logger.warning(
+                        "sales_photo_fill_reminder_failed message_id=%s "
+                        "error_type=%s",
+                        candidate.replacement_message_id,
+                        _error_code(exc),
+                    )
+                finally:
+                    if forwarded is not None:
+                        temporary_id = getattr(forwarded, "message_id", None)
+                        if temporary_id is not None:
+                            await self._delete_duplicate(
+                                bot,
+                                candidate.chat_id,
+                                int(temporary_id),
+                            )
+                    self._safe_touch_heartbeat()
+                    if candidate_index + 1 < len(candidates):
+                        await asyncio.sleep(0.2)
+            logger.info(
+                "sales_photo_fill_reminder_complete publish=%s candidates=%s "
+                "checked=%s sent=%s deleted=%s failures=%s",
+                publish,
+                len(candidates),
+                checked,
+                sent,
+                deleted,
+                failures,
+            )
+
+    async def _fill_reminder_scheduler(self, bot: Bot | Any) -> None:
+        while True:
+            now = utc_now()
+            local_now = now.astimezone(TASHKENT_TZ)
+            cleanup_slot = latest_active_slot(
+                local_now,
+                CLEANUP_CLOCKS,
+                grace=timedelta(minutes=29, seconds=59),
+            )
+            notice_slot = latest_active_slot(
+                local_now,
+                NOTICE_CLOCKS,
+                grace=timedelta(minutes=59, seconds=59),
+            )
+            failed = False
+            for kind, slot, publish in (
+                ("cleanup", cleanup_slot, False),
+                ("notice", notice_slot, True),
+            ):
+                if slot is None:
+                    continue
+                slot_utc = slot.astimezone(UTC)
+                completed = self.repository.fill_reminder_schedule_state(
+                    self.settings.chat_id,
+                    kind,
+                )
+                if completed is not None and completed >= slot_utc:
+                    continue
+                try:
+                    await self.run_fill_reminder_check(bot, publish=publish)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "sales_photo_fill_reminder_scheduler_failed kind=%s "
+                        "error_type=%s",
+                        kind,
+                        _error_code(exc),
+                    )
+                    await asyncio.sleep(60)
+                    failed = True
+                    break
+                self.repository.mark_fill_reminder_schedule(
+                    self.settings.chat_id,
+                    kind,
+                    slot_utc,
+                )
+            if failed:
+                continue
+            next_due = min(
+                next_slot(local_now, CLEANUP_CLOCKS),
+                next_slot(local_now, NOTICE_CLOCKS),
+            ).astimezone(UTC)
+            await asyncio.sleep(max(0.1, (next_due - utc_now()).total_seconds()))
+
     async def _sync_linked_delivery_cards(
         self,
         bot: Bot | Any,
@@ -3864,10 +4093,12 @@ class SalesPhotoService:
         self._startup_gate_active = False
         self._ensure_auto_correction_scheduler(bot)
         self._ensure_delivery_sync(bot)
+        self._ensure_fill_reminder_scheduler(bot)
         while True:
             self._safe_touch_heartbeat()
             self._ensure_auto_correction_scheduler(bot)
             self._ensure_delivery_sync(bot)
+            self._ensure_fill_reminder_scheduler(bot)
             try:
                 stale_before = utc_now() - timedelta(
                     seconds=PROCESSING_STALE_SECONDS
@@ -3930,6 +4161,26 @@ class SalesPhotoService:
             name="sales-photo-auto-correction",
         )
 
+    def _ensure_fill_reminder_scheduler(self, bot: Bot | Any) -> None:
+        task = self._fill_reminder_task
+        if task is not None and not task.done():
+            return
+        if task is not None and not task.cancelled():
+            try:
+                error = task.exception()
+            except asyncio.CancelledError:
+                error = None
+            if error is not None:
+                logger.warning(
+                    "sales_photo_fill_reminder_scheduler_restarted "
+                    "error_type=%s",
+                    _error_code(error),
+                )
+        self._fill_reminder_task = asyncio.create_task(
+            self._fill_reminder_scheduler(bot),
+            name="sales-photo-fill-reminders",
+        )
+
     def start_maintenance(
         self,
         bot: Bot | Any,
@@ -3969,6 +4220,14 @@ class SalesPhotoService:
             except asyncio.CancelledError:
                 pass
             self._delivery_sync_task = None
+        fill_reminder_task = self._fill_reminder_task
+        if fill_reminder_task is not None:
+            fill_reminder_task.cancel()
+            try:
+                await fill_reminder_task
+            except asyncio.CancelledError:
+                pass
+            self._fill_reminder_task = None
         album_tasks = tuple(self._album_tasks.values())
         for album_task in album_tasks:
             album_task.cancel()

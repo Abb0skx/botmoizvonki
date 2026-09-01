@@ -102,6 +102,24 @@ class DeliveryLink:
 
 
 @dataclass(frozen=True)
+class FillReminderCandidate:
+    chat_id: int
+    source_message_id: int
+    replacement_message_id: int
+    sale_date: date
+    order_id: int
+    manager: str | None
+    reminder_message_id: int | None
+
+
+@dataclass(frozen=True)
+class FillReminderRecord:
+    chat_id: int
+    source_message_id: int
+    reminder_message_id: int
+
+
+@dataclass(frozen=True)
 class AutoCorrectionState:
     last_new_at: datetime | None = None
     event_generation: int = 0
@@ -420,6 +438,19 @@ class SalesPhotoRepository:
 
                 CREATE INDEX IF NOT EXISTS idx_sales_photo_delivery_order
                 ON sales_photo_delivery_links(chat_id,delivery_order_id);
+
+                CREATE TABLE IF NOT EXISTS sales_photo_fill_reminders (
+                    chat_id INTEGER NOT NULL,
+                    source_message_id INTEGER NOT NULL,
+                    reminder_message_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(chat_id,source_message_id),
+                    UNIQUE(chat_id,reminder_message_id),
+                    FOREIGN KEY(chat_id,source_message_id)
+                        REFERENCES sales_photo_jobs(chat_id,source_message_id)
+                        ON DELETE CASCADE
+                );
 
                 DROP TABLE IF EXISTS sales_photo_name_cache;
                 """
@@ -1254,6 +1285,171 @@ class SalesPhotoRepository:
             sale_date_from=sale_date_from,
             sale_date_to=sale_date_to,
         )
+
+    def fill_reminder_candidates(
+        self,
+        chat_id: int,
+        sale_date_from: date,
+        sale_date_to: date,
+        limit: int = 2000,
+    ) -> tuple[FillReminderCandidate, ...]:
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT job.chat_id,job.source_message_id,
+                          job.replacement_message_id,job.sale_date,
+                          job.daily_order_id,job.manager,
+                          reminder.reminder_message_id
+                   FROM sales_photo_jobs AS job
+                   LEFT JOIN sales_photo_fill_reminders AS reminder
+                     ON reminder.chat_id=job.chat_id
+                    AND reminder.source_message_id=job.source_message_id
+                   WHERE job.chat_id=?
+                     AND job.replacement_message_id IS NOT NULL
+                     AND job.sale_date>=? AND job.sale_date<=?
+                     AND job.daily_order_id IS NOT NULL
+                     AND job.order_removed=0
+                   ORDER BY job.sale_date,job.daily_order_id,
+                            job.created_at,job.source_message_id
+                   LIMIT ?""",
+                (
+                    int(chat_id),
+                    sale_date_from.isoformat(),
+                    sale_date_to.isoformat(),
+                    max(1, min(int(limit), 2000)),
+                ),
+            ).fetchall()
+        return tuple(
+            FillReminderCandidate(
+                chat_id=int(row["chat_id"]),
+                source_message_id=int(row["source_message_id"]),
+                replacement_message_id=int(row["replacement_message_id"]),
+                sale_date=date.fromisoformat(str(row["sale_date"])),
+                order_id=int(row["daily_order_id"]),
+                manager=str(row["manager"]) if row["manager"] else None,
+                reminder_message_id=(
+                    int(row["reminder_message_id"])
+                    if row["reminder_message_id"] is not None
+                    else None
+                ),
+            )
+            for row in rows
+        )
+
+    def record_fill_reminder(
+        self,
+        chat_id: int,
+        source_message_id: int,
+        reminder_message_id: int,
+        at: datetime | None = None,
+    ) -> None:
+        now = _iso(at or utc_now())
+        with self._connect() as db:
+            db.execute(
+                """INSERT INTO sales_photo_fill_reminders(
+                       chat_id,source_message_id,reminder_message_id,
+                       created_at,updated_at)
+                   VALUES(?,?,?,?,?)
+                   ON CONFLICT(chat_id,source_message_id) DO UPDATE SET
+                       reminder_message_id=excluded.reminder_message_id,
+                       updated_at=excluded.updated_at""",
+                (
+                    int(chat_id),
+                    int(source_message_id),
+                    int(reminder_message_id),
+                    now,
+                    now,
+                ),
+            )
+            db.commit()
+
+    def fill_reminders_outside_window(
+        self,
+        chat_id: int,
+        sale_date_from: date,
+        sale_date_to: date,
+    ) -> tuple[FillReminderRecord, ...]:
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT reminder.chat_id,reminder.source_message_id,
+                          reminder.reminder_message_id
+                   FROM sales_photo_fill_reminders AS reminder
+                   JOIN sales_photo_jobs AS job
+                     ON job.chat_id=reminder.chat_id
+                    AND job.source_message_id=reminder.source_message_id
+                   WHERE reminder.chat_id=?
+                     AND (job.order_removed=1 OR job.sale_date IS NULL
+                          OR job.sale_date<? OR job.sale_date>?)""",
+                (
+                    int(chat_id),
+                    sale_date_from.isoformat(),
+                    sale_date_to.isoformat(),
+                ),
+            ).fetchall()
+        return tuple(
+            FillReminderRecord(
+                chat_id=int(row["chat_id"]),
+                source_message_id=int(row["source_message_id"]),
+                reminder_message_id=int(row["reminder_message_id"]),
+            )
+            for row in rows
+        )
+
+    def clear_fill_reminder(
+        self,
+        chat_id: int,
+        source_message_id: int,
+        reminder_message_id: int | None = None,
+    ) -> bool:
+        with self._connect() as db:
+            cursor = db.execute(
+                """DELETE FROM sales_photo_fill_reminders
+                   WHERE chat_id=? AND source_message_id=?
+                     AND (? IS NULL OR reminder_message_id=?)""",
+                (
+                    int(chat_id),
+                    int(source_message_id),
+                    reminder_message_id,
+                    reminder_message_id,
+                ),
+            )
+            db.commit()
+        return cursor.rowcount == 1
+
+    @staticmethod
+    def _fill_reminder_schedule_key(kind: str, chat_id: int) -> str:
+        return f"fill_reminder:{str(kind)}:{int(chat_id)}"
+
+    def fill_reminder_schedule_state(
+        self,
+        chat_id: int,
+        kind: str,
+    ) -> datetime | None:
+        key = self._fill_reminder_schedule_key(kind, chat_id)
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT value FROM sales_photo_meta WHERE key=?",
+                (key,),
+            ).fetchone()
+        return self._state_datetime(row["value"]) if row is not None else None
+
+    def mark_fill_reminder_schedule(
+        self,
+        chat_id: int,
+        kind: str,
+        slot: datetime,
+    ) -> None:
+        key = self._fill_reminder_schedule_key(kind, chat_id)
+        canonical = _iso(slot)
+        with self._connect() as db:
+            db.execute(
+                """INSERT INTO sales_photo_meta(key,value,updated_at)
+                   VALUES(?,?,?)
+                   ON CONFLICT(key) DO UPDATE SET
+                       value=excluded.value,updated_at=excluded.updated_at
+                   WHERE sales_photo_meta.value < excluded.value""",
+                (key, canonical, _iso(utc_now())),
+            )
+            db.commit()
 
     def unreconciled_recent_photos(
         self,
