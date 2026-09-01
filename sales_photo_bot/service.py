@@ -85,6 +85,12 @@ def _already_deleted(error: BaseException) -> bool:
     return "message to delete not found" in message or "message_id_invalid" in message
 
 
+def _message_to_forward_missing(error: BaseException) -> bool:
+    return isinstance(error, BadRequest) and (
+        "message to forward not found" in str(error).casefold()
+    )
+
+
 def _chat_id(message: object) -> int | None:
     value = getattr(message, "chat_id", None)
     if value is None:
@@ -184,6 +190,7 @@ class SalesPhotoService:
         self._album_tasks: dict[tuple[int, str], asyncio.Task[None]] = {}
         self._active_sources: set[tuple[int, int]] = set()
         self._cancelled_sources: set[tuple[int, int]] = set()
+        self._order_backfill_forward_sources: dict[int, float] = {}
         self._startup_gate_active = False
         self._maintenance_task: asyncio.Task[None] | None = None
 
@@ -229,6 +236,16 @@ class SalesPhotoService:
         if str(getattr(message, "caption", "") or "").startswith(
             BOT_CARD_MARKER
         ):
+            if self._is_order_backfill_forward(message):
+                chat_id = _chat_id(message)
+                message_id = getattr(message, "message_id", None)
+                if chat_id is not None and message_id is not None:
+                    await self._delete_duplicate(
+                        context.bot,
+                        chat_id,
+                        int(message_id),
+                    )
+                return
             await self._reconcile_generated_post(
                 message,
                 context.bot,
@@ -257,6 +274,16 @@ class SalesPhotoService:
             return
         _, body, _ = content
         if body.startswith(BOT_CARD_MARKER):
+            if self._is_order_backfill_forward(message):
+                chat_id = _chat_id(message)
+                message_id = getattr(message, "message_id", None)
+                if chat_id is not None and message_id is not None:
+                    await self._delete_duplicate(
+                        context.bot,
+                        chat_id,
+                        int(message_id),
+                    )
+                return
             await self._reconcile_generated_post(
                 message,
                 context.bot,
@@ -311,6 +338,30 @@ class SalesPhotoService:
                 finished,
                 key,
             )
+        )
+
+    @staticmethod
+    def _forward_origin_message_id(message: object) -> int | None:
+        origin = getattr(message, "forward_origin", None)
+        value = getattr(origin, "message_id", None)
+        if value is None:
+            value = getattr(message, "forward_from_message_id", None)
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _is_order_backfill_forward(self, message: object) -> bool:
+        now = time.monotonic()
+        for source_id, expires_at in tuple(
+            self._order_backfill_forward_sources.items()
+        ):
+            if expires_at < now:
+                self._order_backfill_forward_sources.pop(source_id, None)
+        source_message_id = self._forward_origin_message_id(message)
+        return bool(
+            source_message_id is not None
+            and source_message_id in self._order_backfill_forward_sources
         )
 
     def _queue_album(
@@ -2085,6 +2136,9 @@ class SalesPhotoService:
 
             forwarded = None
             try:
+                self._order_backfill_forward_sources[
+                    job.replacement_message_id
+                ] = time.monotonic() + 600
                 forwarded = await self._send_with_retry(
                     bot.forward_message,
                     {
@@ -2148,6 +2202,18 @@ class SalesPhotoService:
                     self.repository.mark_order_card_applied(
                         job.chat_id,
                         job.source_message_id,
+                    )
+                elif _message_to_forward_missing(exc):
+                    self.repository.mark_order_card_applied(
+                        job.chat_id,
+                        job.source_message_id,
+                    )
+                    logger.info(
+                        "sales_photo_order_backfill_skipped_missing chat_id=%s "
+                        "message_id=%s order_id=%s",
+                        job.chat_id,
+                        job.replacement_message_id,
+                        job.order_id,
                     )
                 else:
                     self.repository.mark_order_backfill_failed(

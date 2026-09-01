@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from telegram import MessageEntity
+from telegram.error import BadRequest
 
 from sales_photo_bot.config import Settings
 from sales_photo_bot.orders import card_order_id, ensure_card_order_id
@@ -183,6 +184,57 @@ class ExistingCardBackfillTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("rasxod: $3", edited)
             self.assertIn("🇺🇿: 1 250 000", edited)
             self.assertEqual(repo.pending_order_backfills(CHAT_ID), ())
+
+    async def test_deleted_legacy_message_is_retired_without_retries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SalesPhotoRepository(root / "sales.db")
+            created = datetime(2026, 8, 31, 10, 0, tzinfo=timezone.utc)
+            repo.claim_photo(
+                CHAT_ID,
+                10,
+                "legacy",
+                source_file_id="file",
+                at=created,
+            )
+            repo.mark_reposted(CHAT_ID, 10, 200, at=created)
+            repo.mark_complete(CHAT_ID, 10, at=created)
+            repo = SalesPhotoRepository(root / "sales.db")
+            service = SalesPhotoService(settings(root), repo)
+            bot = SimpleNamespace(
+                forward_message=AsyncMock(
+                    side_effect=BadRequest("Message to forward not found")
+                ),
+                delete_message=AsyncMock(),
+            )
+
+            await service.backfill_order_cards(bot, ignore_delay=True)
+
+            self.assertEqual(repo.pending_order_backfills(CHAT_ID), ())
+            bot.delete_message.assert_not_awaited()
+
+    async def test_ambiguous_forward_update_is_deleted_automatically(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SalesPhotoRepository(root / "sales.db")
+            service = SalesPhotoService(settings(root), repo)
+            service._order_backfill_forward_sources[200] = float("inf")
+            message = SimpleNamespace(
+                chat_id=CHAT_ID,
+                chat=SimpleNamespace(id=CHAT_ID),
+                message_id=900,
+                text=BOT_CARD_MARKER + "🆔: 1\n\n🛒💵:",
+                entities=(),
+                forward_origin=SimpleNamespace(message_id=200),
+            )
+            bot = SimpleNamespace(delete_message=AsyncMock(return_value=True))
+
+            await service.on_text(
+                SimpleNamespace(effective_message=message),
+                SimpleNamespace(bot=bot),
+            )
+
+            bot.delete_message.assert_awaited_once_with(CHAT_ID, 900)
 
 
 if __name__ == "__main__":
