@@ -66,6 +66,15 @@ class PendingOrderBackfill:
 
 
 @dataclass(frozen=True)
+class PendingPriceBackfill:
+    chat_id: int
+    source_message_id: int
+    replacement_message_id: int
+    attempts: int
+    updated_at: datetime
+
+
+@dataclass(frozen=True)
 class OrderAuditCandidate:
     chat_id: int
     source_message_id: int
@@ -316,6 +325,8 @@ class SalesPhotoRepository:
                     daily_order_id INTEGER,
                     order_card_applied INTEGER NOT NULL DEFAULT 0,
                     order_backfill_attempts INTEGER NOT NULL DEFAULT 0,
+                    price_card_applied INTEGER NOT NULL DEFAULT 0,
+                    price_backfill_attempts INTEGER NOT NULL DEFAULT 0,
                     order_removed INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL CHECK(status IN (
                         'processing','reposted','delete_pending','complete','failed'
@@ -400,6 +411,16 @@ class SalesPhotoRepository:
                 db.execute(
                     "ALTER TABLE sales_photo_jobs ADD COLUMN "
                     "order_backfill_attempts INTEGER NOT NULL DEFAULT 0"
+                )
+            if "price_card_applied" not in columns:
+                db.execute(
+                    "ALTER TABLE sales_photo_jobs ADD COLUMN "
+                    "price_card_applied INTEGER NOT NULL DEFAULT 0"
+                )
+            if "price_backfill_attempts" not in columns:
+                db.execute(
+                    "ALTER TABLE sales_photo_jobs ADD COLUMN "
+                    "price_backfill_attempts INTEGER NOT NULL DEFAULT 0"
                 )
             if "order_removed" not in columns:
                 db.execute(
@@ -508,6 +529,9 @@ class SalesPhotoRepository:
 
                 CREATE INDEX IF NOT EXISTS idx_sales_photo_order_backfill
                 ON sales_photo_jobs(order_card_applied,order_backfill_attempts,updated_at);
+
+                CREATE INDEX IF NOT EXISTS idx_sales_photo_price_backfill
+                ON sales_photo_jobs(price_card_applied,price_backfill_attempts,updated_at);
                 """
             )
             db.commit()
@@ -822,6 +846,55 @@ class SalesPhotoRepository:
             for row in rows
         )
 
+    def mark_price_card_applied(
+        self,
+        chat_id: int,
+        source_message_id: int,
+        at: datetime | None = None,
+    ) -> bool:
+        with self._connect() as db:
+            cursor = db.execute(
+                """UPDATE sales_photo_jobs
+                   SET price_card_applied=1,price_backfill_attempts=0,updated_at=?
+                   WHERE chat_id=? AND source_message_id=?
+                     AND replacement_message_id IS NOT NULL""",
+                (
+                    _iso(at or utc_now()),
+                    int(chat_id),
+                    int(source_message_id),
+                ),
+            )
+            db.commit()
+        return cursor.rowcount == 1
+
+    def pending_price_backfills(
+        self,
+        chat_id: int,
+        limit: int = 50,
+    ) -> tuple[PendingPriceBackfill, ...]:
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT chat_id,source_message_id,replacement_message_id,
+                          price_backfill_attempts,updated_at
+                   FROM sales_photo_jobs
+                   WHERE chat_id=? AND replacement_message_id IS NOT NULL
+                     AND order_removed=0
+                     AND price_card_applied=0 AND price_backfill_attempts<8
+                   ORDER BY created_at,source_message_id
+                   LIMIT ?""",
+                (int(chat_id), max(1, min(int(limit), 200))),
+            ).fetchall()
+        return tuple(
+            PendingPriceBackfill(
+                chat_id=int(row["chat_id"]),
+                source_message_id=int(row["source_message_id"]),
+                replacement_message_id=int(row["replacement_message_id"]),
+                attempts=int(row["price_backfill_attempts"]),
+                updated_at=datetime.fromisoformat(str(row["updated_at"])),
+            )
+            for row in rows
+        )
+
     def order_audit_candidates(
         self,
         chat_id: int,
@@ -874,6 +947,7 @@ class SalesPhotoRepository:
                 """UPDATE sales_photo_jobs
                    SET daily_order_id=NULL,order_removed=1,
                        order_card_applied=1,order_backfill_attempts=0,
+                       price_card_applied=1,price_backfill_attempts=0,
                        updated_at=?
                    WHERE chat_id=? AND source_message_id=?""",
                 (
@@ -925,6 +999,27 @@ class SalesPhotoRepository:
                    SET order_backfill_attempts=order_backfill_attempts+1,updated_at=?
                    WHERE chat_id=? AND source_message_id=?
                      AND order_card_applied=0""",
+                (
+                    _iso(at or utc_now()),
+                    int(chat_id),
+                    int(source_message_id),
+                ),
+            )
+            db.commit()
+
+    def mark_price_backfill_failed(
+        self,
+        chat_id: int,
+        source_message_id: int,
+        at: datetime | None = None,
+    ) -> None:
+        with self._connect() as db:
+            db.execute(
+                """UPDATE sales_photo_jobs
+                   SET price_backfill_attempts=price_backfill_attempts+1,
+                       updated_at=?
+                   WHERE chat_id=? AND source_message_id=?
+                     AND price_card_applied=0""",
                 (
                     _iso(at or utc_now()),
                     int(chat_id),

@@ -1679,9 +1679,10 @@ class EditedCaptionTests(unittest.IsolatedAsyncioTestCase):
             "📞: +998 90 123 45 67 / +998 91 765 43 21",
             kwargs["caption"],
         )
-        self.assertIn("🛒💵: ACME / $100", kwargs["caption"])
+        self.assertIn("🛒💵: ACME / 100$", kwargs["caption"])
         self.assertIn("rasxod: $3", kwargs["caption"])
-        self.assertIn("🇺🇿: 1 250 000", kwargs["caption"])
+        self.assertIn("💵: 101$", kwargs["caption"])
+        self.assertIn("🇺🇿: 1 250 000 So'm", kwargs["caption"])
         self.assertNotIn("parse_mode", kwargs)
         markup = kwargs["reply_markup"].to_dict()
         self.assertEqual(
