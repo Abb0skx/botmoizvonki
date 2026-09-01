@@ -66,6 +66,15 @@ class PendingOrderBackfill:
 
 
 @dataclass(frozen=True)
+class OrderAuditCandidate:
+    chat_id: int
+    source_message_id: int
+    replacement_message_id: int
+    sale_date: date
+    order_id: int
+
+
+@dataclass(frozen=True)
 class PendingDuplicate:
     chat_id: int
     message_id: int
@@ -307,6 +316,7 @@ class SalesPhotoRepository:
                     daily_order_id INTEGER,
                     order_card_applied INTEGER NOT NULL DEFAULT 0,
                     order_backfill_attempts INTEGER NOT NULL DEFAULT 0,
+                    order_removed INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL CHECK(status IN (
                         'processing','reposted','delete_pending','complete','failed'
                     )),
@@ -391,10 +401,16 @@ class SalesPhotoRepository:
                     "ALTER TABLE sales_photo_jobs ADD COLUMN "
                     "order_backfill_attempts INTEGER NOT NULL DEFAULT 0"
                 )
+            if "order_removed" not in columns:
+                db.execute(
+                    "ALTER TABLE sales_photo_jobs ADD COLUMN "
+                    "order_removed INTEGER NOT NULL DEFAULT 0"
+                )
             legacy_rows = db.execute(
                 """SELECT chat_id,source_message_id,created_at
                    FROM sales_photo_jobs
                    WHERE replacement_message_id IS NOT NULL
+                     AND order_removed=0
                      AND (sale_date IS NULL OR daily_order_id IS NULL)
                    ORDER BY created_at,source_message_id"""
             ).fetchall()
@@ -404,6 +420,7 @@ class SalesPhotoRepository:
                     """SELECT chat_id,sale_date,MAX(daily_order_id) AS maximum
                        FROM sales_photo_jobs
                        WHERE sale_date IS NOT NULL AND daily_order_id IS NOT NULL
+                         AND order_removed=0
                        GROUP BY chat_id,sale_date"""
                 ).fetchall()
             }
@@ -538,6 +555,7 @@ class SalesPhotoRepository:
         source_message_ids: tuple[int, ...] | None = None,
         source_kind: str = "photo",
         sale_date: date | None = None,
+        allocate_order: bool = True,
     ) -> bool:
         now = _iso(at or utc_now())
         member_ids = tuple(
@@ -617,12 +635,23 @@ class SalesPhotoRepository:
                 if cursor.rowcount != 1:
                     db.rollback()
                     return False
-            if sale_date is not None:
+            if sale_date is not None and allocate_order:
                 self._ensure_daily_order_locked(
                     db,
                     int(chat_id),
                     int(source_message_id),
                     sale_date,
+                )
+            elif sale_date is not None:
+                db.execute(
+                    """UPDATE sales_photo_jobs
+                       SET sale_date=COALESCE(sale_date,?)
+                       WHERE chat_id=? AND source_message_id=?""",
+                    (
+                        sale_date.isoformat(),
+                        int(chat_id),
+                        int(source_message_id),
+                    ),
                 )
             try:
                 db.executemany(
@@ -671,7 +700,7 @@ class SalesPhotoRepository:
         sale_day = sale_date.isoformat()
         maximum = db.execute(
             """SELECT COALESCE(MAX(daily_order_id),0) FROM sales_photo_jobs
-               WHERE chat_id=? AND sale_date=?""",
+               WHERE chat_id=? AND sale_date=? AND order_removed=0""",
             (int(chat_id), sale_day),
         ).fetchone()[0]
         order_id = int(maximum) + 1
@@ -679,12 +708,14 @@ class SalesPhotoRepository:
             """UPDATE sales_photo_jobs
                SET sale_date=?,daily_order_id=?
                WHERE chat_id=? AND source_message_id=?
-                 AND sale_date IS NULL AND daily_order_id IS NULL""",
+                 AND daily_order_id IS NULL
+                 AND (sale_date IS NULL OR sale_date=?)""",
             (
                 sale_day,
                 order_id,
                 int(chat_id),
                 int(source_message_id),
+                sale_day,
             ),
         )
         if cursor.rowcount != 1:
@@ -772,6 +803,7 @@ class SalesPhotoRepository:
                    FROM sales_photo_jobs
                    WHERE chat_id=? AND replacement_message_id IS NOT NULL
                      AND sale_date IS NOT NULL AND daily_order_id IS NOT NULL
+                     AND order_removed=0
                      AND order_card_applied=0 AND order_backfill_attempts<8
                    ORDER BY created_at,source_message_id
                    LIMIT ?""",
@@ -789,6 +821,97 @@ class SalesPhotoRepository:
             )
             for row in rows
         )
+
+    def order_audit_candidates(
+        self,
+        chat_id: int,
+        limit: int = 500,
+    ) -> tuple[OrderAuditCandidate, ...]:
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT chat_id,source_message_id,replacement_message_id,
+                          sale_date,daily_order_id
+                   FROM sales_photo_jobs
+                   WHERE chat_id=? AND replacement_message_id IS NOT NULL
+                     AND sale_date IS NOT NULL AND daily_order_id IS NOT NULL
+                     AND order_removed=0
+                   ORDER BY sale_date,daily_order_id,created_at,source_message_id
+                   LIMIT ?""",
+                (int(chat_id), max(1, min(int(limit), 2000))),
+            ).fetchall()
+        return tuple(
+            OrderAuditCandidate(
+                chat_id=int(row["chat_id"]),
+                source_message_id=int(row["source_message_id"]),
+                replacement_message_id=int(row["replacement_message_id"]),
+                sale_date=date.fromisoformat(str(row["sale_date"])),
+                order_id=int(row["daily_order_id"]),
+            )
+            for row in rows
+        )
+
+    def mark_order_card_removed(
+        self,
+        chat_id: int,
+        source_message_id: int,
+        at: datetime | None = None,
+    ) -> tuple[date | None, int]:
+        """Remove one sold item from its day and compact all later IDs."""
+
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                """SELECT sale_date FROM sales_photo_jobs
+                   WHERE chat_id=? AND source_message_id=?
+                     AND order_removed=0""",
+                (int(chat_id), int(source_message_id)),
+            ).fetchone()
+            if row is None or row["sale_date"] is None:
+                db.rollback()
+                return None, 0
+            sale_day = date.fromisoformat(str(row["sale_date"]))
+            db.execute(
+                """UPDATE sales_photo_jobs
+                   SET daily_order_id=NULL,order_removed=1,
+                       order_card_applied=1,order_backfill_attempts=0,
+                       updated_at=?
+                   WHERE chat_id=? AND source_message_id=?""",
+                (
+                    _iso(at or utc_now()),
+                    int(chat_id),
+                    int(source_message_id),
+                ),
+            )
+            active_rows = db.execute(
+                """SELECT source_message_id,daily_order_id
+                   FROM sales_photo_jobs
+                   WHERE chat_id=? AND sale_date=? AND order_removed=0
+                     AND replacement_message_id IS NOT NULL
+                     AND daily_order_id IS NOT NULL
+                   ORDER BY created_at,source_message_id""",
+                (int(chat_id), sale_day.isoformat()),
+            ).fetchall()
+            changed = 0
+            for expected_id, active_row in enumerate(active_rows, start=1):
+                current_id = int(active_row["daily_order_id"])
+                if current_id == expected_id:
+                    continue
+                cursor = db.execute(
+                    """UPDATE sales_photo_jobs
+                       SET daily_order_id=?,order_card_applied=0,
+                           order_backfill_attempts=0,updated_at=?
+                       WHERE chat_id=? AND source_message_id=?
+                         AND order_removed=0""",
+                    (
+                        expected_id,
+                        _iso(at or utc_now()),
+                        int(chat_id),
+                        int(active_row["source_message_id"]),
+                    ),
+                )
+                changed += int(cursor.rowcount)
+            db.commit()
+        return sale_day, changed
 
     def mark_order_backfill_failed(
         self,

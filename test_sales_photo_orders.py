@@ -133,6 +133,58 @@ class DailyOrderRepositoryTests(unittest.TestCase):
                 [1, 2],
             )
 
+    def test_removed_sale_compacts_later_ids_and_next_sale_uses_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = SalesPhotoRepository(Path(directory) / "sales.db")
+            sale_day = date(2026, 8, 31)
+            for source_id in range(10, 15):
+                repo.claim_photo(
+                    CHAT_ID,
+                    source_id,
+                    f"unique-{source_id}",
+                    source_file_id=f"file-{source_id}",
+                    sale_date=sale_day,
+                )
+                repo.mark_reposted(CHAT_ID, source_id, source_id + 190)
+                repo.mark_complete(CHAT_ID, source_id)
+                repo.mark_order_card_applied(CHAT_ID, source_id)
+
+            removed_day, changed = repo.mark_order_card_removed(CHAT_ID, 12)
+
+            self.assertEqual(removed_day, sale_day)
+            self.assertEqual(changed, 2)
+            self.assertIsNone(repo.daily_order_for_source(CHAT_ID, 12))
+            self.assertEqual(
+                repo.daily_order_for_source(CHAT_ID, 13),
+                (sale_day, 3),
+            )
+            self.assertEqual(
+                repo.daily_order_for_source(CHAT_ID, 14),
+                (sale_day, 4),
+            )
+            self.assertEqual(
+                [job.order_id for job in repo.pending_order_backfills(CHAT_ID)],
+                [3, 4],
+            )
+
+            repo.claim_photo(
+                CHAT_ID,
+                15,
+                "unique-15",
+                source_file_id="file-15",
+                sale_date=sale_day,
+            )
+            self.assertEqual(
+                repo.daily_order_for_source(CHAT_ID, 15),
+                (sale_day, 5),
+            )
+            reopened = SalesPhotoRepository(repo.path)
+            self.assertIsNone(reopened.daily_order_for_source(CHAT_ID, 12))
+            self.assertEqual(
+                reopened.daily_order_for_source(CHAT_ID, 15),
+                (sale_day, 5),
+            )
+
 
 class ExistingCardBackfillTests(unittest.IsolatedAsyncioTestCase):
     async def test_existing_caption_gets_id_without_losing_manual_finance(self):
@@ -235,6 +287,47 @@ class ExistingCardBackfillTests(unittest.IsolatedAsyncioTestCase):
             )
 
             bot.delete_message.assert_awaited_once_with(CHAT_ID, 900)
+
+    async def test_audit_detects_deleted_card_and_compacts_the_day(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SalesPhotoRepository(root / "sales.db")
+            sale_day = date(2026, 8, 31)
+            for source_id in (10, 11, 12):
+                repo.claim_photo(
+                    CHAT_ID,
+                    source_id,
+                    f"unique-{source_id}",
+                    source_file_id=f"file-{source_id}",
+                    sale_date=sale_day,
+                )
+                repo.mark_reposted(CHAT_ID, source_id, source_id + 190)
+                repo.mark_complete(CHAT_ID, source_id)
+                repo.mark_order_card_applied(CHAT_ID, source_id)
+            service = SalesPhotoService(settings(root), repo)
+
+            async def edit_markup(**kwargs):
+                if kwargs["message_id"] == 201:
+                    raise BadRequest("Message to edit not found")
+                raise BadRequest("Message is not modified")
+
+            bot = SimpleNamespace(
+                edit_message_reply_markup=AsyncMock(side_effect=edit_markup)
+            )
+
+            removed = await service.audit_deleted_order_cards(bot, force=True)
+
+            self.assertEqual(removed, 1)
+            self.assertIsNone(repo.daily_order_for_source(CHAT_ID, 11))
+            self.assertEqual(
+                repo.daily_order_for_source(CHAT_ID, 12),
+                (sale_day, 2),
+            )
+            pending = repo.pending_order_backfills(CHAT_ID)
+            self.assertEqual(
+                [(job.source_message_id, job.order_id) for job in pending],
+                [(12, 2)],
+            )
 
 
 if __name__ == "__main__":

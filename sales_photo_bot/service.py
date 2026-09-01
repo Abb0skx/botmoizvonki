@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Protocol
 
 from telegram import Bot, InputMediaPhoto, Message, Update
@@ -40,6 +41,7 @@ CAPTION_REVISION_TTL_SECONDS = 600.0
 CAPTION_REVISION_LIMIT = 4096
 PROCESSING_STALE_SECONDS = 180
 ALBUM_SETTLE_SECONDS = 1.0
+ORDER_AUDIT_INTERVAL_SECONDS = 60.0
 TEXT_SOURCE_FILE_ID = "sales-photo:text"
 _SOURCE_CALLBACK_RE = re.compile(
     r"^sp:(?:m:[a-z]+|b):(\d+):(\d+):([0-9a-f]{12})$"
@@ -89,6 +91,13 @@ def _message_to_forward_missing(error: BaseException) -> bool:
     return isinstance(error, BadRequest) and (
         "message to forward not found" in str(error).casefold()
     )
+
+
+def _message_to_edit_missing(error: BaseException) -> bool:
+    if not isinstance(error, BadRequest):
+        return False
+    message = str(error).casefold()
+    return "message to edit not found" in message or "message_id_invalid" in message
 
 
 def _chat_id(message: object) -> int | None:
@@ -191,6 +200,8 @@ class SalesPhotoService:
         self._active_sources: set[tuple[int, int]] = set()
         self._cancelled_sources: set[tuple[int, int]] = set()
         self._order_backfill_forward_sources: dict[int, float] = {}
+        self._order_audit_lock = asyncio.Lock()
+        self._last_order_audit = 0.0
         self._startup_gate_active = False
         self._maintenance_task: asyncio.Task[None] | None = None
 
@@ -766,6 +777,7 @@ class SalesPhotoService:
             client_caption=client_caption,
             message_thread_id=getattr(message, "message_thread_id", None),
             sale_date=effective_sale_date,
+            allocate_order=False,
         ):
             return None
         self._active_sources.add(key)
@@ -817,6 +829,7 @@ class SalesPhotoService:
             source_message_ids=(source_message_id,),
             source_kind="text",
             sale_date=effective_sale_date,
+            allocate_order=False,
         ):
             return None
         self._active_sources.add(key)
@@ -907,6 +920,7 @@ class SalesPhotoService:
             client_caption=client_caption,
             message_thread_id=getattr(ordered[0], "message_thread_id", None),
             sale_date=effective_sale_date,
+            allocate_order=False,
         ):
             return None
         self._active_sources.add(key)
@@ -1041,6 +1055,12 @@ class SalesPhotoService:
             )
             return
         try:
+            removed_count = await self.audit_deleted_order_cards(
+                bot,
+                force=True,
+            )
+            if removed_count:
+                await self.backfill_order_cards(bot, ignore_delay=True)
             _, order_id = self.repository.ensure_daily_order(
                 chat_id,
                 source_message_id,
@@ -2204,17 +2224,19 @@ class SalesPhotoService:
                         job.source_message_id,
                     )
                 elif _message_to_forward_missing(exc):
-                    self.repository.mark_order_card_applied(
+                    sale_day, changed = self.repository.mark_order_card_removed(
                         job.chat_id,
                         job.source_message_id,
                     )
                     logger.info(
-                        "sales_photo_order_backfill_skipped_missing chat_id=%s "
-                        "message_id=%s order_id=%s",
+                        "sales_photo_order_backfill_removed chat_id=%s "
+                        "message_id=%s sale_date=%s changed=%s",
                         job.chat_id,
                         job.replacement_message_id,
-                        job.order_id,
+                        sale_day.isoformat() if sale_day else "unknown",
+                        changed,
                     )
+                    return
                 else:
                     self.repository.mark_order_backfill_failed(
                         job.chat_id,
@@ -2249,6 +2271,77 @@ class SalesPhotoService:
                             int(temporary_message_id),
                         )
             self._touch_heartbeat()
+
+    async def audit_deleted_order_cards(
+        self,
+        bot: Bot | Any,
+        *,
+        force: bool = False,
+    ) -> int:
+        """Detect manually deleted Telegram cards and compact their daily IDs."""
+
+        async with self._order_audit_lock:
+            now = time.monotonic()
+            if (
+                not force
+                and now - self._last_order_audit < ORDER_AUDIT_INTERVAL_SECONDS
+            ):
+                return 0
+            self._last_order_audit = now
+            removed_count = 0
+            for candidate in self.repository.order_audit_candidates(
+                self.settings.chat_id,
+            ):
+                placeholder = SimpleNamespace(reply_markup=None)
+                try:
+                    await self._send_with_retry(
+                        bot.edit_message_reply_markup,
+                        {
+                            "chat_id": candidate.chat_id,
+                            "message_id": candidate.replacement_message_id,
+                            "reply_markup": self._current_card_markup(
+                                candidate.chat_id,
+                                candidate.replacement_message_id,
+                                placeholder,
+                            ),
+                        },
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except BadRequest as exc:
+                    if "message is not modified" in str(exc).casefold():
+                        continue
+                    if not _message_to_edit_missing(exc):
+                        logger.warning(
+                            "sales_photo_order_audit_failed chat_id=%s "
+                            "message_id=%s error_type=%s",
+                            candidate.chat_id,
+                            candidate.replacement_message_id,
+                            _error_code(exc),
+                        )
+                        continue
+                    sale_day, changed = self.repository.mark_order_card_removed(
+                        candidate.chat_id,
+                        candidate.source_message_id,
+                    )
+                    removed_count += int(sale_day is not None)
+                    logger.info(
+                        "sales_photo_order_removed chat_id=%s message_id=%s "
+                        "sale_date=%s changed=%s",
+                        candidate.chat_id,
+                        candidate.replacement_message_id,
+                        sale_day.isoformat() if sale_day else "unknown",
+                        changed,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "sales_photo_order_audit_failed chat_id=%s message_id=%s "
+                        "error_type=%s",
+                        candidate.chat_id,
+                        candidate.replacement_message_id,
+                        _error_code(exc),
+                    )
+            return removed_count
 
     async def retry_duplicate_cleanups(self, bot: Bot | Any) -> None:
         now = utc_now()
@@ -2326,6 +2419,7 @@ class SalesPhotoService:
     ) -> None:
         await self._wait_for_startup_drain(startup_ready, update_queue)
         try:
+            await self.audit_deleted_order_cards(bot, force=True)
             await self.backfill_order_cards(bot, ignore_delay=True)
         except asyncio.CancelledError:
             raise
@@ -2356,6 +2450,7 @@ class SalesPhotoService:
                     "sales_photo_stale_release_failed error_type=%s", _error_code(exc)
                 )
             for stage_name, stage in (
+                ("order_audit", self.audit_deleted_order_cards),
                 ("order_backfill", self.backfill_order_cards),
                 ("source_delete", self.retry_pending_deletions),
                 ("duplicate_delete", self.retry_duplicate_cleanups),
