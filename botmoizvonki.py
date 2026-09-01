@@ -604,6 +604,9 @@ CALL_SOURCE_PROFILES = {
         "sim_labels": {
             "998908456162": "SIM 1",
         },
+        "source_by_number": {
+            "998908456162": "olx",
+        },
         "source_by_slot": {
             0: "olx",
         },
@@ -616,6 +619,9 @@ CALL_SOURCE_PROFILES = {
         },
         "sim_labels": {
             "998908534466": "SIM 1",
+        },
+        "source_by_number": {
+            "998908534466": "olx",
         },
         "source_by_slot": {
             0: "olx",

@@ -162,10 +162,21 @@ class CallSourceTests(unittest.TestCase):
         self.assertIn("👤 Менеджер: Otabek", button_texts)
         self.assertIn("📣 Источник: OLX", button_texts)
 
-    def test_tecno_sim_two_has_no_automatic_source(self):
+    def test_tecno_known_sim_number_is_olx_even_if_slot_is_one(self):
         saved = self.save(
             "texnikacholx@gmail.com",
             self.event(16, "+998900000016", 1, "+998908456162"),
+        )
+        call = bot.get_call(saved["call_id"])
+
+        self.assertEqual(call["device_name"], "Tecno")
+        self.assertEqual(call["talk_manager_code"], "otabek")
+        self.assertEqual(call["effective_lead_source_code"], "olx")
+
+    def test_tecno_unknown_sim_two_has_no_automatic_source(self):
+        saved = self.save(
+            "texnikacholx@gmail.com",
+            self.event(19, "+998900000019", 1, "+998977777779"),
         )
         call = bot.get_call(saved["call_id"])
 
