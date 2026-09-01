@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import timedelta
 from typing import Any
 
@@ -22,6 +23,10 @@ from .service import IdentifierRecognizer, SalesPhotoService
 
 
 logger = logging.getLogger(__name__)
+OBNOVIT_COMMAND_RE = re.compile(
+    r"^/obnovit(?:@[A-Za-z0-9_]+)?(?:\s|$)",
+    re.IGNORECASE,
+)
 POLLING_ALLOWED_UPDATES = (
     "message",
     "channel_post",
@@ -158,6 +163,15 @@ def build_application(
             filters.UpdateType.EDITED_CHANNEL_POST
             & filters.Chat(chat_id=settings.chat_id),
             service.on_edited_photo,
+        )
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.UpdateType.CHANNEL_POST
+            & filters.Chat(chat_id=settings.chat_id)
+            & filters.TEXT
+            & filters.Regex(OBNOVIT_COMMAND_RE),
+            service.on_obnovit,
         )
     )
     application.add_handler(

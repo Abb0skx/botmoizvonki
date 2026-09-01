@@ -2436,7 +2436,7 @@ class ApplicationWiringTests(unittest.TestCase):
             self.assertIsNone(
                 app.bot_data["sales_photo_service"].recognizer
             )
-            self.assertEqual(len(app.handlers[0]), 4)
+            self.assertEqual(len(app.handlers[0]), 5)
             self.assertEqual(app.update_processor.max_concurrent_updates, 4)
             keyboard = manager_keyboard().to_dict()
             self.assertEqual(
@@ -2445,7 +2445,7 @@ class ApplicationWiringTests(unittest.TestCase):
             )
             signature = repo.callback_signature(CHAT_ID, 10, 0)
             callback_data = f"sp:m:olmas:10:0:{signature}"
-            self.assertIsNotNone(app.handlers[0][3].pattern.fullmatch(callback_data))
+            self.assertIsNotNone(app.handlers[0][4].pattern.fullmatch(callback_data))
 
             chat = Chat(id=CHAT_ID, type="channel")
             photo = PhotoSize(
@@ -2481,13 +2481,24 @@ class ApplicationWiringTests(unittest.TestCase):
                     text="A16",
                 ),
             )
+            command_channel_post = Update(
+                update_id=5,
+                channel_post=Message(
+                    message_id=12,
+                    date=datetime.now(timezone.utc),
+                    chat=chat,
+                    text="/obnovit",
+                ),
+            )
             self.assertTrue(app.handlers[0][0].check_update(channel_post))
             self.assertFalse(app.handlers[0][0].check_update(edited_post))
             self.assertFalse(app.handlers[0][1].check_update(channel_post))
             self.assertTrue(app.handlers[0][1].check_update(edited_post))
             self.assertTrue(app.handlers[0][1].check_update(edited_text_post))
             self.assertFalse(app.handlers[0][2].check_update(channel_post))
-            self.assertTrue(app.handlers[0][2].check_update(text_channel_post))
+            self.assertFalse(app.handlers[0][2].check_update(text_channel_post))
+            self.assertTrue(app.handlers[0][2].check_update(command_channel_post))
+            self.assertTrue(app.handlers[0][3].check_update(text_channel_post))
 
     def test_polling_subscribes_to_edited_channel_posts(self):
         with tempfile.TemporaryDirectory() as directory:

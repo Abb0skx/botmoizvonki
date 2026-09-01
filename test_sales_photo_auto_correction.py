@@ -241,6 +241,121 @@ class AutoCorrectionRepositoryTests(unittest.TestCase):
 
 
 class RecentCardCorrectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_manual_scan_recovers_lost_huawei_and_orders_by_source_time(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SalesPhotoRepository(root / "sales.db")
+            sale_day = date(2026, 9, 1)
+            repo.claim_photo(
+                CHAT_ID,
+                90,
+                "huawei-unique",
+                source_file_id="huawei-file",
+                sale_date=sale_day,
+                allocate_order=False,
+            )
+            repo.mark_failed(CHAT_ID, 90, "NetworkError")
+            repo.claim_photo(
+                CHAT_ID,
+                91,
+                "redmi-unique",
+                source_file_id="redmi-file",
+                sale_date=sale_day,
+                allocate_order=False,
+            )
+            repo.mark_reposted(CHAT_ID, 91, 93)
+            repo.mark_complete(CHAT_ID, 91)
+
+            async def forward_message(**kwargs):
+                message_id = int(kwargs["message_id"])
+                if message_id not in {92, 93}:
+                    raise BadRequest("Message to forward not found")
+                unique_id = (
+                    "huawei-unique" if message_id == 92 else "redmi-unique"
+                )
+                return SimpleNamespace(
+                    message_id=900 + message_id,
+                    chat_id=CHAT_ID,
+                    caption=raw_card(order_id=3),
+                    caption_entities=(),
+                    text=None,
+                    reply_markup=None,
+                    photo=(
+                        SimpleNamespace(
+                            file_unique_id=unique_id,
+                            file_size=100,
+                            width=10,
+                            height=10,
+                        ),
+                    ),
+                )
+
+            bot = SimpleNamespace(
+                forward_message=AsyncMock(side_effect=forward_message),
+                edit_message_caption=AsyncMock(),
+                edit_message_text=AsyncMock(),
+                edit_message_reply_markup=AsyncMock(),
+                delete_message=AsyncMock(return_value=True),
+            )
+            service = SalesPhotoService(settings(root), repo)
+
+            success = await service.auto_correct_recent_cards(
+                bot,
+                reason="command:/obnovit",
+                reference_date=sale_day,
+                force_rewrite=True,
+                scan_until_message_id=95,
+            )
+
+            self.assertTrue(success)
+            self.assertEqual(repo.source_for_replacement(CHAT_ID, 92), 90)
+            self.assertEqual(
+                repo.daily_order_for_replacement(CHAT_ID, 92),
+                (sale_day, 1),
+            )
+            self.assertEqual(
+                repo.daily_order_for_replacement(CHAT_ID, 93),
+                (sale_day, 2),
+            )
+            captions = {
+                int(call.kwargs["message_id"]): call.kwargs["caption"]
+                for call in bot.edit_message_caption.await_args_list
+            }
+            self.assertIn("🆔: 1", captions[92])
+            self.assertIn("🆔: 2", captions[93])
+
+    async def test_obnovit_deletes_command_and_runs_forced_reconciliation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SalesPhotoRepository(root / "sales.db")
+            service = SalesPhotoService(settings(root), repo)
+            service.auto_correct_recent_cards = AsyncMock(return_value=True)
+            bot = SimpleNamespace(
+                delete_message=AsyncMock(return_value=True),
+                send_message=AsyncMock(
+                    return_value=SimpleNamespace(message_id=501)
+                ),
+            )
+            update = SimpleNamespace(
+                effective_message=SimpleNamespace(
+                    chat_id=CHAT_ID,
+                    message_id=500,
+                    text="/obnovit",
+                )
+            )
+
+            with patch("sales_photo_bot.service.asyncio.sleep", new=AsyncMock()):
+                await service.on_obnovit(update, SimpleNamespace(bot=bot))
+
+            service.auto_correct_recent_cards.assert_awaited_once()
+            kwargs = service.auto_correct_recent_cards.await_args.kwargs
+            self.assertTrue(kwargs["force_rewrite"])
+            self.assertEqual(kwargs["scan_until_message_id"], 500)
+            deleted_ids = {
+                int(call.args[1]) for call in bot.delete_message.await_args_list
+            }
+            self.assertEqual(deleted_ids, {500, 501})
+
     async def test_repairs_only_today_yesterday_and_day_before(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

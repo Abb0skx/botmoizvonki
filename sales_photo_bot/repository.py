@@ -84,6 +84,13 @@ class OrderAuditCandidate:
 
 
 @dataclass(frozen=True)
+class UnreconciledPhoto:
+    chat_id: int
+    source_message_id: int
+    source_file_unique_id: str
+
+
+@dataclass(frozen=True)
 class AutoCorrectionState:
     last_new_at: datetime | None = None
     event_generation: int = 0
@@ -1190,6 +1197,62 @@ class SalesPhotoRepository:
             sale_date_to=sale_date_to,
         )
 
+    def unreconciled_recent_photos(
+        self,
+        chat_id: int,
+        sale_date_from: date,
+        sale_date_to: date,
+        limit: int = 100,
+    ) -> tuple[UnreconciledPhoto, ...]:
+        """Return photo sends whose Telegram result may have been lost."""
+
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT chat_id,source_message_id,source_file_unique_id
+                   FROM sales_photo_jobs
+                   WHERE chat_id=? AND replacement_message_id IS NULL
+                     AND order_removed=0 AND status IN ('processing','failed')
+                     AND sale_date>=? AND sale_date<=?
+                     AND source_file_unique_id NOT LIKE 'text:%'
+                   ORDER BY created_at,source_message_id
+                   LIMIT ?""",
+                (
+                    int(chat_id),
+                    sale_date_from.isoformat(),
+                    sale_date_to.isoformat(),
+                    max(1, min(int(limit), 500)),
+                ),
+            ).fetchall()
+        return tuple(
+            UnreconciledPhoto(
+                chat_id=int(row["chat_id"]),
+                source_message_id=int(row["source_message_id"]),
+                source_file_unique_id=str(row["source_file_unique_id"]),
+            )
+            for row in rows
+        )
+
+    def tracked_message_ids(self, chat_id: int) -> frozenset[int]:
+        """Return message IDs already owned by the durable ledger."""
+
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT source_message_id AS message_id
+                     FROM sales_photo_jobs WHERE chat_id=?
+                   UNION
+                   SELECT replacement_message_id AS message_id
+                     FROM sales_photo_jobs
+                     WHERE chat_id=? AND replacement_message_id IS NOT NULL
+                   UNION
+                   SELECT member_message_id AS message_id
+                     FROM sales_photo_source_members WHERE chat_id=?
+                   UNION
+                   SELECT message_id FROM sales_photo_output_members
+                     WHERE chat_id=?""",
+                (int(chat_id), int(chat_id), int(chat_id), int(chat_id)),
+            ).fetchall()
+        return frozenset(int(row["message_id"]) for row in rows)
+
     def compact_recent_daily_orders(
         self,
         chat_id: int,
@@ -1241,8 +1304,7 @@ class SalesPhotoRepository:
                        FROM sales_photo_jobs
                        WHERE chat_id=? AND sale_date=? AND order_removed=0
                          AND replacement_message_id IS NOT NULL
-                       ORDER BY CASE WHEN daily_order_id IS NULL THEN 1 ELSE 0 END,
-                                daily_order_id,created_at,source_message_id""",
+                       ORDER BY created_at,source_message_id""",
                     (int(chat_id), sale_day),
                 ).fetchall()
                 if all(

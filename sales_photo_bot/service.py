@@ -56,6 +56,8 @@ ALBUM_SETTLE_SECONDS = 1.0
 ORDER_AUDIT_INTERVAL_SECONDS = 60.0
 AUTO_CORRECTION_RETRY_SECONDS = 60.0
 AUTO_CORRECTION_CARD_INTERVAL_SECONDS = 1.1
+MANUAL_RECOVERY_LOOKAHEAD_MESSAGES = 100
+MANUAL_RECOVERY_INTERVAL_SECONDS = 0.05
 TEXT_SOURCE_FILE_ID = "sales-photo:text"
 _SOURCE_CALLBACK_RE = re.compile(
     r"^sp:(?:m:[a-z]+|b):(\d+):(\d+):([0-9a-f]{12})$"
@@ -371,6 +373,60 @@ class SalesPhotoService:
         claim = self._claim_text(message)
         if claim is not None:
             self._schedule_claim(claim, context.bot)
+
+    async def on_obnovit(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Force a recent-card reconciliation from a channel command."""
+
+        message = update.effective_message
+        chat_id = _chat_id(message) if message is not None else None
+        command_message_id = (
+            getattr(message, "message_id", None) if message is not None else None
+        )
+        if chat_id != self.settings.chat_id or command_message_id is None:
+            return
+        command_message_id = int(command_message_id)
+        await self._delete_duplicate(context.bot, chat_id, command_message_id)
+        status_text = BOT_CARD_MARKER + "✅ Обновление завершено"
+        try:
+            await self.auto_correct_recent_cards(
+                context.bot,
+                reason="command:/obnovit",
+                reference_date=tashkent_today(),
+                force_rewrite=True,
+                scan_until_message_id=command_message_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception(
+                "sales_photo_manual_correction_failed chat_id=%s error_type=%s",
+                chat_id,
+                _error_code(exc),
+            )
+            status_text = BOT_CARD_MARKER + "❌ Обновление не выполнено"
+        status_message = None
+        try:
+            status_message = await self._send_with_retry(
+                context.bot.send_message,
+                {
+                    "chat_id": chat_id,
+                    "text": status_text,
+                    "disable_notification": True,
+                },
+            )
+            await asyncio.sleep(3)
+        finally:
+            status_message_id = getattr(status_message, "message_id", None)
+            if status_message_id is not None:
+                await self._delete_duplicate(
+                    context.bot,
+                    chat_id,
+                    int(status_message_id),
+                )
 
     def _schedule_claim(self, claim: _PhotoClaim, bot: Bot | Any) -> None:
         source_key = (claim.chat_id, claim.source_message_id)
@@ -2679,11 +2735,21 @@ class SalesPhotoService:
         *,
         reason: str,
         reference_date: date | None = None,
+        force_rewrite: bool = False,
+        scan_until_message_id: int | None = None,
     ) -> bool:
         """Repair current cards for Tashkent today, yesterday and day before."""
 
         async with self._auto_correction_lock:
             sale_date_from, sale_date_to = _recent_sale_window(reference_date)
+            recovered = 0
+            if scan_until_message_id is not None:
+                recovered = await self._recover_untracked_generated_cards(
+                    bot,
+                    sale_date_from=sale_date_from,
+                    sale_date_to=sale_date_to,
+                    scan_until_message_id=int(scan_until_message_id),
+                )
             released_orders, renumbered_orders = (
                 self.repository.compact_recent_daily_orders(
                     self.settings.chat_id,
@@ -2740,7 +2806,7 @@ class SalesPhotoService:
                                 1024 if content_kind == "caption" else 4096
                             ),
                         )
-                        if final.changed:
+                        if final.changed or force_rewrite:
                             edit_kwargs: dict[str, Any] = {
                                 "chat_id": candidate.chat_id,
                                 "message_id": candidate.replacement_message_id,
@@ -2833,7 +2899,7 @@ class SalesPhotoService:
                 "sales_photo_auto_correction_complete reason=%s "
                 "sale_date_from=%s sale_date_to=%s candidates=%s checked=%s "
                 "corrected=%s removed=%s released_orders=%s "
-                "renumbered_orders=%s failures=%s",
+                "renumbered_orders=%s recovered=%s failures=%s",
                 reason,
                 sale_date_from.isoformat(),
                 sale_date_to.isoformat(),
@@ -2843,6 +2909,7 @@ class SalesPhotoService:
                 removed,
                 released_orders,
                 renumbered_orders,
+                recovered,
                 failures,
             )
             # A per-card Telegram failure must not turn one requested trigger
@@ -2851,6 +2918,133 @@ class SalesPhotoService:
             # that prevent the pass itself from starting still propagate to the
             # scheduler and use its short retry.
             return True
+
+    async def _recover_untracked_generated_cards(
+        self,
+        bot: Bot | Any,
+        *,
+        sale_date_from: date,
+        sale_date_to: date,
+        scan_until_message_id: int,
+    ) -> int:
+        """Recover sent cards whose successful Bot API response was lost."""
+
+        unresolved = self.repository.unreconciled_recent_photos(
+            self.settings.chat_id,
+            sale_date_from,
+            sale_date_to,
+        )
+        if not unresolved:
+            return 0
+        by_unique_id: dict[str, list[int]] = {}
+        candidate_message_ids: set[int] = set()
+        tracked = self.repository.tracked_message_ids(self.settings.chat_id)
+        upper = int(scan_until_message_id)
+        for candidate in unresolved:
+            by_unique_id.setdefault(candidate.source_file_unique_id, []).append(
+                candidate.source_message_id
+            )
+            candidate_message_ids.update(
+                range(
+                    candidate.source_message_id + 1,
+                    min(
+                        upper,
+                        candidate.source_message_id
+                        + MANUAL_RECOVERY_LOOKAHEAD_MESSAGES
+                        + 1,
+                    ),
+                )
+            )
+        candidate_message_ids.difference_update(tracked)
+
+        recovered = 0
+        for index, message_id in enumerate(sorted(candidate_message_ids)):
+            forwarded = None
+            try:
+                self._order_backfill_forward_sources[message_id] = (
+                    time.monotonic() + 600
+                )
+                forwarded = await self._send_with_retry(
+                    bot.forward_message,
+                    {
+                        "chat_id": self.settings.chat_id,
+                        "from_chat_id": self.settings.chat_id,
+                        "message_id": message_id,
+                        "disable_notification": True,
+                    },
+                )
+                self._track_maintenance_forward(message_id, forwarded)
+                content = _message_content(forwarded)
+                if content is None or not content[1].startswith(BOT_CARD_MARKER):
+                    continue
+                photos = tuple(getattr(forwarded, "photo", None) or ())
+                if not photos:
+                    continue
+                photo = max(
+                    photos,
+                    key=lambda item: (
+                        int(getattr(item, "file_size", 0) or 0),
+                        int(getattr(item, "width", 0) or 0)
+                        * int(getattr(item, "height", 0) or 0),
+                    ),
+                )
+                unique_id = str(getattr(photo, "file_unique_id", "") or "")
+                source_ids = by_unique_id.get(unique_id, [])
+                if len(source_ids) != 1:
+                    continue
+                source_message_id = source_ids[0]
+                outcome = self.repository.record_replacement(
+                    self.settings.chat_id,
+                    source_message_id,
+                    message_id,
+                )
+                if outcome not in {"recorded", "same"}:
+                    continue
+                await self._delete_source(
+                    bot,
+                    self.settings.chat_id,
+                    source_message_id,
+                )
+                by_unique_id.pop(unique_id, None)
+                recovered += int(outcome == "recorded")
+                logger.info(
+                    "sales_photo_orphan_recovered chat_id=%s "
+                    "source_message_id=%s replacement_message_id=%s",
+                    self.settings.chat_id,
+                    source_message_id,
+                    message_id,
+                )
+            except asyncio.CancelledError:
+                raise
+            except BadRequest as exc:
+                if not _message_to_forward_missing(exc):
+                    logger.warning(
+                        "sales_photo_orphan_scan_failed chat_id=%s "
+                        "message_id=%s error_type=%s",
+                        self.settings.chat_id,
+                        message_id,
+                        _error_code(exc),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "sales_photo_orphan_scan_failed chat_id=%s message_id=%s "
+                    "error_type=%s",
+                    self.settings.chat_id,
+                    message_id,
+                    _error_code(exc),
+                )
+            finally:
+                if forwarded is not None:
+                    temporary_message_id = getattr(forwarded, "message_id", None)
+                    if temporary_message_id is not None:
+                        await self._delete_duplicate(
+                            bot,
+                            self.settings.chat_id,
+                            int(temporary_message_id),
+                        )
+                if index + 1 < len(candidate_message_ids):
+                    await asyncio.sleep(MANUAL_RECOVERY_INTERVAL_SECONDS)
+        return recovered
 
     async def _wait_for_auto_correction_wake(self, timeout: float) -> None:
         try:
