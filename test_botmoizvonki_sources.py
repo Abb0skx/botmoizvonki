@@ -318,56 +318,171 @@ class CallSourceTests(unittest.TestCase):
             "dashboard",
         )
 
-    def test_dashboard_device_manager_admin_requires_configured_token(self):
-        class FakeRequest:
-            def __init__(self, token=""):
-                self.headers = {
-                    "X-Dashboard-Admin-Token": token,
-                    "Host": "bot.texnikach.uz",
-                }
+    def test_permanent_manager_survives_restart_and_uses_call_start_time(self):
+        change_time = 1_800_000_100
 
-        original_token = (
-            bot.DASHBOARD_ADMIN_TOKEN
+        before = self.event(
+            40,
+            "+998900000040",
+            0,
+        )
+        before["start_time"] = change_time - 1
+
+        bot.set_permanent_device_manager(
+            "texnikacholx@gmail.com",
+            "ali",
+            changed_by="owner",
+            now_ts=change_time,
+        )
+        bot.init_db()
+
+        delayed_old_call = self.save(
+            "texnikacholx@gmail.com",
+            before,
         )
 
-        try:
-            bot.DASHBOARD_ADMIN_TOKEN = ""
+        after = self.event(
+            41,
+            "+998900000041",
+            0,
+        )
+        after["start_time"] = change_time + 1
+        new_call = self.save(
+            "texnikacholx@gmail.com",
+            after,
+        )
 
-            with self.assertRaises(
-                bot.HTTPException
-            ) as missing:
-                bot.require_dashboard_admin(
-                    FakeRequest()
+        self.assertEqual(
+            bot.get_call(delayed_old_call["call_id"])[
+                "talk_manager_code"
+            ],
+            "otabek",
+        )
+        self.assertEqual(
+            bot.get_call(new_call["call_id"])[
+                "talk_manager_code"
+            ],
+            "ali",
+        )
+
+        current = bot.get_effective_device_manager(
+            "texnikacholx@gmail.com",
+            change_time + 2,
+        )
+        self.assertEqual(current["manager_code"], "ali")
+        self.assertTrue(current["permanent_custom"])
+
+    def test_temporary_manager_overrides_permanent_then_returns_to_it(self):
+        change_time = 1_800_000_200
+
+        bot.set_permanent_device_manager(
+            "texnikach@gmail.com",
+            "olmas",
+            now_ts=change_time,
+        )
+        temporary = bot.set_device_manager_assignment(
+            "texnikach@gmail.com",
+            "ali",
+            now_ts=change_time + 1,
+        )
+
+        active = bot.get_effective_device_manager(
+            "texnikach@gmail.com",
+            change_time + 2,
+        )
+        expired = bot.get_effective_device_manager(
+            "texnikach@gmail.com",
+            temporary["effective_until"] + 1,
+        )
+
+        self.assertEqual(active["manager_code"], "ali")
+        self.assertTrue(active["temporary"])
+        self.assertEqual(
+            active["permanent_manager_code"],
+            "olmas",
+        )
+        self.assertEqual(expired["manager_code"], "olmas")
+        self.assertFalse(expired["temporary"])
+        self.assertTrue(expired["permanent_custom"])
+
+    def test_reset_permanent_manager_restores_configured_manager(self):
+        change_time = 1_800_000_300
+
+        bot.set_permanent_device_manager(
+            "texnikach@gmail.com",
+            "ali",
+            changed_by="owner",
+            now_ts=change_time,
+        )
+        result = bot.reset_permanent_device_manager(
+            "texnikach@gmail.com",
+            changed_by="owner",
+            now_ts=change_time + 1,
+        )
+
+        self.assertEqual(result["manager_code"], "abbos")
+        self.assertFalse(result["permanent_custom"])
+
+        with bot.connect_db() as conn:
+            current_count = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM device_manager_defaults
+                WHERE user_login = ?
+                """,
+                ("texnikach@gmail.com",),
+            ).fetchone()[0]
+            history = conn.execute(
+                """
+                SELECT action, old_manager_code, new_manager_code
+                FROM device_manager_default_history
+                WHERE user_login = ?
+                ORDER BY id
+                """,
+                ("texnikach@gmail.com",),
+            ).fetchall()
+
+        self.assertEqual(current_count, 0)
+        self.assertEqual(
+            [row["action"] for row in history],
+            ["set", "reset"],
+        )
+        self.assertEqual(
+            history[-1]["new_manager_code"],
+            "abbos",
+        )
+
+    def test_dashboard_manager_updates_need_no_password_but_check_origin(self):
+        class FakeRequest:
+            def __init__(self, origin=""):
+                self.headers = {
+                    "Host": "bot.texnikach.uz",
+                }
+                if origin:
+                    self.headers["Origin"] = origin
+
+        bot.require_dashboard_same_origin(
+            FakeRequest()
+        )
+        bot.require_dashboard_same_origin(
+            FakeRequest(
+                "https://bot.texnikach.uz"
+            )
+        )
+
+        with self.assertRaises(
+            bot.HTTPException
+        ) as forbidden:
+            bot.require_dashboard_same_origin(
+                FakeRequest(
+                    "https://example.com"
                 )
-
-            self.assertEqual(
-                missing.exception.status_code,
-                503,
             )
 
-            bot.DASHBOARD_ADMIN_TOKEN = (
-                "test-secret-token"
-            )
-
-            with self.assertRaises(
-                bot.HTTPException
-            ) as forbidden:
-                bot.require_dashboard_admin(
-                    FakeRequest("wrong")
-                )
-
-            self.assertEqual(
-                forbidden.exception.status_code,
-                403,
-            )
-
-            bot.require_dashboard_admin(
-                FakeRequest("test-secret-token")
-            )
-        finally:
-            bot.DASHBOARD_ADMIN_TOKEN = (
-                original_token
-            )
+        self.assertEqual(
+            forbidden.exception.status_code,
+            403,
+        )
 
     def test_only_configured_admin_can_rate_manager(self):
         saved = self.save(
@@ -621,7 +736,7 @@ class CallSourceTests(unittest.TestCase):
         html = bot.dashboard()
 
         self.assertIn(
-            "Кто работает с телефонами сегодня",
+            "Кто работает с телефонами",
             html,
         )
         self.assertIn(
@@ -629,9 +744,12 @@ class CallSourceTests(unittest.TestCase):
             html,
         )
         self.assertIn(
-            "Назначить до 00:00",
+            "На сегодня",
             html,
         )
+        self.assertIn("Постоянно", html)
+        self.assertNotIn("Код доступа", html)
+        self.assertNotIn("DASHBOARD_ADMIN_TOKEN", html)
         self.assertIn("Моя средняя оценка менеджеров", html)
         self.assertIn("Мои оценки менеджеров по дням", html)
         self.assertIn("<th>Моя оценка</th>", html)
