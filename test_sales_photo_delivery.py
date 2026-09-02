@@ -75,6 +75,27 @@ def create_delivery_db(path: Path) -> None:
 
 
 class DeliveryReaderTests(unittest.TestCase):
+    def test_reads_event_cursor_from_base_reader(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "delivery.db"
+            create_delivery_db(path)
+            with sqlite3.connect(path) as db:
+                db.executemany(
+                    "INSERT INTO order_events VALUES(?,?,?,?)",
+                    (
+                        (1, 10, "order_created", '["product","client_phone"]'),
+                        (2, 10, "order_updated", "invalid-json"),
+                    ),
+                )
+
+            reader = DeliveryReader(path)
+
+            self.assertEqual(reader.latest_event_id(), 2)
+            events = reader.events_after(0)
+            self.assertEqual([event.id for event in events], [1, 2])
+            self.assertEqual(events[0].changed_fields, {"product", "client_phone"})
+            self.assertEqual(events[1].changed_fields, frozenset())
+
     def test_one_delivery_matches_many_sales_cards_but_two_match_none(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "delivery.db"

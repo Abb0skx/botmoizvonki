@@ -218,6 +218,34 @@ class DeliveryReader:
                 result[order.id] = order
         return result
 
+    def latest_event_id(self) -> int:
+        with self._connect() as db:
+            row = db.execute("SELECT COALESCE(MAX(id),0) FROM order_events").fetchone()
+        return int(row[0])
+
+    def events_after(self, event_id: int, limit: int = 500) -> tuple[DeliveryEvent, ...]:
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT id,order_id,event_type,changed_fields
+                   FROM order_events WHERE id>? ORDER BY id LIMIT ?""",
+                (int(event_id), max(1, min(int(limit), 2000))),
+            ).fetchall()
+        result = []
+        for row in rows:
+            try:
+                fields = json.loads(str(row["changed_fields"] or "[]"))
+            except (TypeError, json.JSONDecodeError):
+                fields = []
+            result.append(
+                DeliveryEvent(
+                    id=int(row["id"]),
+                    order_id=int(row["order_id"]),
+                    event_type=str(row["event_type"] or ""),
+                    changed_fields=frozenset(str(value) for value in fields),
+                )
+            )
+        return tuple(result)
+
 
 class DeliverySalesBridge(DeliveryReader):
     """Narrow read/write bridge for delivery-initiated sales-card requests."""
@@ -327,35 +355,6 @@ class DeliverySalesBridge(DeliveryReader):
                 ),
             )
         return True
-
-    def latest_event_id(self) -> int:
-        with self._connect() as db:
-            row = db.execute("SELECT COALESCE(MAX(id),0) FROM order_events").fetchone()
-        return int(row[0])
-
-    def events_after(self, event_id: int, limit: int = 500) -> tuple[DeliveryEvent, ...]:
-        with self._connect() as db:
-            rows = db.execute(
-                """SELECT id,order_id,event_type,changed_fields
-                   FROM order_events WHERE id>? ORDER BY id LIMIT ?""",
-                (int(event_id), max(1, min(int(limit), 2000))),
-            ).fetchall()
-        result = []
-        for row in rows:
-            try:
-                fields = json.loads(str(row["changed_fields"] or "[]"))
-            except (TypeError, json.JSONDecodeError):
-                fields = []
-            result.append(
-                DeliveryEvent(
-                    id=int(row["id"]),
-                    order_id=int(row["order_id"]),
-                    event_type=str(row["event_type"] or ""),
-                    changed_fields=frozenset(str(value) for value in fields),
-                )
-            )
-        return tuple(result)
-
 
 @dataclass(frozen=True)
 class DeliveryBlockNormalization:
