@@ -65,6 +65,9 @@ model_other_variants,Другие варианты у менеджера.,Сок
 model_from_prefix,от,Префикс минимальной цены
 model_empty_memory_label,Цена,Подпись без памяти
 model_not_found_reply,"Уточните модель: {manager_url}",Модель не найдена
+private_reply_unavailable_ru,RU SHEET,Закрытый Direct — русский
+private_reply_unavailable_uz,UZ SHEET,Закрытый Direct — узбекский
+private_reply_unavailable_bilingual,BOTH SHEET,Закрытый Direct — два языка
 '''
 
 
@@ -107,6 +110,47 @@ class TriggerDetectionTests(unittest.TestCase):
     def test_normal_comment_is_not_a_trigger(self):
         self.assertFalse(
             instagram_bot.is_generic_trigger("Классный телефон")
+        )
+
+    def test_comment_language_detection_supports_unknown(self):
+        self.assertEqual(
+            instagram_bot.detect_language("Сколько стоит?"),
+            "ru",
+        )
+        self.assertEqual(
+            instagram_bot.detect_language("Narxi qancha?"),
+            "uz",
+        )
+        self.assertEqual(
+            instagram_bot.detect_language("S25 +++"),
+            "unknown",
+        )
+
+    def test_private_reply_unavailable_text_comes_from_settings(self):
+        settings = instagram_bot.parse_direct_settings_csv(
+            DIRECT_SETTINGS_CSV
+        )
+
+        self.assertEqual(
+            instagram_bot.build_private_reply_unavailable_message(
+                "ru",
+                settings=settings,
+            ),
+            "RU SHEET",
+        )
+        self.assertEqual(
+            instagram_bot.build_private_reply_unavailable_message(
+                "uz",
+                settings=settings,
+            ),
+            "UZ SHEET",
+        )
+        self.assertEqual(
+            instagram_bot.build_private_reply_unavailable_message(
+                "unknown",
+                settings=settings,
+            ),
+            "BOTH SHEET",
         )
 
     def test_sheet_rules_are_parsed_and_sorted(self):
@@ -387,6 +431,117 @@ class TriggerDetectionTests(unittest.TestCase):
             )
 
         public_reply.assert_not_called()
+
+    def test_unavailable_direct_gets_public_sheet_fallback(self):
+        response = instagram_bot.requests.Response()
+        response.status_code = 400
+        response.url = "https://graph.instagram.com/messages"
+        response._content = json.dumps(
+            {
+                "error": {
+                    "code": 551,
+                    "message": "This person isn't available right now.",
+                },
+            }
+        ).encode("utf-8")
+        direct_error = instagram_bot.requests.HTTPError(
+            "recipient unavailable",
+            response=response,
+        )
+
+        with patch.object(
+            instagram_bot,
+            "get_product_catalog",
+            return_value=self.product_catalog,
+        ), patch.object(
+            instagram_bot,
+            "find_price_model_in_text",
+            return_value={
+                "status": "not_found",
+                "family": None,
+                "alias": None,
+            },
+        ), patch.object(
+            instagram_bot,
+            "resolve_post_model_families",
+            return_value={
+                "families": [],
+                "invalid_models": [],
+                "configured_models": [],
+            },
+        ), patch.object(
+            instagram_bot,
+            "resolve_response_rule",
+            return_value={
+                "rule": {
+                    "priority": 0,
+                    "match_type": "default",
+                    "private_reply": "Общий ответ",
+                    "public_reply": "Ответили в Direct ✅",
+                    "row_number": 5,
+                },
+                "source": "google_sheet_default",
+            },
+        ), patch.object(
+            instagram_bot,
+            "get_direct_config",
+            return_value=self.direct_config,
+        ), patch.object(
+            instagram_bot,
+            "send_private_reply",
+            side_effect=direct_error,
+        ), patch.object(
+            instagram_bot,
+            "send_public_comment_reply",
+        ) as public_reply, patch.object(
+            instagram_bot,
+            "update_comment_status",
+        ) as update_status:
+            instagram_bot.process_instagram_comment(
+                instagram_account_id="account-id",
+                commenter_id="customer-id",
+                username="customer",
+                media_id="media-id",
+                comment_id="comment-id",
+                comment_text="Сколько стоит?",
+            )
+
+        public_reply.assert_called_once_with(
+            "comment-id",
+            "RU SHEET",
+        )
+        update_status.assert_called_once_with(
+            "comment-id",
+            "done",
+            product_id=None,
+            detection_source=(
+                "google_sheet_default_"
+                "private_reply_unavailable"
+            ),
+        )
+
+    def test_token_error_does_not_claim_direct_is_closed(self):
+        response = instagram_bot.requests.Response()
+        response.status_code = 400
+        response.url = "https://graph.instagram.com/messages"
+        response._content = json.dumps(
+            {
+                "error": {
+                    "code": 190,
+                    "message": "Invalid OAuth access token.",
+                },
+            }
+        ).encode("utf-8")
+        token_error = instagram_bot.requests.HTTPError(
+            "invalid token",
+            response=response,
+        )
+
+        self.assertFalse(
+            instagram_bot.is_private_reply_recipient_unavailable(
+                token_error
+            )
+        )
 
     def test_product_response_precedes_google_sheet_rules(self):
         model_result = instagram_bot.find_price_model_in_text(

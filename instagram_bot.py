@@ -652,6 +652,10 @@ def detect_language(
     )
 
     uz_words = {
+        "assalom",
+        "buyurtma",
+        "iltimos",
+        "kerak",
         "narx",
         "narxi",
         "narh",
@@ -664,6 +668,10 @@ def detect_language(
         "nechpul",
         "necha",
         "nechchi",
+        "rahmat",
+        "rang",
+        "salom",
+        "xotira",
     }
 
     words = set(
@@ -679,13 +687,20 @@ def detect_language(
         return "uz"
 
     if re.search(
+        r"[қғҳў]",
+        text.lower(),
+    ):
+
+        return "uz"
+
+    if re.search(
         r"[а-яё]",
         text.lower(),
     ):
 
         return "ru"
 
-    return "uz"
+    return "unknown"
 
 
 # =========================================================
@@ -822,6 +837,23 @@ LOCAL_DIRECT_SETTINGS = {
         "Iltimos, modelning to‘liq nomini yozing. "
         "Yordam va buyurtma uchun menejerga murojaat qiling:\n"
         "{manager_url}"
+    ),
+
+    "private_reply_unavailable_ru": (
+        "Ваш Direct закрыт, поэтому мы не смогли вам написать. "
+        "Посмотрите актуальные цены по ссылке в шапке профиля."
+    ),
+
+    "private_reply_unavailable_uz": (
+        "Direct'ingiz yopiq, shuning uchun sizga xabar yubora olmadik. "
+        "Aktual narxlarni profilimizdagi havola orqali ko'ring."
+    ),
+
+    "private_reply_unavailable_bilingual": (
+        "Ваш Direct закрыт, поэтому мы не смогли вам написать. "
+        "Посмотрите актуальные цены по ссылке в шапке профиля.\n\n"
+        "Direct'ingiz yopiq, shuning uchun sizga xabar yubora olmadik. "
+        "Aktual narxlarni profilimizdagi havola orqali ko'ring."
     ),
 }
 
@@ -4846,6 +4878,48 @@ def build_public_reply(
     )
 
 
+def build_private_reply_unavailable_message(
+    language: str,
+    *,
+    settings: dict[str, str] | None = None,
+) -> str:
+
+    merged_settings = dict(
+        LOCAL_DIRECT_SETTINGS
+    )
+
+    if settings:
+
+        merged_settings.update(
+            settings
+        )
+
+    setting_name = {
+        "ru":
+            "private_reply_unavailable_ru",
+
+        "uz":
+            "private_reply_unavailable_uz",
+    }.get(
+        language,
+        "private_reply_unavailable_bilingual",
+    )
+
+    template = str(
+        merged_settings.get(
+            setting_name
+        )
+        or LOCAL_DIRECT_SETTINGS[
+            setting_name
+        ]
+    ).strip()
+
+    return render_direct_template(
+        template,
+        merged_settings,
+    )
+
+
 # =========================================================
 # META API
 # =========================================================
@@ -4943,6 +5017,122 @@ def send_private_reply(
     )
 
     return result
+
+
+def get_instagram_api_error_details(
+    exc: Exception,
+) -> dict:
+
+    response = getattr(
+        exc,
+        "response",
+        None,
+    )
+
+    status_code = getattr(
+        response,
+        "status_code",
+        None,
+    )
+
+    payload = {}
+
+    if response is not None:
+
+        try:
+
+            payload = response.json()
+
+        except Exception:
+
+            payload = {}
+
+    error = (
+        payload.get(
+            "error"
+        )
+        if isinstance(
+            payload,
+            dict,
+        )
+        else {}
+    )
+
+    if not isinstance(
+        error,
+        dict,
+    ):
+
+        error = {}
+
+    return {
+        "status_code": status_code,
+        "code": error.get(
+            "code"
+        ),
+        "subcode": error.get(
+            "error_subcode"
+        ),
+        "message": str(
+            error.get(
+                "message"
+            )
+            or exc
+            or ""
+        ).strip(),
+    }
+
+
+def is_private_reply_recipient_unavailable(
+    exc: Exception,
+) -> bool:
+
+    details = get_instagram_api_error_details(
+        exc
+    )
+
+    if details[
+        "status_code"
+    ] not in {
+        400,
+        403,
+    }:
+
+        return False
+
+    if details[
+        "code"
+    ] == 551:
+
+        return True
+
+    message = details[
+        "message"
+    ].lower()
+
+    recipient_unavailable_markers = (
+        "recipient is not available",
+        "recipient isn't available",
+        "recipient unavailable",
+        "this person is not available",
+        "this person isn't available",
+        "cannot be messaged",
+        "can't be messaged",
+        "cannot send a message to this user",
+        "can't send a message to this user",
+        "does not allow new message requests",
+        "doesn't allow new message requests",
+        "privacy settings",
+        "blocked by the recipient",
+        "user has blocked",
+        "not eligible for messaging",
+        "not a valid instagram user",
+    )
+
+    return any(
+        marker in message
+        for marker in recipient_unavailable_markers
+    )
 
 
 # =========================================================
@@ -5828,11 +6018,70 @@ def process_instagram_comment(
         # PRIVATE REPLY FIRST
         # -------------------------------------------------
 
-        send_private_reply(
-            instagram_account_id,
-            comment_id,
-            private_message,
-        )
+        try:
+
+            send_private_reply(
+                instagram_account_id,
+                comment_id,
+                private_message,
+            )
+
+        except Exception as exc:
+
+            if (
+                not INSTAGRAM_PUBLIC_REPLY_ENABLED
+                or not is_private_reply_recipient_unavailable(
+                    exc
+                )
+            ):
+
+                raise
+
+            fallback_language = detect_language(
+                comment_text
+            )
+
+            direct_config = get_direct_config()
+
+            fallback_message = (
+                build_private_reply_unavailable_message(
+                    fallback_language,
+                    settings=direct_config[
+                        "settings"
+                    ],
+                )
+            )
+
+            send_public_comment_reply(
+                comment_id,
+                fallback_message,
+            )
+
+            update_comment_status(
+                comment_id,
+                "done",
+                product_id=None,
+                detection_source=(
+                    f"{source}_"
+                    "private_reply_unavailable"
+                ),
+            )
+
+            print(
+                "INSTAGRAM PRIVATE REPLY "
+                "UNAVAILABLE PUBLIC FALLBACK SENT:",
+                {
+                    "comment_id": comment_id,
+                    "language": fallback_language,
+                    "error": (
+                        get_instagram_api_error_details(
+                            exc
+                        )
+                    ),
+                },
+            )
+
+            return
 
         # -------------------------------------------------
         # PUBLIC REPLY ONLY AFTER SUCCESSFUL DIRECT
