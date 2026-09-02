@@ -2170,7 +2170,36 @@ async def comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         order, synchronized = await _sync_order(context, order.id)
         if not synchronized:
             _schedule_sync_retry(context, order.id)
-    await update.message.reply_text("Проверьте данные заказа.", reply_markup=main_keyboard())
+    sales_queued = False
+    if (
+        order
+        and order.product_photo_file_id
+        and order.sales_card_status in {"none", "failed"}
+    ):
+        try:
+            photo_path = await _persist_product_photo(context, order)
+            queued = repo.request_sales_card(
+                order.id,
+                actor_id=update.effective_user.id,
+                actor_name=_name(update.effective_user),
+                product_photo_path=photo_path,
+            )
+        except Exception:
+            logger.exception(
+                "Could not automatically queue sales card for order %s",
+                order.id,
+            )
+        else:
+            if queued and queued.sales_card_status in {"pending", "processing", "complete"}:
+                order = queued
+                sales_queued = True
+                _, synchronized = await _sync_order(context, order.id)
+                if not synchronized:
+                    _schedule_sync_retry(context, order.id)
+    confirmation = "Проверьте данные заказа."
+    if sales_queued:
+        confirmation += "\n📸 Фото нового товара отправляется в канал продаж."
+    await update.message.reply_text(confirmation, reply_markup=main_keyboard())
     context.user_data.pop("draft", None)
     return ConversationHandler.END
 
@@ -2278,6 +2307,25 @@ async def toggle_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await query.answer()
 
 
+async def _persist_product_photo(
+    context: ContextTypes.DEFAULT_TYPE,
+    order,
+) -> str | None:
+    if not order.product_photo_file_id:
+        return None
+    settings: Settings = context.application.bot_data["settings"]
+    photo_key = hashlib.sha256(
+        (order.product_photo_unique_id or order.product_photo_file_id).encode()
+    ).hexdigest()[:20]
+    relative = Path("product_photos") / f"order-{order.id}-{photo_key}.jpg"
+    destination = settings.database_path.parent / relative
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not destination.is_file():
+        telegram_file = await context.bot.get_file(order.product_photo_file_id)
+        await telegram_file.download_to_drive(custom_path=destination)
+    return relative.as_posix()
+
+
 def _sales_card_preview(order) -> str:
     phones = [display_phone(order.client_phone)]
     if order.client_phone_2 and order.client_phone_2 != order.client_phone:
@@ -2334,28 +2382,15 @@ async def sales_card_action(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await query.answer("Карточка уже создаётся", show_alert=True)
         return
 
-    photo_path: str | None = None
-    if order.product_photo_file_id:
-        photo_key = hashlib.sha256(
-            (order.product_photo_unique_id or order.product_photo_file_id).encode()
-        ).hexdigest()[:20]
-        relative = Path("product_photos") / (
-            f"order-{order.id}-{photo_key}.jpg"
+    try:
+        photo_path = await _persist_product_photo(context, order)
+    except Exception:
+        logger.exception("Could not persist product photo for order %s", order.id)
+        await query.answer(
+            "Не удалось подготовить фото. Попробуйте ещё раз.",
+            show_alert=True,
         )
-        destination = settings.database_path.parent / relative
-        try:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            if not destination.is_file():
-                telegram_file = await context.bot.get_file(order.product_photo_file_id)
-                await telegram_file.download_to_drive(custom_path=destination)
-            photo_path = relative.as_posix()
-        except Exception:
-            logger.exception("Could not persist product photo for order %s", order.id)
-            await query.answer(
-                "Не удалось подготовить фото. Попробуйте ещё раз.",
-                show_alert=True,
-            )
-            return
+        return
 
     queued = repo.request_sales_card(
         order.id,

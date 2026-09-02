@@ -128,6 +128,45 @@ class FinalCreationStepSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Заказ №1", message.reply_text.await_args_list[0].args[0])
         self.assertEqual(message.reply_text.await_args_list[2].args[0], "Проверьте данные заказа.")
 
+    async def test_new_order_photo_is_queued_for_sales_without_backfill(self):
+        card_message = SimpleNamespace(chat_id=101, message_id=503)
+        message = SimpleNamespace(
+            text="Пропустить",
+            reply_text=AsyncMock(side_effect=[card_message, None]),
+        )
+        update = self.private_update(message)
+        context = self.make_context()
+        context.user_data["draft"].update(
+            product_photo_file_id="telegram-photo",
+            product_photo_unique_id="unique-photo",
+        )
+
+        with (
+            patch(
+                "app.handlers.orders._persist_product_photo",
+                new=AsyncMock(return_value="product_photos/order-1-photo.jpg"),
+            ) as persist_photo,
+            patch(
+                "app.handlers.orders._sync_order",
+                new=AsyncMock(return_value=(None, True)),
+            ) as sync_order,
+        ):
+            state = await comment(update, context)
+
+        self.assertEqual(state, ConversationHandler.END)
+        order = self.repo.list_all()[0]
+        self.assertEqual(order.sales_card_status, "pending")
+        self.assertEqual(
+            order.product_photo_path,
+            "product_photos/order-1-photo.jpg",
+        )
+        persist_photo.assert_awaited_once()
+        sync_order.assert_awaited_once_with(context, order.id)
+        self.assertIn(
+            "Фото нового товара отправляется",
+            message.reply_text.await_args_list[-1].args[0],
+        )
+
     async def test_missing_persisted_draft_ends_safely(self):
         message = SimpleNamespace(text="Пропустить", reply_text=AsyncMock())
         update = self.private_update(message)
