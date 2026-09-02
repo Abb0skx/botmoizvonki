@@ -155,6 +155,220 @@ class CallSourceTests(unittest.TestCase):
         self.assertNotIn("✅ Купил", button_texts)
         self.assertNotIn("🕓 В работе / ожидает", button_texts)
 
+    def test_temporary_device_manager_uses_call_start_and_expires_at_midnight(self):
+        event = self.event(
+            10,
+            "+998900000010",
+            0,
+        )
+        assignment_start = (
+            event["start_time"]
+            - 10
+        )
+
+        assignment = (
+            bot.set_device_manager_assignment(
+                "texnikacholx@gmail.com",
+                "ali",
+                changed_by="test-admin",
+                now_ts=assignment_start,
+            )
+        )
+
+        before = self.event(
+            11,
+            "+998900000011",
+            0,
+        )
+        before["start_time"] = (
+            assignment_start
+            - 1
+        )
+
+        before_call = self.save(
+            "texnikacholx@gmail.com",
+            before,
+        )
+        active_call = self.save(
+            "texnikacholx@gmail.com",
+            event,
+        )
+
+        expired = self.event(
+            12,
+            "+998900000012",
+            0,
+        )
+        expired["start_time"] = (
+            assignment["effective_until"]
+            + 1
+        )
+        expired_call = self.save(
+            "texnikacholx@gmail.com",
+            expired,
+        )
+
+        self.assertEqual(
+            bot.get_call(before_call["call_id"])[
+                "talk_manager_code"
+            ],
+            "otabek",
+        )
+        self.assertEqual(
+            bot.get_call(active_call["call_id"])[
+                "talk_manager_code"
+            ],
+            "ali",
+        )
+        self.assertEqual(
+            bot.get_call(expired_call["call_id"])[
+                "talk_manager_code"
+            ],
+            "otabek",
+        )
+        self.assertEqual(
+            assignment["effective_until"],
+            bot.next_uz_midnight_timestamp(
+                assignment_start
+            ),
+        )
+
+    def test_reset_restores_default_without_changing_existing_calls(self):
+        event = self.event(
+            13,
+            "+998900000013",
+            0,
+        )
+        assignment_start = (
+            event["start_time"]
+            - 1
+        )
+
+        bot.set_device_manager_assignment(
+            "texnikach@gmail.com",
+            "ali",
+            changed_by="test-admin",
+            now_ts=assignment_start,
+        )
+        temporary_call = self.save(
+            "texnikach@gmail.com",
+            event,
+        )
+
+        bot.reset_device_manager_assignment(
+            "texnikach@gmail.com",
+            now_ts=(
+                event["start_time"]
+                + 1
+            ),
+        )
+
+        after = self.event(
+            14,
+            "+998900000014",
+            0,
+        )
+        after["start_time"] = (
+            event["start_time"]
+            + 2
+        )
+        default_call = self.save(
+            "texnikach@gmail.com",
+            after,
+        )
+
+        bot.init_db()
+
+        self.assertEqual(
+            bot.get_call(temporary_call["call_id"])[
+                "talk_manager_code"
+            ],
+            "ali",
+        )
+        self.assertEqual(
+            bot.get_call(default_call["call_id"])[
+                "talk_manager_code"
+            ],
+            "abbos",
+        )
+
+        with bot.connect_db() as conn:
+            history = conn.execute(
+                """
+                SELECT *
+                FROM device_manager_assignments
+                WHERE user_login = ?
+                """,
+                (
+                    "texnikach@gmail.com",
+                ),
+            ).fetchall()
+
+        self.assertEqual(len(history), 1)
+        self.assertEqual(
+            history[0]["changed_by"],
+            "test-admin",
+        )
+        self.assertEqual(
+            history[0]["effective_until"],
+            event["start_time"] + 1,
+        )
+        self.assertEqual(
+            history[0]["ended_by"],
+            "dashboard",
+        )
+
+    def test_dashboard_device_manager_admin_requires_configured_token(self):
+        class FakeRequest:
+            def __init__(self, token=""):
+                self.headers = {
+                    "X-Dashboard-Admin-Token": token,
+                    "Host": "bot.texnikach.uz",
+                }
+
+        original_token = (
+            bot.DASHBOARD_ADMIN_TOKEN
+        )
+
+        try:
+            bot.DASHBOARD_ADMIN_TOKEN = ""
+
+            with self.assertRaises(
+                bot.HTTPException
+            ) as missing:
+                bot.require_dashboard_admin(
+                    FakeRequest()
+                )
+
+            self.assertEqual(
+                missing.exception.status_code,
+                503,
+            )
+
+            bot.DASHBOARD_ADMIN_TOKEN = (
+                "test-secret-token"
+            )
+
+            with self.assertRaises(
+                bot.HTTPException
+            ) as forbidden:
+                bot.require_dashboard_admin(
+                    FakeRequest("wrong")
+                )
+
+            self.assertEqual(
+                forbidden.exception.status_code,
+                403,
+            )
+
+            bot.require_dashboard_admin(
+                FakeRequest("test-secret-token")
+            )
+        finally:
+            bot.DASHBOARD_ADMIN_TOKEN = (
+                original_token
+            )
+
     def test_only_configured_admin_can_rate_manager(self):
         saved = self.save(
             "texnikach@gmail.com",
@@ -406,6 +620,18 @@ class CallSourceTests(unittest.TestCase):
     def test_dashboard_replaces_sales_controls_with_manager_ratings(self):
         html = bot.dashboard()
 
+        self.assertIn(
+            "Кто работает с телефонами сегодня",
+            html,
+        )
+        self.assertIn(
+            "/admin/device-managers",
+            html,
+        )
+        self.assertIn(
+            "Назначить до 00:00",
+            html,
+        )
         self.assertIn("Моя средняя оценка менеджеров", html)
         self.assertIn("Мои оценки менеджеров по дням", html)
         self.assertIn("<th>Моя оценка</th>", html)

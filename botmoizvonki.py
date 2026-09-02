@@ -162,6 +162,11 @@ PUBLIC_BASE_URL = os.getenv(
     "https://bot.texnikach.uz",
 ).rstrip("/")
 
+DASHBOARD_ADMIN_TOKEN = os.getenv(
+    "DASHBOARD_ADMIN_TOKEN",
+    "",
+).strip()
+
 SMS_COOLDOWN_DAYS = 30
 
 RESULT_COOLDOWN_HOURS = 30
@@ -1564,6 +1569,74 @@ def init_db():
                 conn.execute(
                     sql
                 )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS
+                device_manager_assignments (
+
+                id INTEGER
+                    PRIMARY KEY
+                    AUTOINCREMENT,
+
+                user_login TEXT
+                    NOT NULL,
+
+                device_name TEXT
+                    NOT NULL,
+
+                manager_code TEXT
+                    NOT NULL,
+
+                manager_name TEXT
+                    NOT NULL,
+
+                effective_from INTEGER
+                    NOT NULL,
+
+                effective_until INTEGER
+                    NOT NULL,
+
+                changed_at INTEGER
+                    NOT NULL,
+
+                changed_by TEXT,
+
+                ended_by TEXT,
+
+                created_at TIMESTAMP
+                    DEFAULT CURRENT_TIMESTAMP,
+
+                CHECK (
+                    effective_until
+                    >= effective_from
+                )
+            )
+            """
+        )
+
+        device_assignment_columns = {
+            row["name"]
+            for row in conn.execute(
+                """
+                PRAGMA table_info(
+                    device_manager_assignments
+                )
+                """
+            ).fetchall()
+        }
+
+        if (
+            "ended_by"
+            not in device_assignment_columns
+        ):
+            conn.execute(
+                """
+                ALTER TABLE
+                    device_manager_assignments
+                ADD COLUMN ended_by TEXT
+                """
+            )
 
         conn.execute(
             """
@@ -3558,6 +3631,19 @@ def init_db():
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS
+            idx_device_manager_assignments_lookup
+
+            ON device_manager_assignments(
+                user_login,
+                effective_from,
+                effective_until
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
             idx_manager_ratings_time_manager
 
             ON manager_ratings(
@@ -3766,6 +3852,381 @@ def init_db():
 
 
 init_db()
+
+
+# =========================================================
+# DEVICE MANAGER ASSIGNMENTS
+# =========================================================
+
+def next_uz_midnight_timestamp(
+    now_ts: int,
+) -> int:
+
+    local_now = datetime.fromtimestamp(
+        int(now_ts),
+        UZ_TZ,
+    )
+
+    next_midnight = (
+        local_now
+        .replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        + timedelta(days=1)
+    )
+
+    return int(
+        next_midnight.timestamp()
+    )
+
+
+def get_effective_device_manager(
+    user_login: str | None,
+    at_ts: int | None = None,
+    conn=None,
+):
+
+    normalized_login = normalize_user_login(
+        user_login
+    )
+
+    profile = get_call_source_profile(
+        normalized_login
+    )
+
+    if not profile:
+        return {
+            "user_login": normalized_login,
+            "device_name": (
+                normalized_login
+                or "Неизвестно"
+            ),
+            "manager_code": None,
+            "manager_name": None,
+            "default_manager_code": None,
+            "default_manager_name": None,
+            "temporary": False,
+            "effective_from": None,
+            "effective_until": None,
+            "assignment_id": None,
+        }
+
+    if at_ts is None:
+        at_ts = int(
+            datetime.now(
+                timezone.utc
+            ).timestamp()
+        )
+    else:
+        try:
+            at_ts = int(at_ts)
+        except (
+            TypeError,
+            ValueError,
+        ):
+            at_ts = 0
+
+    owns_connection = conn is None
+
+    if owns_connection:
+        conn = connect_db()
+
+    try:
+        assignment = conn.execute(
+            """
+            SELECT
+                id,
+                manager_code,
+                manager_name,
+                effective_from,
+                effective_until
+
+            FROM device_manager_assignments
+
+            WHERE
+                user_login = ?
+                AND effective_from <= ?
+                AND effective_until > ?
+
+            ORDER BY
+                effective_from DESC,
+                id DESC
+
+            LIMIT 1
+            """,
+            (
+                normalized_login,
+                at_ts,
+                at_ts,
+            ),
+        ).fetchone()
+    finally:
+        if owns_connection:
+            conn.close()
+
+    default_manager_code = profile.get(
+        "default_manager_code"
+    )
+    default_manager_name = MANAGERS.get(
+        default_manager_code
+    )
+
+    if (
+        assignment
+        and assignment["manager_code"]
+            in MANAGERS
+    ):
+        return {
+            "user_login": normalized_login,
+            "device_name": profile["device_name"],
+            "manager_code": assignment[
+                "manager_code"
+            ],
+            "manager_name": MANAGERS[
+                assignment["manager_code"]
+            ],
+            "default_manager_code": (
+                default_manager_code
+            ),
+            "default_manager_name": (
+                default_manager_name
+            ),
+            "temporary": True,
+            "effective_from": assignment[
+                "effective_from"
+            ],
+            "effective_until": assignment[
+                "effective_until"
+            ],
+            "assignment_id": assignment["id"],
+        }
+
+    return {
+        "user_login": normalized_login,
+        "device_name": profile["device_name"],
+        "manager_code": default_manager_code,
+        "manager_name": default_manager_name,
+        "default_manager_code": default_manager_code,
+        "default_manager_name": default_manager_name,
+        "temporary": False,
+        "effective_from": None,
+        "effective_until": None,
+        "assignment_id": None,
+    }
+
+
+def list_device_manager_assignments(
+    now_ts: int | None = None,
+):
+
+    if now_ts is None:
+        now_ts = int(
+            datetime.now(
+                timezone.utc
+            ).timestamp()
+        )
+
+    with connect_db() as conn:
+        devices = [
+            get_effective_device_manager(
+                user_login,
+                now_ts,
+                conn,
+            )
+            for user_login in CALL_SOURCE_PROFILES
+        ]
+
+    for device in devices:
+        until = device[
+            "effective_until"
+        ]
+        device["effective_until_label"] = (
+            datetime.fromtimestamp(
+                until,
+                UZ_TZ,
+            ).strftime(
+                "%d.%m.%Y %H:%M"
+            )
+            if until
+            else None
+        )
+
+    return devices
+
+
+def set_device_manager_assignment(
+    user_login: str,
+    manager_code: str,
+    changed_by: str = "dashboard",
+    now_ts: int | None = None,
+):
+
+    normalized_login = normalize_user_login(
+        user_login
+    )
+    profile = get_call_source_profile(
+        normalized_login
+    )
+
+    if not profile:
+        raise ValueError(
+            "Неизвестный телефон"
+        )
+
+    manager_code = str(
+        manager_code
+        or ""
+    ).strip().casefold()
+    manager_name = MANAGERS.get(
+        manager_code
+    )
+
+    if not manager_name:
+        raise ValueError(
+            "Неизвестный менеджер"
+        )
+
+    if now_ts is None:
+        now_ts = int(
+            datetime.now(
+                timezone.utc
+            ).timestamp()
+        )
+    else:
+        now_ts = int(now_ts)
+
+    effective_until = (
+        next_uz_midnight_timestamp(
+            now_ts
+        )
+    )
+
+    with connect_db() as conn:
+        conn.execute(
+            "BEGIN IMMEDIATE"
+        )
+
+        conn.execute(
+            """
+            UPDATE device_manager_assignments
+
+            SET
+                effective_until = ?,
+                ended_by = ?
+
+            WHERE
+                user_login = ?
+                AND effective_from <= ?
+                AND effective_until > ?
+            """,
+            (
+                now_ts,
+                str(changed_by or "dashboard")[:200],
+                normalized_login,
+                now_ts,
+                now_ts,
+            ),
+        )
+
+        cursor = conn.execute(
+            """
+            INSERT INTO device_manager_assignments (
+                user_login,
+                device_name,
+                manager_code,
+                manager_name,
+                effective_from,
+                effective_until,
+                changed_at,
+                changed_by
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                normalized_login,
+                profile["device_name"],
+                manager_code,
+                manager_name,
+                now_ts,
+                effective_until,
+                now_ts,
+                str(changed_by or "dashboard")[:200],
+            ),
+        )
+
+        conn.commit()
+
+    result = get_effective_device_manager(
+        normalized_login,
+        now_ts,
+    )
+    result["assignment_id"] = cursor.lastrowid
+
+    return result
+
+
+def reset_device_manager_assignment(
+    user_login: str,
+    changed_by: str = "dashboard",
+    now_ts: int | None = None,
+):
+
+    normalized_login = normalize_user_login(
+        user_login
+    )
+
+    if not get_call_source_profile(
+        normalized_login
+    ):
+        raise ValueError(
+            "Неизвестный телефон"
+        )
+
+    if now_ts is None:
+        now_ts = int(
+            datetime.now(
+                timezone.utc
+            ).timestamp()
+        )
+    else:
+        now_ts = int(now_ts)
+
+    with connect_db() as conn:
+        conn.execute(
+            "BEGIN IMMEDIATE"
+        )
+
+        conn.execute(
+            """
+            UPDATE device_manager_assignments
+
+            SET
+                effective_until = ?,
+                ended_by = ?
+
+            WHERE
+                user_login = ?
+                AND effective_from <= ?
+                AND effective_until > ?
+            """,
+            (
+                now_ts,
+                str(changed_by or "dashboard")[:200],
+                normalized_login,
+                now_ts,
+                now_ts,
+            ),
+        )
+
+        conn.commit()
+
+    return get_effective_device_manager(
+        normalized_login,
+        now_ts,
+    )
 
 
 # =========================================================
@@ -6993,6 +7454,37 @@ def save_call(
             merged_src_slot,
         )
 
+        call_start_time = event_value(
+            "start_time"
+        )
+
+        try:
+            manager_attribution_time = int(
+                call_start_time
+                or event_created
+                or 0
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            manager_attribution_time = 0
+
+        if manager_attribution_time <= 0:
+            manager_attribution_time = int(
+                datetime.now(
+                    timezone.utc
+                ).timestamp()
+            )
+
+        device_manager = (
+            get_effective_device_manager(
+                merged_user_login,
+                manager_attribution_time,
+                conn,
+            )
+        )
+
         values = (
             db_call_id,
             event_pbx_call_id,
@@ -7017,7 +7509,7 @@ def save_call(
             event_value("src_id"),
             merged_src_slot,
             event_created,
-            event_value("start_time"),
+            call_start_time,
             event_value("answer_time"),
             event_value("end_time"),
             merged_duration,
@@ -7156,13 +7648,13 @@ def save_call(
 
         if not is_internal_contact:
 
-            default_manager_code = device[
-                "default_manager_code"
+            default_manager_code = device_manager[
+                "manager_code"
             ]
 
-            default_manager_name = MANAGERS.get(
-                default_manager_code
-            )
+            default_manager_name = device_manager[
+                "manager_name"
+            ]
 
             if default_manager_name:
                 conn.execute(
@@ -7193,9 +7685,16 @@ def save_call(
                         default_manager_code,
                         default_manager_name,
                         (
-                            "Авто: "
-                            + normalize_user_login(
-                                merged_user_login
+                            "Авто по телефону: "
+                            + device_manager[
+                                "device_name"
+                            ]
+                            + (
+                                " (дежурный до конца дня)"
+                                if device_manager[
+                                    "temporary"
+                                ]
+                                else " (по умолчанию)"
                             )
                         ),
                         call_id,
@@ -16018,6 +16517,187 @@ def rating_details(
 
 
 # =========================================================
+# DASHBOARD DEVICE MANAGER ADMIN
+# =========================================================
+
+def require_dashboard_admin(
+    request: Request,
+):
+
+    if not DASHBOARD_ADMIN_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "DASHBOARD_ADMIN_TOKEN "
+                "не настроен"
+            ),
+        )
+
+    received_token = request.headers.get(
+        "X-Dashboard-Admin-Token",
+        "",
+    ).strip()
+
+    authorization = request.headers.get(
+        "Authorization",
+        "",
+    ).strip()
+
+    if (
+        not received_token
+        and authorization.casefold().startswith(
+            "bearer "
+        )
+    ):
+        received_token = authorization[7:].strip()
+
+    if not secrets.compare_digest(
+        received_token,
+        DASHBOARD_ADMIN_TOKEN,
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Неверный код доступа",
+        )
+
+    origin = request.headers.get(
+        "Origin",
+        "",
+    ).strip()
+
+    if origin:
+        parsed_origin = urlparse(origin)
+        public_host = urlparse(
+            PUBLIC_BASE_URL
+        ).netloc.casefold()
+        request_host = request.headers.get(
+            "Host",
+            "",
+        ).casefold()
+        origin_host = parsed_origin.netloc.casefold()
+
+        if (
+            parsed_origin.scheme not in {
+                "http",
+                "https",
+            }
+            or not origin_host
+            or origin_host not in {
+                public_host,
+                request_host,
+            }
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Недопустимый источник запроса",
+            )
+
+
+@app.get(
+    "/admin/device-managers"
+)
+def admin_device_managers(
+    request: Request,
+):
+
+    require_dashboard_admin(
+        request
+    )
+
+    return {
+        "devices": (
+            list_device_manager_assignments()
+        ),
+        "managers": [
+            {
+                "code": code,
+                "name": name,
+            }
+            for code, name in MANAGERS.items()
+        ],
+    }
+
+
+@app.post(
+    "/admin/device-managers"
+)
+async def update_admin_device_manager(
+    request: Request,
+):
+
+    require_dashboard_admin(
+        request
+    )
+
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Некорректный JSON",
+        ) from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="Некорректные данные",
+        )
+
+    user_login = normalize_user_login(
+        payload.get("user_login")
+    )
+    action = str(
+        payload.get("action")
+        or "assign"
+    ).strip().casefold()
+
+    try:
+        if action == "reset":
+            device = (
+                reset_device_manager_assignment(
+                    user_login,
+                    changed_by="dashboard-admin",
+                )
+            )
+        elif action == "assign":
+            device = (
+                set_device_manager_assignment(
+                    user_login,
+                    payload.get("manager_code"),
+                    changed_by="dashboard-admin",
+                )
+            )
+        else:
+            raise ValueError(
+                "Неизвестное действие"
+            )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
+
+    until = device[
+        "effective_until"
+    ]
+    device["effective_until_label"] = (
+        datetime.fromtimestamp(
+            until,
+            UZ_TZ,
+        ).strftime(
+            "%d.%m.%Y %H:%M"
+        )
+        if until
+        else None
+    )
+
+    return {
+        "ok": True,
+        "device": device,
+    }
+
+
+# =========================================================
 # DASHBOARD
 # =========================================================
 
@@ -16424,6 +17104,110 @@ tbody tr:last-child td {
     color: #111;
 }
 
+.device-manager-login {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.admin-input,
+.device-manager-select {
+    min-height: 42px;
+    border: 1px solid #3a3a3a;
+    border-radius: 9px;
+    background: #111;
+    color: #fff;
+    padding: 9px 11px;
+}
+
+.admin-input {
+    width: min(320px, 100%);
+}
+
+.admin-action,
+.admin-reset {
+    min-height: 42px;
+    border: 1px solid #d9b565;
+    border-radius: 9px;
+    padding: 9px 12px;
+    cursor: pointer;
+    font-weight: 700;
+}
+
+.admin-action {
+    background: #d9b565;
+    color: #111;
+}
+
+.admin-reset {
+    background: transparent;
+    color: #d9b565;
+}
+
+.admin-action:disabled,
+.admin-reset:disabled {
+    cursor: wait;
+    opacity: .55;
+}
+
+.device-manager-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 12px;
+}
+
+.device-manager-card {
+    padding: 16px;
+    border: 1px solid #303030;
+    border-radius: 13px;
+    background: #151515;
+}
+
+.device-manager-name {
+    margin-bottom: 5px;
+    font-size: 19px;
+    font-weight: 750;
+}
+
+.device-manager-status {
+    min-height: 38px;
+    margin-bottom: 12px;
+    color: #aaa;
+    font-size: 13px;
+    line-height: 1.45;
+}
+
+.device-manager-status.temporary {
+    color: #d9b565;
+}
+
+.device-manager-actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.device-manager-select {
+    flex: 1;
+    min-width: 120px;
+}
+
+.admin-message {
+    margin-top: 12px;
+    min-height: 20px;
+    color: #aaa;
+    font-size: 13px;
+}
+
+.admin-message.error {
+    color: #ffabab;
+}
+
+.hidden {
+    display: none !important;
+}
+
 .modal-overlay {
     position: fixed;
     inset: 0;
@@ -16710,6 +17494,63 @@ tbody tr:last-child td {
     >
         Показать
     </button>
+
+</div>
+
+
+<div class="panel">
+
+    <div class="panel-header">
+
+        <div>
+            <h2>Кто работает с телефонами сегодня</h2>
+            <div class="subtitle">
+                Назначение действует для новых звонков до 00:00.
+                Старые звонки не меняются.
+            </div>
+        </div>
+
+        <button
+            class="admin-reset hidden"
+            id="device_manager_lock"
+            type="button"
+        >
+            Закрыть управление
+        </button>
+
+    </div>
+
+    <div
+        class="device-manager-login"
+        id="device_manager_login"
+    >
+        <input
+            class="admin-input"
+            id="dashboard_admin_token"
+            type="password"
+            autocomplete="current-password"
+            placeholder="Код доступа администратора"
+        >
+
+        <button
+            class="admin-action"
+            id="device_manager_unlock"
+            type="button"
+        >
+            Открыть управление
+        </button>
+    </div>
+
+    <div
+        class="device-manager-grid hidden"
+        id="device_manager_grid"
+    ></div>
+
+    <div
+        class="admin-message"
+        id="device_manager_message"
+        aria-live="polite"
+    ></div>
 
 </div>
 
@@ -17484,6 +18325,9 @@ let chartMode =
 let timelineData =
     [];
 
+let dashboardAdminToken =
+    "";
+
 
 function formatDuration(
     seconds
@@ -17627,6 +18471,417 @@ async function getJson(
     return (
         await response.json()
     );
+}
+
+
+function setDeviceManagerMessage(
+    message,
+    isError = false
+) {
+
+    const element =
+        document.getElementById(
+            "device_manager_message"
+        );
+
+    element.textContent =
+        message || "";
+
+    element.classList.toggle(
+        "error",
+        Boolean(isError)
+    );
+}
+
+
+function saveDashboardAdminToken(
+    token
+) {
+
+    try {
+        if (token) {
+            sessionStorage.setItem(
+                "texnikach_dashboard_admin_token",
+                token
+            );
+        } else {
+            sessionStorage.removeItem(
+                "texnikach_dashboard_admin_token"
+            );
+        }
+    } catch (error) {
+        console.warn(
+            "Session storage is unavailable",
+            error
+        );
+    }
+}
+
+
+function readDashboardAdminToken() {
+
+    try {
+        return sessionStorage.getItem(
+            "texnikach_dashboard_admin_token"
+        ) || "";
+    } catch (error) {
+        return "";
+    }
+}
+
+
+async function deviceManagerRequest(
+    method = "GET",
+    payload = null
+) {
+
+    const options = {
+        method,
+        cache: "no-store",
+        headers: {
+            "X-Dashboard-Admin-Token":
+                dashboardAdminToken,
+        },
+    };
+
+    if (payload !== null) {
+        options.headers["Content-Type"] =
+            "application/json";
+        options.body = JSON.stringify(
+            payload
+        );
+    }
+
+    const response = await fetch(
+        "/admin/device-managers",
+        options
+    );
+
+    let data = {};
+
+    try {
+        data = await response.json();
+    } catch (error) {
+        data = {};
+    }
+
+    if (!response.ok) {
+        const requestError = new Error(
+            data.detail
+            || (
+                "Ошибка HTTP "
+                + response.status
+            )
+        );
+
+        requestError.status =
+            response.status;
+
+        throw requestError;
+    }
+
+    return data;
+}
+
+
+function renderDeviceManagers(
+    data
+) {
+
+    const grid =
+        document.getElementById(
+            "device_manager_grid"
+        );
+
+    grid.textContent = "";
+
+    data.devices.forEach(
+        device => {
+            const card =
+                document.createElement(
+                    "div"
+                );
+
+            card.className =
+                "device-manager-card";
+
+            const name =
+                document.createElement(
+                    "div"
+                );
+
+            name.className =
+                "device-manager-name";
+            name.textContent =
+                device.device_name;
+
+            const status =
+                document.createElement(
+                    "div"
+                );
+
+            status.className =
+                "device-manager-status";
+
+            if (device.temporary) {
+                status.classList.add(
+                    "temporary"
+                );
+                status.textContent =
+                    "Сейчас: "
+                    + device.manager_name
+                    + ". Временно до "
+                    + device.effective_until_label;
+            } else {
+                status.textContent =
+                    "Сейчас: "
+                    + device.manager_name
+                    + " (по умолчанию)";
+            }
+
+            const actions =
+                document.createElement(
+                    "div"
+                );
+
+            actions.className =
+                "device-manager-actions";
+
+            const select =
+                document.createElement(
+                    "select"
+                );
+
+            select.className =
+                "device-manager-select";
+            select.setAttribute(
+                "aria-label",
+                "Менеджер для "
+                + device.device_name
+            );
+
+            data.managers.forEach(
+                manager => {
+                    const option =
+                        document.createElement(
+                            "option"
+                        );
+
+                    option.value =
+                        manager.code;
+                    option.textContent =
+                        manager.name;
+                    option.selected =
+                        manager.code
+                        === device.manager_code;
+
+                    select.appendChild(
+                        option
+                    );
+                }
+            );
+
+            const save =
+                document.createElement(
+                    "button"
+                );
+
+            save.type = "button";
+            save.className =
+                "admin-action";
+            save.textContent =
+                "Назначить до 00:00";
+
+            const reset =
+                document.createElement(
+                    "button"
+                );
+
+            reset.type = "button";
+            reset.className =
+                "admin-reset";
+            reset.textContent =
+                "Вернуть стандартного";
+            reset.disabled =
+                !device.temporary;
+
+            save.addEventListener(
+                "click",
+                async () => {
+                    save.disabled = true;
+                    reset.disabled = true;
+                    setDeviceManagerMessage(
+                        "Сохраняю назначение…"
+                    );
+
+                    try {
+                        await deviceManagerRequest(
+                            "POST",
+                            {
+                                action: "assign",
+                                user_login:
+                                    device.user_login,
+                                manager_code:
+                                    select.value,
+                            }
+                        );
+
+                        setDeviceManagerMessage(
+                            device.device_name
+                            + ": назначение сохранено"
+                        );
+                        await loadDeviceManagers(
+                            false
+                        );
+                    } catch (error) {
+                        setDeviceManagerMessage(
+                            error.message,
+                            true
+                        );
+                        save.disabled = false;
+                        reset.disabled =
+                            !device.temporary;
+                    }
+                }
+            );
+
+            reset.addEventListener(
+                "click",
+                async () => {
+                    save.disabled = true;
+                    reset.disabled = true;
+                    setDeviceManagerMessage(
+                        "Возвращаю стандартного менеджера…"
+                    );
+
+                    try {
+                        await deviceManagerRequest(
+                            "POST",
+                            {
+                                action: "reset",
+                                user_login:
+                                    device.user_login,
+                            }
+                        );
+
+                        setDeviceManagerMessage(
+                            device.device_name
+                            + ": стандартный менеджер возвращён"
+                        );
+                        await loadDeviceManagers(
+                            false
+                        );
+                    } catch (error) {
+                        setDeviceManagerMessage(
+                            error.message,
+                            true
+                        );
+                        save.disabled = false;
+                        reset.disabled = false;
+                    }
+                }
+            );
+
+            actions.appendChild(
+                select
+            );
+            actions.appendChild(
+                save
+            );
+            actions.appendChild(
+                reset
+            );
+
+            card.appendChild(name);
+            card.appendChild(status);
+            card.appendChild(actions);
+            grid.appendChild(card);
+        }
+    );
+
+    document
+        .getElementById(
+            "device_manager_login"
+        )
+        .classList.add(
+            "hidden"
+        );
+
+    grid.classList.remove(
+        "hidden"
+    );
+
+    document
+        .getElementById(
+            "device_manager_lock"
+        )
+        .classList.remove(
+            "hidden"
+        );
+}
+
+
+async function loadDeviceManagers(
+    showLoading = true
+) {
+
+    if (!dashboardAdminToken) {
+        return;
+    }
+
+    if (showLoading) {
+        setDeviceManagerMessage(
+            "Загружаю назначения…"
+        );
+    }
+
+    try {
+        const data =
+            await deviceManagerRequest();
+
+        saveDashboardAdminToken(
+            dashboardAdminToken
+        );
+        renderDeviceManagers(data);
+
+        if (showLoading) {
+            setDeviceManagerMessage("");
+        }
+    } catch (error) {
+        if (error.status === 403) {
+            dashboardAdminToken = "";
+            saveDashboardAdminToken("");
+
+            document
+                .getElementById(
+                    "device_manager_login"
+                )
+                .classList.remove(
+                    "hidden"
+                );
+
+            document
+                .getElementById(
+                    "device_manager_grid"
+                )
+                .classList.add(
+                    "hidden"
+                );
+
+            document
+                .getElementById(
+                    "device_manager_lock"
+                )
+                .classList.add(
+                    "hidden"
+                );
+        }
+
+        setDeviceManagerMessage(
+            error.message,
+            true
+        );
+    }
 }
 
 
@@ -19352,12 +20607,123 @@ document
     );
 
 
+async function unlockDeviceManagers() {
+
+    const input =
+        document.getElementById(
+            "dashboard_admin_token"
+        );
+
+    const token =
+        input.value.trim();
+
+    if (!token) {
+        setDeviceManagerMessage(
+            "Введите код доступа",
+            true
+        );
+        input.focus();
+        return;
+    }
+
+    dashboardAdminToken = token;
+    await loadDeviceManagers();
+}
+
+
+document
+    .getElementById(
+        "device_manager_unlock"
+    )
+    .addEventListener(
+        "click",
+        unlockDeviceManagers
+    );
+
+
+document
+    .getElementById(
+        "dashboard_admin_token"
+    )
+    .addEventListener(
+        "keydown",
+        event => {
+            if (event.key === "Enter") {
+                unlockDeviceManagers();
+            }
+        }
+    );
+
+
+document
+    .getElementById(
+        "device_manager_lock"
+    )
+    .addEventListener(
+        "click",
+        () => {
+            dashboardAdminToken = "";
+            saveDashboardAdminToken("");
+
+            document
+                .getElementById(
+                    "dashboard_admin_token"
+                )
+                .value = "";
+
+            document
+                .getElementById(
+                    "device_manager_login"
+                )
+                .classList.remove(
+                    "hidden"
+                );
+
+            document
+                .getElementById(
+                    "device_manager_grid"
+                )
+                .classList.add(
+                    "hidden"
+                );
+
+            document
+                .getElementById(
+                    "device_manager_lock"
+                )
+                .classList.add(
+                    "hidden"
+                );
+
+            setDeviceManagerMessage("");
+        }
+    );
+
+
+dashboardAdminToken =
+    readDashboardAdminToken();
+
+if (dashboardAdminToken) {
+    loadDeviceManagers();
+}
+
+
 loadAll();
 
 
 setInterval(
     loadAll,
     30000
+);
+
+
+setInterval(
+    () => {
+        if (dashboardAdminToken) {
+            loadDeviceManagers(false);
+        }
+    },
+    60000
 );
 
 </script>
