@@ -109,6 +109,8 @@ class FillReminderCandidate:
     sale_date: date
     order_id: int
     manager: str | None
+    supplier_price_filled: bool
+    phone_filled: bool
     reminder_message_id: int | None
 
 
@@ -367,6 +369,7 @@ class SalesPhotoRepository:
                     client_phone TEXT,
                     client_phone_2 TEXT,
                     product_label TEXT,
+                    supplier_price_filled INTEGER NOT NULL DEFAULT 0,
                     ui_generation INTEGER NOT NULL DEFAULT 0,
                     sale_date TEXT,
                     daily_order_id INTEGER,
@@ -475,6 +478,17 @@ class SalesPhotoRepository:
             if "product_label" not in columns:
                 db.execute(
                     "ALTER TABLE sales_photo_jobs ADD COLUMN product_label TEXT"
+                )
+            if "supplier_price_filled" not in columns:
+                db.execute(
+                    "ALTER TABLE sales_photo_jobs ADD COLUMN "
+                    "supplier_price_filled INTEGER NOT NULL DEFAULT 0"
+                )
+                # Historical cards predate quiet database-backed checks. Treat
+                # their supplier field as already reviewed instead of scanning
+                # and forwarding the whole channel during migration.
+                db.execute(
+                    "UPDATE sales_photo_jobs SET supplier_price_filled=1"
                 )
             if "ui_generation" not in columns:
                 db.execute(
@@ -1321,6 +1335,8 @@ class SalesPhotoRepository:
                 """SELECT job.chat_id,job.source_message_id,
                           job.replacement_message_id,job.sale_date,
                           job.daily_order_id,job.manager,
+                          job.supplier_price_filled,
+                          job.client_phone,job.client_phone_2,
                           reminder.reminder_message_id
                    FROM sales_photo_jobs AS job
                    LEFT JOIN sales_photo_fill_reminders AS reminder
@@ -1349,6 +1365,8 @@ class SalesPhotoRepository:
                 sale_date=date.fromisoformat(str(row["sale_date"])),
                 order_id=int(row["daily_order_id"]),
                 manager=str(row["manager"]) if row["manager"] else None,
+                supplier_price_filled=bool(row["supplier_price_filled"]),
+                phone_filled=bool(row["client_phone"] or row["client_phone_2"]),
                 reminder_message_id=(
                     int(row["reminder_message_id"])
                     if row["reminder_message_id"] is not None
@@ -2966,6 +2984,7 @@ class SalesPhotoRepository:
         replacement_message_id: int,
         phones: tuple[str, ...],
         product_label: str | None,
+        supplier_price_filled: bool | None = None,
         at: datetime | None = None,
     ) -> bool:
         """Persist customer identity for call and sales analytics.
@@ -2987,13 +3006,20 @@ class SalesPhotoRepository:
         with self._connect() as db:
             cursor = db.execute(
                 """UPDATE sales_photo_jobs
-                   SET client_phone=?,client_phone_2=?,product_label=?,updated_at=?
+                   SET client_phone=?,client_phone_2=?,product_label=?,
+                       supplier_price_filled=COALESCE(?,supplier_price_filled),
+                       updated_at=?
                    WHERE chat_id=? AND replacement_message_id=?
                      AND status IN ('reposted','delete_pending','complete')""",
                 (
                     first_phone,
                     second_phone,
                     product,
+                    (
+                        int(bool(supplier_price_filled))
+                        if supplier_price_filled is not None
+                        else None
+                    ),
                     _iso(at or utc_now()),
                     int(chat_id),
                     int(replacement_message_id),

@@ -58,6 +58,7 @@ from .repository import SalesPhotoRepository, utc_now
 from .reminders import (
     CLEANUP_CLOCKS,
     FILL_REMINDER_MARKER,
+    FillCheck,
     NOTICE_CLOCKS,
     build_fill_reminder,
     inspect_fill_fields,
@@ -1047,6 +1048,7 @@ class SalesPhotoService:
                 replacement_message_id,
                 extract_caption_phones(body),
                 product_label_from_card(body),
+                supplier_price_filled=inspect_fill_fields(body, None).supplier_price,
             )
         except Exception as exc:
             logger.warning(
@@ -3473,28 +3475,12 @@ class SalesPhotoService:
             )
             checked = sent = deleted = failures = 0
             for candidate_index, candidate in enumerate(candidates):
-                forwarded = None
                 try:
-                    self._order_backfill_forward_sources[
-                        candidate.replacement_message_id
-                    ] = time.monotonic() + 600
-                    forwarded = await self._send_with_retry(
-                        bot.forward_message,
-                        {
-                            "chat_id": candidate.chat_id,
-                            "from_chat_id": candidate.chat_id,
-                            "message_id": candidate.replacement_message_id,
-                            "disable_notification": True,
-                        },
+                    check = FillCheck(
+                        supplier_price=candidate.supplier_price_filled,
+                        phone=candidate.phone_filled,
+                        manager=candidate.manager,
                     )
-                    self._track_maintenance_forward(
-                        candidate.replacement_message_id,
-                        forwarded,
-                    )
-                    content = _message_content(forwarded)
-                    if content is None:
-                        raise RuntimeError("forwarded_card_has_no_content")
-                    check = inspect_fill_fields(content[1], candidate.manager)
                     checked += 1
                     if check.complete or publish:
                         old_id = candidate.reminder_message_id
@@ -3545,31 +3531,6 @@ class SalesPhotoService:
                     sent += 1
                 except asyncio.CancelledError:
                     raise
-                except BadRequest as exc:
-                    failures += 1
-                    if _message_to_forward_missing(exc):
-                        self.repository.mark_order_card_removed(
-                            candidate.chat_id,
-                            candidate.source_message_id,
-                        )
-                        if candidate.reminder_message_id is not None:
-                            if await self._delete_duplicate(
-                                bot,
-                                candidate.chat_id,
-                                candidate.reminder_message_id,
-                            ):
-                                self.repository.clear_fill_reminder(
-                                    candidate.chat_id,
-                                    candidate.source_message_id,
-                                    candidate.reminder_message_id,
-                                )
-                    else:
-                        logger.warning(
-                            "sales_photo_fill_reminder_failed message_id=%s "
-                            "error_type=%s",
-                            candidate.replacement_message_id,
-                            _error_code(exc),
-                        )
                 except Exception as exc:
                     failures += 1
                     logger.warning(
@@ -3579,17 +3540,7 @@ class SalesPhotoService:
                         _error_code(exc),
                     )
                 finally:
-                    if forwarded is not None:
-                        temporary_id = getattr(forwarded, "message_id", None)
-                        if temporary_id is not None:
-                            await self._delete_duplicate(
-                                bot,
-                                candidate.chat_id,
-                                int(temporary_id),
-                            )
                     self._safe_touch_heartbeat()
-                    if candidate_index + 1 < len(candidates):
-                        await asyncio.sleep(0.2)
             logger.info(
                 "sales_photo_fill_reminder_complete publish=%s candidates=%s "
                 "checked=%s sent=%s deleted=%s failures=%s",

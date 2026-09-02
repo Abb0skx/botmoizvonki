@@ -152,18 +152,7 @@ class FillReminderServiceTests(unittest.IsolatedAsyncioTestCase):
             )
             repo.mark_reposted(CHAT_ID, 10, 200)
             repo.mark_complete(CHAT_ID, 10)
-            cards = {200: CARD}
             next_message_id = 800
-
-            async def forward_message(**kwargs):
-                message_id = int(kwargs["message_id"])
-                return SimpleNamespace(
-                    message_id=900 + message_id,
-                    chat_id=CHAT_ID,
-                    caption=cards[message_id],
-                    caption_entities=(),
-                    text=None,
-                )
 
             async def send_message(**kwargs):
                 nonlocal next_message_id
@@ -171,7 +160,7 @@ class FillReminderServiceTests(unittest.IsolatedAsyncioTestCase):
                 return SimpleNamespace(message_id=next_message_id)
 
             bot = SimpleNamespace(
-                forward_message=AsyncMock(side_effect=forward_message),
+                forward_message=AsyncMock(),
                 send_message=AsyncMock(side_effect=send_message),
                 delete_message=AsyncMock(return_value=True),
             )
@@ -205,7 +194,15 @@ class FillReminderServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(
                 repo.commit_reserved_manager_selection(CHAT_ID, 200, "Ali", 0)
             )
-            cards[200] = CARD.replace("📞:", "📞: любой текст")
+            self.assertTrue(
+                repo.sync_sale_details(
+                    CHAT_ID,
+                    200,
+                    ("+998 90 123 45 67",),
+                    "A30",
+                    supplier_price_filled=True,
+                )
+            )
             await service.run_fill_reminder_check(
                 bot,
                 publish=False,
@@ -241,6 +238,7 @@ class FillReminderServiceTests(unittest.IsolatedAsyncioTestCase):
             )
 
             self.assertIn(call(CHAT_ID, 777), bot.delete_message.await_args_list)
+            bot.forward_message.assert_not_awaited()
             self.assertEqual(
                 repo.fill_reminders_outside_window(
                     CHAT_ID,
