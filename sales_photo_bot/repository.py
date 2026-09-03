@@ -368,6 +368,7 @@ class SalesPhotoRepository:
                     manager TEXT,
                     client_phone TEXT,
                     client_phone_2 TEXT,
+                    phone_field_filled INTEGER NOT NULL DEFAULT 0,
                     product_label TEXT,
                     supplier_price_filled INTEGER NOT NULL DEFAULT 0,
                     ui_generation INTEGER NOT NULL DEFAULT 0,
@@ -474,6 +475,16 @@ class SalesPhotoRepository:
             if "client_phone_2" not in columns:
                 db.execute(
                     "ALTER TABLE sales_photo_jobs ADD COLUMN client_phone_2 TEXT"
+                )
+            if "phone_field_filled" not in columns:
+                db.execute(
+                    "ALTER TABLE sales_photo_jobs ADD COLUMN "
+                    "phone_field_filled INTEGER NOT NULL DEFAULT 0"
+                )
+                db.execute(
+                    """UPDATE sales_photo_jobs SET phone_field_filled=1
+                       WHERE client_phone IS NOT NULL
+                          OR client_phone_2 IS NOT NULL"""
                 )
             if "product_label" not in columns:
                 db.execute(
@@ -1336,6 +1347,7 @@ class SalesPhotoRepository:
                           job.replacement_message_id,job.sale_date,
                           job.daily_order_id,job.manager,
                           job.supplier_price_filled,
+                          job.phone_field_filled,
                           job.client_phone,job.client_phone_2,
                           reminder.reminder_message_id
                    FROM sales_photo_jobs AS job
@@ -1366,7 +1378,11 @@ class SalesPhotoRepository:
                 order_id=int(row["daily_order_id"]),
                 manager=str(row["manager"]) if row["manager"] else None,
                 supplier_price_filled=bool(row["supplier_price_filled"]),
-                phone_filled=bool(row["client_phone"] or row["client_phone_2"]),
+                phone_filled=bool(
+                    row["phone_field_filled"]
+                    or row["client_phone"]
+                    or row["client_phone_2"]
+                ),
                 reminder_message_id=(
                     int(row["reminder_message_id"])
                     if row["reminder_message_id"] is not None
@@ -2985,6 +3001,7 @@ class SalesPhotoRepository:
         phones: tuple[str, ...],
         product_label: str | None,
         supplier_price_filled: bool | None = None,
+        phone_field_filled: bool | None = None,
         at: datetime | None = None,
     ) -> bool:
         """Persist customer identity for call and sales analytics.
@@ -3008,6 +3025,7 @@ class SalesPhotoRepository:
                 """UPDATE sales_photo_jobs
                    SET client_phone=?,client_phone_2=?,product_label=?,
                        supplier_price_filled=COALESCE(?,supplier_price_filled),
+                       phone_field_filled=COALESCE(?,phone_field_filled),
                        updated_at=?
                    WHERE chat_id=? AND replacement_message_id=?
                      AND status IN ('reposted','delete_pending','complete')""",
@@ -3018,6 +3036,11 @@ class SalesPhotoRepository:
                     (
                         int(bool(supplier_price_filled))
                         if supplier_price_filled is not None
+                        else None
+                    ),
+                    (
+                        int(bool(phone_field_filled))
+                        if phone_field_filled is not None
                         else None
                     ),
                     _iso(at or utc_now()),

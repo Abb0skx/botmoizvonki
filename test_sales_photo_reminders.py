@@ -52,11 +52,15 @@ class FillReminderFormattingTests(unittest.TestCase):
     def test_only_non_whitespace_after_colon_counts_as_filled(self):
         empty = inspect_fill_fields("🛒💵:   \n📞:\t", None)
         arbitrary = inspect_fill_fields("🛒💵: x\n📞: не номер", "Ali")
+        dash = inspect_fill_fields("🛒💵: x\n📞: -", "Ali")
+        no_number = inspect_fill_fields("🛒💵: x\n📞: Без номера", "Ali")
 
         self.assertFalse(empty.supplier_price)
         self.assertFalse(empty.phone)
         self.assertFalse(empty.complete)
         self.assertTrue(arbitrary.complete)
+        self.assertTrue(dash.complete)
+        self.assertTrue(no_number.complete)
 
     def test_notice_lists_only_missing_fields_and_always_mentions_admin(self):
         check = inspect_fill_fields("🛒💵: заполнено\n📞:", None)
@@ -117,6 +121,34 @@ class FillReminderScheduleTests(unittest.TestCase):
 
 
 class FillReminderServiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_placeholder_phone_is_persisted_as_intentionally_filled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SalesPhotoRepository(root / "sales.db")
+            repo.claim_photo(
+                CHAT_ID,
+                10,
+                "unique",
+                source_file_id="file",
+                sale_date=date(2026, 9, 1),
+            )
+            repo.mark_reposted(CHAT_ID, 10, 200)
+            repo.mark_complete(CHAT_ID, 10)
+            service = SalesPhotoService(settings(root), repo)
+
+            service._sync_sale_details(
+                CHAT_ID,
+                200,
+                CARD.replace("📞:", "📞: Без номера"),
+            )
+
+            candidate = repo.fill_reminder_candidates(
+                CHAT_ID,
+                date(2026, 9, 1),
+                date(2026, 9, 1),
+            )[0]
+            self.assertTrue(candidate.phone_filled)
+
     async def test_own_reminder_is_never_treated_as_a_short_model(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -198,9 +230,10 @@ class FillReminderServiceTests(unittest.IsolatedAsyncioTestCase):
                 repo.sync_sale_details(
                     CHAT_ID,
                     200,
-                    ("+998 90 123 45 67",),
+                    (),
                     "A30",
                     supplier_price_filled=True,
+                    phone_field_filled=True,
                 )
             )
             await service.run_fill_reminder_check(
@@ -219,6 +252,23 @@ class FillReminderServiceTests(unittest.IsolatedAsyncioTestCase):
                 date(2026, 9, 1),
             )[0]
             self.assertIsNone(candidate.reminder_message_id)
+            self.assertTrue(candidate.phone_filled)
+
+            repo.sync_sale_details(
+                CHAT_ID,
+                200,
+                (),
+                "A30",
+                supplier_price_filled=True,
+                phone_field_filled=False,
+            )
+            self.assertFalse(
+                repo.fill_reminder_candidates(
+                    CHAT_ID,
+                    date(2026, 9, 1),
+                    date(2026, 9, 1),
+                )[0].phone_filled
+            )
 
             repo.claim_photo(
                 CHAT_ID,

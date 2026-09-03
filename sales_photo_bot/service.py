@@ -1081,12 +1081,14 @@ class SalesPhotoService:
         body: str,
     ) -> None:
         try:
+            fill = inspect_fill_fields(body, None)
             self.repository.sync_sale_details(
                 chat_id,
                 replacement_message_id,
                 extract_caption_phones(body),
                 product_label_from_card(body),
-                supplier_price_filled=inspect_fill_fields(body, None).supplier_price,
+                supplier_price_filled=fill.supplier_price,
+                phone_field_filled=fill.phone,
             )
         except Exception as exc:
             logger.warning(
