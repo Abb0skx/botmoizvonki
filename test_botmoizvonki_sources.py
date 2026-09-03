@@ -1713,6 +1713,397 @@ class CallSourceTests(unittest.TestCase):
         )
         self.assertIn("Расшифровка звонка", sections)
 
+    def create_sent_customer_rating(
+        self,
+        db_call_id=50,
+        client_number="+998900000050",
+        user_login="texnikach@gmail.com",
+        sent_at=1_800_000_100,
+        expires_at=1_900_000_000,
+        score=None,
+        score_source=None,
+    ):
+        saved = self.save(
+            user_login,
+            self.event(
+                db_call_id,
+                client_number,
+                0,
+            ),
+        )
+
+        with bot.connect_db() as conn:
+            call = conn.execute(
+                """
+                SELECT
+                    client_key,
+                    client_window_id
+
+                FROM calls
+
+                WHERE id = ?
+                """,
+                (
+                    saved["call_id"],
+                ),
+            ).fetchone()
+            cursor = conn.execute(
+                """
+                INSERT INTO call_ratings (
+                    call_id,
+                    client_window_id,
+                    token_hash,
+                    client_key,
+                    sender_user_login,
+                    sms_status,
+                    sms_reserved_at,
+                    sms_sent_at,
+                    score,
+                    score_source,
+                    rated_at,
+                    expires_at
+                )
+
+                VALUES (
+                    ?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    saved["call_id"],
+                    call["client_window_id"],
+                    f"sms-token-{db_call_id}",
+                    call["client_key"],
+                    user_login,
+                    sent_at - 1,
+                    sent_at,
+                    score,
+                    score_source,
+                    sent_at + 1 if score else None,
+                    expires_at,
+                ),
+            )
+            conn.commit()
+
+        return saved, cursor.lastrowid
+
+    @staticmethod
+    def inbound_sms_request(
+        client_number,
+        text,
+        *,
+        direction=0,
+        user_login="texnikach@gmail.com",
+        event_created=1_800_000_200,
+        start_time=1_800_000_190,
+        event_pbx_call_id="sms-event-1",
+    ):
+        request = mock.Mock()
+        request.headers = {}
+        request.query_params = {}
+        request.json = mock.AsyncMock(
+            return_value={
+                "webhook": {
+                    "action": "sms.message",
+                    "user_login": user_login,
+                    "user_id": 1,
+                    "account_id": 98073,
+                    "account_name": "texnikachuz",
+                },
+                "event": {
+                    "event_type": 32,
+                    "direction": direction,
+                    "event_pbx_call_id": event_pbx_call_id,
+                    "event_created": event_created,
+                    "start_time": start_time,
+                    "client_number": client_number,
+                    "client_name": "Client",
+                    "src_number": "+998998446162",
+                    "src_id": 1,
+                    "src_slot": 0,
+                    "text": text,
+                },
+            }
+        )
+        return request
+
+    def test_inbound_sms_rating_is_saved_and_visible_in_all_statistics(self):
+        saved, rating_id = self.create_sent_customer_rating()
+        request = self.inbound_sms_request(
+            "+998900000050",
+            " 5 ",
+        )
+
+        result = asyncio.run(
+            bot.moizvonki_webhook(
+                request
+            )
+        )
+
+        self.assertTrue(
+            result["sms_rating"]["processed"]
+        )
+        self.assertEqual(
+            result["sms_rating"]["score"],
+            5,
+        )
+
+        with bot.connect_db() as conn:
+            rating = conn.execute(
+                """
+                SELECT *
+                FROM call_ratings
+                WHERE id = ?
+                """,
+                (
+                    rating_id,
+                ),
+            ).fetchone()
+            inbound = conn.execute(
+                """
+                SELECT *
+                FROM inbound_sms_events
+                """
+            ).fetchone()
+
+        self.assertEqual(rating["score"], 5)
+        self.assertEqual(
+            rating["score_source"],
+            "sms",
+        )
+        self.assertEqual(
+            rating["rated_at"],
+            1_800_000_190,
+        )
+        self.assertEqual(
+            rating["inbound_sms_event_id"],
+            inbound["id"],
+        )
+        self.assertEqual(
+            inbound["processing_status"],
+            "rating_saved",
+        )
+        self.assertEqual(inbound["text"], " 5 ")
+
+        period = {
+            "period": "custom",
+            "date_from": "2027-01-01",
+            "date_to": "2027-02-01",
+        }
+        summary = bot.stats(**period)["stats"]
+        manager = bot.stats_managers(
+            **period
+        )["results"][0]
+        daily = bot.stats_ratings_daily(
+            **period
+        )["results"][0]
+        recent = bot.stats_recent(
+            **period
+        )["results"][0]
+
+        self.assertEqual(summary["average_rating"], 5.0)
+        self.assertEqual(summary["ratings_count"], 1)
+        self.assertEqual(manager["average_rating"], 5.0)
+        self.assertEqual(daily["average_rating"], 5.0)
+        self.assertEqual(recent["customer_rating"], 5)
+        self.assertEqual(
+            recent["customer_rating_source"],
+            "sms",
+        )
+
+        details = bot.rating_details(
+            saved["call_id"]
+        )
+        sections = {
+            section["title"]: section["items"]
+            for section in details["sections"]
+        }
+        rating_details = sections[
+            "Оценка и SMS"
+        ]
+        self.assertEqual(
+            rating_details["Способ ответа"],
+            "Входящее SMS",
+        )
+        self.assertEqual(
+            rating_details["Полученное SMS"],
+            " 5 ",
+        )
+
+    def test_inbound_sms_webhook_is_idempotent_and_keeps_first_rating(self):
+        _, rating_id = self.create_sent_customer_rating(
+            db_call_id=51,
+            client_number="+998900000051",
+        )
+        request = self.inbound_sms_request(
+            "+998900000051",
+            "4",
+            event_pbx_call_id="sms-event-51",
+        )
+
+        first = asyncio.run(
+            bot.moizvonki_webhook(request)
+        )
+        duplicate = asyncio.run(
+            bot.moizvonki_webhook(request)
+        )
+
+        self.assertTrue(
+            first["sms_rating"]["processed"]
+        )
+        self.assertTrue(
+            duplicate["sms_rating"]["duplicate"]
+        )
+
+        with bot.connect_db() as conn:
+            inbound_count = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM inbound_sms_events
+                """
+            ).fetchone()[0]
+            rating = conn.execute(
+                """
+                SELECT score, score_source
+                FROM call_ratings
+                WHERE id = ?
+                """,
+                (
+                    rating_id,
+                ),
+            ).fetchone()
+
+        self.assertEqual(inbound_count, 1)
+        self.assertEqual(rating["score"], 4)
+        self.assertEqual(rating["score_source"], "sms")
+
+    def test_only_incoming_exact_digit_from_same_phone_can_rate(self):
+        _, rating_id = self.create_sent_customer_rating(
+            db_call_id=52,
+            client_number="+998900000052",
+        )
+
+        outgoing = asyncio.run(
+            bot.moizvonki_webhook(
+                self.inbound_sms_request(
+                    "+998900000052",
+                    "5",
+                    direction=1,
+                    event_pbx_call_id="sms-outgoing-52",
+                )
+            )
+        )
+        non_rating = asyncio.run(
+            bot.moizvonki_webhook(
+                self.inbound_sms_request(
+                    "+998900000052",
+                    "Оценка 5",
+                    event_pbx_call_id="sms-text-52",
+                )
+            )
+        )
+        wrong_phone = asyncio.run(
+            bot.moizvonki_webhook(
+                self.inbound_sms_request(
+                    "+998900000052",
+                    "5",
+                    user_login="texnikacholx@gmail.com",
+                    event_pbx_call_id="sms-account-52",
+                )
+            )
+        )
+
+        self.assertEqual(
+            outgoing["sms_rating"]["reason"],
+            "outgoing_ignored",
+        )
+        self.assertEqual(
+            non_rating["sms_rating"]["reason"],
+            "non_rating",
+        )
+        self.assertEqual(
+            wrong_phone["sms_rating"]["reason"],
+            "no_rating_request",
+        )
+
+        with bot.connect_db() as conn:
+            rating = conn.execute(
+                """
+                SELECT score
+                FROM call_ratings
+                WHERE id = ?
+                """,
+                (
+                    rating_id,
+                ),
+            ).fetchone()
+            inbound = conn.execute(
+                """
+                SELECT
+                    processing_status,
+                    text
+
+                FROM inbound_sms_events
+
+                ORDER BY id
+                """
+            ).fetchall()
+
+        self.assertIsNone(rating["score"])
+        self.assertEqual(len(inbound), 2)
+        self.assertEqual(
+            [row["processing_status"] for row in inbound],
+            [
+                "non_rating",
+                "no_rating_request",
+            ],
+        )
+
+    def test_existing_web_rating_is_never_overwritten_by_sms(self):
+        _, rating_id = self.create_sent_customer_rating(
+            db_call_id=53,
+            client_number="+998900000053",
+            score=2,
+            score_source="web",
+        )
+
+        result = asyncio.run(
+            bot.moizvonki_webhook(
+                self.inbound_sms_request(
+                    "+998900000053",
+                    "5",
+                    event_pbx_call_id="sms-rated-53",
+                )
+            )
+        )
+
+        self.assertEqual(
+            result["sms_rating"]["reason"],
+            "already_rated",
+        )
+        self.assertEqual(
+            result["sms_rating"]["score"],
+            2,
+        )
+        self.assertEqual(
+            result["sms_rating"]["received_score"],
+            5,
+        )
+
+        with bot.connect_db() as conn:
+            rating = conn.execute(
+                """
+                SELECT score, score_source
+                FROM call_ratings
+                WHERE id = ?
+                """,
+                (
+                    rating_id,
+                ),
+            ).fetchone()
+
+        self.assertEqual(rating["score"], 2)
+        self.assertEqual(rating["score_source"], "web")
+
 
 if __name__ == "__main__":
     unittest.main()

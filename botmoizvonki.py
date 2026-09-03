@@ -230,6 +230,8 @@ https://texnikach.uz/go"""
 RATING_SMS_TEXT = """TEXNIKACH
 Оцените звонок от 1 до 5.
 Qo‘ng‘iroqni 1 dan 5 gacha baholang.
+Ответьте на SMS одной цифрой 1–5 или откройте ссылку.
+SMSga 1–5 oralig‘idagi bitta raqam bilan javob bering yoki havolani oching.
 {rating_url}
 1 — плохо/yomon, 5 — отлично/a’lo"""
 
@@ -1877,6 +1879,8 @@ def init_db():
                     ),
 
                 rated_at INTEGER,
+                score_source TEXT,
+                inbound_sms_event_id INTEGER,
                 expires_at INTEGER NOT NULL,
 
                 first_opened_at INTEGER,
@@ -1991,6 +1995,18 @@ def init_db():
                 ALTER TABLE call_ratings
                 ADD COLUMN device_data_updated_at INTEGER
                 """,
+
+            "score_source":
+                """
+                ALTER TABLE call_ratings
+                ADD COLUMN score_source TEXT
+                """,
+
+            "inbound_sms_event_id":
+                """
+                ALTER TABLE call_ratings
+                ADD COLUMN inbound_sms_event_id INTEGER
+                """,
         }
 
         for column, sql in (
@@ -2000,6 +2016,85 @@ def init_db():
                 conn.execute(
                     sql
                 )
+
+        # Ratings saved before response-source tracking was introduced came
+        # exclusively from the public rating page.
+        conn.execute(
+            """
+            UPDATE call_ratings
+
+            SET score_source = 'web'
+
+            WHERE
+                score IS NOT NULL
+                AND COALESCE(
+                    score_source,
+                    ''
+                ) = ''
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS
+                inbound_sms_events (
+
+                id INTEGER
+                    PRIMARY KEY
+                    AUTOINCREMENT,
+
+                dedup_key TEXT
+                    NOT NULL
+                    UNIQUE,
+
+                event_pbx_call_id TEXT,
+                event_type INTEGER,
+                event_created INTEGER,
+                sms_time INTEGER,
+                direction INTEGER NOT NULL,
+
+                client_number TEXT,
+                client_key TEXT,
+                client_name TEXT,
+
+                user_id INTEGER,
+                user_login TEXT,
+                account_id INTEGER,
+                account_name TEXT,
+
+                provider_src_number TEXT,
+                src_number TEXT,
+                src_id INTEGER,
+                src_slot INTEGER,
+
+                text TEXT,
+                rating_score INTEGER
+                    CHECK (
+                        rating_score BETWEEN 1 AND 5
+                    ),
+
+                rating_id INTEGER,
+                call_id INTEGER,
+
+                processing_status TEXT
+                    NOT NULL,
+
+                processing_reason TEXT,
+                raw_payload_json TEXT,
+                received_at INTEGER NOT NULL,
+                processed_at INTEGER,
+
+                created_at TIMESTAMP
+                    DEFAULT CURRENT_TIMESTAMP,
+
+                FOREIGN KEY(rating_id)
+                    REFERENCES call_ratings(id),
+
+                FOREIGN KEY(call_id)
+                    REFERENCES calls(id)
+            )
+            """
+        )
 
         conn.execute(
             """
@@ -3824,6 +3919,27 @@ def init_db():
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS
+            idx_inbound_sms_client_time
+
+            ON inbound_sms_events(
+                client_key,
+                sms_time
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_inbound_sms_rating
+
+            ON inbound_sms_events(rating_id)
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
             idx_client_windows_period
 
             ON client_windows(started_at)
@@ -5398,6 +5514,662 @@ def mark_rating_sms_error(
         )
 
         conn.commit()
+
+
+def parse_provider_integer(
+    value,
+) -> int | None:
+
+    try:
+        return int(
+            value
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+
+def parse_provider_timestamp(
+    value,
+) -> int | None:
+
+    timestamp = parse_provider_integer(
+        value
+    )
+
+    if not timestamp or timestamp < 0:
+        return None
+
+    # Some Android providers expose milliseconds while the Moizvonki API
+    # normally uses Unix seconds.
+    if timestamp > 10_000_000_000:
+        timestamp //= 1000
+
+    return timestamp or None
+
+
+def parse_inbound_rating_score(
+    text,
+) -> int | None:
+
+    candidate = str(
+        text
+        if text is not None
+        else ""
+    ).strip()
+
+    if not re.fullmatch(
+        r"[1-5]",
+        candidate,
+    ):
+        return None
+
+    return int(
+        candidate
+    )
+
+
+def build_inbound_sms_dedup_key(
+    webhook: dict,
+    event: dict,
+) -> str:
+
+    identity = {
+        "account_id": webhook.get(
+            "account_id"
+        ),
+        "user_id": webhook.get(
+            "user_id"
+        ),
+        "user_login": normalize_user_login(
+            webhook.get(
+                "user_login"
+            )
+        ),
+        "event_pbx_call_id": event.get(
+            "event_pbx_call_id"
+        ),
+        "event_type": event.get(
+            "event_type"
+        ),
+        "event_created": event.get(
+            "event_created"
+        ),
+        "start_time": event.get(
+            "start_time"
+        ),
+        "direction": event.get(
+            "direction"
+        ),
+        "client_number": normalize_phone(
+            event.get(
+                "client_number"
+            )
+        ),
+        "src_number": normalize_phone(
+            event.get(
+                "src_number"
+            )
+        ),
+        "src_id": event.get(
+            "src_id"
+        ),
+        "src_slot": event.get(
+            "src_slot"
+        ),
+        "text": str(
+            event.get(
+                "text"
+            )
+            or ""
+        ),
+    }
+
+    serialized = json.dumps(
+        identity,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(
+            ",",
+            ":",
+        ),
+        default=str,
+    )
+
+    return hashlib.sha256(
+        serialized.encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+def process_inbound_sms_event(
+    webhook: dict,
+    event: dict,
+    raw_payload: dict,
+    received_at: int | None = None,
+):
+
+    event_type = parse_provider_integer(
+        event.get(
+            "event_type"
+        )
+    )
+    direction = parse_provider_integer(
+        event.get(
+            "direction"
+        )
+    )
+
+    if event_type != 32:
+        return {
+            "processed": False,
+            "reason": "invalid_event_type",
+        }
+
+    # Outgoing messages are deliberately excluded. Only a message received
+    # from the client is allowed to become a rating.
+    if direction != 0:
+        return {
+            "processed": False,
+            "reason": "outgoing_ignored",
+        }
+
+    now_ts = (
+        parse_provider_timestamp(
+            received_at
+        )
+        or int(
+            datetime.now(
+                timezone.utc
+            ).timestamp()
+        )
+    )
+    event_created = parse_provider_timestamp(
+        event.get(
+            "event_created"
+        )
+    )
+    sms_time = (
+        parse_provider_timestamp(
+            event.get(
+                "start_time"
+            )
+        )
+        or event_created
+        or now_ts
+    )
+
+    client_number = str(
+        event.get(
+            "client_number"
+        )
+        or ""
+    )[:100]
+    client_key = normalize_phone(
+        client_number
+    )
+    client_name = str(
+        event.get(
+            "client_name"
+        )
+        or ""
+    )[:500]
+    user_login = normalize_user_login(
+        webhook.get(
+            "user_login"
+        )
+    )
+    provider_src_number = str(
+        event.get(
+            "src_number"
+        )
+        or ""
+    )[:100]
+    resolved_device = resolve_call_device(
+        user_login,
+        provider_src_number,
+        event.get(
+            "src_slot"
+        ),
+    )
+    src_number = (
+        resolved_device[
+            "src_number"
+        ]
+        or provider_src_number
+    )[:100]
+    src_slot = resolved_device[
+        "src_slot"
+    ]
+    sms_text = str(
+        event.get(
+            "text"
+        )
+        or ""
+    )[:10000]
+    rating_score = parse_inbound_rating_score(
+        sms_text
+    )
+    dedup_key = build_inbound_sms_dedup_key(
+        webhook,
+        event,
+    )
+    raw_payload_json = json.dumps(
+        raw_payload,
+        ensure_ascii=False,
+        separators=(
+            ",",
+            ":",
+        ),
+        default=str,
+    )[:50000]
+
+    with connect_db() as conn:
+
+        conn.execute(
+            "BEGIN IMMEDIATE"
+        )
+
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO inbound_sms_events (
+                dedup_key,
+                event_pbx_call_id,
+                event_type,
+                event_created,
+                sms_time,
+                direction,
+                client_number,
+                client_key,
+                client_name,
+                user_id,
+                user_login,
+                account_id,
+                account_name,
+                provider_src_number,
+                src_number,
+                src_id,
+                src_slot,
+                text,
+                rating_score,
+                processing_status,
+                raw_payload_json,
+                received_at
+            )
+
+            VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                'received', ?, ?
+            )
+            """,
+            (
+                dedup_key,
+                str(
+                    event.get(
+                        "event_pbx_call_id"
+                    )
+                    or ""
+                )[:500],
+                event_type,
+                event_created,
+                sms_time,
+                direction,
+                client_number,
+                client_key,
+                client_name,
+                parse_provider_integer(
+                    webhook.get(
+                        "user_id"
+                    )
+                ),
+                user_login,
+                parse_provider_integer(
+                    webhook.get(
+                        "account_id"
+                    )
+                ),
+                str(
+                    webhook.get(
+                        "account_name"
+                    )
+                    or ""
+                )[:500],
+                provider_src_number,
+                src_number,
+                parse_provider_integer(
+                    event.get(
+                        "src_id"
+                    )
+                ),
+                src_slot,
+                sms_text,
+                rating_score,
+                raw_payload_json,
+                now_ts,
+            ),
+        )
+
+        if cursor.rowcount != 1:
+            previous = conn.execute(
+                """
+                SELECT
+                    id,
+                    processing_status,
+                    rating_id,
+                    call_id,
+                    rating_score
+
+                FROM inbound_sms_events
+
+                WHERE dedup_key = ?
+
+                LIMIT 1
+                """,
+                (
+                    dedup_key,
+                ),
+            ).fetchone()
+
+            conn.commit()
+
+            return {
+                "processed": False,
+                "duplicate": True,
+                "reason": (
+                    previous[
+                        "processing_status"
+                    ]
+                    if previous
+                    else "duplicate"
+                ),
+                "sms_event_id": (
+                    previous["id"]
+                    if previous
+                    else None
+                ),
+                "rating_id": (
+                    previous["rating_id"]
+                    if previous
+                    else None
+                ),
+                "call_id": (
+                    previous["call_id"]
+                    if previous
+                    else None
+                ),
+                "score": (
+                    previous["rating_score"]
+                    if previous
+                    else rating_score
+                ),
+            }
+
+        sms_event_id = cursor.lastrowid
+
+        def finish_without_rating(
+            status: str,
+            reason: str,
+        ):
+            conn.execute(
+                """
+                UPDATE inbound_sms_events
+
+                SET
+                    processing_status = ?,
+                    processing_reason = ?,
+                    processed_at = ?
+
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    reason,
+                    now_ts,
+                    sms_event_id,
+                ),
+            )
+            conn.commit()
+
+            return {
+                "processed": False,
+                "duplicate": False,
+                "reason": status,
+                "sms_event_id": sms_event_id,
+                "score": rating_score,
+            }
+
+        if not client_key:
+            return finish_without_rating(
+                "empty_number",
+                "В событии отсутствует номер клиента",
+            )
+
+        if get_internal_contact_name(
+            client_key
+        ):
+            return finish_without_rating(
+                "internal_contact",
+                "Внутренние контакты не участвуют в оценках",
+            )
+
+        if rating_score is None:
+            return finish_without_rating(
+                "non_rating",
+                "Ожидалась одна цифра от 1 до 5",
+            )
+
+        if not user_login:
+            return finish_without_rating(
+                "missing_user_login",
+                "Не удалось определить телефон, получивший SMS",
+            )
+
+        candidates = conn.execute(
+            """
+            SELECT
+                rating.id,
+                rating.call_id,
+                rating.client_window_id,
+                rating.score,
+                rating.sms_sent_at,
+                rating.expires_at,
+                COALESCE(
+                    NULLIF(
+                        rating.sender_user_login,
+                        ''
+                    ),
+                    call.user_login
+                ) AS expected_user_login
+
+            FROM call_ratings AS rating
+
+            JOIN calls AS call
+                ON call.id = rating.call_id
+
+            WHERE
+                rating.client_key = ?
+                AND rating.sms_status = 'sent'
+                AND rating.sms_sent_at IS NOT NULL
+
+            ORDER BY
+                rating.sms_sent_at DESC,
+                rating.id DESC
+
+            LIMIT 20
+            """,
+            (
+                client_key,
+            ),
+        ).fetchall()
+
+        candidate = None
+
+        for row in candidates:
+            if normalize_user_login(
+                row[
+                    "expected_user_login"
+                ]
+            ) != user_login:
+                continue
+
+            if (
+                row["sms_sent_at"]
+                > sms_time + 5 * 60
+            ):
+                continue
+
+            if row["expires_at"] < sms_time:
+                continue
+
+            candidate = row
+            break
+
+        if not candidate:
+            return finish_without_rating(
+                "no_rating_request",
+                "Нет подходящего отправленного запроса оценки",
+            )
+
+        existing_score = candidate[
+            "score"
+        ]
+
+        if (
+            existing_score is None
+            and candidate[
+                "client_window_id"
+            ]
+        ):
+            scored = conn.execute(
+                """
+                SELECT score
+
+                FROM call_ratings
+
+                WHERE
+                    client_window_id = ?
+                    AND score IS NOT NULL
+
+                ORDER BY
+                    rated_at,
+                    id
+
+                LIMIT 1
+                """,
+                (
+                    candidate[
+                        "client_window_id"
+                    ],
+                ),
+            ).fetchone()
+
+            if scored:
+                existing_score = scored[
+                    "score"
+                ]
+
+        if existing_score is not None:
+            conn.execute(
+                """
+                UPDATE inbound_sms_events
+
+                SET
+                    rating_id = ?,
+                    call_id = ?,
+                    processing_status = 'already_rated',
+                    processing_reason = ?,
+                    processed_at = ?
+
+                WHERE id = ?
+                """,
+                (
+                    candidate["id"],
+                    candidate["call_id"],
+                    (
+                        "Первая оценка уже сохранена: "
+                        + str(
+                            existing_score
+                        )
+                    ),
+                    now_ts,
+                    sms_event_id,
+                ),
+            )
+            conn.commit()
+
+            return {
+                "processed": False,
+                "duplicate": False,
+                "reason": "already_rated",
+                "sms_event_id": sms_event_id,
+                "rating_id": candidate["id"],
+                "call_id": candidate["call_id"],
+                "score": existing_score,
+                "received_score": rating_score,
+            }
+
+        updated = conn.execute(
+            """
+            UPDATE call_ratings
+
+            SET
+                score = ?,
+                rated_at = ?,
+                score_source = 'sms',
+                inbound_sms_event_id = ?
+
+            WHERE
+                id = ?
+                AND score IS NULL
+            """,
+            (
+                rating_score,
+                sms_time,
+                sms_event_id,
+                candidate["id"],
+            ),
+        )
+
+        if updated.rowcount != 1:
+            raise sqlite3.IntegrityError(
+                "Не удалось атомарно сохранить SMS-оценку"
+            )
+
+        conn.execute(
+            """
+            UPDATE inbound_sms_events
+
+            SET
+                rating_id = ?,
+                call_id = ?,
+                processing_status = 'rating_saved',
+                processing_reason = NULL,
+                processed_at = ?
+
+            WHERE id = ?
+            """,
+            (
+                candidate["id"],
+                candidate["call_id"],
+                now_ts,
+                sms_event_id,
+            ),
+        )
+
+        conn.commit()
+
+        return {
+            "processed": True,
+            "duplicate": False,
+            "reason": "rating_saved",
+            "sms_event_id": sms_event_id,
+            "rating_id": candidate["id"],
+            "call_id": candidate["call_id"],
+            "score": rating_score,
+        }
 
 
 # =========================================================
@@ -13006,6 +13778,8 @@ def submit_rating(
             SET
                 score = ?,
                 rated_at = ?,
+                score_source = 'web',
+                inbound_sms_event_id = NULL,
                 rated_ip = ?,
                 user_agent = ?,
                 accept_language = ?,
@@ -16419,6 +17193,9 @@ def stats_recent(
                 rating.score
                     AS customer_rating,
 
+                rating.score_source
+                    AS customer_rating_source,
+
                 manager_rating.score
                     AS manager_rating,
 
@@ -16595,6 +17372,12 @@ def stats_recent(
                         "customer_rating"
                     ],
 
+                "customer_rating_source":
+                    row[
+                        "customer_rating_source"
+                    ]
+                    or "",
+
                 "manager_rating":
                     row[
                         "manager_rating"
@@ -16743,6 +17526,8 @@ def rating_details(
                 rating.provider_response,
                 rating.score,
                 rating.rated_at,
+                rating.score_source,
+                rating.inbound_sms_event_id,
                 rating.expires_at,
                 rating.created_at AS rating_created_at,
                 rating.first_opened_at,
@@ -16757,6 +17542,27 @@ def rating_details(
                 rating.request_headers_json,
                 rating.device_data_json,
                 rating.device_data_updated_at
+
+                ,inbound_sms.text
+                    AS inbound_sms_text
+                ,inbound_sms.sms_time
+                    AS inbound_sms_time
+                ,inbound_sms.received_at
+                    AS inbound_sms_received_at
+                ,inbound_sms.client_number
+                    AS inbound_sms_client_number
+                ,inbound_sms.user_login
+                    AS inbound_sms_user_login
+                ,inbound_sms.provider_src_number
+                    AS inbound_sms_provider_src_number
+                ,inbound_sms.src_number
+                    AS inbound_sms_src_number
+                ,inbound_sms.src_slot
+                    AS inbound_sms_src_slot
+                ,inbound_sms.processing_status
+                    AS inbound_sms_status
+                ,inbound_sms.event_pbx_call_id
+                    AS inbound_sms_pbx_id
 
                 ,transcription.status
                     AS transcription_status
@@ -16777,6 +17583,12 @@ def rating_details(
 
             JOIN call_ratings AS rating
                 ON rating.call_id = call.id
+
+            LEFT JOIN inbound_sms_events
+                AS inbound_sms
+
+                ON inbound_sms.id =
+                    rating.inbound_sms_event_id
 
             LEFT JOIN client_results
                 AS client_result
@@ -16953,6 +17765,55 @@ def rating_details(
                 "items": {
                     "Оценка": f'{row["score"]} из 5',
                     "Оценено": format_uz_datetime(row["rated_at"]),
+                    "Способ ответа": (
+                        "Входящее SMS"
+                        if row["score_source"] == "sms"
+                        else "Страница оценки"
+                    ),
+                    "Полученное SMS": row["inbound_sms_text"] or "—",
+                    "Время SMS на телефоне": format_uz_datetime(
+                        row["inbound_sms_time"]
+                    ),
+                    "SMS доставлено webhook": format_uz_datetime(
+                        row["inbound_sms_received_at"]
+                    ),
+                    "Номер клиента в SMS": (
+                        row["inbound_sms_client_number"]
+                        or "—"
+                    ),
+                    "Устройство, получившее SMS": (
+                        (
+                            get_call_source_profile(
+                                row["inbound_sms_user_login"]
+                            )
+                            or {}
+                        ).get(
+                            "device_name"
+                        )
+                        or row["inbound_sms_user_login"]
+                        or "—"
+                    ),
+                    "Аккаунт телефона SMS": (
+                        row["inbound_sms_user_login"]
+                        or "—"
+                    ),
+                    "SIM, получившая SMS": (
+                        row["inbound_sms_src_number"]
+                        or "—"
+                    ),
+                    "Номер SIM от провайдера": (
+                        row["inbound_sms_provider_src_number"]
+                        or "—"
+                    ),
+                    "Слот входящего SMS": row["inbound_sms_src_slot"],
+                    "Статус входящего SMS": (
+                        row["inbound_sms_status"]
+                        or "—"
+                    ),
+                    "PBX ID входящего SMS": (
+                        row["inbound_sms_pbx_id"]
+                        or "—"
+                    ),
                     "SMS статус": row["sms_status"] or "—",
                     "SMS зарезервировано": format_uz_datetime(row["sms_reserved_at"]),
                     "SMS отправлено": format_uz_datetime(row["sms_sent_at"]),
@@ -20604,7 +21465,13 @@ async function loadRecent() {
             ) {
                 customerRating.textContent =
                     row.customer_rating
-                    + " ★";
+                    + " ★"
+                    + (
+                        row.customer_rating_source
+                        === "sms"
+                            ? " · SMS"
+                            : " · Сайт"
+                    );
 
             } else {
                 customerRating.textContent =
@@ -21041,7 +21908,22 @@ async def moizvonki_webhook(
                 detail="Invalid Moizvonki secret",
             )
 
-    data = await request.json()
+    try:
+        data = await request.json()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid JSON",
+        ) from exc
+
+    if not isinstance(
+        data,
+        dict,
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid webhook payload",
+        )
 
     webhook = (
         data.get(
@@ -21056,6 +21938,65 @@ async def moizvonki_webhook(
         )
         or {}
     )
+
+    if not isinstance(
+        webhook,
+        dict,
+    ) or not isinstance(
+        event,
+        dict,
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid webhook payload",
+        )
+
+    action = str(
+        webhook.get(
+            "action"
+        )
+        or ""
+    ).strip()
+
+    print(
+        "MOIZVONKI EVENT:",
+        action,
+        event.get(
+            "db_call_id"
+        ),
+        webhook.get(
+            "user_login"
+        ),
+    )
+
+    if action == "sms.message":
+        sms_result = process_inbound_sms_event(
+            webhook,
+            event,
+            data,
+            received_at=webhook_received_at,
+        )
+
+        print(
+            "INBOUND SMS RESULT:",
+            json.dumps(
+                sms_result,
+                ensure_ascii=False,
+            ),
+        )
+
+        return {
+            "ok": True,
+            "event": "sms.message",
+            "sms_rating": sms_result,
+        }
+
+    if action != "call.finish":
+        return {
+            "ok": True,
+            "ignored": True,
+            "event": action,
+        }
 
     def event_timestamp(
         key: str,
@@ -21108,19 +22049,6 @@ async def moizvonki_webhook(
     )
 
     print(
-        "MOIZVONKI EVENT:",
-        webhook.get(
-            "action"
-        ),
-        event.get(
-            "db_call_id"
-        ),
-        webhook.get(
-            "user_login"
-        ),
-    )
-
-    print(
         "MOIZVONKI DELIVERY LATENCY:",
         json.dumps(
             {
@@ -21140,17 +22068,6 @@ async def moizvonki_webhook(
             ensure_ascii=False,
         ),
     )
-
-    if (
-        webhook.get(
-            "action"
-        )
-        != "call.finish"
-    ):
-
-        return {
-            "ok": True
-        }
 
     answered = int(
         event.get(
