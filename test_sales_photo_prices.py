@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 from telegram import MessageEntity
 
 from sales_photo_bot.config import Settings
+from sales_photo_bot.dates import tashkent_today
 from sales_photo_bot.prices import normalize_card_prices
 from sales_photo_bot.repository import SalesPhotoRepository
 from sales_photo_bot.service import BOT_CARD_MARKER
@@ -198,7 +199,7 @@ class ExistingPriceBackfillTests(unittest.IsolatedAsyncioTestCase):
                 10,
                 "legacy",
                 source_file_id="file",
-                sale_date=date(2026, 8, 31),
+                sale_date=tashkent_today(),
             )
             repo.mark_reposted(CHAT_ID, 10, 200)
             repo.mark_complete(CHAT_ID, 10)

@@ -339,6 +339,39 @@ class SalesPhotoService:
         if chat_type == str(ChatType.CHANNEL) and status not in {"creator", "owner"}:
             if not bool(getattr(membership, "can_post_messages", False)):
                 raise RuntimeError("Боту требуется право публикации в канале")
+        if self.settings.check_chat_id is not None:
+            check_chat = await bot.get_chat(self.settings.check_chat_id)
+            check_actual_id = int(check_chat.id)
+            if check_actual_id != self.settings.check_chat_id:
+                raise RuntimeError(
+                    "Telegram вернул другой ID канала технических проверок"
+                )
+            check_chat_type = str(check_chat.type)
+            if check_chat_type != str(ChatType.CHANNEL):
+                raise RuntimeError(
+                    "Чат технических проверок должен быть Telegram-каналом"
+                )
+            check_membership = await bot.get_chat_member(
+                self.settings.check_chat_id,
+                self.bot_id,
+            )
+            check_status = str(getattr(check_membership, "status", ""))
+            if check_status not in {"administrator", "creator", "owner"}:
+                raise RuntimeError(
+                    "Бот должен быть администратором канала технических проверок"
+                )
+            if check_status not in {"creator", "owner"} and not bool(
+                getattr(check_membership, "can_delete_messages", False)
+            ):
+                raise RuntimeError(
+                    "Боту требуется право удаления в канале технических проверок"
+                )
+            if check_status not in {"creator", "owner"} and not bool(
+                getattr(check_membership, "can_post_messages", False)
+            ):
+                raise RuntimeError(
+                    "Боту требуется право публикации в канале технических проверок"
+                )
         provider_preflight = getattr(self.recognizer, "preflight", None)
         if provider_preflight is not None:
             await provider_preflight()
@@ -350,7 +383,12 @@ class SalesPhotoService:
                     "sales_photo_delivery_preflight_failed error_type=%s",
                     _error_code(exc),
                 )
-        logger.info("sales_photo_preflight_ok chat_id=%s chat_type=%s", actual_id, chat_type)
+        logger.info(
+            "sales_photo_preflight_ok chat_id=%s chat_type=%s check_chat_id=%s",
+            actual_id,
+            chat_type,
+            self.settings.check_chat_id,
+        )
         return self.bot_id
 
     @staticmethod
@@ -1817,6 +1855,51 @@ class SalesPhotoService:
                     raise _RetryWaitCancelled() from cancelled
         raise RuntimeError("unreachable send retry state")
 
+    @property
+    def _inspection_chat_id(self) -> int:
+        return self.settings.check_chat_id or self.settings.chat_id
+
+    async def _forward_for_inspection(
+        self,
+        bot: Bot | Any,
+        *,
+        source_chat_id: int,
+        message_id: int,
+    ) -> Any:
+        """Read a card through a quiet forward outside the sales channel."""
+
+        destination_chat_id = self._inspection_chat_id
+        uses_source_chat = destination_chat_id == source_chat_id
+        if uses_source_chat:
+            self._order_backfill_forward_sources[int(message_id)] = (
+                time.monotonic() + 600
+            )
+        try:
+            forwarded = await self._send_with_retry(
+                bot.forward_message,
+                {
+                    "chat_id": destination_chat_id,
+                    "from_chat_id": source_chat_id,
+                    "message_id": int(message_id),
+                    "disable_notification": True,
+                    "read_timeout": 30,
+                    "write_timeout": 30,
+                    "connect_timeout": 10,
+                    "pool_timeout": 10,
+                },
+            )
+        except asyncio.CancelledError:
+            if uses_source_chat:
+                self._order_backfill_forward_sources.pop(int(message_id), None)
+            raise
+        except Exception:
+            if uses_source_chat:
+                self._order_backfill_forward_sources.pop(int(message_id), None)
+            raise
+        if uses_source_chat:
+            self._track_maintenance_forward(int(message_id), forwarded)
+        return forwarded
+
     async def _reconcile_generated_post(
         self,
         message: Message | Any,
@@ -2681,21 +2764,10 @@ class SalesPhotoService:
 
             forwarded = None
             try:
-                self._order_backfill_forward_sources[
-                    job.replacement_message_id
-                ] = time.monotonic() + 600
-                forwarded = await self._send_with_retry(
-                    bot.forward_message,
-                    {
-                        "chat_id": job.chat_id,
-                        "from_chat_id": job.chat_id,
-                        "message_id": job.replacement_message_id,
-                        "disable_notification": True,
-                    },
-                )
-                self._track_maintenance_forward(
-                    job.replacement_message_id,
-                    forwarded,
+                forwarded = await self._forward_for_inspection(
+                    bot,
+                    source_chat_id=job.chat_id,
+                    message_id=job.replacement_message_id,
                 )
                 content = _message_content(forwarded)
                 if content is None:
@@ -2796,7 +2868,7 @@ class SalesPhotoService:
                     if temporary_message_id is not None:
                         await self._delete_duplicate(
                             bot,
-                            job.chat_id,
+                            self._inspection_chat_id,
                             int(temporary_message_id),
                         )
             self._touch_heartbeat()
@@ -2826,24 +2898,12 @@ class SalesPhotoService:
 
             forwarded = None
             try:
-                # Telegram has no get-message endpoint. A quiet self-forward is
-                # the only reliable way to fetch the current manager-edited card.
-                # The update handlers recognize and immediately remove this copy.
-                self._order_backfill_forward_sources[
-                    job.replacement_message_id
-                ] = time.monotonic() + 600
-                forwarded = await self._send_with_retry(
-                    bot.forward_message,
-                    {
-                        "chat_id": job.chat_id,
-                        "from_chat_id": job.chat_id,
-                        "message_id": job.replacement_message_id,
-                        "disable_notification": True,
-                    },
-                )
-                self._track_maintenance_forward(
-                    job.replacement_message_id,
-                    forwarded,
+                # Telegram has no get-message endpoint. Read the current
+                # manager-edited card through the quiet inspection channel.
+                forwarded = await self._forward_for_inspection(
+                    bot,
+                    source_chat_id=job.chat_id,
+                    message_id=job.replacement_message_id,
                 )
                 content = _message_content(forwarded)
                 if content is None:
@@ -2939,7 +2999,7 @@ class SalesPhotoService:
                     if temporary_message_id is not None:
                         await self._delete_duplicate(
                             bot,
-                            job.chat_id,
+                            self._inspection_chat_id,
                             int(temporary_message_id),
                         )
             self._touch_heartbeat()
@@ -3063,21 +3123,10 @@ class SalesPhotoService:
                 key = (candidate.chat_id, candidate.replacement_message_id)
                 try:
                     async with self._card_lock(key):
-                        self._order_backfill_forward_sources[
-                            candidate.replacement_message_id
-                        ] = time.monotonic() + 600
-                        forwarded = await self._send_with_retry(
-                            bot.forward_message,
-                            {
-                                "chat_id": candidate.chat_id,
-                                "from_chat_id": candidate.chat_id,
-                                "message_id": candidate.replacement_message_id,
-                                "disable_notification": True,
-                            },
-                        )
-                        self._track_maintenance_forward(
-                            candidate.replacement_message_id,
-                            forwarded,
+                        forwarded = await self._forward_for_inspection(
+                            bot,
+                            source_chat_id=candidate.chat_id,
+                            message_id=candidate.replacement_message_id,
                         )
                         content = _message_content(forwarded)
                         if content is None:
@@ -3200,7 +3249,7 @@ class SalesPhotoService:
                         if temporary_message_id is not None:
                             await self._delete_duplicate(
                                 bot,
-                                candidate.chat_id,
+                                self._inspection_chat_id,
                                 int(temporary_message_id),
                             )
                     self._safe_touch_heartbeat()
@@ -3274,19 +3323,11 @@ class SalesPhotoService:
         for index, message_id in enumerate(sorted(candidate_message_ids)):
             forwarded = None
             try:
-                self._order_backfill_forward_sources[message_id] = (
-                    time.monotonic() + 600
+                forwarded = await self._forward_for_inspection(
+                    bot,
+                    source_chat_id=self.settings.chat_id,
+                    message_id=message_id,
                 )
-                forwarded = await self._send_with_retry(
-                    bot.forward_message,
-                    {
-                        "chat_id": self.settings.chat_id,
-                        "from_chat_id": self.settings.chat_id,
-                        "message_id": message_id,
-                        "disable_notification": True,
-                    },
-                )
-                self._track_maintenance_forward(message_id, forwarded)
                 content = _message_content(forwarded)
                 if content is None or not content[1].startswith(BOT_CARD_MARKER):
                     continue
@@ -3352,7 +3393,7 @@ class SalesPhotoService:
                     if temporary_message_id is not None:
                         await self._delete_duplicate(
                             bot,
-                            self.settings.chat_id,
+                            self._inspection_chat_id,
                             int(temporary_message_id),
                         )
                 if index + 1 < len(candidate_message_ids):
@@ -3624,21 +3665,10 @@ class SalesPhotoService:
             key = (link.chat_id, link.replacement_message_id)
             try:
                 async with self._card_lock(key):
-                    self._order_backfill_forward_sources[
-                        link.replacement_message_id
-                    ] = time.monotonic() + 600
-                    forwarded = await self._send_with_retry(
-                        bot.forward_message,
-                        {
-                            "chat_id": link.chat_id,
-                            "from_chat_id": link.chat_id,
-                            "message_id": link.replacement_message_id,
-                            "disable_notification": True,
-                        },
-                    )
-                    self._track_maintenance_forward(
-                        link.replacement_message_id,
-                        forwarded,
+                    forwarded = await self._forward_for_inspection(
+                        bot,
+                        source_chat_id=link.chat_id,
+                        message_id=link.replacement_message_id,
                     )
                     content = _message_content(forwarded)
                     if content is None:
@@ -3723,7 +3753,7 @@ class SalesPhotoService:
                     if temporary_id is not None:
                         await self._delete_duplicate(
                             bot,
-                            link.chat_id,
+                            self._inspection_chat_id,
                             int(temporary_id),
                         )
                 if index + 1 < len(links):
@@ -4008,21 +4038,26 @@ class SalesPhotoService:
 
     async def retry_duplicate_cleanups(self, bot: Bot | Any) -> None:
         now = utc_now()
-        for job in self.repository.pending_duplicate_cleanups(
-            self.settings.chat_id,
-            limit=10,
-        ):
-            updated_at = job.updated_at
-            if updated_at.tzinfo is None:
-                updated_at = updated_at.replace(tzinfo=UTC)
-            delay = min(
-                3600,
-                self.settings.delete_retry_seconds * (2 ** min(job.attempts, 7)),
-            )
-            if (now - updated_at).total_seconds() < delay:
-                continue
-            await self._delete_duplicate(bot, job.chat_id, job.message_id)
-            self._touch_heartbeat()
+        cleanup_chat_ids = (self._inspection_chat_id,)
+        if self._inspection_chat_id != self.settings.chat_id:
+            cleanup_chat_ids += (self.settings.chat_id,)
+        for cleanup_chat_id in cleanup_chat_ids:
+            for job in self.repository.pending_duplicate_cleanups(
+                cleanup_chat_id,
+                limit=10,
+            ):
+                updated_at = job.updated_at
+                if updated_at.tzinfo is None:
+                    updated_at = updated_at.replace(tzinfo=UTC)
+                delay = min(
+                    3600,
+                    self.settings.delete_retry_seconds
+                    * (2 ** min(job.attempts, 7)),
+                )
+                if (now - updated_at).total_seconds() < delay:
+                    continue
+                await self._delete_duplicate(bot, job.chat_id, job.message_id)
+                self._touch_heartbeat()
 
     def _touch_heartbeat(self) -> None:
         path = Path(self.settings.heartbeat_path)

@@ -67,6 +67,7 @@ def _telegram_ids(value: str) -> frozenset[int]:
 class Settings:
     bot_token: str = field(repr=False)
     chat_id: int
+    check_chat_id: int | None = None
     db_path: Path = Path("data/sales_photo.db")
     heartbeat_path: Path = Path("/tmp/sales-photo-heartbeat")
     allowed_user_ids: frozenset[int] = frozenset()
@@ -94,6 +95,22 @@ class Settings:
         if chat_id >= 0:
             raise ConfigError("SALES_PHOTO_CHAT_ID должен быть отрицательным ID канала")
 
+        raw_check_chat_id = _required(values, "SALES_PHOTO_CHECK_CHAT_ID")
+        try:
+            check_chat_id = int(raw_check_chat_id)
+        except ValueError as exc:
+            raise ConfigError(
+                "SALES_PHOTO_CHECK_CHAT_ID должен быть целым числом"
+            ) from exc
+        if check_chat_id >= 0:
+            raise ConfigError(
+                "SALES_PHOTO_CHECK_CHAT_ID должен быть отрицательным ID канала"
+            )
+        if check_chat_id == chat_id:
+            raise ConfigError(
+                "Канал технических проверок должен отличаться от канала продаж"
+            )
+
         db_path = Path(
             str(values.get("SALES_PHOTO_DB_PATH", "data/sales_photo.db")).strip()
         ).expanduser()
@@ -113,6 +130,7 @@ class Settings:
         return cls(
             bot_token=token,
             chat_id=chat_id,
+            check_chat_id=check_chat_id,
             db_path=db_path,
             heartbeat_path=heartbeat_path,
             allowed_user_ids=_telegram_ids(

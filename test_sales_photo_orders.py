@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import date, datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,12 +12,14 @@ from telegram import MessageEntity
 from telegram.error import BadRequest
 
 from sales_photo_bot.config import Settings
+from sales_photo_bot.dates import tashkent_today
 from sales_photo_bot.orders import card_order_id, ensure_card_order_id
 from sales_photo_bot.repository import SalesPhotoRepository
 from sales_photo_bot.service import BOT_CARD_MARKER, SalesPhotoService
 
 
 CHAT_ID = -1001234567890
+CHECK_CHAT_ID = -1004340217539
 TOKEN = "1234567890:" + "A" * 35
 
 
@@ -309,7 +312,15 @@ class ExistingCardBackfillTests(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             path = root / "sales.db"
             repo = SalesPhotoRepository(path)
-            created = datetime(2026, 8, 31, 10, 0, tzinfo=timezone.utc)
+            sale_day = tashkent_today()
+            created = datetime(
+                sale_day.year,
+                sale_day.month,
+                sale_day.day,
+                10,
+                0,
+                tzinfo=timezone.utc,
+            )
             repo.claim_photo(
                 CHAT_ID,
                 10,
@@ -320,7 +331,10 @@ class ExistingCardBackfillTests(unittest.IsolatedAsyncioTestCase):
             repo.mark_reposted(CHAT_ID, 10, 200, at=created)
             repo.mark_complete(CHAT_ID, 10, at=created)
             repo = SalesPhotoRepository(path)
-            service = SalesPhotoService(settings(root), repo)
+            service = SalesPhotoService(
+                replace(settings(root), check_chat_id=CHECK_CHAT_ID),
+                repo,
+            )
             current = (
                 BOT_CARD_MARKER
                 + "🛒💵: ACME $100\nrasxod: $3\n\n"
@@ -329,7 +343,7 @@ class ExistingCardBackfillTests(unittest.IsolatedAsyncioTestCase):
             )
             forwarded = SimpleNamespace(
                 message_id=900,
-                chat_id=CHAT_ID,
+                chat_id=CHECK_CHAT_ID,
                 caption=current,
                 caption_entities=(),
                 text=None,
@@ -345,7 +359,11 @@ class ExistingCardBackfillTests(unittest.IsolatedAsyncioTestCase):
             await service.backfill_order_cards(bot, ignore_delay=True)
 
             bot.forward_message.assert_awaited_once()
-            bot.delete_message.assert_awaited_once_with(CHAT_ID, 900)
+            forward_kwargs = bot.forward_message.await_args.kwargs
+            self.assertEqual(forward_kwargs["chat_id"], CHECK_CHAT_ID)
+            self.assertEqual(forward_kwargs["from_chat_id"], CHAT_ID)
+            self.assertTrue(forward_kwargs["disable_notification"])
+            bot.delete_message.assert_awaited_once_with(CHECK_CHAT_ID, 900)
             bot.edit_message_caption.assert_awaited_once()
             edited = bot.edit_message_caption.await_args.kwargs["caption"]
             self.assertTrue(edited.startswith(BOT_CARD_MARKER + "🆔: 1\n\n"))
@@ -358,7 +376,15 @@ class ExistingCardBackfillTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             repo = SalesPhotoRepository(root / "sales.db")
-            created = datetime(2026, 8, 31, 10, 0, tzinfo=timezone.utc)
+            sale_day = tashkent_today()
+            created = datetime(
+                sale_day.year,
+                sale_day.month,
+                sale_day.day,
+                10,
+                0,
+                tzinfo=timezone.utc,
+            )
             repo.claim_photo(
                 CHAT_ID,
                 10,
@@ -409,7 +435,7 @@ class ExistingCardBackfillTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             repo = SalesPhotoRepository(root / "sales.db")
-            sale_day = date(2026, 8, 31)
+            sale_day = tashkent_today()
             for source_id in (10, 11, 12):
                 repo.claim_photo(
                     CHAT_ID,

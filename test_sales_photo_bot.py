@@ -36,6 +36,7 @@ from sales_photo_bot.service import BOT_CARD_MARKER, SalesPhotoService
 
 
 CHAT_ID = -1001234567890
+CHECK_CHAT_ID = -1004340217539
 BOT_ID = 777
 TOKEN = "1234567890:" + "A" * 35
 
@@ -183,11 +184,13 @@ class ConfigTests(unittest.TestCase):
                 {
                     "SALES_PHOTO_BOT_TOKEN": TOKEN,
                     "SALES_PHOTO_CHAT_ID": str(CHAT_ID),
+                    "SALES_PHOTO_CHECK_CHAT_ID": str(CHECK_CHAT_ID),
                     "SALES_PHOTO_DB_PATH": str(Path(directory) / "db.sqlite"),
                     "SALES_PHOTO_ALLOWED_USER_IDS": "1,2,2",
                 }
             )
         self.assertEqual(parsed.allowed_user_ids, frozenset({1, 2}))
+        self.assertEqual(parsed.check_chat_id, CHECK_CHAT_ID)
         self.assertNotIn(TOKEN, repr(parsed))
         self.assertEqual(parsed.heartbeat_path, Path("/tmp/sales-photo-heartbeat"))
         self.assertEqual(parsed.source_edit_grace_seconds, 3)
@@ -205,15 +208,32 @@ class ConfigTests(unittest.TestCase):
             {
                 "SALES_PHOTO_BOT_TOKEN": TOKEN,
                 "SALES_PHOTO_CHAT_ID": str(CHAT_ID),
+                "SALES_PHOTO_CHECK_CHAT_ID": str(CHECK_CHAT_ID),
             }
         )
         self.assertFalse(hasattr(parsed, "ocr_timeout_seconds"))
+        with self.assertRaisesRegex(ConfigError, "SALES_PHOTO_CHECK_CHAT_ID"):
+            Settings.from_env(
+                {
+                    "SALES_PHOTO_BOT_TOKEN": TOKEN,
+                    "SALES_PHOTO_CHAT_ID": str(CHAT_ID),
+                }
+            )
         with self.assertRaises(ConfigError):
             Settings.from_env(
                 {
                     "SALES_PHOTO_BOT_TOKEN": TOKEN,
                     "SALES_PHOTO_CHAT_ID": str(CHAT_ID),
+                    "SALES_PHOTO_CHECK_CHAT_ID": str(CHECK_CHAT_ID),
                     "SALES_PHOTO_STARTUP_DRAIN_SECONDS": "0",
+                }
+            )
+        with self.assertRaisesRegex(ConfigError, "должен отличаться"):
+            Settings.from_env(
+                {
+                    "SALES_PHOTO_BOT_TOKEN": TOKEN,
+                    "SALES_PHOTO_CHAT_ID": str(CHAT_ID),
+                    "SALES_PHOTO_CHECK_CHAT_ID": str(CHAT_ID),
                 }
             )
 
@@ -1497,6 +1517,28 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(repo.pending_duplicate_cleanups(CHAT_ID), ())
         bot.delete_message.assert_awaited_with(CHAT_ID, 201)
 
+    async def test_duplicate_cleanup_retries_main_and_check_channels(self):
+        repo = SalesPhotoRepository(self.root / "db.sqlite")
+        old = utc_now() - timedelta(minutes=10)
+        repo.queue_duplicate_cleanup(CHAT_ID, 201, at=old)
+        repo.queue_duplicate_cleanup(CHECK_CHAT_ID, 901, at=old)
+        configured = replace(
+            settings(self.root),
+            check_chat_id=CHECK_CHAT_ID,
+        )
+        service = SalesPhotoService(configured, repo, StaticRecognizer())
+        bot = telegram_bot()
+
+        await service.retry_duplicate_cleanups(bot)
+
+        calls = {
+            (int(call.args[0]), int(call.args[1]))
+            for call in bot.delete_message.await_args_list
+        }
+        self.assertEqual(calls, {(CHAT_ID, 201), (CHECK_CHAT_ID, 901)})
+        self.assertEqual(repo.pending_duplicate_cleanups(CHAT_ID), ())
+        self.assertEqual(repo.pending_duplicate_cleanups(CHECK_CHAT_ID), ())
+
     async def test_duplicate_and_marked_bot_repost_do_not_recurse(self):
         repo = SalesPhotoRepository(self.root / "db.sqlite")
         service = SalesPhotoService(settings(self.root), repo, StaticRecognizer())
@@ -1684,6 +1726,35 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
             status="administrator", can_delete_messages=False, can_post_messages=True
         )
         with self.assertRaisesRegex(RuntimeError, "право удаления"):
+            await service.preflight(bot)
+
+    async def test_preflight_checks_technical_channel_permissions(self):
+        repo = SalesPhotoRepository(self.root / "db.sqlite")
+        service = SalesPhotoService(
+            replace(settings(self.root), check_chat_id=CHECK_CHAT_ID),
+            repo,
+            StaticRecognizer(),
+        )
+
+        async def get_chat(chat_id):
+            return SimpleNamespace(id=chat_id, type="channel")
+
+        async def get_member(chat_id, _bot_id):
+            return SimpleNamespace(
+                status="administrator",
+                can_delete_messages=chat_id == CHAT_ID,
+                can_post_messages=True,
+            )
+
+        bot = SimpleNamespace(
+            get_me=AsyncMock(return_value=SimpleNamespace(id=BOT_ID)),
+            get_chat=AsyncMock(side_effect=get_chat),
+            get_chat_member=AsyncMock(side_effect=get_member),
+        )
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "право удаления в канале технических проверок",
+        ):
             await service.preflight(bot)
 
 
