@@ -672,6 +672,15 @@ def detect_language(
         "rang",
         "salom",
         "xotira",
+        "бор",
+        "борми",
+        "неча",
+        "нечпул",
+        "нарх",
+        "нархи",
+        "қанча",
+        "рахмат",
+        "салом",
     }
 
     words = set(
@@ -837,6 +846,19 @@ LOCAL_DIRECT_SETTINGS = {
         "Iltimos, modelning to‘liq nomini yozing. "
         "Yordam va buyurtma uchun menejerga murojaat qiling:\n"
         "{manager_url}"
+    ),
+
+    "model_sent_public_ru": (
+        "Есть в наличии. Отправили в Direct ✅"
+    ),
+
+    "model_sent_public_uz": (
+        "Mavjud. Directga yubordik ✅"
+    ),
+
+    "model_sent_public_bilingual": (
+        "Есть в наличии. Отправили в Direct ✅\n\n"
+        "Mavjud. Directga yubordik ✅"
     ),
 
     "private_reply_unavailable_ru": (
@@ -4920,6 +4942,48 @@ def build_private_reply_unavailable_message(
     )
 
 
+def build_model_sent_public_reply(
+    language: str,
+    *,
+    settings: dict[str, str] | None = None,
+) -> str:
+
+    merged_settings = dict(
+        LOCAL_DIRECT_SETTINGS
+    )
+
+    if settings:
+
+        merged_settings.update(
+            settings
+        )
+
+    setting_name = {
+        "ru":
+            "model_sent_public_ru",
+
+        "uz":
+            "model_sent_public_uz",
+    }.get(
+        language,
+        "model_sent_public_bilingual",
+    )
+
+    template = str(
+        merged_settings.get(
+            setting_name
+        )
+        or LOCAL_DIRECT_SETTINGS[
+            setting_name
+        ]
+    ).strip()
+
+    return render_direct_template(
+        template,
+        merged_settings,
+    )
+
+
 # =========================================================
 # META API
 # =========================================================
@@ -6088,6 +6152,24 @@ def process_instagram_comment(
         # -------------------------------------------------
 
         if INSTAGRAM_PUBLIC_REPLY_ENABLED:
+
+            if source in {
+                "product_sheet_model",
+                "post_sheet_models",
+            }:
+
+                direct_config = get_direct_config()
+
+                public_message = (
+                    build_model_sent_public_reply(
+                        detect_language(
+                            comment_text
+                        ),
+                        settings=direct_config[
+                            "settings"
+                        ],
+                    )
+                )
 
             try:
 

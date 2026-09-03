@@ -65,6 +65,9 @@ model_other_variants,Другие варианты у менеджера.,Сок
 model_from_prefix,от,Префикс минимальной цены
 model_empty_memory_label,Цена,Подпись без памяти
 model_not_found_reply,"Уточните модель: {manager_url}",Модель не найдена
+model_sent_public_ru,RU MODEL SENT,Модель отправлена — русский
+model_sent_public_uz,UZ MODEL SENT,Модель отправлена — узбекский
+model_sent_public_bilingual,BOTH MODEL SENT,Модель отправлена — два языка
 private_reply_unavailable_ru,RU SHEET,Закрытый Direct — русский
 private_reply_unavailable_uz,UZ SHEET,Закрытый Direct — узбекский
 private_reply_unavailable_bilingual,BOTH SHEET,Закрытый Direct — два языка
@@ -122,6 +125,10 @@ class TriggerDetectionTests(unittest.TestCase):
             "uz",
         )
         self.assertEqual(
+            instagram_bot.detect_language("Нархи қанча?"),
+            "uz",
+        )
+        self.assertEqual(
             instagram_bot.detect_language("S25 +++"),
             "unknown",
         )
@@ -151,6 +158,33 @@ class TriggerDetectionTests(unittest.TestCase):
                 settings=settings,
             ),
             "BOTH SHEET",
+        )
+
+    def test_model_sent_public_text_comes_from_settings(self):
+        settings = instagram_bot.parse_direct_settings_csv(
+            DIRECT_SETTINGS_CSV
+        )
+
+        self.assertEqual(
+            instagram_bot.build_model_sent_public_reply(
+                "ru",
+                settings=settings,
+            ),
+            "RU MODEL SENT",
+        )
+        self.assertEqual(
+            instagram_bot.build_model_sent_public_reply(
+                "uz",
+                settings=settings,
+            ),
+            "UZ MODEL SENT",
+        )
+        self.assertEqual(
+            instagram_bot.build_model_sent_public_reply(
+                "unknown",
+                settings=settings,
+            ),
+            "BOTH MODEL SENT",
         )
 
     def test_sheet_rules_are_parsed_and_sorted(self):
@@ -545,15 +579,20 @@ class TriggerDetectionTests(unittest.TestCase):
 
     def test_product_response_precedes_google_sheet_rules(self):
         model_result = instagram_bot.find_price_model_in_text(
-            "S25 narx",
+            "S25",
             catalog=self.product_catalog,
         )
         sent_messages = []
+        public_messages = []
 
         with patch.object(
             instagram_bot,
             "get_product_catalog",
             return_value=self.product_catalog,
+        ), patch.object(
+            instagram_bot,
+            "get_direct_config",
+            return_value=self.direct_config,
         ), patch.object(
             instagram_bot,
             "find_price_model_in_text",
@@ -571,6 +610,7 @@ class TriggerDetectionTests(unittest.TestCase):
         ) as private_reply, patch.object(
             instagram_bot,
             "send_public_comment_reply",
+            side_effect=lambda *args: public_messages.append(args[1]),
         ), patch.object(
             instagram_bot,
             "update_comment_status",
@@ -581,7 +621,7 @@ class TriggerDetectionTests(unittest.TestCase):
                 username="customer",
                 media_id="media-id",
                 comment_id="comment-id",
-                comment_text="S25 narx",
+                comment_text="S25",
             )
 
         post_models.assert_not_called()
@@ -589,6 +629,10 @@ class TriggerDetectionTests(unittest.TestCase):
         private_reply.assert_called_once()
         self.assertIn("Samsung Galaxy S25", sent_messages[0])
         self.assertNotIn("$", sent_messages[0])
+        self.assertEqual(
+            public_messages,
+            ["BOTH MODEL SENT"],
+        )
 
     def test_post_mapping_precedes_response_rules(self):
         base_family = instagram_bot.find_price_model_in_text(
@@ -600,11 +644,16 @@ class TriggerDetectionTests(unittest.TestCase):
             catalog=self.product_catalog,
         )["family"]
         sent_messages = []
+        public_messages = []
 
         with patch.object(
             instagram_bot,
             "get_product_catalog",
             return_value=self.product_catalog,
+        ), patch.object(
+            instagram_bot,
+            "get_direct_config",
+            return_value=self.direct_config,
         ), patch.object(
             instagram_bot,
             "find_price_model_in_text",
@@ -631,6 +680,7 @@ class TriggerDetectionTests(unittest.TestCase):
         ), patch.object(
             instagram_bot,
             "send_public_comment_reply",
+            side_effect=lambda *args: public_messages.append(args[1]),
         ), patch.object(
             instagram_bot,
             "update_comment_status",
@@ -648,6 +698,10 @@ class TriggerDetectionTests(unittest.TestCase):
         self.assertIn("Samsung Galaxy S25", sent_messages[0])
         self.assertIn("Samsung Galaxy S25 Ultra", sent_messages[0])
         self.assertNotIn("$", sent_messages[0])
+        self.assertEqual(
+            public_messages,
+            ["UZ MODEL SENT"],
+        )
 
     def test_automatic_post_sync_appends_only_new_media(self):
         headers = [
