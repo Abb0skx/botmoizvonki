@@ -79,6 +79,8 @@ class Settings:
     log_level: str = "INFO"
     delivery_db_path: Path | None = None
     delivery_sync_seconds: int = 15
+    calls_db_path: Path | None = None
+    calls_sync_seconds: int = 30
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> "Settings":
@@ -159,5 +161,13 @@ class Settings:
             ),
             delivery_sync_seconds=_bounded_int(
                 values, "SALES_PHOTO_DELIVERY_SYNC_SECONDS", 15, 5, 300
+            ),
+            calls_db_path=(
+                Path(str(values["SALES_PHOTO_CALLS_DB_PATH"]).strip()).expanduser()
+                if str(values.get("SALES_PHOTO_CALLS_DB_PATH", "")).strip()
+                else None
+            ),
+            calls_sync_seconds=_bounded_int(
+                values, "SALES_PHOTO_CALLS_SYNC_SECONDS", 30, 10, 300
             ),
         )

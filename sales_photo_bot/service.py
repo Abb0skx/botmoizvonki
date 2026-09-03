@@ -23,6 +23,7 @@ from .auto_correction import (
     latest_auto_correction_slot,
     next_auto_correction_slot,
 )
+from .calls import CallIndex, CallReader
 from .config import Settings
 from .dates import (
     TASHKENT_TZ,
@@ -285,6 +286,11 @@ class SalesPhotoService:
             if settings.delivery_db_path is not None
             else None
         )
+        self.call_reader = (
+            CallReader(settings.calls_db_path)
+            if settings.calls_db_path is not None
+            else None
+        )
         self.bot_id: int | None = None
         self._photo_locks: dict[tuple[int, int], asyncio.Lock] = {}
         self._photo_lock_users: dict[tuple[int, int], int] = {}
@@ -312,6 +318,7 @@ class SalesPhotoService:
         self._maintenance_task: asyncio.Task[None] | None = None
         self._auto_correction_task: asyncio.Task[None] | None = None
         self._delivery_sync_task: asyncio.Task[None] | None = None
+        self._call_sync_task: asyncio.Task[None] | None = None
         self._fill_reminder_task: asyncio.Task[None] | None = None
 
     async def preflight(self, bot: Bot) -> int:
@@ -383,6 +390,14 @@ class SalesPhotoService:
                     "sales_photo_delivery_preflight_failed error_type=%s",
                     _error_code(exc),
                 )
+        if self.call_reader is not None:
+            try:
+                self.call_reader.validate()
+            except Exception as exc:
+                logger.warning(
+                    "sales_photo_calls_preflight_failed error_type=%s",
+                    _error_code(exc),
+                )
         logger.info(
             "sales_photo_preflight_ok chat_id=%s chat_type=%s check_chat_id=%s",
             actual_id,
@@ -418,6 +433,44 @@ class SalesPhotoService:
                 _error_code(exc),
             )
             return None
+
+    def _call_index(
+        self,
+        sale_date_from: date,
+        sale_date_to: date,
+    ) -> CallIndex | None:
+        if self.call_reader is None:
+            return None
+        try:
+            return self.call_reader.index(sale_date_from, sale_date_to)
+        except Exception as exc:
+            logger.warning(
+                "sales_photo_calls_read_failed error_type=%s",
+                _error_code(exc),
+            )
+            return None
+
+    def _apply_call_match(
+        self,
+        *,
+        chat_id: int,
+        source_message_id: int,
+        body: str,
+        sale_date: date,
+        call_index: CallIndex | None,
+    ) -> bool:
+        if call_index is None:
+            return False
+        match = call_index.match(extract_caption_phones(body), sale_date)
+        _, changed = self.repository.sync_auto_call_manager(
+            chat_id,
+            source_message_id,
+            match.manager,
+            sale_date=sale_date,
+            call_ids=match.call_ids,
+            ambiguous=match.ambiguous,
+        )
+        return changed
 
     def _apply_delivery_match(
         self,
@@ -955,7 +1008,7 @@ class SalesPhotoService:
                 )
             source_id = self.repository.source_for_replacement(chat_id, message_id)
             if daily_order is not None and source_id is not None:
-                delivery_final, _ = self._apply_delivery_match(
+                delivery_final, delivery_manager_changed = self._apply_delivery_match(
                     chat_id=chat_id,
                     source_message_id=source_id,
                     body=final.body,
@@ -969,8 +1022,23 @@ class SalesPhotoService:
                 final = _CardNormalization(
                     delivery_final.body,
                     delivery_final.entities,
-                    final.changed or delivery_final.changed,
+                    final.changed
+                    or delivery_final.changed
+                    or delivery_manager_changed,
                 )
+                call_manager_changed = self._apply_call_match(
+                    chat_id=chat_id,
+                    source_message_id=source_id,
+                    body=final.body,
+                    sale_date=daily_order[0],
+                    call_index=self._call_index(daily_order[0], daily_order[0]),
+                )
+                if call_manager_changed:
+                    final = _CardNormalization(
+                        final.body,
+                        final.entities,
+                        True,
+                    )
             try:
                 edit_kwargs: dict[str, Any] = {
                     "chat_id": chat_id,
@@ -1735,12 +1803,16 @@ class SalesPhotoService:
             round((time.monotonic() - started) * 1000),
         )
 
-        if self.delivery_reader is not None and not claim.source_kind.startswith("delivery_"):
+        if self.call_reader is not None or (
+            self.delivery_reader is not None
+            and not claim.source_kind.startswith("delivery_")
+        ):
             try:
                 await self._sync_new_delivery_card(
                     bot,
                     source_message_id=source_message_id,
                     replacement=replacement,
+                    apply_delivery=not claim.source_kind.startswith("delivery_"),
                 )
             except asyncio.CancelledError:
                 raise
@@ -1787,6 +1859,7 @@ class SalesPhotoService:
         *,
         source_message_id: int,
         replacement: object,
+        apply_delivery: bool = True,
     ) -> None:
         content = _message_content(replacement)
         message_id = getattr(replacement, "message_id", None)
@@ -1800,15 +1873,27 @@ class SalesPhotoService:
             return
         content_kind, body, entities = content
         max_length = 1024 if content_kind == "caption" else 4096
-        final, manager_changed = self._apply_delivery_match(
+        if apply_delivery:
+            final, manager_changed = self._apply_delivery_match(
+                chat_id=self.settings.chat_id,
+                source_message_id=source_message_id,
+                body=body,
+                entities=entities,
+                sale_date=daily_order[0],
+                delivery_index=self._delivery_index(daily_order[0], daily_order[0]),
+                max_length=max_length,
+            )
+        else:
+            final = _CardNormalization(body, entities)
+            manager_changed = False
+        call_manager_changed = self._apply_call_match(
             chat_id=self.settings.chat_id,
             source_message_id=source_message_id,
-            body=body,
-            entities=entities,
+            body=final.body,
             sale_date=daily_order[0],
-            delivery_index=self._delivery_index(daily_order[0], daily_order[0]),
-            max_length=max_length,
+            call_index=self._call_index(daily_order[0], daily_order[0]),
         )
+        manager_changed = manager_changed or call_manager_changed
         if not final.changed and not manager_changed:
             return
         kwargs: dict[str, Any] = {
@@ -2535,6 +2620,7 @@ class SalesPhotoService:
             else:
                 self._ui_generations.pop(callback_key, None)
                 self._pending_managers.pop(callback_key, None)
+                self.repository.mark_delivery_manager_manual(chat_id, message_id)
             await query.answer("Не удалось обновить карточку", show_alert=True)
             logger.warning(
                 "sales_photo_manager_edit_failed chat_id=%s message_id=%s "
@@ -2645,6 +2731,7 @@ class SalesPhotoService:
                     self._ui_generations.pop(callback_key, None)
             else:
                 self._ui_generations.pop(callback_key, None)
+                self.repository.mark_delivery_manager_manual(chat_id, message_id)
             await query.answer("Не удалось вернуть список", show_alert=True)
             logger.warning(
                 "sales_photo_back_edit_failed chat_id=%s message_id=%s error_type=%s",
@@ -3096,6 +3183,7 @@ class SalesPhotoService:
         async with self._auto_correction_lock:
             sale_date_from, sale_date_to = _recent_sale_window(reference_date)
             delivery_index = self._delivery_index(sale_date_from, sale_date_to)
+            call_index = self._call_index(sale_date_from, sale_date_to)
             recovered = 0
             if scan_until_message_id is not None:
                 recovered = await self._recover_untracked_generated_cards(
@@ -3164,6 +3252,16 @@ class SalesPhotoService:
                             delivery_final.body,
                             delivery_final.entities,
                             final.changed or delivery_final.changed,
+                        )
+                        call_manager_changed = self._apply_call_match(
+                            chat_id=candidate.chat_id,
+                            source_message_id=candidate.source_message_id,
+                            body=final.body,
+                            sale_date=current_order[0],
+                            call_index=call_index,
+                        )
+                        manager_changed = (
+                            manager_changed or call_manager_changed
                         )
                         self._sync_sale_details(
                             candidate.chat_id,
@@ -4027,6 +4125,111 @@ class SalesPhotoService:
                     _error_code(exc),
                 )
 
+    async def sync_call_managers(
+        self,
+        bot: Bot | Any,
+        *,
+        reference_date: date | None = None,
+    ) -> int:
+        """Refresh manager buttons from recent qualified phone calls."""
+
+        if self.call_reader is None:
+            return 0
+        sale_date_from, sale_date_to = _recent_sale_window(reference_date)
+        call_index = self._call_index(sale_date_from, sale_date_to)
+        if call_index is None:
+            return 0
+        candidates = self.repository.call_sync_candidates(
+            self.settings.chat_id,
+            sale_date_from,
+            sale_date_to,
+        )
+        changed_count = 0
+        for candidate in candidates:
+            key = (candidate.chat_id, candidate.replacement_message_id)
+            try:
+                async with self._card_lock(key):
+                    match = call_index.match(candidate.phones, candidate.sale_date)
+                    _, changed = self.repository.sync_auto_call_manager(
+                        candidate.chat_id,
+                        candidate.source_message_id,
+                        match.manager,
+                        sale_date=candidate.sale_date,
+                        call_ids=match.call_ids,
+                        ambiguous=match.ambiguous,
+                    )
+                    if not changed:
+                        continue
+                    await self._send_with_retry(
+                        bot.edit_message_reply_markup,
+                        {
+                            "chat_id": candidate.chat_id,
+                            "message_id": candidate.replacement_message_id,
+                            "reply_markup": self._current_card_markup(
+                                candidate.chat_id,
+                                candidate.replacement_message_id,
+                                SimpleNamespace(reply_markup=None),
+                            ),
+                        },
+                    )
+                    changed_count += 1
+            except asyncio.CancelledError:
+                raise
+            except BadRequest as exc:
+                if "message is not modified" in str(exc).casefold():
+                    continue
+                if _message_to_edit_missing(exc):
+                    self.repository.mark_order_card_removed(
+                        candidate.chat_id,
+                        candidate.source_message_id,
+                    )
+                    continue
+                logger.warning(
+                    "sales_photo_call_manager_edit_failed chat_id=%s "
+                    "message_id=%s error_type=%s",
+                    candidate.chat_id,
+                    candidate.replacement_message_id,
+                    _error_code(exc),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "sales_photo_call_manager_sync_failed chat_id=%s "
+                    "message_id=%s error_type=%s",
+                    candidate.chat_id,
+                    candidate.replacement_message_id,
+                    _error_code(exc),
+                )
+        if changed_count:
+            await self.run_fill_reminder_check(
+                bot,
+                publish=False,
+                reference_date=reference_date,
+            )
+        logger.info(
+            "sales_photo_call_manager_sync_complete checked=%s changed=%s",
+            len(candidates),
+            changed_count,
+        )
+        return changed_count
+
+    async def _call_sync_loop(self, bot: Bot | Any) -> None:
+        if self.call_reader is None:
+            return
+        while True:
+            try:
+                await self.sync_call_managers(
+                    bot,
+                    reference_date=tashkent_today(),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "sales_photo_call_sync_failed error_type=%s",
+                    _error_code(exc),
+                )
+            await asyncio.sleep(self.settings.calls_sync_seconds)
+
     def _ensure_delivery_sync(self, bot: Bot | Any) -> None:
         if self.delivery_reader is None:
             return
@@ -4036,6 +4239,27 @@ class SalesPhotoService:
         self._delivery_sync_task = asyncio.create_task(
             self._delivery_sync_loop(bot),
             name="sales-photo-delivery-sync",
+        )
+
+    def _ensure_call_sync(self, bot: Bot | Any) -> None:
+        if self.call_reader is None:
+            return
+        task = self._call_sync_task
+        if task is not None and not task.done():
+            return
+        if task is not None and not task.cancelled():
+            try:
+                error = task.exception()
+            except asyncio.CancelledError:
+                error = None
+            if error is not None:
+                logger.warning(
+                    "sales_photo_call_sync_restarted error_type=%s",
+                    _error_code(error),
+                )
+        self._call_sync_task = asyncio.create_task(
+            self._call_sync_loop(bot),
+            name="sales-photo-call-sync",
         )
 
     async def retry_duplicate_cleanups(self, bot: Bot | Any) -> None:
@@ -4131,11 +4355,13 @@ class SalesPhotoService:
         self._startup_gate_active = False
         self._ensure_auto_correction_scheduler(bot)
         self._ensure_delivery_sync(bot)
+        self._ensure_call_sync(bot)
         self._ensure_fill_reminder_scheduler(bot)
         while True:
             self._safe_touch_heartbeat()
             self._ensure_auto_correction_scheduler(bot)
             self._ensure_delivery_sync(bot)
+            self._ensure_call_sync(bot)
             self._ensure_fill_reminder_scheduler(bot)
             try:
                 stale_before = utc_now() - timedelta(
@@ -4258,6 +4484,14 @@ class SalesPhotoService:
             except asyncio.CancelledError:
                 pass
             self._delivery_sync_task = None
+        call_sync_task = self._call_sync_task
+        if call_sync_task is not None:
+            call_sync_task.cancel()
+            try:
+                await call_sync_task
+            except asyncio.CancelledError:
+                pass
+            self._call_sync_task = None
         fill_reminder_task = self._fill_reminder_task
         if fill_reminder_task is not None:
             fill_reminder_task.cancel()

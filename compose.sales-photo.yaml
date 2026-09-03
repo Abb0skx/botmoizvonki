@@ -16,6 +16,8 @@ services:
       SALES_PHOTO_DB_PATH: /app/data/sales_photo.db
       SALES_PHOTO_DELIVERY_DB_PATH: /app/delivery-data/delivery.db
       SALES_PHOTO_DELIVERY_SYNC_SECONDS: "${SALES_PHOTO_DELIVERY_SYNC_SECONDS:-15}"
+      SALES_PHOTO_CALLS_DB_PATH: /app/calls-data/calls.db
+      SALES_PHOTO_CALLS_SYNC_SECONDS: "${SALES_PHOTO_CALLS_SYNC_SECONDS:-30}"
       SALES_PHOTO_HEARTBEAT_PATH: /tmp/sales-photo-heartbeat
       SALES_PHOTO_ALLOWED_USER_IDS: "${SALES_PHOTO_ALLOWED_USER_IDS:-}"
       SALES_PHOTO_DELETE_RETRY_SECONDS: "${SALES_PHOTO_DELETE_RETRY_SECONDS:-30}"
@@ -29,6 +31,9 @@ services:
       # Normal reads use SQLite mode=ro. A narrow integration bridge updates
       # only sales-card request/result fields. Both images use UID/GID 10001.
       - texnikach-delivery-data:/app/delivery-data
+      # SQLite is opened with mode=ro. The mount is writable only so a live WAL
+      # database can use its existing shared-memory sidecars.
+      - botmoizvonki-data:/app/calls-data
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=64m
@@ -46,3 +51,6 @@ volumes:
   sales-photo-data:
   texnikach-delivery-data:
     external: true
+  botmoizvonki-data:
+    external: true
+    name: ${SALES_PHOTO_CALLS_VOLUME:-nylgfmvjodgie9dga7ngprgl-botmoizvonki-data}
