@@ -67,7 +67,7 @@ model_empty_memory_label,Цена,Подпись без памяти
 model_not_found_reply,"Уточните модель: {manager_url}",Модель не найдена
 model_sent_public_ru,RU MODEL SENT,Модель отправлена — русский
 model_sent_public_uz,UZ MODEL SENT,Модель отправлена — узбекский
-model_sent_public_bilingual,BOTH MODEL SENT,Модель отправлена — два языка
+model_sent_public_bilingual,Direct ✅,Модель отправлена — язык не определён
 private_reply_unavailable_ru,RU SHEET,Закрытый Direct — русский
 private_reply_unavailable_uz,UZ SHEET,Закрытый Direct — узбекский
 private_reply_unavailable_bilingual,BOTH SHEET,Закрытый Direct — два языка
@@ -184,7 +184,7 @@ class TriggerDetectionTests(unittest.TestCase):
                 "unknown",
                 settings=settings,
             ),
-            "BOTH MODEL SENT",
+            "Direct ✅",
         )
 
     def test_sheet_rules_are_parsed_and_sorted(self):
@@ -631,7 +631,7 @@ class TriggerDetectionTests(unittest.TestCase):
         self.assertNotIn("$", sent_messages[0])
         self.assertEqual(
             public_messages,
-            ["BOTH MODEL SENT"],
+            ["Direct ✅"],
         )
 
     def test_post_mapping_precedes_response_rules(self):

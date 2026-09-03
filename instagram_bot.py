@@ -856,10 +856,7 @@ LOCAL_DIRECT_SETTINGS = {
         "Mavjud. Directga yubordik ✅"
     ),
 
-    "model_sent_public_bilingual": (
-        "Есть в наличии. Отправили в Direct ✅\n\n"
-        "Mavjud. Directga yubordik ✅"
-    ),
+    "model_sent_public_bilingual": "Direct ✅",
 
     "private_reply_unavailable_ru": (
         "Ваш Direct закрыт, поэтому мы не смогли вам написать. "
