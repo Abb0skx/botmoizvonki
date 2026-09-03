@@ -7,7 +7,7 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, StreamingResponse
 
 from app.analytics_service import build_delivery_analytics
 from app.database import OrderRepository
@@ -30,6 +30,10 @@ STATS_PASSWORD = (
     or os.getenv("REVIEWS_ADMIN_PASSWORD")
     or ""
 )
+MONITORING_BASE_URL = os.getenv("MONITORING_BASE_URL", "").strip().rstrip("/")
+MONITORING_DELIVERY_SERVICE_TOKEN = os.getenv(
+    "MONITORING_DELIVERY_SERVICE_TOKEN", ""
+).strip()
 TEMPLATE_DIR = Path(__file__).parent / "templates"
 STATS_TEMPLATE_PATH = TEMPLATE_DIR / "delivery_stats.html"
 MONITOR_TEMPLATE_PATH = TEMPLATE_DIR / "delivery_monitor.html"
@@ -75,6 +79,21 @@ def require_stats_auth(request: Request) -> str:
     return username
 
 
+def require_internal_monitoring_auth(request: Request) -> None:
+    if not MONITORING_DELIVERY_SERVICE_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="monitoring_delivery_service_token_not_configured",
+        )
+    authorization = request.headers.get("authorization", "")
+    prefix = "Bearer "
+    supplied = authorization[len(prefix):] if authorization.startswith(prefix) else ""
+    if not supplied or not secrets.compare_digest(
+        supplied, MONITORING_DELIVERY_SERVICE_TOKEN
+    ):
+        raise HTTPException(status_code=403, detail="invalid_service_token")
+
+
 def _repository() -> OrderRepository:
     if not DATABASE_PATH.is_file():
         raise HTTPException(status_code=503, detail="delivery_database_not_found")
@@ -111,7 +130,10 @@ def _report(day: str, courier_id: int | None) -> dict:
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     response = await call_next(request)
-    if request.url.path.startswith("/delivery/"):
+    if (
+        request.url.path.startswith("/delivery/")
+        or request.url.path.startswith("/internal/monitoring/")
+    ):
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
@@ -131,8 +153,8 @@ async def security_headers(request: Request, call_next):
 @app.get("/delivery/stats/healthz")
 @app.get("/delivery/monitor/healthz")
 def health():
-    if not STATS_PASSWORD:
-        return JSONResponse({"ok": False, "reason": "password"}, status_code=503)
+    if not STATS_PASSWORD and not MONITORING_DELIVERY_SERVICE_TOKEN:
+        return JSONResponse({"ok": False, "reason": "authentication"}, status_code=503)
     if not DATABASE_PATH.is_file():
         return JSONResponse({"ok": False, "reason": "database"}, status_code=503)
     try:
@@ -183,14 +205,70 @@ def robots():
 
 @app.get("/delivery/stats", response_class=HTMLResponse)
 @app.get("/delivery/stats/", response_class=HTMLResponse, include_in_schema=False)
-def statistics_page(_username: str = Depends(require_stats_auth)):
+def statistics_page(request: Request):
+    if MONITORING_BASE_URL:
+        target = MONITORING_BASE_URL + "/delivery/stats"
+        if request.url.query:
+            target += "?" + request.url.query
+        return RedirectResponse(target, status_code=303)
+    require_stats_auth(request)
     return HTMLResponse(STATS_TEMPLATE_PATH.read_text(encoding="utf-8"))
 
 
 @app.get("/delivery/monitor", response_class=HTMLResponse)
 @app.get("/delivery/monitor/", response_class=HTMLResponse, include_in_schema=False)
-def monitor_page(_username: str = Depends(require_stats_auth)):
+def monitor_page(request: Request):
+    if MONITORING_BASE_URL:
+        return RedirectResponse(MONITORING_BASE_URL + "/delivery/live", status_code=303)
+    require_stats_auth(request)
     return HTMLResponse(MONITOR_TEMPLATE_PATH.read_text(encoding="utf-8"))
+
+
+@app.get("/internal/monitoring/v1/delivery/live")
+async def internal_monitoring_live(request: Request):
+    require_internal_monitoring_auth(request)
+    repository = _repository()
+    state = await run_in_threadpool(build_delivery_monitor, repository)
+    return await enrich_monitor_routes(state, _routing_service())
+
+
+@app.get("/internal/monitoring/v1/delivery/report")
+async def internal_monitoring_report(
+    request: Request,
+    day: str = Query("today", max_length=20),
+    courier_id: int | None = Query(None),
+):
+    require_internal_monitoring_auth(request)
+    report = await run_in_threadpool(_report, day, courier_id)
+    return await enrich_stats_routes(report, _routing_service())
+
+
+@app.get("/internal/monitoring/v1/delivery/analytics")
+def internal_monitoring_analytics(
+    request: Request,
+    month: str | None = Query(None, max_length=7),
+    week: str | None = Query(None, max_length=8),
+    courier_id: int | None = Query(None),
+):
+    require_internal_monitoring_auth(request)
+    if courier_id is not None and courier_id not in COURIERS_BY_ID:
+        raise HTTPException(status_code=422, detail="unknown_courier")
+    try:
+        return build_delivery_analytics(
+            _repository(), month=month, week=week, courier_id=courier_id
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@app.get("/internal/monitoring/v1/delivery/map.png")
+async def internal_monitoring_map(
+    request: Request,
+    day: str = Query("today", max_length=20),
+    courier_id: int | None = Query(None),
+):
+    require_internal_monitoring_auth(request)
+    return await statistics_map(day=day, courier_id=courier_id, _username="internal")
 
 
 @app.get("/delivery/monitor/api/state")

@@ -8,7 +8,26 @@ from fastapi import HTTPException, Request
 from .config import PriceSettings
 
 
-def require_admin(request: Request, settings: PriceSettings) -> None:
+def _monitoring_session(request: Request, *, admin: bool = False):
+    """Use the unified portal session when it is present and enabled.
+
+    Imports stay local so the price subsystem can still run on its own during
+    rollback, without making monitoring a startup dependency.
+    """
+    from monitoring.auth import SESSION_COOKIE
+    from monitoring import router as monitoring_router
+
+    if not monitoring_router.settings.enabled:
+        return None
+    if not request.cookies.get(SESSION_COOKIE):
+        return None
+    return monitoring_router.get_auth().principal(request, admin=admin)
+
+
+def require_admin(request: Request, settings: PriceSettings):
+    principal = _monitoring_session(request)
+    if principal is not None:
+        return principal
     if not settings.admin_password:
         raise HTTPException(
             status_code=503,
@@ -45,12 +64,19 @@ def require_admin(request: Request, settings: PriceSettings) -> None:
                 "WWW-Authenticate": 'Basic realm="Texnikach Price"'
             },
         )
+    return None
 
 
 def require_admin_action(
     request: Request,
     settings: PriceSettings,
 ) -> None:
+    principal = _monitoring_session(request, admin=True)
+    if principal is not None:
+        from monitoring import router as monitoring_router
+
+        monitoring_router.get_auth().verify_csrf(request, principal)
+        return
     require_admin(request, settings)
     if not secrets.compare_digest(
         request.headers.get("x-requested-with", ""),

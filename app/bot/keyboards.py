@@ -323,13 +323,20 @@ def orders_channel_keyboard(order: Order) -> InlineKeyboardMarkup:
 
 def statistics_keyboard(base_url: str) -> InlineKeyboardMarkup:
     base = base_url.rstrip("/")
-    monitor = base.rsplit("/", 1)[0] + "/monitor"
+    if base.endswith("/monitoring"):
+        portal = base
+        report_base = base + "/delivery/stats"
+        monitor = base + "/delivery/live"
+    else:
+        portal = base
+        report_base = base
+        monitor = base.rsplit("/", 1)[0] + "/monitor"
 
     def report_url(day: str, courier_id: int | None = None) -> str:
         query = {"day": day}
         if courier_id is not None:
             query["courier_id"] = str(courier_id)
-        return f"{base}?{urlencode(query)}"
+        return f"{report_base}?{urlencode(query)}"
 
     rows = [[
         InlineKeyboardButton("📅 Все заказы сегодня", url=report_url("today")),
@@ -345,7 +352,7 @@ def statistics_keyboard(base_url: str) -> InlineKeyboardMarkup:
     rows.append(courier_buttons[:2])
     rows.append(courier_buttons[2:])
     rows.append([InlineKeyboardButton("🚦 Мониторинг курьеров", url=monitor)])
-    rows.append([InlineKeyboardButton("🌐 Открыть всю статистику", url=base)])
+    rows.append([InlineKeyboardButton("🌐 Открыть всю статистику", url=portal)])
     return InlineKeyboardMarkup(rows)
 
 

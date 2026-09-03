@@ -283,6 +283,23 @@ class StatisticsKeyboardTests(unittest.TestCase):
             urls,
         )
 
+    def test_monitoring_portal_links_keep_delivery_filters(self):
+        keyboard = statistics_keyboard("https://bot.texnikach.uz/monitoring")
+        urls = [
+            button.url
+            for row in keyboard.inline_keyboard
+            for button in row
+        ]
+        self.assertIn(
+            "https://bot.texnikach.uz/monitoring/delivery/stats?day=today",
+            urls,
+        )
+        self.assertIn(
+            "https://bot.texnikach.uz/monitoring/delivery/live",
+            urls,
+        )
+        self.assertIn("https://bot.texnikach.uz/monitoring", urls)
+
 
 if __name__ == "__main__":
     unittest.main()

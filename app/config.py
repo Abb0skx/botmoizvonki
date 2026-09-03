@@ -23,7 +23,7 @@ class Settings:
     database_path: Path
     manager_ids: frozenset[int]
     courier_ids: frozenset[int]
-    stats_url: str = "https://bot.texnikach.uz/delivery/stats"
+    stats_url: str = "https://bot.texnikach.uz/monitoring"
 
     @classmethod
     def load(cls) -> "Settings":
@@ -80,8 +80,8 @@ class Settings:
             stats_url=(
                 os.getenv(
                     "DELIVERY_STATS_URL",
-                    "https://bot.texnikach.uz/delivery/stats",
+                    "https://bot.texnikach.uz/monitoring",
                 ).strip().rstrip("/")
-                or "https://bot.texnikach.uz/delivery/stats"
+                or "https://bot.texnikach.uz/monitoring"
             ),
         )

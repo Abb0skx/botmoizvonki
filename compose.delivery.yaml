@@ -16,6 +16,7 @@ services:
       # The bot only needs the stats URL, never the Basic Auth secret.
       DELIVERY_STATS_PASSWORD: ""
       REVIEWS_ADMIN_PASSWORD: ""
+      MONITORING_DELIVERY_SERVICE_TOKEN: ""
     volumes:
       - delivery-data:/app/data
     read_only: true

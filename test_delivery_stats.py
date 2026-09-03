@@ -781,6 +781,42 @@ class DeliveryStatsWebTests(unittest.TestCase):
         self.assertEqual(response.headers["content-type"], "image/png")
         self.assertEqual(response.content, b"png-data")
 
+    def test_internal_monitoring_api_uses_separate_service_token(self):
+        with patch.object(
+            self.stats, "MONITORING_DELIVERY_SERVICE_TOKEN", "portal-service-key"
+        ), patch.object(
+            self.stats,
+            "enrich_stats_routes",
+            AsyncMock(side_effect=lambda report, _service: report),
+        ):
+            denied = self.client.get(
+                "/internal/monitoring/v1/delivery/report?day=today"
+            )
+            self.assertEqual(denied.status_code, 403)
+            response = self.client.get(
+                "/internal/monitoring/v1/delivery/report?day=today",
+                headers={"Authorization": "Bearer portal-service-key"},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["summary"]["orders"], 1)
+
+    def test_legacy_page_redirects_to_monitoring_with_filters(self):
+        with patch.object(
+            self.stats,
+            "MONITORING_BASE_URL",
+            "https://bot.texnikach.uz/monitoring",
+        ):
+            response = self.client.get(
+                "/delivery/stats?day=yesterday&delivery_courier_id=1799690992",
+                follow_redirects=False,
+            )
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(
+            response.headers["location"],
+            "https://bot.texnikach.uz/monitoring/delivery/stats"
+            "?day=yesterday&delivery_courier_id=1799690992",
+        )
+
 
 class DeliveryStatsBotTests(unittest.IsolatedAsyncioTestCase):
     async def test_manager_gets_today_yesterday_and_courier_links(self):
