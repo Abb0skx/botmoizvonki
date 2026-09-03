@@ -226,12 +226,13 @@ async def price_page(request: Request) -> HTMLResponse:
     # Staged rollout: while the new subsystem is explicitly disabled, preserve
     # the existing read-only page exactly as it works today. Enabling the
     # subsystem switches this same route to fail-closed Basic authentication.
-    if settings.enabled:
-        require_admin(request, settings)
+    principal = require_admin(request, settings) if settings.enabled else None
     document = _page_html()
     if document is None:
         return _secure_html("<h1>Price page not found</h1>", status_code=404)
-    if settings.enabled:
+    if settings.enabled and (
+        principal is None or getattr(principal, "role", None) == "admin"
+    ):
         document = _inject_admin_script(document)
     return _secure_html(document)
 

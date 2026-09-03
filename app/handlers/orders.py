@@ -1536,7 +1536,7 @@ async def show_statistics(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "📊 <b>Статистика доставки TEXNIKACH</b>\n\n"
         "Выберите день или курьера. На сайте доступны показатели, "
         "хронология, интерактивная карта и PNG с очередностью доставок.\n\n"
-        "🔒 При открытии сайт запросит логин и пароль.",
+        "🔐 Вход выполняется через Telegram без отдельного пароля.",
         parse_mode=ParseMode.HTML,
         reply_markup=statistics_keyboard(settings.stats_url),
     )
@@ -1546,6 +1546,8 @@ def _monitor_url(settings: Settings) -> str | None:
     stats_url = (getattr(settings, "stats_url", "") or "").strip().rstrip("/")
     if not stats_url:
         return None
+    if stats_url.endswith("/monitoring"):
+        return stats_url + "/delivery/live"
     return stats_url.rsplit("/", 1)[0] + "/monitor"
 
 

@@ -1,7 +1,21 @@
 (() => {
     "use strict";
 
-    const actionHeader = {"X-Requested-With": "TexnikachPriceAdmin"};
+    const csrfCookieName = "__Host-texnikach_monitoring_csrf=";
+    const csrfToken = () => {
+        const item = document.cookie
+            .split("; ")
+            .find((value) => value.startsWith(csrfCookieName));
+        return item
+            ? decodeURIComponent(item.slice(csrfCookieName.length))
+            : "";
+    };
+    const actionHeaders = () => {
+        const headers = {"X-Requested-With": "TexnikachPriceAdmin"};
+        const token = csrfToken();
+        if (token) headers["X-CSRF-Token"] = token;
+        return headers;
+    };
 
     const style = document.createElement("style");
     style.textContent = `
@@ -89,7 +103,7 @@
             method: "POST",
             credentials: "same-origin",
             headers: {
-                ...actionHeader,
+                ...actionHeaders(),
                 ...extraHeaders,
                 "Content-Type": "application/json",
             },

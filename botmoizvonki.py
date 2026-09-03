@@ -37,7 +37,7 @@ from fastapi import (
     Request,
 )
 
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from instagram_bot import router as instagram_router
 from price_server.router import (
@@ -46,6 +46,8 @@ from price_server.router import (
     stop_price_server,
 )
 from reviews.router import router as reviews_router
+from monitoring.router import router as monitoring_router
+from monitoring.router import settings as monitoring_settings
 from telegram_business.router import router as telegram_business_router
 from telegram_business.router import get_service as get_telegram_business_service
 from telegram_business.router import settings as telegram_business_settings
@@ -71,11 +73,53 @@ app.include_router(
 )
 
 app.include_router(
+    monitoring_router
+)
+
+app.include_router(
     telegram_business_router
 )
 
 _telegram_business_scheduler = None
 _transcription_worker = None
+
+
+@app.middleware("http")
+async def protect_legacy_manager_routes(request: Request, call_next):
+    """Move human dashboards behind the passwordless monitoring portal.
+
+    Public review forms, webhooks, health checks and the price sync endpoint
+    deliberately remain outside this guard.
+    """
+    path = request.url.path.rstrip("/") or "/"
+    if monitoring_settings.enabled:
+        redirects = {
+            "/dashboard": "/monitoring/calls",
+            "/admin/reviews": "/monitoring/reviews",
+        }
+        if path in redirects and request.method == "GET":
+            target = redirects[path]
+            if request.url.query:
+                target += "?" + request.url.query
+            response = RedirectResponse(target, status_code=303)
+            response.headers["Cache-Control"] = "no-store"
+            return response
+        if path == "/stats" or path.startswith("/stats/"):
+            return JSONResponse(
+                {"detail": "monitoring_session_required"},
+                status_code=401,
+                headers={
+                    "Cache-Control": "no-store",
+                    "X-Robots-Tag": "noindex, nofollow",
+                },
+            )
+        if path.startswith("/api/admin/reviews"):
+            return JSONResponse(
+                {"detail": "use_monitoring_api"},
+                status_code=410,
+                headers={"Cache-Control": "no-store"},
+            )
+    return await call_next(request)
 
 
 @app.on_event("startup")

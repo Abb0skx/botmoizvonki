@@ -3,7 +3,8 @@
 This package is the server half of the Texnikach price workflow. It is deployed
 with the `botmoizvonki` FastAPI application and owns:
 
-- password protection for `/price`;
+- legacy password protection for `/price` and read-only manager access through
+  the Telegram-authenticated `/monitoring/prices` portal;
 - durable price snapshots in SQLite;
 - Telegram send, edit and delayed-publication jobs;
 - a 24-hour delayed-post preview channel with administrator-only cancellation;

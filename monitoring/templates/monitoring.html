@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#0c1014">
+  <title>TEXNIKACH — мониторинг</title>
+  <link rel="stylesheet" href="/monitoring/assets/monitoring.css">
+</head>
+<body>
+  <script id="monitoring-bootstrap" type="application/json">__BOOTSTRAP__</script>
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <a href="/monitoring" class="brand"><span class="brand-mark small">T</span><span><b>TEXNIKACH</b><small>Monitoring</small></span></a>
+      <nav class="nav" aria-label="Разделы мониторинга">
+        <a data-nav="overview" href="/monitoring"><span>⌂</span> Главная</a>
+        <a data-nav="calls" href="/monitoring/calls"><span>☎</span> Звонки</a>
+        <a data-nav="site" href="/monitoring/site"><span>◫</span> Сайт GO</a>
+        <a data-nav="reviews" href="/monitoring/reviews"><span>★</span> Отзывы</a>
+        <a data-nav="delivery/live" href="/monitoring/delivery/live"><span>⌖</span> Доставка сейчас</a>
+        <a data-nav="delivery/stats" href="/monitoring/delivery/stats"><span>▥</span> Статистика доставки</a>
+        <a data-nav="prices" href="/monitoring/prices"><span>₽</span> Прайс</a>
+      </nav>
+      <div class="sidebar-user">
+        <div class="user-avatar" id="userAvatar">M</div>
+        <div><b id="userName">Менеджер</b><small id="userRole">manager</small></div>
+      </div>
+    </aside>
+
+    <main class="workspace">
+      <header class="topbar">
+        <button class="menu-button" id="menuButton" type="button" aria-label="Открыть меню" aria-expanded="false">☰</button>
+        <div>
+          <div class="eyebrow" id="pageEyebrow">ОПЕРАЦИОННЫЙ ЦЕНТР</div>
+          <h1 id="pageTitle">Главная</h1>
+        </div>
+        <div class="top-actions">
+          <span class="updated" id="updated" aria-live="polite">Подготовка…</span>
+          <button class="icon-button" id="refreshButton" type="button" aria-label="Обновить данные">↻</button>
+          <button class="logout-button" id="logoutButton" type="button">Выйти</button>
+        </div>
+      </header>
+
+      <section class="filterbar" id="filterbar" aria-label="Период отчёта">
+        <div class="periods" id="periods">
+          <button type="button" data-period="today">Сегодня</button>
+          <button type="button" data-period="yesterday">Вчера</button>
+          <button type="button" data-period="7d">7 дней</button>
+          <button type="button" data-period="30d">30 дней</button>
+          <button type="button" data-period="custom">Свой период</button>
+        </div>
+        <div class="custom-dates" id="customDates" hidden>
+          <label>С <input type="date" id="dateFrom"></label>
+          <label>По <input type="date" id="dateTo"></label>
+          <button class="primary-button" type="button" id="applyDates">Показать</button>
+        </div>
+      </section>
+
+      <div class="page-status" id="pageStatus" aria-live="polite"></div>
+      <div id="content" class="content"><div class="loading-card">Загружаем данные…</div></div>
+    </main>
+  </div>
+  <div class="scrim" id="scrim"></div>
+  <script src="/monitoring/assets/monitoring.js" defer></script>
+</body>
+</html>
+

@@ -8,6 +8,8 @@ requests
 python-dotenv
 pandas
 openpyxl
+httpx>=0.28,<0.29
+cryptography>=50,<51
 gspread
 google-auth
 python-telegram-bot>=22.0,<23.0
