@@ -244,16 +244,51 @@ class ForwardingService:
                 "show_alert": True,
             }
 
-        try:
-            actor_id = int(telegram_user.get("id"))
-        except (TypeError, ValueError):
-            actor_id = 0
+        if (
+            not isinstance(callback_query_id, str)
+            or not callback_query_id.strip()
+        ):
+            return {
+                "queued": False,
+                "reason": "invalid",
+                "message": "Неверный идентификатор команды",
+                "show_alert": True,
+            }
 
-        if actor_id not in self.settings.admin_ids:
+        raw_actor_id = telegram_user.get("id")
+        actor_id = (
+            raw_actor_id
+            if type(raw_actor_id) is int and raw_actor_id > 0
+            else 0
+        )
+
+        parts = str(callback_data or "").split(":")
+        if len(parts) != 3 or parts[0] != "fwd":
+            return {
+                "queued": False,
+                "reason": "invalid",
+                "message": "Неверная команда",
+                "show_alert": True,
+            }
+
+        source_code, target_code = parts[1], parts[2]
+        employee = DEVICES.get(source_code)
+        if not employee or not employee.controls_enabled:
+            return {
+                "queued": False,
+                "reason": "invalid",
+                "message": "Управление для этого телефона отключено",
+                "show_alert": True,
+            }
+
+        if not self.settings.can_control(actor_id, source_code):
             return {
                 "queued": False,
                 "reason": "forbidden",
-                "message": "Только Abbos может управлять переадресацией",
+                "message": (
+                    "У вас нет доступа к управлению "
+                    f"{employee.name}"
+                ),
                 "show_alert": True,
             }
 
@@ -280,17 +315,6 @@ class ForwardingService:
                 "show_alert": True,
             }
 
-        parts = str(callback_data or "").split(":")
-        if len(parts) != 3 or parts[0] != "fwd":
-            return {
-                "queued": False,
-                "reason": "invalid",
-                "message": "Неверная команда",
-                "show_alert": True,
-            }
-
-        source_code, target_code = parts[1], parts[2]
-        employee = DEVICES.get(source_code)
         try:
             action, service_number, target, target_number = (
                 self.service_number(source_code, target_code)
@@ -310,7 +334,7 @@ class ForwardingService:
             or ""
         )
         result = self.repository.queue_operation(
-            callback_query_id=str(callback_query_id),
+            callback_query_id=callback_query_id,
             employee=employee,
             action=action,
             target=target,

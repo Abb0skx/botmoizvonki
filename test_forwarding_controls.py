@@ -15,6 +15,7 @@ from forwarding.config import (
     OPERATOR,
     ROUTES,
     ForwardingSettings,
+    load_forwarding_settings,
 )
 from forwarding.repository import ForwardingRepository
 from forwarding.service import ForwardingService
@@ -23,6 +24,8 @@ from forwarding.service import ForwardingService
 UZ_TZ = timezone(timedelta(hours=5))
 CHAT_ID = -100123456789
 ADMIN_ID = 202134293
+REDMI_CONTROLLER_ID = 7636344727
+TECNO_CONTROLLER_ID = 702960146
 
 _IMPORT_TMP = tempfile.TemporaryDirectory()
 _IMPORT_DIR = Path(_IMPORT_TMP.name)
@@ -88,6 +91,10 @@ class ForwardingControlTests(unittest.TestCase):
             confirmation_timeout_seconds=120,
             correlation_window_seconds=3600,
             admin_ids=frozenset({ADMIN_ID}),
+            device_controller_ids={
+                "redmi": frozenset({REDMI_CONTROLLER_ID}),
+                "tecno": frozenset({TECNO_CONTROLLER_ID}),
+            },
         )
         self.service = ForwardingService(
             repository=self.repository,
@@ -262,6 +269,197 @@ class ForwardingControlTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM forwarding_operations"
             ).fetchone()[0]
         self.assertEqual(count, 1)
+
+    def test_device_controllers_are_limited_to_their_own_phone(self):
+        self.activate_post()
+
+        redmi = self.queue(
+            "fwd:redmi:poco",
+            callback_id="redmi-owner",
+            actor_id=REDMI_CONTROLLER_ID,
+        )
+        self.assertTrue(redmi["queued"])
+
+        redmi_for_tecno = self.queue(
+            "fwd:tecno:poco",
+            callback_id="redmi-owner-tries-tecno",
+            actor_id=REDMI_CONTROLLER_ID,
+            now_ts=self.timestamp(second=3),
+        )
+        self.assertEqual(redmi_for_tecno["reason"], "forbidden")
+        self.assertIn("Tecno", redmi_for_tecno["message"])
+
+        tecno = self.queue(
+            "fwd:tecno:redmi",
+            callback_id="tecno-owner",
+            actor_id=TECNO_CONTROLLER_ID,
+            now_ts=self.timestamp(second=3),
+        )
+        self.assertTrue(tecno["queued"])
+
+        tecno_for_redmi = self.queue(
+            "fwd:redmi:off",
+            callback_id="tecno-owner-tries-redmi",
+            actor_id=TECNO_CONTROLLER_ID,
+            now_ts=self.timestamp(second=4),
+        )
+        self.assertEqual(tecno_for_redmi["reason"], "forbidden")
+        self.assertIn("Redmi", tecno_for_redmi["message"])
+
+        with self.repository.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT employee_id, requested_by
+                FROM forwarding_operations
+                ORDER BY id
+                """
+            ).fetchall()
+        self.assertEqual(
+            [(row["employee_id"], row["requested_by"]) for row in rows],
+            [
+                ("redmi", REDMI_CONTROLLER_ID),
+                ("tecno", TECNO_CONTROLLER_ID),
+            ],
+        )
+
+    def test_superadmin_controls_both_phones_but_poco_stays_disabled(self):
+        self.activate_post()
+        redmi = self.queue(
+            "fwd:redmi:off",
+            callback_id="super-redmi",
+            actor_id=ADMIN_ID,
+        )
+        self.assertTrue(redmi["queued"])
+
+        tecno = self.queue(
+            "fwd:tecno:off",
+            callback_id="super-tecno",
+            actor_id=ADMIN_ID,
+            now_ts=self.timestamp(second=3),
+        )
+        self.assertTrue(tecno["queued"])
+
+        poco = self.queue(
+            "fwd:poco:off",
+            callback_id="super-poco",
+            actor_id=ADMIN_ID,
+            now_ts=self.timestamp(second=4),
+        )
+        self.assertEqual(poco["reason"], "invalid")
+
+    def test_invalid_callback_never_uses_device_acl(self):
+        self.activate_post()
+        for index, callback_data in enumerate(
+            ("", "fwd", "fwd:unknown:off", "other:redmi:off")
+        ):
+            result = self.queue(
+                callback_data,
+                callback_id=f"invalid-{index}",
+                actor_id=REDMI_CONTROLLER_ID,
+            )
+            self.assertEqual(result["reason"], "invalid")
+
+    def test_username_cannot_spoof_numeric_telegram_id(self):
+        post = self.activate_post()
+        result = self.service.queue_callback(
+            callback_query_id="spoofed-name",
+            callback_data="fwd:redmi:poco",
+            telegram_user={"id": 999, "username": "AbbosTch"},
+            chat_id=CHAT_ID,
+            message_id=post["message_id"],
+            now_ts=self.timestamp(second=1),
+        )
+        self.assertEqual(result["reason"], "forbidden")
+        with self.repository.connect() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM forwarding_operations"
+            ).fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_actor_id_must_be_an_exact_positive_json_integer(self):
+        post = self.activate_post()
+        for index, actor_id in enumerate(
+            (
+                float(REDMI_CONTROLLER_ID),
+                REDMI_CONTROLLER_ID + 0.9,
+                str(REDMI_CONTROLLER_ID),
+                True,
+                0,
+                -REDMI_CONTROLLER_ID,
+                None,
+            )
+        ):
+            result = self.service.queue_callback(
+                callback_query_id=f"invalid-actor-{index}",
+                callback_data="fwd:redmi:poco",
+                telegram_user={"id": actor_id, "username": "AbbosTch"},
+                chat_id=CHAT_ID,
+                message_id=post["message_id"],
+                now_ts=self.timestamp(second=1),
+            )
+            self.assertEqual(result["reason"], "forbidden")
+
+        with self.repository.connect() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM forwarding_operations"
+            ).fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_callback_query_id_is_required_and_denial_does_not_poison_it(self):
+        post = self.activate_post()
+        for callback_id in (None, "", "   "):
+            result = self.service.queue_callback(
+                callback_query_id=callback_id,
+                callback_data="fwd:redmi:poco",
+                telegram_user={"id": REDMI_CONTROLLER_ID},
+                chat_id=CHAT_ID,
+                message_id=post["message_id"],
+                now_ts=self.timestamp(second=1),
+            )
+            self.assertEqual(result["reason"], "invalid")
+
+        denied = self.service.queue_callback(
+            callback_query_id="not-poisoned",
+            callback_data="fwd:redmi:poco",
+            telegram_user={"id": 999},
+            chat_id=CHAT_ID,
+            message_id=post["message_id"],
+            now_ts=self.timestamp(second=1),
+        )
+        self.assertEqual(denied["reason"], "forbidden")
+        allowed = self.service.queue_callback(
+            callback_query_id="not-poisoned",
+            callback_data="fwd:redmi:poco",
+            telegram_user={"id": REDMI_CONTROLLER_ID},
+            chat_id=CHAT_ID,
+            message_id=post["message_id"],
+            now_ts=self.timestamp(second=1),
+        )
+        self.assertTrue(allowed["queued"])
+
+    def test_acl_environment_defaults_and_superadmin_are_stable(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "FORWARDING_ADMIN_IDS": "999, bad-value",
+                "FORWARDING_REDMI_CONTROLLER_IDS": (
+                    f"{REDMI_CONTROLLER_ID}, 111"
+                ),
+                "FORWARDING_TECNO_CONTROLLER_IDS": "",
+            },
+            clear=False,
+        ):
+            settings = load_forwarding_settings()
+
+        self.assertEqual(settings.admin_ids, frozenset({ADMIN_ID, 999}))
+        self.assertEqual(
+            settings.device_controller_ids["redmi"],
+            frozenset({REDMI_CONTROLLER_ID, 111}),
+        )
+        self.assertEqual(
+            settings.device_controller_ids["tecno"],
+            frozenset({TECNO_CONTROLLER_ID}),
+        )
 
     def test_parallel_clicks_create_only_one_active_operation(self):
         self.activate_post()

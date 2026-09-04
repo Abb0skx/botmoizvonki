@@ -1,6 +1,7 @@
 import os
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Mapping
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,16 @@ class ForwardingSettings:
     confirmation_timeout_seconds: int
     correlation_window_seconds: int
     admin_ids: frozenset[int]
+    device_controller_ids: Mapping[str, frozenset[int]] = field(
+        default_factory=dict
+    )
+
+    def can_control(self, actor_id: int, source_code: str) -> bool:
+        return (
+            actor_id in self.admin_ids
+            or actor_id
+            in self.device_controller_ids.get(source_code, frozenset())
+        )
 
 
 OPERATOR = OperatorConfig(
@@ -161,18 +172,52 @@ def _post_clock() -> tuple[int, int]:
     return 20, 0
 
 
-def _admin_ids() -> frozenset[int]:
-    raw = os.getenv(
-        "FORWARDING_ADMIN_IDS",
-        "202134293",
-    )
+def _parse_ids(raw: str) -> frozenset[int]:
     result = set()
     for item in str(raw).split(","):
         try:
-            result.add(int(item.strip()))
+            value = int(item.strip())
         except (TypeError, ValueError):
             continue
-    return frozenset(result or {202134293})
+        if value > 0:
+            result.add(value)
+    return frozenset(result)
+
+
+def _admin_ids() -> frozenset[int]:
+    # Abbos always retains full access, even if extra administrators are
+    # configured through the environment.
+    return frozenset(
+        {202134293}
+        | set(
+            _parse_ids(
+                os.getenv(
+                    "FORWARDING_ADMIN_IDS",
+                    "202134293",
+                )
+            )
+        )
+    )
+
+
+def _device_controller_ids() -> Mapping[str, frozenset[int]]:
+    defaults = {
+        "redmi": frozenset({7636344727}),
+        "tecno": frozenset({702960146}),
+    }
+    result = {}
+    for device_code, default_ids in defaults.items():
+        env_name = (
+            "FORWARDING_"
+            f"{device_code.upper()}_CONTROLLER_IDS"
+        )
+        raw = os.getenv(
+            env_name,
+            ",".join(str(item) for item in sorted(default_ids)),
+        )
+        parsed = _parse_ids(raw)
+        result[device_code] = parsed or default_ids
+    return result
 
 
 def load_forwarding_settings() -> ForwardingSettings:
@@ -209,4 +254,5 @@ def load_forwarding_settings() -> ForwardingSettings:
             86400,
         ),
         admin_ids=_admin_ids(),
+        device_controller_ids=_device_controller_ids(),
     )
