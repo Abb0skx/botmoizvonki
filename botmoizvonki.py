@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import ipaddress
 import json
+import logging
 import os
 import re
 import secrets
@@ -52,6 +53,35 @@ from telegram_business.router import router as telegram_business_router
 from telegram_business.router import get_service as get_telegram_business_service
 from telegram_business.router import settings as telegram_business_settings
 from telegram_business.scheduler import DurableScheduler
+from forwarding import (
+    DEVICES as FORWARDING_DEVICES,
+    OPERATOR as FORWARDING_OPERATOR,
+    ROUTES as FORWARDING_ROUTES,
+    ForwardingRepository,
+    ForwardingScheduler,
+    ForwardingService,
+    load_forwarding_settings,
+)
+from forwarding.service import canonical_dial_string
+
+
+class _RedactAccessQueryFilter(logging.Filter):
+    """Keep bearer query parameters out of Uvicorn access logs."""
+
+    def filter(self, record):
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3:
+            full_path = args[2]
+            if isinstance(full_path, str) and "?" in full_path:
+                redacted = list(args)
+                redacted[2] = full_path.split("?", 1)[0]
+                record.args = tuple(redacted)
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(
+    _RedactAccessQueryFilter()
+)
 
 
 # =========================================================
@@ -82,6 +112,8 @@ app.include_router(
 
 _telegram_business_scheduler = None
 _transcription_worker = None
+_forwarding_scheduler = None
+_forwarding_service = None
 
 
 @app.middleware("http")
@@ -126,6 +158,7 @@ async def protect_legacy_manager_routes(request: Request, call_next):
 async def start_telegram_business():
     global _telegram_business_scheduler
     global _transcription_worker
+    global _forwarding_scheduler
 
     await start_price_server()
 
@@ -148,6 +181,17 @@ async def start_telegram_business():
             _transcription_worker = TranscriptionWorker()
             await _transcription_worker.start()
 
+    if FORWARDING_SETTINGS.enabled and not forwarding_security_error():
+        _forwarding_scheduler = ForwardingScheduler(
+            get_forwarding_service()
+        )
+        await _forwarding_scheduler.start()
+    elif FORWARDING_SETTINGS.enabled:
+        print(
+            "FORWARDING STARTUP BLOCKED:",
+            forwarding_security_error(),
+        )
+
 
 @app.on_event("shutdown")
 async def stop_telegram_business():
@@ -158,6 +202,9 @@ async def stop_telegram_business():
 
     if _transcription_worker:
         await _transcription_worker.stop()
+
+    if _forwarding_scheduler:
+        await _forwarding_scheduler.stop()
 
 
 # =========================================================
@@ -217,6 +264,19 @@ MISSED_CALL_ALERT_USERNAME = os.getenv(
     "MISSED_CALL_ALERT_USERNAME",
     "@AbbosTch",
 ).strip()
+
+FORWARDING_SETTINGS = load_forwarding_settings()
+
+
+def forwarding_security_error() -> str:
+    missing = []
+    if not TELEGRAM_WEBHOOK_SECRET:
+        missing.append("TELEGRAM_WEBHOOK_SECRET")
+    if not MOIZVONKI_WEBHOOK_SECRET:
+        missing.append("MOIZVONKI_WEBHOOK_SECRET")
+    if not missing:
+        return ""
+    return "не настроено: " + ", ".join(missing)
 
 AUTO_SMS_ENABLED = (
     os.getenv(
@@ -1259,6 +1319,13 @@ def init_db():
         conn.execute(
             "PRAGMA synchronous = NORMAL"
         )
+
+        ForwardingRepository(
+            connect_db,
+            FORWARDING_OPERATOR,
+            FORWARDING_DEVICES,
+            FORWARDING_ROUTES,
+        ).init_schema(conn)
 
         conn.execute(
             """
@@ -5174,6 +5241,100 @@ def send_client_sms(
         )
 
     return result
+
+
+def moizvonki_make_call(
+    user_login: str,
+    service_number: str,
+):
+    """Queue one exact dial string on the phone for ``user_login``.
+
+    Star/hash characters are intentionally preserved. A timeout is allowed to
+    bubble up because it is ambiguous: the provider may have accepted the
+    command even though our HTTP client did not receive the response.
+    """
+    if not MOIZVONKI_API_URL:
+        raise RuntimeError(
+            "MOIZVONKI_API_URL не указан"
+        )
+    if not MOIZVONKI_API_KEY:
+        raise RuntimeError(
+            "MOIZVONKI_API_KEY не указан"
+        )
+
+    normalized_login = normalize_user_login(
+        user_login
+    )
+    if not normalized_login:
+        raise RuntimeError(
+            "Не указан user_login телефона"
+        )
+
+    exact_number = canonical_dial_string(
+        service_number
+    )
+    if exact_number != str(
+        service_number
+        or ""
+    ).strip():
+        raise ValueError(
+            "Некорректная строка сервисного набора"
+        )
+
+    payload = {
+        "user_name": normalized_login,
+        "api_key": MOIZVONKI_API_KEY,
+        "action": "calls.make_call",
+        "to": exact_number,
+    }
+
+    response = HTTP.post(
+        MOIZVONKI_API_URL,
+        json=payload,
+        timeout=30,
+    )
+    response_text = (
+        response.text
+        or ""
+    ).strip()
+
+    if response.status_code >= 500:
+        raise requests.ConnectionError(
+            "МоиЗвонки временно недоступен; результат команды неизвестен"
+        )
+
+    if not response.ok:
+        raise RuntimeError(
+            "МоиЗвонки HTTP "
+            f"{response.status_code}: "
+            + response_text[:500]
+        )
+
+    try:
+        body = response.json()
+    except ValueError:
+        body = {
+            "status": response_text
+            or "accepted",
+        }
+
+    if (
+        isinstance(body, dict)
+        and (
+            body.get("error")
+            or body.get("success") is False
+            or body.get("ok") is False
+        )
+    ):
+        raise RuntimeError(
+            "МоиЗвонки отклонил команду: "
+            + str(body)[:1000]
+        )
+
+    return {
+        "http_status": response.status_code,
+        "body": body,
+    }
 
 
 def mark_sms_sent(
@@ -10470,6 +10631,7 @@ def send_voice_bytes(
 def answer_callback_query(
     callback_query_id: str,
     text: str = "",
+    show_alert: bool = False,
 ):
 
     if not callback_query_id:
@@ -10485,6 +10647,10 @@ def answer_callback_query(
         if text:
 
             data["text"] = text
+
+        if show_alert:
+
+            data["show_alert"] = True
 
         telegram_api(
             "answerCallbackQuery",
@@ -10525,6 +10691,29 @@ def edit_reply_markup(
 
         timeout=30,
     )
+
+
+def get_forwarding_service():
+    global _forwarding_service
+
+    if _forwarding_service is None:
+        repository = ForwardingRepository(
+            connect_db,
+            FORWARDING_OPERATOR,
+            FORWARDING_DEVICES,
+            FORWARDING_ROUTES,
+        )
+        repository.init_schema()
+        _forwarding_service = ForwardingService(
+            repository=repository,
+            settings=FORWARDING_SETTINGS,
+            chat_id=TELEGRAM_CHAT_ID,
+            telegram_api=telegram_api,
+            make_call=moizvonki_make_call,
+            local_timezone=UZ_TZ,
+        )
+
+    return _forwarding_service
 
 
 # =========================================================
@@ -11448,9 +11637,9 @@ async def telegram_webhook(
             )
         )
 
-        if (
-            received_secret
-            != TELEGRAM_WEBHOOK_SECRET
+        if not secrets.compare_digest(
+            received_secret,
+            TELEGRAM_WEBHOOK_SECRET,
         ):
 
             raise HTTPException(
@@ -11525,6 +11714,67 @@ async def telegram_webhook(
     )
 
     try:
+
+        # =================================================
+        # CALL FORWARDING CONTROL
+        # =================================================
+
+        if callback_data.startswith(
+            "fwd:"
+        ):
+
+            security_error = forwarding_security_error()
+            if security_error:
+                answer_callback_query(
+                    callback_id,
+                    "Команды заблокированы: " + security_error,
+                    show_alert=True,
+                )
+                return {
+                    "ok": True,
+                    "forwarding": "webhook_secret_required",
+                }
+
+            forwarding_result = await asyncio.to_thread(
+                get_forwarding_service().queue_callback,
+                callback_query_id=callback_id,
+                callback_data=callback_data,
+                telegram_user=telegram_user,
+                chat_id=chat_id,
+                message_id=message_id,
+            )
+
+            answer_callback_query(
+                callback_id,
+                forwarding_result.get(
+                    "message",
+                    "Команда обработана",
+                ),
+                show_alert=bool(
+                    forwarding_result.get(
+                        "show_alert"
+                    )
+                ),
+            )
+
+            if forwarding_result.get(
+                "queued"
+            ):
+                try:
+                    await asyncio.to_thread(
+                        get_forwarding_service()
+                        .refresh_current_post
+                    )
+                except Exception as exc:
+                    print(
+                        "FORWARDING POST UPDATE ERROR:",
+                        repr(exc),
+                    )
+
+            return {
+                "ok": True,
+                "forwarding": forwarding_result,
+            }
 
         # =================================================
         # LEAD SOURCE MENU
@@ -22093,6 +22343,45 @@ async def moizvonki_webhook(
             "event": "sms.message",
             "sms_rating": sms_result,
         }
+
+    if MOIZVONKI_WEBHOOK_SECRET:
+        forwarding_service = get_forwarding_service()
+
+        try:
+            forwarding_result = await asyncio.to_thread(
+                forwarding_service.handle_provider_event,
+                action,
+                webhook,
+                event,
+                now_ts=webhook_received_at,
+            )
+        except Exception as exc:
+            print(
+                "FORWARDING EVENT ERROR:",
+                repr(exc),
+            )
+
+            # Fail closed for an exact service command. It must never enter
+            # the customer-call pipeline, statistics or automatic SMS even
+            # when its forwarding audit update temporarily fails.
+            if forwarding_service.is_known_service_event(
+                webhook,
+                event,
+            ):
+                return {
+                    "ok": True,
+                    "event": action,
+                    "forwarding": "suppressed_after_error",
+                }
+        else:
+            if forwarding_result.get(
+                "handled"
+            ):
+                return {
+                    "ok": True,
+                    "event": action,
+                    "forwarding": forwarding_result,
+                }
 
     if action != "call.finish":
         return {
