@@ -12,7 +12,13 @@ from .dates import TASHKENT_TZ
 
 FILL_REMINDER_MARKER = "\u2063\u2064"
 ADMIN_MENTION = "@Texnikach_Admin"
-NOTICE_CLOCKS = tuple(time(hour, 0) for hour in range(11, 22))
+NOTICE_CLOCKS = (
+    *(time(hour, 0) for hour in range(9, 17)),
+    time(16, 30),
+    *(time(hour, minute) for hour in range(17, 20) for minute in (0, 30)),
+    time(20, 0),
+    time(21, 0),
+)
 REMINDER_TOKEN_ANCHOR = "\u2063"
 REMINDER_TOKEN_RE = re.compile(
     r"^https://t\.me/Texnikach_Admin\?start=sr_([0-9a-f]{24})_([0-9a-f]{16})$"

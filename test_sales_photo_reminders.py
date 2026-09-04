@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import tempfile
 import unittest
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, call
@@ -90,21 +90,30 @@ class FillReminderFormattingTests(unittest.TestCase):
 
 class FillReminderScheduleTests(unittest.TestCase):
     def test_requested_clocks(self):
-        self.assertEqual(NOTICE_CLOCKS, tuple(datetime.min.replace(hour=hour).time() for hour in range(11, 22)))
+        self.assertEqual(
+            NOTICE_CLOCKS,
+            (
+                *(time(hour, 0) for hour in range(9, 17)),
+                time(16, 30),
+                *(time(hour, minute) for hour in range(17, 20) for minute in (0, 30)),
+                time(20, 0),
+                time(21, 0),
+            ),
+        )
         self.assertEqual(REMINDER_CLEANUP_INTERVAL_SECONDS, 5 * 60)
 
     def test_slot_helpers_do_not_send_old_notice_outside_window(self):
         at_1159 = datetime(2026, 9, 1, 11, 59, tzinfo=timezone.utc).astimezone(
             timezone.utc
         )
-        # 11:59 UTC is 16:59 in Tashkent, so the 16:00 notice is still active.
+        # 11:59 UTC is 16:59 in Tashkent, so 16:30 is the latest active slot.
         self.assertEqual(
             latest_active_slot(
                 at_1159,
                 NOTICE_CLOCKS,
                 grace=timedelta(minutes=59, seconds=59),
-            ).hour,
-            16,
+            ).time(),
+            time(16, 30),
         )
         late = datetime(2026, 9, 1, 18, 0, tzinfo=UTC)  # 23:00 Tashkent
         self.assertIsNone(
@@ -114,7 +123,7 @@ class FillReminderScheduleTests(unittest.TestCase):
                 grace=timedelta(minutes=59, seconds=59),
             )
         )
-        self.assertEqual(next_slot(late, NOTICE_CLOCKS).hour, 11)
+        self.assertEqual(next_slot(late, NOTICE_CLOCKS).hour, 9)
 
 
 class FillReminderServiceTests(unittest.IsolatedAsyncioTestCase):
@@ -259,6 +268,71 @@ class FillReminderServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(attempts), 1)
             self.assertEqual(attempts[0].state, "confirmed")
             self.assertEqual(attempts[0].telegram_message_id, 801)
+
+    async def test_scheduled_publish_replaces_existing_reminder(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SalesPhotoRepository(root / "sales.db")
+            self._sale(repo)
+            bot = self._bot(CARD)
+            service = SalesPhotoService(settings(root), repo)
+
+            await service.run_fill_reminder_check(
+                bot,
+                publish=True,
+                rotate_existing=True,
+                reference_date=date(2026, 9, 1),
+            )
+            await service.run_fill_reminder_check(
+                bot,
+                publish=True,
+                rotate_existing=True,
+                reference_date=date(2026, 9, 1),
+            )
+
+            self.assertEqual(bot.send_message.await_count, 2)
+            self.assertIn(call(CHAT_ID, 801), bot.delete_message.await_args_list)
+            attempts = repo.open_fill_reminder_attempts(CHAT_ID, 10)
+            self.assertEqual(len(attempts), 1)
+            self.assertEqual(attempts[0].state, "confirmed")
+            self.assertEqual(attempts[0].telegram_message_id, 802)
+
+    async def test_failed_scheduled_replacement_keeps_previous_reminder(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SalesPhotoRepository(root / "sales.db")
+            self._sale(repo)
+            bot = self._bot(CARD)
+            service = SalesPhotoService(settings(root), repo)
+
+            await service.run_fill_reminder_check(
+                bot,
+                publish=True,
+                rotate_existing=True,
+                reference_date=date(2026, 9, 1),
+            )
+            bot.send_message.side_effect = NetworkError("lost response")
+            await service.run_fill_reminder_check(
+                bot,
+                publish=True,
+                rotate_existing=True,
+                reference_date=date(2026, 9, 1),
+            )
+            await service.run_fill_reminder_check(
+                bot,
+                publish=True,
+                rotate_existing=True,
+                reference_date=date(2026, 9, 1),
+            )
+
+            self.assertEqual(bot.send_message.await_count, 2)
+            self.assertNotIn(call(CHAT_ID, 801), bot.delete_message.await_args_list)
+            attempts = repo.open_fill_reminder_attempts(CHAT_ID, 10)
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual(
+                [attempt.state for attempt in attempts],
+                ["confirmed", "ambiguous"],
+            )
 
     async def test_live_card_removes_stale_cached_reminder(self):
         with tempfile.TemporaryDirectory() as directory:

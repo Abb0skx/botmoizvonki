@@ -3856,6 +3856,7 @@ class SalesPhotoService:
         check: FillCheck | None,
         *,
         publish: bool,
+        rotate_existing: bool,
     ) -> tuple[int, int, int]:
         attempts = list(
             self.repository.open_fill_reminder_attempts(
@@ -3904,6 +3905,27 @@ class SalesPhotoService:
                     deleted += 1
                 else:
                     failures += 1
+
+        unresolved_send = any(
+            attempt.telegram_message_id is None
+            and attempt.state in {"pending", "ambiguous", "delete_pending"}
+            for attempt in attempts
+        )
+        if canonical is not None and publish and rotate_existing:
+            # Keep the previous notice visible until Telegram confirms the new
+            # hourly/half-hourly one. Once confirmed, retire the old notice;
+            # deletion failures remain durable and are retried by cleanup.
+            # An earlier send with an unknown result blocks another rotation
+            # until its signed Telegram update arrives or the attempt expires.
+            if unresolved_send:
+                return 0, deleted, failures
+            sent = int(await self._publish_fill_reminder(bot, candidate, check))
+            if sent:
+                if await self._delete_fill_reminder_attempt(bot, canonical):
+                    deleted += 1
+                else:
+                    failures += 1
+            return sent, deleted, failures
 
         if canonical is not None:
             if re.fullmatch(r"[0-9a-f]{24}", canonical.attempt_id):
@@ -3956,6 +3978,7 @@ class SalesPhotoService:
         bot: Bot | Any,
         *,
         publish: bool,
+        rotate_existing: bool = False,
         reference_date: date | None = None,
         source_message_id: int | None = None,
     ) -> None:
@@ -4021,6 +4044,7 @@ class SalesPhotoService:
                                 candidate,
                                 check,
                                 publish=publish,
+                                rotate_existing=rotate_existing,
                             )
                         )
                         sent += new_sent
@@ -4072,7 +4096,11 @@ class SalesPhotoService:
                         "notice",
                     )
                     if completed is None or completed < slot_utc:
-                        await self.run_fill_reminder_check(bot, publish=True)
+                        await self.run_fill_reminder_check(
+                            bot,
+                            publish=True,
+                            rotate_existing=True,
+                        )
                         self.repository.mark_fill_reminder_schedule(
                             self.settings.chat_id,
                             "notice",
