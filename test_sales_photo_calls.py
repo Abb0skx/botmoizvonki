@@ -5,7 +5,8 @@ import tempfile
 import unittest
 from datetime import date, datetime
 from pathlib import Path
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, call
 
 from sales_photo_bot.calls import CallReader
 from sales_photo_bot.config import Settings
@@ -234,6 +235,55 @@ class CallSyncServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(repo.selected_manager(CHAT_ID, 200), "Otabek")
             self.assertEqual(repo.selected_manager(CHAT_ID, 201), "Otabek")
             self.assertEqual(bot.edit_message_reply_markup.await_count, 2)
+
+    async def test_call_manager_immediately_removes_completed_card_reminder(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            calls_path = root / "calls.db"
+            create_calls_db(calls_path)
+            add_call(calls_path, 1, "Otabek")
+            repo = SalesPhotoRepository(root / "sales.db")
+            create_sale(repo, 10, 200)
+            repo.sync_sale_details(
+                CHAT_ID,
+                200,
+                ("+998 90 123 45 67",),
+                "Phone",
+                supplier_price_filled=True,
+                phone_field_filled=True,
+            )
+            repo.record_fill_reminder(CHAT_ID, 10, 777)
+            service = SalesPhotoService(
+                Settings(
+                    bot_token=TOKEN,
+                    chat_id=CHAT_ID,
+                    db_path=root / "sales.db",
+                    heartbeat_path=root / "heartbeat",
+                    calls_db_path=calls_path,
+                ),
+                repo,
+            )
+            card = SimpleNamespace(
+                message_id=900,
+                caption="🛒💵: supplier 100$\n📞: +998 90 123 45 67",
+                caption_entities=(),
+                text=None,
+                entities=(),
+            )
+            bot = SimpleNamespace(
+                edit_message_reply_markup=AsyncMock(return_value=True),
+                forward_message=AsyncMock(return_value=card),
+                delete_message=AsyncMock(return_value=True),
+            )
+
+            changed = await service.sync_call_managers(
+                bot,
+                reference_date=SALE_DATE,
+            )
+
+            self.assertEqual(changed, 1)
+            self.assertIn(call(CHAT_ID, 777), bot.delete_message.await_args_list)
+            self.assertEqual(repo.open_fill_reminder_attempts(CHAT_ID, 10), ())
 
 
 if __name__ == "__main__":

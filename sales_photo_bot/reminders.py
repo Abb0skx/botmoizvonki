@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
+import re
 from typing import Sequence
+
+from telegram import MessageEntity
 
 from .dates import TASHKENT_TZ
 
@@ -10,9 +13,9 @@ from .dates import TASHKENT_TZ
 FILL_REMINDER_MARKER = "\u2063\u2064"
 ADMIN_MENTION = "@Texnikach_Admin"
 NOTICE_CLOCKS = tuple(time(hour, 0) for hour in range(11, 22))
-CLEANUP_CLOCKS = tuple(
-    (datetime(2000, 1, 1, 10, 15) + timedelta(minutes=30 * offset)).time()
-    for offset in range(23)
+REMINDER_TOKEN_ANCHOR = "\u2063"
+REMINDER_TOKEN_RE = re.compile(
+    r"^https://t\.me/Texnikach_Admin\?start=sr_([0-9a-f]{24})_([0-9a-f]{16})$"
 )
 
 
@@ -63,6 +66,48 @@ def build_fill_reminder(check: FillCheck) -> str:
     lines.extend(("", "Пожалуйста, заполните:"))
     lines.extend(f"• {label}" for label in check.missing_labels)
     return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class SignedReminder:
+    text: str
+    entities: tuple[MessageEntity, ...]
+
+
+def build_signed_fill_reminder(check: FillCheck, token_url: str) -> SignedReminder:
+    """Attach a machine-readable token without changing visible reminder text."""
+
+    plain = build_fill_reminder(check)
+    text = plain[: len(FILL_REMINDER_MARKER)] + REMINDER_TOKEN_ANCHOR + plain[
+        len(FILL_REMINDER_MARKER) :
+    ]
+    return SignedReminder(
+        text=text,
+        entities=(
+            MessageEntity(
+                type=MessageEntity.TEXT_LINK,
+                offset=len(FILL_REMINDER_MARKER),
+                length=len(REMINDER_TOKEN_ANCHOR),
+                url=token_url,
+            ),
+        ),
+    )
+
+
+def extract_reminder_token(
+    body: object,
+    entities: Sequence[object],
+) -> tuple[str, str] | None:
+    if not str(body or "").startswith(FILL_REMINDER_MARKER):
+        return None
+    for entity in entities:
+        entity_type = str(getattr(entity, "type", ""))
+        if entity_type not in {"text_link", str(MessageEntity.TEXT_LINK)}:
+            continue
+        match = REMINDER_TOKEN_RE.fullmatch(str(getattr(entity, "url", "") or ""))
+        if match is not None:
+            return match.group(1), match.group(2)
+    return None
 
 
 def _local(value: datetime) -> datetime:

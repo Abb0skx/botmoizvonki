@@ -5,6 +5,8 @@ import hmac
 import json
 import logging
 import os
+import re
+import secrets
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -121,6 +123,7 @@ class FillReminderCandidate:
     supplier_price_filled: bool
     phone_filled: bool
     reminder_message_id: int | None
+    has_open_reminder: bool
 
 
 @dataclass(frozen=True)
@@ -137,6 +140,19 @@ class FillReminderRecord:
     chat_id: int
     source_message_id: int
     reminder_message_id: int
+
+
+@dataclass(frozen=True)
+class FillReminderAttempt:
+    attempt_id: str
+    chat_id: int
+    source_message_id: int
+    replacement_message_id: int
+    telegram_message_id: int | None
+    state: str
+    retry_count: int
+    created_at: datetime
+    updated_at: datetime
 
 
 @dataclass(frozen=True)
@@ -494,6 +510,33 @@ class SalesPhotoRepository:
                         ON DELETE CASCADE
                 );
 
+                CREATE TABLE IF NOT EXISTS sales_photo_reminder_attempts (
+                    attempt_id TEXT PRIMARY KEY,
+                    chat_id INTEGER NOT NULL,
+                    source_message_id INTEGER NOT NULL,
+                    replacement_message_id INTEGER NOT NULL,
+                    telegram_message_id INTEGER,
+                    state TEXT NOT NULL CHECK(state IN (
+                        'pending','confirmed','ambiguous','delete_pending',
+                        'deleted','failed'
+                    )),
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    last_error_code TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    confirmed_at TEXT,
+                    deleted_at TEXT,
+                    UNIQUE(chat_id,telegram_message_id),
+                    FOREIGN KEY(chat_id,source_message_id)
+                        REFERENCES sales_photo_jobs(chat_id,source_message_id)
+                        ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_sales_photo_reminder_source
+                ON sales_photo_reminder_attempts(
+                    chat_id,source_message_id,state,created_at
+                );
+
                 DROP TABLE IF EXISTS sales_photo_name_cache;
                 """
             )
@@ -682,6 +725,27 @@ class SalesPhotoRepository:
                     ),
                 )
             migration_time = _iso(utc_now())
+            db.execute(
+                """INSERT OR IGNORE INTO sales_photo_reminder_attempts(
+                       attempt_id,chat_id,source_message_id,
+                       replacement_message_id,telegram_message_id,state,
+                       retry_count,last_error_code,created_at,updated_at,
+                       confirmed_at,deleted_at)
+                   SELECT printf('legacy-%d-%d-%d',reminder.chat_id,
+                                 reminder.source_message_id,
+                                 reminder.reminder_message_id),
+                          reminder.chat_id,reminder.source_message_id,
+                          job.replacement_message_id,
+                          reminder.reminder_message_id,'confirmed',0,NULL,
+                          reminder.created_at,reminder.updated_at,
+                          reminder.created_at,NULL
+                   FROM sales_photo_fill_reminders AS reminder
+                   JOIN sales_photo_jobs AS job
+                     ON job.chat_id=reminder.chat_id
+                    AND job.source_message_id=reminder.source_message_id
+                   WHERE job.replacement_message_id IS NOT NULL"""
+            )
+            db.execute("DELETE FROM sales_photo_fill_reminders")
             db.execute(
                 """INSERT OR IGNORE INTO sales_photo_source_members(
                        chat_id,source_message_id,member_message_id,
@@ -1486,11 +1550,25 @@ class SalesPhotoRepository:
                           job.supplier_price_filled,
                           job.phone_field_filled,
                           job.client_phone,job.client_phone_2,
-                          reminder.reminder_message_id
+                          (SELECT attempt.telegram_message_id
+                             FROM sales_photo_reminder_attempts AS attempt
+                            WHERE attempt.chat_id=job.chat_id
+                              AND attempt.source_message_id=job.source_message_id
+                              AND attempt.state IN (
+                                  'confirmed','delete_pending')
+                              AND attempt.telegram_message_id IS NOT NULL
+                            ORDER BY attempt.created_at DESC
+                            LIMIT 1) AS reminder_message_id,
+                          EXISTS(
+                            SELECT 1
+                              FROM sales_photo_reminder_attempts AS attempt
+                             WHERE attempt.chat_id=job.chat_id
+                               AND attempt.source_message_id=job.source_message_id
+                               AND attempt.state IN (
+                                   'pending','confirmed','ambiguous',
+                                   'delete_pending')
+                          ) AS has_open_reminder
                    FROM sales_photo_jobs AS job
-                   LEFT JOIN sales_photo_fill_reminders AS reminder
-                     ON reminder.chat_id=job.chat_id
-                    AND reminder.source_message_id=job.source_message_id
                    WHERE job.chat_id=?
                      AND job.replacement_message_id IS NOT NULL
                      AND job.sale_date>=? AND job.sale_date<=?
@@ -1525,6 +1603,7 @@ class SalesPhotoRepository:
                     if row["reminder_message_id"] is not None
                     else None
                 ),
+                has_open_reminder=bool(row["has_open_reminder"]),
             )
             for row in rows
         )
@@ -1536,20 +1615,39 @@ class SalesPhotoRepository:
         reminder_message_id: int,
         at: datetime | None = None,
     ) -> None:
+        """Compatibility helper for legacy callers and migration tests."""
+
         now = _iso(at or utc_now())
         with self._connect() as db:
+            row = db.execute(
+                """SELECT replacement_message_id FROM sales_photo_jobs
+                   WHERE chat_id=? AND source_message_id=?""",
+                (int(chat_id), int(source_message_id)),
+            ).fetchone()
+            if row is None or row["replacement_message_id"] is None:
+                raise RuntimeError("reminder target does not exist")
+            attempt_id = (
+                f"legacy-{int(chat_id)}-{int(source_message_id)}-"
+                f"{int(reminder_message_id)}"
+            )
             db.execute(
-                """INSERT INTO sales_photo_fill_reminders(
-                       chat_id,source_message_id,reminder_message_id,
-                       created_at,updated_at)
-                   VALUES(?,?,?,?,?)
-                   ON CONFLICT(chat_id,source_message_id) DO UPDATE SET
-                       reminder_message_id=excluded.reminder_message_id,
-                       updated_at=excluded.updated_at""",
+                """INSERT INTO sales_photo_reminder_attempts(
+                       attempt_id,chat_id,source_message_id,
+                       replacement_message_id,telegram_message_id,state,
+                       retry_count,last_error_code,created_at,updated_at,
+                       confirmed_at,deleted_at)
+                   VALUES(?,?,?,?,?,'confirmed',0,NULL,?,?,?,NULL)
+                   ON CONFLICT(attempt_id) DO UPDATE SET
+                       telegram_message_id=excluded.telegram_message_id,
+                       state='confirmed',updated_at=excluded.updated_at,
+                       confirmed_at=excluded.confirmed_at,deleted_at=NULL""",
                 (
+                    attempt_id,
                     int(chat_id),
                     int(source_message_id),
+                    int(row["replacement_message_id"]),
                     int(reminder_message_id),
+                    now,
                     now,
                     now,
                 ),
@@ -1564,13 +1662,15 @@ class SalesPhotoRepository:
     ) -> tuple[FillReminderRecord, ...]:
         with self._connect() as db:
             rows = db.execute(
-                """SELECT reminder.chat_id,reminder.source_message_id,
-                          reminder.reminder_message_id
-                   FROM sales_photo_fill_reminders AS reminder
+                """SELECT attempt.chat_id,attempt.source_message_id,
+                          attempt.telegram_message_id AS reminder_message_id
+                   FROM sales_photo_reminder_attempts AS attempt
                    JOIN sales_photo_jobs AS job
-                     ON job.chat_id=reminder.chat_id
-                    AND job.source_message_id=reminder.source_message_id
-                   WHERE reminder.chat_id=?
+                     ON job.chat_id=attempt.chat_id
+                    AND job.source_message_id=attempt.source_message_id
+                   WHERE attempt.chat_id=?
+                     AND attempt.state IN ('confirmed','delete_pending')
+                     AND attempt.telegram_message_id IS NOT NULL
                      AND (job.order_removed=1 OR job.sale_date IS NULL
                           OR job.sale_date<? OR job.sale_date>?)""",
                 (
@@ -1596,10 +1696,14 @@ class SalesPhotoRepository:
     ) -> bool:
         with self._connect() as db:
             cursor = db.execute(
-                """DELETE FROM sales_photo_fill_reminders
+                """UPDATE sales_photo_reminder_attempts
+                   SET state='deleted',deleted_at=?,updated_at=?
                    WHERE chat_id=? AND source_message_id=?
-                     AND (? IS NULL OR reminder_message_id=?)""",
+                     AND state IN ('pending','confirmed','ambiguous','delete_pending')
+                     AND (? IS NULL OR telegram_message_id=?)""",
                 (
+                    _iso(utc_now()),
+                    _iso(utc_now()),
                     int(chat_id),
                     int(source_message_id),
                     reminder_message_id,
@@ -1607,7 +1711,223 @@ class SalesPhotoRepository:
                 ),
             )
             db.commit()
+        return cursor.rowcount > 0
+
+    @staticmethod
+    def _reminder_attempt_from_row(row: sqlite3.Row) -> FillReminderAttempt:
+        return FillReminderAttempt(
+            attempt_id=str(row["attempt_id"]),
+            chat_id=int(row["chat_id"]),
+            source_message_id=int(row["source_message_id"]),
+            replacement_message_id=int(row["replacement_message_id"]),
+            telegram_message_id=(
+                int(row["telegram_message_id"])
+                if row["telegram_message_id"] is not None
+                else None
+            ),
+            state=str(row["state"]),
+            retry_count=int(row["retry_count"]),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+            updated_at=datetime.fromisoformat(str(row["updated_at"])),
+        )
+
+    def create_fill_reminder_attempt(
+        self,
+        chat_id: int,
+        source_message_id: int,
+        replacement_message_id: int,
+        at: datetime | None = None,
+    ) -> FillReminderAttempt:
+        now_value = at or utc_now()
+        if now_value.tzinfo is None:
+            now_value = now_value.replace(tzinfo=UTC)
+        now = _iso(now_value)
+        attempt_id = secrets.token_hex(12)
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT replacement_message_id FROM sales_photo_jobs
+                   WHERE chat_id=? AND source_message_id=?
+                     AND replacement_message_id=? AND order_removed=0""",
+                (
+                    int(chat_id),
+                    int(source_message_id),
+                    int(replacement_message_id),
+                ),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("reminder target does not exist")
+            db.execute(
+                """INSERT INTO sales_photo_reminder_attempts(
+                       attempt_id,chat_id,source_message_id,
+                       replacement_message_id,telegram_message_id,state,
+                       retry_count,last_error_code,created_at,updated_at,
+                       confirmed_at,deleted_at)
+                   VALUES(?,?,?,?,NULL,'pending',0,NULL,?,?,NULL,NULL)""",
+                (
+                    attempt_id,
+                    int(chat_id),
+                    int(source_message_id),
+                    int(replacement_message_id),
+                    now,
+                    now,
+                ),
+            )
+            db.commit()
+        return FillReminderAttempt(
+            attempt_id=attempt_id,
+            chat_id=int(chat_id),
+            source_message_id=int(source_message_id),
+            replacement_message_id=int(replacement_message_id),
+            telegram_message_id=None,
+            state="pending",
+            retry_count=0,
+            created_at=now_value.astimezone(UTC),
+            updated_at=now_value.astimezone(UTC),
+        )
+
+    def fill_reminder_token_url(self, attempt_id: str) -> str:
+        signature = hmac.new(
+            self._signing_key,
+            f"fill-reminder:{attempt_id}".encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()[:16]
+        return (
+            "https://t.me/Texnikach_Admin?start="
+            f"sr_{str(attempt_id)}_{signature}"
+        )
+
+    def valid_fill_reminder_token(self, attempt_id: str, signature: str) -> bool:
+        if not re.fullmatch(r"[0-9a-f]{24}", str(attempt_id)):
+            return False
+        expected = self.fill_reminder_token_url(attempt_id).rsplit("_", 1)[-1]
+        return hmac.compare_digest(expected, str(signature))
+
+    def fill_reminder_attempt(
+        self,
+        attempt_id: str,
+    ) -> FillReminderAttempt | None:
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT * FROM sales_photo_reminder_attempts
+                   WHERE attempt_id=?""",
+                (str(attempt_id),),
+            ).fetchone()
+        return self._reminder_attempt_from_row(row) if row is not None else None
+
+    def open_fill_reminder_attempts(
+        self,
+        chat_id: int,
+        source_message_id: int | None = None,
+    ) -> tuple[FillReminderAttempt, ...]:
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT * FROM sales_photo_reminder_attempts
+                   WHERE chat_id=?
+                     AND (? IS NULL OR source_message_id=?)
+                     AND state IN (
+                         'pending','confirmed','ambiguous','delete_pending')
+                   ORDER BY created_at,attempt_id""",
+                (
+                    int(chat_id),
+                    source_message_id,
+                    source_message_id,
+                ),
+            ).fetchall()
+        return tuple(self._reminder_attempt_from_row(row) for row in rows)
+
+    def confirm_fill_reminder_attempt(
+        self,
+        attempt_id: str,
+        telegram_message_id: int,
+        at: datetime | None = None,
+    ) -> bool:
+        now = _iso(at or utc_now())
+        with self._connect() as db:
+            try:
+                cursor = db.execute(
+                    """UPDATE sales_photo_reminder_attempts
+                       SET telegram_message_id=?,state='confirmed',
+                           confirmed_at=COALESCE(confirmed_at,?),
+                           last_error_code=NULL,updated_at=?
+                       WHERE attempt_id=? AND state!='deleted'""",
+                    (
+                        int(telegram_message_id),
+                        now,
+                        now,
+                        str(attempt_id),
+                    ),
+                )
+                db.commit()
+            except sqlite3.IntegrityError:
+                db.rollback()
+                return False
         return cursor.rowcount == 1
+
+    def mark_fill_reminder_attempt_state(
+        self,
+        attempt_id: str,
+        state: str,
+        error_code: str | None = None,
+        at: datetime | None = None,
+    ) -> bool:
+        if state not in {"ambiguous", "delete_pending", "failed"}:
+            raise ValueError("invalid reminder attempt state")
+        now = _iso(at or utc_now())
+        allowed_previous = (
+            ("pending", "ambiguous")
+            if state in {"ambiguous", "failed"}
+            else ("pending", "confirmed", "ambiguous", "delete_pending")
+        )
+        placeholders = ",".join("?" for _ in allowed_previous)
+        with self._connect() as db:
+            cursor = db.execute(
+                f"""UPDATE sales_photo_reminder_attempts
+                   SET state=?,retry_count=retry_count+1,
+                       last_error_code=?,updated_at=?
+                   WHERE attempt_id=? AND state IN ({placeholders})""",
+                (
+                    state,
+                    str(error_code or "")[:80] or None,
+                    now,
+                    str(attempt_id),
+                    *allowed_previous,
+                ),
+            )
+            db.commit()
+        return cursor.rowcount == 1
+
+    def mark_fill_reminder_attempt_deleted(
+        self,
+        attempt_id: str,
+        at: datetime | None = None,
+    ) -> bool:
+        now = _iso(at or utc_now())
+        with self._connect() as db:
+            cursor = db.execute(
+                """UPDATE sales_photo_reminder_attempts
+                   SET state='deleted',deleted_at=?,updated_at=?,
+                       last_error_code=NULL
+                   WHERE attempt_id=? AND state!='deleted'""",
+                (now, now, str(attempt_id)),
+            )
+            db.commit()
+        return cursor.rowcount == 1
+
+    def expire_unconfirmed_fill_reminders(
+        self,
+        older_than: datetime,
+    ) -> int:
+        now = _iso(utc_now())
+        with self._connect() as db:
+            cursor = db.execute(
+                """UPDATE sales_photo_reminder_attempts
+                   SET state='failed',last_error_code='confirmation_timeout',
+                       updated_at=?
+                   WHERE state IN ('pending','ambiguous') AND created_at<?""",
+                (now, _iso(older_than)),
+            )
+            db.commit()
+        return cursor.rowcount
 
     @staticmethod
     def _fill_reminder_schedule_key(kind: str, chat_id: int) -> str:
