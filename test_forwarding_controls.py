@@ -89,7 +89,7 @@ class ForwardingControlTests(unittest.TestCase):
             poll_seconds=2,
             command_cooldown_seconds=90,
             confirmation_timeout_seconds=120,
-            correlation_window_seconds=3600,
+            correlation_window_seconds=5 * 60,
             admin_ids=frozenset({ADMIN_ID}),
             device_controller_ids={
                 "redmi": frozenset({REDMI_CONTROLLER_ID}),
@@ -1038,7 +1038,7 @@ class ForwardingControlTests(unittest.TestCase):
             timeout_seconds=120,
         )
 
-        new_time = self.timestamp(hour=21, minute=0, second=2)
+        new_time = self.timestamp(hour=20, minute=5, second=2)
         new = self.queue(
             "fwd:redmi:poco",
             callback_id="new-after-window",

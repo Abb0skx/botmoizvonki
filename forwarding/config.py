@@ -251,7 +251,7 @@ def load_forwarding_settings() -> ForwardingSettings:
         ),
         correlation_window_seconds=_env_int(
             "FORWARDING_CORRELATION_WINDOW_SECONDS",
-            3600,
+            5 * 60,
             120,
             86400,
         ),
