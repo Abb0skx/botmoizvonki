@@ -17,7 +17,7 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import requests
 
@@ -5281,11 +5281,22 @@ def moizvonki_make_call(
             "Некорректная строка сервисного набора"
         )
 
+    # The Android app concatenates this value to ``tel:`` without escaping
+    # it. In a URI, a raw ``#`` begins the fragment and never reaches the
+    # dialer. Keep the logical/audit value unchanged, but percent-encode each
+    # hash for transport so Android decodes the full MMI command.
+    android_tel_uri_number = quote(
+        exact_number,
+        # ``*`` is safe in an opaque tel URI. Encode ``+`` and every ``#``
+        # so the decoded scheme-specific part reaches the dialer unchanged.
+        safe="*",
+    )
+
     payload = {
         "user_name": normalized_login,
         "api_key": MOIZVONKI_API_KEY,
         "action": "calls.make_call",
-        "to": exact_number,
+        "to": android_tel_uri_number,
     }
 
     response = HTTP.post(

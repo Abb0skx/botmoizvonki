@@ -71,12 +71,17 @@ def _sim_evidence(operation, event: dict) -> str:
         if slot is not None
     }
 
-    if any(number != expected_number for number in numbers):
-        return "wrong"
+    # The SIM number is stronger evidence than the slot index. Android and
+    # provider payloads do not consistently use the same 0/1-based slot
+    # numbering, while an exact MSISDN match is unambiguous. A contradictory
+    # number seen in any event still fails closed.
+    if numbers:
+        if any(number != expected_number for number in numbers):
+            return "wrong"
+        if expected_number in numbers:
+            return "matched"
     if any(slot != expected_slot for slot in slots):
         return "wrong"
-    if expected_number in numbers:
-        return "matched"
     return "unknown"
 
 

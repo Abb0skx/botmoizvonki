@@ -4,6 +4,7 @@ import threading
 
 from datetime import datetime, timezone
 from html import escape
+from urllib.parse import unquote
 
 import requests
 
@@ -28,7 +29,7 @@ def canonical_dial_string(value: str | None) -> str:
     """Preserve carrier-control characters and remove presentation spaces."""
     return "".join(
         char
-        for char in str(value or "")
+        for char in unquote(str(value or ""))
         if char in "+*#0123456789"
     )
 
@@ -36,6 +37,27 @@ def canonical_dial_string(value: str | None) -> str:
 def dial_digit_signature(value: str | None) -> str:
     return "".join(
         char for char in str(value or "") if char.isdigit()
+    )
+
+
+def service_dial_matches(expected: str, actual: str) -> bool:
+    """Match an exact MMI string or the phone-number form made by dialers.
+
+    Some Android dialers collapse ``**21*+number#`` into ``+21number``.
+    Recognising only the complete digit signature keeps that failed service
+    attempt out of customer statistics and automatic SMS, without treating
+    the plain forwarding target as a service command.
+    """
+    expected_canonical = canonical_dial_string(expected)
+    actual_canonical = canonical_dial_string(actual)
+    if not expected_canonical or not actual_canonical:
+        return False
+    if actual_canonical == expected_canonical:
+        return True
+    if "*" in actual_canonical or "#" in actual_canonical:
+        return False
+    return dial_digit_signature(actual_canonical) == dial_digit_signature(
+        expected_canonical
     )
 
 
@@ -679,11 +701,7 @@ class ForwardingService:
         )
         if not fallback_is_timely:
             return False
-        if actual_canonical == expected:
-            return True
-        if dial_digit_signature(actual_canonical) == dial_digit_signature(
-            expected
-        ):
+        if service_dial_matches(expected, actual_canonical):
             return True
         if operation["action"] == "enable":
             return dial_digit_signature(actual_canonical) == (
@@ -697,7 +715,7 @@ class ForwardingService:
         actual: str,
     ):
         actual_canonical = canonical_dial_string(actual)
-        if actual_canonical == canonical_dial_string(OPERATOR.disable_number):
+        if service_dial_matches(OPERATOR.disable_number, actual_canonical):
             return "disable", None, None, OPERATOR.disable_number
         for (route_source, route_target), route in ROUTES.items():
             if route_source != source_code:
@@ -705,12 +723,25 @@ class ForwardingService:
             service_number = OPERATOR.enable_template.format(
                 target=route.target_number
             )
-            if actual_canonical == canonical_dial_string(service_number):
+            if service_dial_matches(service_number, actual_canonical):
                 return (
                     "enable",
                     DEVICES[route_target],
                     route.target_number,
                     service_number,
+                )
+            # Suppress delayed retries produced by the legacy command that
+            # omitted Beeline's voice-service class (``*11``).
+            legacy_service_number = f"**21*{route.target_number}#"
+            if service_dial_matches(
+                legacy_service_number,
+                actual_canonical,
+            ):
+                return (
+                    "enable",
+                    DEVICES[route_target],
+                    route.target_number,
+                    legacy_service_number,
                 )
         return None
 
@@ -858,7 +889,7 @@ class ForwardingService:
 
 def validate_forwarding_config() -> None:
     command_pattern = re.compile(
-        r"(?:##21#|\*\*21\*\+?[0-9]{7,15}#)\Z"
+        r"(?:##21#|\*\*21\*\+?[0-9]{7,15}\*11#)\Z"
     )
     for source_code, device in DEVICES.items():
         if device.controls_enabled:

@@ -55,7 +55,8 @@ class ForwardingSettings:
 OPERATOR = OperatorConfig(
     code="configured_sim",
     name="Настроенный оператор SIM",
-    enable_template="**21*{target}#",
+    # Beeline Uzbekistan documents *11 as the voice-service class.
+    enable_template="**21*{target}*11#",
     disable_number="##21#",
 )
 
@@ -66,7 +67,8 @@ DEVICES = {
         name="Redmi",
         moizvonki_user="aashshdjdjdjsj@gmail.com",
         operator_code=OPERATOR.code,
-        sim_slot=0,
+        # Moizvonki webhooks number the first SIM as 1.
+        sim_slot=1,
         sim_number="+998908534466",
         controls_enabled=True,
     ),
@@ -75,7 +77,7 @@ DEVICES = {
         name="Tecno",
         moizvonki_user="texnikacholx@gmail.com",
         operator_code=OPERATOR.code,
-        sim_slot=0,
+        sim_slot=1,
         sim_number="+998908456162",
         controls_enabled=True,
     ),
@@ -86,7 +88,7 @@ DEVICES = {
         operator_code=OPERATOR.code,
         # Poco is a Dual-SIM phone. Public calls.make_call documentation
         # exposes no SIM selector, so it intentionally has no controls yet.
-        sim_slot=1,
+        sim_slot=2,
         sim_number="+998901313999",
         controls_enabled=False,
     ),

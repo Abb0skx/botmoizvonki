@@ -152,10 +152,10 @@ class ForwardingControlTests(unittest.TestCase):
 
     def test_exact_routes_and_poco_has_no_controls(self):
         expected = {
-            ("redmi", "poco"): "**21*+998901313999#",
-            ("redmi", "tecno"): "**21*+998908456162#",
-            ("tecno", "poco"): "**21*+998901313999#",
-            ("tecno", "redmi"): "**21*+998908534466#",
+            ("redmi", "poco"): "**21*+998901313999*11#",
+            ("redmi", "tecno"): "**21*+998908456162*11#",
+            ("tecno", "poco"): "**21*+998901313999*11#",
+            ("tecno", "redmi"): "**21*+998908534466*11#",
             ("redmi", "off"): "##21#",
             ("tecno", "off"): "##21#",
         }
@@ -494,7 +494,7 @@ class ForwardingControlTests(unittest.TestCase):
             [
                 (
                     "aashshdjdjdjsj@gmail.com",
-                    "**21*+998901313999#",
+                    "**21*+998901313999*11#",
                 )
             ],
         )
@@ -508,7 +508,7 @@ class ForwardingControlTests(unittest.TestCase):
             {"user_login": "aashshdjdjdjsj@gmail.com"},
             {
                 "direction": 1,
-                "client_number": "**21*+998901313999#",
+                "client_number": "**21*+998901313999*11#",
                 "answered": 1,
                 "db_call_id": 7001,
                 "event_pbx_call_id": "fwd-7001",
@@ -538,7 +538,7 @@ class ForwardingControlTests(unittest.TestCase):
             {"user_login": "aashshdjdjdjsj@gmail.com"},
             {
                 "direction": 1,
-                "client_number": "**21*+998901313999#",
+                "client_number": "**21*+998901313999*11#",
                 "answered": 1,
                 "db_call_id": 7099,
                 "event_pbx_call_id": "before-dispatch",
@@ -596,7 +596,7 @@ class ForwardingControlTests(unittest.TestCase):
             {"user_login": "aashshdjdjdjsj@gmail.com"},
             {
                 "direction": 1,
-                "client_number": "**21*+998901313999#",
+                "client_number": "**21*+998901313999*11#",
                 "answered": 1,
                 "db_call_id": 7101,
                 "event_pbx_call_id": "wrong-sim",
@@ -628,7 +628,7 @@ class ForwardingControlTests(unittest.TestCase):
             {"user_login": "texnikacholx@gmail.com"},
             {
                 "direction": 1,
-                "client_number": "**21*+998901313999#",
+                "client_number": "**21*+998901313999*11#",
                 "answered": 1,
                 "db_call_id": 7102,
                 "event_pbx_call_id": "missing-sim",
@@ -660,7 +660,7 @@ class ForwardingControlTests(unittest.TestCase):
             webhook,
             {
                 "direction": 1,
-                "client_number": "**21*+998908534466#",
+                "client_number": "**21*+998908534466*11#",
                 "event_pbx_call_id": "identity-on-start",
                 "start_time": self.timestamp(second=3),
                 "src_number": "+998908456162",
@@ -673,7 +673,7 @@ class ForwardingControlTests(unittest.TestCase):
             webhook,
             {
                 "direction": 1,
-                "client_number": "**21*+998908534466#",
+                "client_number": "**21*+998908534466*11#",
                 "event_pbx_call_id": "identity-on-start",
                 "db_call_id": 7103,
                 "answered": 1,
@@ -699,7 +699,7 @@ class ForwardingControlTests(unittest.TestCase):
             webhook,
             {
                 "direction": 1,
-                "client_number": "**21*+998908534466#",
+                "client_number": "**21*+998908534466*11#",
                 "event_pbx_call_id": "contradictory-sim",
                 "start_time": self.timestamp(second=3),
                 "src_number": "+998900000000",
@@ -712,7 +712,7 @@ class ForwardingControlTests(unittest.TestCase):
             webhook,
             {
                 "direction": 1,
-                "client_number": "**21*+998908534466#",
+                "client_number": "**21*+998908534466*11#",
                 "event_pbx_call_id": "contradictory-sim",
                 "db_call_id": 7104,
                 "answered": 1,
@@ -766,6 +766,107 @@ class ForwardingControlTests(unittest.TestCase):
         self.assertTrue(duplicate["handled"])
         self.assertTrue(duplicate["duplicate"])
 
+    def test_collapsed_service_number_is_suppressed_without_active_operation(self):
+        event = {
+            "direction": 1,
+            # Failed Android URI handling may strip every star/hash and move
+            # the plus to the front of the complete MMI digit signature.
+            "client_number": "+2199890131399911",
+            "answered": 0,
+            "db_call_id": 7110,
+            "event_pbx_call_id": "collapsed-service",
+            "start_time": self.timestamp(second=3),
+            "end_time": self.timestamp(second=8),
+            "src_number": "+998908456162",
+            "src_slot": 1,
+        }
+        result = self.service.handle_provider_event(
+            "call.finish",
+            {"user_login": "texnikacholx@gmail.com"},
+            event,
+            now_ts=self.timestamp(second=9),
+        )
+        self.assertTrue(result["handled"])
+        self.assertTrue(result["external"])
+        self.assertTrue(
+            self.service.is_known_service_event(
+                {"user_login": "texnikacholx@gmail.com"},
+                event,
+            )
+        )
+
+    def test_legacy_collapsed_service_number_is_also_suppressed(self):
+        event = {
+            "direction": 1,
+            "client_number": "+21998901313999",
+            "answered": 0,
+            "db_call_id": 7111,
+            "event_pbx_call_id": "legacy-collapsed-service",
+            "start_time": self.timestamp(second=3),
+            "end_time": self.timestamp(second=8),
+            "src_number": "+998908456162",
+            "src_slot": 1,
+        }
+        result = self.service.handle_provider_event(
+            "call.finish",
+            {"user_login": "texnikacholx@gmail.com"},
+            event,
+            now_ts=self.timestamp(second=9),
+        )
+        self.assertTrue(result["handled"])
+        self.assertTrue(result["external"])
+
+    def test_plain_target_is_not_service_without_active_operation(self):
+        event = {
+            "direction": 1,
+            "client_number": "+998901313999",
+            "answered": 0,
+            "db_call_id": 7112,
+            "event_pbx_call_id": "ordinary-target-call",
+            "start_time": self.timestamp(second=3),
+            "end_time": self.timestamp(second=8),
+            "src_number": "+998908456162",
+            "src_slot": 1,
+        }
+        result = self.service.handle_provider_event(
+            "call.finish",
+            {"user_login": "texnikacholx@gmail.com"},
+            event,
+            now_ts=self.timestamp(second=9),
+        )
+        self.assertFalse(result["handled"])
+        self.assertFalse(
+            self.service.is_known_service_event(
+                {"user_login": "texnikacholx@gmail.com"},
+                event,
+            )
+        )
+
+    def test_exact_sim_number_wins_over_zero_based_slot(self):
+        self.activate_post()
+        queued = self.queue("fwd:tecno:poco")
+        self.service.dispatch_one(self.timestamp(second=2))
+        self.service.handle_provider_event(
+            "call.finish",
+            {"user_login": "texnikacholx@gmail.com"},
+            {
+                "direction": 1,
+                "client_number": "**21*+998901313999*11#",
+                "answered": 1,
+                "db_call_id": 7113,
+                "event_pbx_call_id": "zero-based-slot",
+                "start_time": self.timestamp(second=3),
+                "end_time": self.timestamp(second=8),
+                "src_number": "+998908456162",
+                "src_slot": 0,
+            },
+            now_ts=self.timestamp(second=9),
+        )
+        operation = self.repository.get_operation(
+            queued["operation"]["id"]
+        )
+        self.assertEqual(operation["status"], "call_completed")
+
     def test_second_distinct_finish_cannot_overwrite_terminal_result(self):
         self.activate_post()
         queued = self.queue("fwd:redmi:poco")
@@ -813,7 +914,7 @@ class ForwardingControlTests(unittest.TestCase):
         webhook = {"user_login": "texnikacholx@gmail.com"}
         base_event = {
             "direction": 1,
-            "client_number": "**21*+998908534466#",
+            "client_number": "**21*+998908534466*11#",
             "event_pbx_call_id": "fwd-sequence",
             "start_time": self.timestamp(second=3),
             "src_number": "+998908456162",
@@ -989,7 +1090,7 @@ class ForwardingControlTests(unittest.TestCase):
         self.service.dispatch_one(self.timestamp(second=3))
         shared_event = {
             "direction": 1,
-            "client_number": "**21*+998901313999#",
+            "client_number": "**21*+998901313999*11#",
             "answered": 1,
             "db_call_id": 7777,
             "event_pbx_call_id": "shared-pbx-id",
@@ -1038,7 +1139,7 @@ class ForwardingControlTests(unittest.TestCase):
             {"user_login": "aashshdjdjdjsj@gmail.com"},
             {
                 "direction": 1,
-                "client_number": "**21*+998901313999#",
+                "client_number": "**21*+998901313999*11#",
                 "answered": 1,
                 "db_call_id": 7888,
                 "event_pbx_call_id": "external-wrong-sim",
@@ -1239,7 +1340,7 @@ class ForwardingBotIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(filter_instance.filter(record))
         self.assertEqual(record.args[2], "/webhooks/moizvonki")
 
-    async def test_make_call_payload_preserves_service_code_exactly(self):
+    async def test_make_call_payload_encodes_hash_for_android_tel_uri(self):
         import botmoizvonki as bot
 
         class Response:
@@ -1260,17 +1361,47 @@ class ForwardingBotIntegrationTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = bot.moizvonki_make_call(
                 "aashshdjdjdjsj@gmail.com",
-                "**21*+998901313999#",
+                "**21*+998901313999*11#",
             )
 
         payload = fake_http.post.call_args.kwargs["json"]
         self.assertEqual(payload["action"], "calls.make_call")
-        self.assertEqual(payload["to"], "**21*+998901313999#")
+        self.assertEqual(
+            payload["to"],
+            "**21*%2B998901313999*11%23",
+        )
         self.assertEqual(
             payload["user_name"],
             "aashshdjdjdjsj@gmail.com",
         )
         self.assertEqual(result["body"]["status"], "Call posted")
+
+    async def test_cancel_payload_encodes_every_hash(self):
+        import botmoizvonki as bot
+
+        class Response:
+            ok = True
+            status_code = 200
+            text = "Call posted"
+
+            @staticmethod
+            def json():
+                raise ValueError
+
+        fake_http = mock.Mock()
+        fake_http.post.return_value = Response()
+        with (
+            mock.patch.object(bot, "HTTP", fake_http),
+            mock.patch.object(bot, "MOIZVONKI_API_URL", "https://example.test/api/v1"),
+            mock.patch.object(bot, "MOIZVONKI_API_KEY", "secret"),
+        ):
+            bot.moizvonki_make_call(
+                "texnikacholx@gmail.com",
+                "##21#",
+            )
+
+        payload = fake_http.post.call_args.kwargs["json"]
+        self.assertEqual(payload["to"], "%23%2321%23")
 
     async def test_matching_service_finish_never_enters_customer_pipeline(self):
         import botmoizvonki as bot
