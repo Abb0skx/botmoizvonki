@@ -125,6 +125,19 @@ class MonitoringSettingsTests(unittest.TestCase):
         self.assertEqual(current.manager_ids, frozenset({101, 202, 303}))
         self.assertEqual(current.admin_ids, frozenset())
 
+    def test_standalone_service_urls_and_tokens_are_loaded(self):
+        with patch.dict(os.environ, {
+            "MONITORING_DELIVERY_BASE_URL": "http://delivery-stats:8080/",
+            "MONITORING_DELIVERY_SERVICE_TOKEN": "delivery-secret",
+            "MONITORING_PRICE_BASE_URL": "http://price-web:8080/",
+            "MONITORING_PRICE_SERVICE_TOKEN": "price-secret",
+        }, clear=False):
+            current = MonitoringSettings.load()
+        self.assertEqual(current.delivery_base_url, "http://delivery-stats:8080")
+        self.assertEqual(current.delivery_service_token, "delivery-secret")
+        self.assertEqual(current.price_base_url, "http://price-web:8080")
+        self.assertEqual(current.price_service_token, "price-secret")
+
 
 class MonitoringRouteTests(unittest.TestCase):
     def setUp(self):
@@ -281,6 +294,43 @@ class MonitoringRouteTests(unittest.TestCase):
             get_bytes.await_args.kwargs["params"]["courier_id"], "42"
         )
 
+    def test_price_summary_and_catalog_are_session_protected(self):
+        self.assertEqual(
+            self.client.get("/monitoring/api/prices").status_code,
+            401,
+        )
+        self.assertEqual(
+            self.client.get("/monitoring/prices/catalog").status_code,
+            401,
+        )
+        self.login()
+        summary = {"status": "enabled", "snapshot": None, "sections": []}
+        with patch.object(
+            monitoring_router.prices_adapter.PriceAdapter,
+            "summary",
+            new=AsyncMock(return_value=summary),
+        ):
+            response = self.client.get("/monitoring/api/prices")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["data"], summary)
+
+        with patch.object(
+            monitoring_router.prices_adapter.PriceAdapter,
+            "catalog",
+            new=AsyncMock(return_value=(
+                b"<html>price</html>",
+                "text/html; charset=utf-8",
+            )),
+        ):
+            catalog = self.client.get("/monitoring/prices/catalog")
+        self.assertEqual(catalog.status_code, 200)
+        self.assertEqual(catalog.text, "<html>price</html>")
+        self.assertEqual(catalog.headers["x-frame-options"], "SAMEORIGIN")
+        self.assertIn(
+            "frame-ancestors 'self'",
+            catalog.headers["content-security-policy"],
+        )
+
     def test_overview_survives_one_unavailable_source(self):
         self.login()
         calls = {"stats": {"calls": 12, "answered": 10}}
@@ -297,7 +347,9 @@ class MonitoringRouteTests(unittest.TestCase):
             "reviews_dashboard",
             return_value=reviews,
         ), patch.object(
-            monitoring_router.prices_adapter, "price_summary", return_value=prices
+            monitoring_router.prices_adapter.PriceAdapter,
+            "summary",
+            new=AsyncMock(return_value=prices),
         ), patch.object(
             monitoring_router.DeliveryAdapter, "get", new=AsyncMock(return_value={"summary": {"active": 2}})
         ), patch.object(

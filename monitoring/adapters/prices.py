@@ -2,42 +2,65 @@ from __future__ import annotations
 
 from typing import Any
 
+import httpx
 
-def price_summary() -> dict[str, Any]:
-    import importlib
+from monitoring.config import MonitoringSettings
 
-    source = importlib.import_module("price_server.router")
 
-    settings = source.settings
-    if not settings.enabled:
+class PriceAdapter:
+    def __init__(self, settings: MonitoringSettings):
+        self.settings = settings
+
+    def configured(self) -> bool:
+        return bool(
+            self.settings.price_base_url
+            and self.settings.price_service_token
+        )
+
+    def _headers(self, accept: str) -> dict[str, str]:
         return {
-            "status": "disabled",
-            "snapshot": None,
-            "sections": [],
-            "scheduler_running": False,
+            "Authorization": "Bearer " + self.settings.price_service_token,
+            "Accept": accept,
         }
-    if source._startup_error:
-        return {
-            "status": "blocked",
-            "snapshot": None,
-            "sections": [],
-            "scheduler_running": False,
-        }
-    repository = source.get_repository()
-    snapshot = repository.get_current_snapshot(include_payload=False)
-    sections = []
-    for section in repository.list_sections():
-        sections.append({
-            key: section.get(key)
-            for key in (
-                "snapshot_id", "section_key", "position", "title",
-                "product_count", "changed_recent",
+
+    async def summary(self) -> dict[str, Any]:
+        if not self.configured():
+            raise RuntimeError("price_source_not_configured")
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(8.0, connect=2.0),
+            follow_redirects=False,
+        ) as client:
+            response = await client.get(
+                self.settings.price_base_url
+                + "/internal/monitoring/v1/prices/summary",
+                headers=self._headers("application/json"),
             )
-        })
-    return {
-        "status": "enabled",
-        "snapshot": snapshot,
-        "sections": sections,
-        "scheduler_running": bool(source._scheduler and source._scheduler.running),
-        "telegram_configured": settings.telegram_configured,
-    }
+        if response.status_code != 200:
+            raise RuntimeError(f"price_source_http_{response.status_code}")
+        if len(response.content) > 2 * 1024 * 1024:
+            raise RuntimeError("price_source_response_too_large")
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise RuntimeError("price_source_invalid_json")
+        return payload
+
+    async def catalog(self) -> tuple[bytes, str]:
+        if not self.configured():
+            raise RuntimeError("price_source_not_configured")
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(15.0, connect=2.0),
+            follow_redirects=False,
+        ) as client:
+            response = await client.get(
+                self.settings.price_base_url
+                + "/internal/monitoring/v1/prices/catalog",
+                headers=self._headers("text/html"),
+            )
+        if response.status_code != 200:
+            raise RuntimeError(f"price_source_http_{response.status_code}")
+        if len(response.content) > 12 * 1024 * 1024:
+            raise RuntimeError("price_source_response_too_large")
+        return response.content, response.headers.get("content-type", "")
+
+
+__all__ = ["PriceAdapter"]

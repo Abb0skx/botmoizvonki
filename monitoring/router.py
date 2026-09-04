@@ -71,6 +71,23 @@ def _html(content: str, status_code: int = 200) -> HTMLResponse:
     return monitoring_security_headers(HTMLResponse(content, status_code=status_code))
 
 
+def _catalog_html(content: bytes) -> Response:
+    response = Response(content, media_type="text/html")
+    response.headers["Cache-Control"] = "no-store, private"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "SAMEORIGIN"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["X-Robots-Tag"] = "noindex, nofollow, noarchive"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'none'; script-src 'unsafe-inline'; "
+        "style-src 'unsafe-inline' https:; img-src data: https:; "
+        "font-src data: https:; connect-src 'none'; "
+        "frame-ancestors 'self'; base-uri 'none'; form-action 'none'"
+    )
+    return response
+
+
 def _meta(source: str, status: str = "ok", **extra: Any) -> dict[str, Any]:
     return {
         "source": source,
@@ -320,8 +337,27 @@ async def api_review_detail(request: Request, review_id: int):
 @router.get("/monitoring/api/prices")
 async def api_prices(request: Request):
     _principal(request)
-    data = await run_in_threadpool(prices_adapter.price_summary)
+    try:
+        data = await prices_adapter.PriceAdapter(settings).summary()
+    except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+        return _json(_source_error("prices", exc), status_code=503)
     return _json({"data": data, "meta": _meta("prices")})
+
+
+@router.get("/monitoring/prices/catalog")
+async def monitoring_price_catalog(request: Request):
+    _principal(request)
+    try:
+        content, media_type = await prices_adapter.PriceAdapter(settings).catalog()
+    except (httpx.HTTPError, RuntimeError, ValueError):
+        raise HTTPException(
+            status_code=503, detail="price_catalog_unavailable"
+        ) from None
+    if media_type.split(";", 1)[0].strip().casefold() != "text/html":
+        raise HTTPException(
+            status_code=502, detail="price_catalog_invalid_media_type"
+        )
+    return _catalog_html(content)
 
 
 @router.get("/monitoring/api/managers")
@@ -459,7 +495,7 @@ async def api_overview(
         )
 
     async def prices_source():
-        return await run_in_threadpool(prices_adapter.price_summary)
+        return await prices_adapter.PriceAdapter(settings).summary()
 
     async def delivery_source():
         return await DeliveryAdapter(settings).get(

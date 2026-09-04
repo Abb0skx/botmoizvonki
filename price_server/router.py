@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import secrets
 import threading
 import uuid
 from datetime import datetime, time, timedelta, timezone
@@ -10,7 +12,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from .auth import require_admin, require_admin_action, require_sync_key
 from .config import PriceSettings
@@ -38,6 +40,10 @@ _scheduler: PriceScheduler | None = None
 _startup_error = ""
 _runtime_lock = threading.RLock()
 _ADMIN_JS = Path(__file__).resolve().parent / "static" / "admin.js"
+MONITORING_BASE_URL = os.getenv("MONITORING_BASE_URL", "").strip().rstrip("/")
+MONITORING_PRICE_SERVICE_TOKEN = os.getenv(
+    "MONITORING_PRICE_SERVICE_TOKEN", ""
+).strip()
 
 
 def get_repository() -> PriceRepository:
@@ -74,6 +80,25 @@ def _require_enabled() -> None:
             status_code=503,
             detail="price_server_configuration_blocked",
         )
+
+
+def require_internal_monitoring_auth(request: Request) -> None:
+    if not MONITORING_PRICE_SERVICE_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="monitoring_price_service_token_not_configured",
+        )
+    authorization = request.headers.get("authorization", "")
+    prefix = "Bearer "
+    supplied = (
+        authorization[len(prefix):]
+        if authorization.startswith(prefix)
+        else ""
+    )
+    if not supplied or not secrets.compare_digest(
+        supplied, MONITORING_PRICE_SERVICE_TOKEN
+    ):
+        raise HTTPException(status_code=403, detail="invalid_service_token")
 
 
 async def start_price_server() -> None:
@@ -222,7 +247,9 @@ async def price_admin_script() -> Response:
 
 @router.get("/price", response_class=HTMLResponse)
 @router.get("/price/", response_class=HTMLResponse, include_in_schema=False)
-async def price_page(request: Request) -> HTMLResponse:
+async def price_page(request: Request) -> Response:
+    if MONITORING_BASE_URL:
+        return RedirectResponse(MONITORING_BASE_URL + "/prices", status_code=303)
     # Staged rollout: while the new subsystem is explicitly disabled, preserve
     # the existing read-only page exactly as it works today. Enabling the
     # subsystem switches this same route to fail-closed Basic authentication.
@@ -234,6 +261,44 @@ async def price_page(request: Request) -> HTMLResponse:
         principal is None or getattr(principal, "role", None) == "admin"
     ):
         document = _inject_admin_script(document)
+    return _secure_html(document)
+
+
+@router.get("/internal/monitoring/v1/prices/summary")
+async def internal_monitoring_price_summary(request: Request) -> dict[str, Any]:
+    require_internal_monitoring_auth(request)
+    _require_enabled()
+    repository = get_repository()
+    snapshot = repository.get_current_snapshot(include_payload=False)
+    sections = []
+    for section in repository.list_sections():
+        sections.append({
+            key: section.get(key)
+            for key in (
+                "snapshot_id",
+                "section_key",
+                "position",
+                "title",
+                "product_count",
+                "changed_recent",
+            )
+        })
+    return {
+        "status": "enabled",
+        "snapshot": snapshot,
+        "sections": sections,
+        "scheduler_running": bool(_scheduler and _scheduler.running),
+        "telegram_configured": settings.telegram_configured,
+    }
+
+
+@router.get("/internal/monitoring/v1/prices/catalog", response_class=HTMLResponse)
+async def internal_monitoring_price_catalog(request: Request) -> HTMLResponse:
+    require_internal_monitoring_auth(request)
+    _require_enabled()
+    document = _page_html()
+    if document is None:
+        return _secure_html("<h1>Price page not found</h1>", status_code=404)
     return _secure_html(document)
 
 

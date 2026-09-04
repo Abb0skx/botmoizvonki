@@ -3929,6 +3929,94 @@ class PricePageAuthTests(unittest.TestCase):
                     module._startup_error,
                 ) = old
 
+    def test_monitoring_price_api_uses_service_token_and_redirects_legacy_page(self):
+        module = importlib.import_module("price_server.router")
+        with tempfile.TemporaryDirectory() as folder:
+            legacy = Path(folder) / "index.html"
+            legacy.write_text(
+                "<!doctype html><html><body>legacy price</body></html>",
+                encoding="utf-8",
+            )
+            configured = PriceSettings(
+                enabled=True,
+                db_path=Path(folder) / "price.db",
+                legacy_html_path=legacy,
+                admin_username="admin",
+                admin_password="secret",
+                sync_api_key="sync",
+                telegram_bot_token="",
+                telegram_channel_id="",
+                telegram_channel_username="",
+                product_sort_sheet_id="sheet",
+                posts_sheet_name="Telegram Posts",
+                timezone="Asia/Tashkent",
+                scheduler_poll_seconds=1,
+                sync_max_bytes=2_000_000,
+            )
+            repository = PriceRepository(configured)
+            repository.ingest_snapshot(snapshot(datetime.now(timezone.utc)))
+            old = (
+                module.settings,
+                module._repository,
+                module._service,
+                module._startup_error,
+                module.MONITORING_BASE_URL,
+                module.MONITORING_PRICE_SERVICE_TOKEN,
+            )
+            module.settings = configured
+            module._repository = repository
+            module._service = None
+            module._startup_error = ""
+            module.MONITORING_BASE_URL = ""
+            module.MONITORING_PRICE_SERVICE_TOKEN = "portal-service-key"
+            try:
+                anonymous = Request(
+                    {
+                        "type": "http",
+                        "method": "GET",
+                        "path": "/internal",
+                        "headers": [],
+                    }
+                )
+                with self.assertRaises(HTTPException) as raised:
+                    asyncio.run(module.internal_monitoring_price_summary(anonymous))
+                self.assertEqual(raised.exception.status_code, 403)
+
+                authorized = Request({
+                    "type": "http",
+                    "method": "GET",
+                    "path": "/internal",
+                    "headers": [(b"authorization", b"Bearer portal-service-key")],
+                })
+                summary = asyncio.run(
+                    module.internal_monitoring_price_summary(authorized)
+                )
+                self.assertEqual(summary["status"], "enabled")
+                self.assertEqual(len(summary["sections"]), 1)
+                catalog = asyncio.run(
+                    module.internal_monitoring_price_catalog(authorized)
+                )
+                self.assertIn(b"<body>100</body>", catalog.body)
+
+                module.MONITORING_BASE_URL = (
+                    "https://bot.texnikach.uz/monitoring"
+                )
+                redirected = asyncio.run(module.price_page(anonymous))
+                self.assertEqual(redirected.status_code, 303)
+                self.assertEqual(
+                    redirected.headers["location"],
+                    "https://bot.texnikach.uz/monitoring/prices",
+                )
+            finally:
+                (
+                    module.settings,
+                    module._repository,
+                    module._service,
+                    module._startup_error,
+                    module.MONITORING_BASE_URL,
+                    module.MONITORING_PRICE_SERVICE_TOKEN,
+                ) = old
+
     def test_update_all_endpoint_requires_auth_csrf_and_is_idempotent(self):
         module = importlib.import_module("price_server.router")
         with tempfile.TemporaryDirectory() as folder:

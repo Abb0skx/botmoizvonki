@@ -24,6 +24,9 @@ MONITORING_TELEGRAM_REDIRECT_URI=https://bot.texnikach.uz/monitoring/auth/callba
 MONITORING_DELIVERY_BASE_URL=http://texnikach-delivery-stats:8080
 MONITORING_DELIVERY_SERVICE_TOKEN=
 
+MONITORING_PRICE_BASE_URL=http://texnikach-price-web:8080
+MONITORING_PRICE_SERVICE_TOKEN=
+
 MONITORING_GO_API_URL=
 MONITORING_GO_API_TOKEN=
 ```
@@ -34,7 +37,9 @@ replica while the session store is SQLite; use PostgreSQL or Redis before
 adding replicas.
 
 The delivery token belongs only in the main web service and `delivery-stats`.
-It must be explicitly blanked in the Telegram delivery-bot container.
+The price token belongs only in the main web service and the standalone price
+web service. Both are separate random values. The delivery token must be
+explicitly blanked in the Telegram delivery-bot container.
 
 The GO adapter contract is documented in `docs/monitoring-go-api.md`.
 
@@ -45,7 +50,7 @@ The GO adapter contract is documented in `docs/monitoring-go-api.md`.
 | Overview / calls | existing calls SQLite and reporting functions | read-only |
 | Reviews | existing reviews SQLite and analytics functions | read-only |
 | Delivery | delivery web service internal API | read-only |
-| Prices | existing price repository | read-only; `/price` reuses the same session |
+| Prices | standalone price service internal API | read-only; full catalogue is proxied by the portal |
 | GO site | OpenCart internal API | read-only; unavailable until that API is deployed |
 
 `/dashboard` and `/admin/reviews` redirect to the matching portal section when
@@ -54,11 +59,9 @@ delivery service receives `MONITORING_BASE_URL`. Public `/rating` links and
 webhooks are unchanged. Legacy Basic credentials stay available only as a
 rollback path and must be removed after the migration is accepted.
 
-Price mutations remain administrator-only. An authenticated manager opening
-`/price` receives the catalogue without action controls; an administrator gets
-the existing controls. Mutating requests require the portal CSRF token and an
-exact same-origin request. If the portal cookie is absent, the legacy Basic
-flow remains available during the rollback window.
+The standalone `/price` page redirects to `/monitoring/prices` after its
+`MONITORING_BASE_URL` is configured. Price mutations remain in the separate
+administrator-only API and never receive the manager's browser cookie.
 
 ## Manager identity registry
 
@@ -82,9 +85,11 @@ fallback: administrator rights must always be granted explicitly.
    Client ID/Secret into the main web-service secrets.
 2. Add numeric employee IDs to the manager/admin allowlists. Do not use
    Telegram usernames as authorization identifiers.
-3. Generate a separate random delivery service token and place the same value
-   in the main web service and `delivery-stats`. Keep it blank in
-   `delivery-bot` as enforced by `compose.delivery.yaml`.
+3. Generate separate random delivery and price service tokens. Put the
+   delivery value in the main web service and `delivery-stats`; put the price
+   value in the main web service and standalone price web service. Keep the
+   delivery token blank in `delivery-bot` as enforced by
+   `compose.delivery.yaml`.
 4. Mount persistent storage for `MONITORING_SESSION_DB_PATH`, keep the main web
    service at one replica, and rate-limit `/monitoring/auth/start` at the edge.
 5. Deploy the read-only OpenCart endpoint from `docs/monitoring-go-api.md`, then

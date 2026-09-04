@@ -53,6 +53,21 @@ def _https_url(name: str, value: str, *, required: bool) -> str:
     return cleaned
 
 
+def _http_url(name: str, value: str) -> str:
+    cleaned = value.strip().rstrip("/")
+    if not cleaned:
+        return ""
+    parsed = urlparse(cleaned)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+    ):
+        raise RuntimeError(f"{name} must be an HTTP(S) URL without credentials")
+    return cleaned
+
+
 @dataclass(frozen=True)
 class MonitoringSettings:
     enabled: bool
@@ -67,6 +82,8 @@ class MonitoringSettings:
     telegram_redirect_uri: str
     delivery_base_url: str = ""
     delivery_service_token: str = ""
+    price_base_url: str = ""
+    price_service_token: str = ""
     go_api_url: str = ""
     go_api_token: str = ""
 
@@ -89,13 +106,14 @@ class MonitoringSettings:
             ),
             required=True,
         )
-        delivery_base = os.getenv("MONITORING_DELIVERY_BASE_URL", "").strip().rstrip("/")
-        if delivery_base:
-            parsed = urlparse(delivery_base)
-            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-                raise RuntimeError("MONITORING_DELIVERY_BASE_URL must be an HTTP(S) URL")
-            if parsed.username or parsed.password:
-                raise RuntimeError("MONITORING_DELIVERY_BASE_URL must not contain credentials")
+        delivery_base = _http_url(
+            "MONITORING_DELIVERY_BASE_URL",
+            os.getenv("MONITORING_DELIVERY_BASE_URL", ""),
+        )
+        price_base = _http_url(
+            "MONITORING_PRICE_BASE_URL",
+            os.getenv("MONITORING_PRICE_BASE_URL", ""),
+        )
         return cls(
             enabled=enabled,
             base_url=base_url,
@@ -125,6 +143,10 @@ class MonitoringSettings:
             delivery_base_url=delivery_base,
             delivery_service_token=os.getenv(
                 "MONITORING_DELIVERY_SERVICE_TOKEN", ""
+            ).strip(),
+            price_base_url=price_base,
+            price_service_token=os.getenv(
+                "MONITORING_PRICE_SERVICE_TOKEN", ""
             ).strip(),
             go_api_url=_https_url(
                 "MONITORING_GO_API_URL",
