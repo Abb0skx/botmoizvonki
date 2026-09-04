@@ -2173,18 +2173,13 @@ async def comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         if not synchronized:
             _schedule_sync_retry(context, order.id)
     sales_queued = False
-    if (
-        order
-        and order.product_photo_file_id
-        and order.sales_card_status in {"none", "failed"}
-    ):
+    if order and order.product_photo_file_id:
         try:
-            photo_path = await _persist_product_photo(context, order)
-            queued = repo.request_sales_card(
-                order.id,
+            order, sales_queued = await _queue_product_photo_sales_card(
+                context,
+                order,
                 actor_id=update.effective_user.id,
                 actor_name=_name(update.effective_user),
-                product_photo_path=photo_path,
             )
         except Exception:
             logger.exception(
@@ -2192,9 +2187,7 @@ async def comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 order.id,
             )
         else:
-            if queued and queued.sales_card_status in {"pending", "processing", "complete"}:
-                order = queued
-                sales_queued = True
+            if sales_queued:
                 _, synchronized = await _sync_order(context, order.id)
                 if not synchronized:
                     _schedule_sync_retry(context, order.id)
@@ -2326,6 +2319,39 @@ async def _persist_product_photo(
         telegram_file = await context.bot.get_file(order.product_photo_file_id)
         await telegram_file.download_to_drive(custom_path=destination)
     return relative.as_posix()
+
+
+async def _queue_product_photo_sales_card(
+    context: ContextTypes.DEFAULT_TYPE,
+    order,
+    *,
+    actor_id: int,
+    actor_name: str,
+    actor_role: str = "manager",
+) -> tuple[object, bool]:
+    """Persist a product photo and idempotently create its sales-card request."""
+    repo: OrderRepository = context.application.bot_data["repo"]
+    async with _order_sync_lock(context.application, order.id):
+        latest = repo.get(order.id)
+        if latest is None:
+            raise RuntimeError("sales_card_order_missing")
+        if (
+            not latest.product_photo_file_id
+            or latest.status == "cancelled"
+            or latest.sales_card_status not in {"none", "failed"}
+        ):
+            return latest, False
+        photo_path = await _persist_product_photo(context, latest)
+        queued = repo.request_sales_card(
+            latest.id,
+            actor_id=actor_id,
+            actor_name=actor_name,
+            actor_role=actor_role,
+            product_photo_path=photo_path,
+        )
+        if queued is None:
+            raise RuntimeError("sales_card_order_missing")
+        return queued, queued.sales_card_status == "pending"
 
 
 def _sales_card_preview(order) -> str:
@@ -2645,6 +2671,23 @@ async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if cleanup_messages:
         await _process_cleanup_messages(context, order_id=order.id)
 
+    sales_queued = False
+    sales_queue_failed = False
+    if field == "product_photo" and order.product_photo_file_id:
+        try:
+            order, sales_queued = await _queue_product_photo_sales_card(
+                context,
+                order,
+                actor_id=actor.id if actor else previous.manager_id,
+                actor_name=_name(actor) if actor else previous.manager_name,
+            )
+        except Exception:
+            sales_queue_failed = True
+            logger.exception(
+                "Could not automatically queue edited product photo for order %s",
+                order.id,
+            )
+
     keyboard = manager_sent_keyboard(order) if sent else review_keyboard(order.id)
     manager_refreshed = True
     try:
@@ -2688,6 +2731,13 @@ async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         result = "⚠️ Данные сохранены в базе, но карточку менеджера обновить не удалось."
     elif not refreshed:
         result = "⚠️ Данные сохранены, но карточку в группе обновить не удалось."
+    elif sales_queue_failed:
+        result = (
+            "⚠️ Фото товара сохранено, но пока не отправлено в «Проданные». "
+            "Фоновая проверка повторит отправку автоматически."
+        )
+    elif sales_queued:
+        result = "✅ Фото товара сохранено и отправляется в канал продаж."
     elif field == "amount":
         result = f"✅ Новая цена сохранена:\n{money(order.amount_usd, order.amount_uzs)}"
     else:

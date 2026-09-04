@@ -597,6 +597,7 @@ class OrderRepository:
         *,
         actor_id: int,
         actor_name: str,
+        actor_role: str = "manager",
         product_photo_path: str | None = None,
     ) -> Order | None:
         """Queue one idempotent sales-card request for the exact delivery order."""
@@ -634,12 +635,27 @@ class OrderRepository:
                 event_type="sales_card_creation_started",
                 actor_id=actor_id,
                 actor_name=actor_name,
-                actor_role="manager",
+                actor_role=actor_role,
                 from_status=row["status"],
                 to_status=row["status"],
                 changed_fields={"sales_card_status", "product_photo_path"},
             )
         return Order.from_row(row)
+
+    def list_sales_cards_needing_queue(self, *, limit: int = 20) -> list[Order]:
+        """Return photo orders whose idempotent sales request was never completed."""
+        limit, _ = self._page_bounds(limit, 0)
+        with self.connect() as db:
+            rows = db.execute(
+                """SELECT * FROM orders
+                   WHERE product_photo_file_id IS NOT NULL
+                     AND sales_card_status IN ('none','failed')
+                     AND status != 'cancelled'
+                   ORDER BY updated_at,id
+                   LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        return [Order.from_row(row) for row in rows]
 
     def get(self, order_id: int) -> Order | None:
         with self.connect() as db:

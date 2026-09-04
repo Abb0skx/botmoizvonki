@@ -29,6 +29,7 @@ from app.bot.application import (
     _touch_health_signal,
     initialize_delivery_runtime,
     reconcile_pending_orders,
+    reconcile_sales_card_requests,
     send_waiting_pickup_reminders,
     shutdown_delivery_runtime,
 )
@@ -138,6 +139,38 @@ class DeliveryRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         sync.assert_awaited_once()
         repo.mark_sync_attempted.assert_not_called()
+
+    async def test_sales_card_recovery_queues_each_missing_product_photo_once(self):
+        orders = [SimpleNamespace(id=1), SimpleNamespace(id=2)]
+        repo = SimpleNamespace(
+            claim_periodic_job=Mock(return_value=True),
+            list_sales_cards_needing_queue=Mock(return_value=orders),
+        )
+        application = self.application(repo=repo)
+        queue = AsyncMock(side_effect=[(orders[0], True), (orders[1], False)])
+
+        with patch("app.bot.application._queue_product_photo_sales_card", queue):
+            recovered = await reconcile_sales_card_requests(application, slot=42)
+
+        self.assertEqual(recovered, 1)
+        repo.claim_periodic_job.assert_called_once_with("sales_card_autoqueue", 42)
+        repo.list_sales_cards_needing_queue.assert_called_once()
+        self.assertEqual(queue.await_count, 2)
+        self.assertTrue(
+            all(call.kwargs["actor_role"] == "integration" for call in queue.await_args_list)
+        )
+
+    async def test_sales_card_recovery_duplicate_slot_does_not_scan(self):
+        repo = SimpleNamespace(
+            claim_periodic_job=Mock(return_value=False),
+            list_sales_cards_needing_queue=Mock(),
+        )
+        application = self.application(repo=repo)
+
+        recovered = await reconcile_sales_card_requests(application, slot=42)
+
+        self.assertEqual(recovered, 0)
+        repo.list_sales_cards_needing_queue.assert_not_called()
 
     async def test_callback_error_is_an_alert_and_never_a_group_message(self):
         query = SimpleNamespace(answer=AsyncMock())

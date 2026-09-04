@@ -167,6 +167,58 @@ class FinalCreationStepSafetyTests(unittest.IsolatedAsyncioTestCase):
             message.reply_text.await_args_list[-1].args[0],
         )
 
+    async def test_edited_product_photo_is_queued_for_sales(self):
+        order = self.repo.create(
+            manager_id=self.user.id,
+            manager_name=self.user.full_name,
+            data=complete_draft(),
+        )
+        photo = SimpleNamespace(
+            file_id="edited-telegram-photo",
+            file_unique_id="edited-unique-photo",
+            file_size=500,
+            width=1000,
+            height=1000,
+        )
+        message = SimpleNamespace(
+            text=None,
+            photo=[photo],
+            location=None,
+            reply_text=AsyncMock(),
+        )
+        update = self.private_update(message)
+        update.effective_chat.id = self.user.id
+        context = self.make_context()
+        context.user_data = {
+            "edit": {
+                "order_id": order.id,
+                "field": "product_photo",
+                "message_id": 504,
+                "chat_id": self.user.id,
+                "updated_at": order.updated_at,
+            }
+        }
+        context.bot = SimpleNamespace(edit_message_text=AsyncMock())
+
+        with patch(
+            "app.handlers.orders._persist_product_photo",
+            new=AsyncMock(return_value="product_photos/order-1-edited.jpg"),
+        ) as persist_photo:
+            state = await save_edit(update, context)
+
+        self.assertEqual(state, ConversationHandler.END)
+        updated = self.repo.get(order.id)
+        self.assertEqual(updated.sales_card_status, "pending")
+        self.assertEqual(
+            updated.product_photo_path,
+            "product_photos/order-1-edited.jpg",
+        )
+        persist_photo.assert_awaited_once()
+        self.assertIn(
+            "отправляется в канал продаж",
+            message.reply_text.await_args.args[0],
+        )
+
     async def test_missing_persisted_draft_ends_safely(self):
         message = SimpleNamespace(text="Пропустить", reply_text=AsyncMock())
         update = self.private_update(message)

@@ -1168,6 +1168,41 @@ class RepositoryTests(unittest.TestCase):
         updated = self.repo.transition(order.id, {"draft"}, payment_status="collect_on_delivery")
         self.assertEqual(updated.payment_status, "collect_on_delivery")
 
+    def test_sales_card_recovery_selects_only_unqueued_non_cancelled_photos(self):
+        missing = self.repo.create(
+            manager_id=1,
+            manager_name="A",
+            data={**self.data, "product_photo_file_id": "photo-missing"},
+        )
+        failed = self.repo.create(
+            manager_id=1,
+            manager_name="A",
+            data={**self.data, "product_photo_file_id": "photo-failed"},
+        )
+        self.repo.update(failed.id, sales_card_status="failed")
+        pending = self.repo.create(
+            manager_id=1,
+            manager_name="A",
+            data={**self.data, "product_photo_file_id": "photo-pending"},
+        )
+        self.repo.request_sales_card(
+            pending.id,
+            actor_id=1,
+            actor_name="A",
+            product_photo_path="product_photos/pending.jpg",
+        )
+        cancelled = self.repo.create(
+            manager_id=1,
+            manager_name="A",
+            data={**self.data, "product_photo_file_id": "photo-cancelled"},
+        )
+        self.repo.update(cancelled.id, status="cancelled")
+        self.repo.create(manager_id=1, manager_name="A", data=self.data)
+
+        selected = self.repo.list_sales_cards_needing_queue()
+
+        self.assertEqual({order.id for order in selected}, {missing.id, failed.id})
+
     def test_atomic_courier_claim(self):
         order = self.repo.create(manager_id=1, manager_name="A", data=self.data)
         self.repo.update(order.id, status="pending")

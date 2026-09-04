@@ -24,6 +24,7 @@ from app.handlers import register_handlers
 from app.handlers.orders import (
     _notify_log,
     _process_cleanup_messages,
+    _queue_product_photo_sales_card,
     _sync_order,
     _waiting_pickup_reminder_messages,
     reconcile_orders_on_start,
@@ -40,6 +41,8 @@ SYNC_RECONCILIATION_BATCH_SIZE = 100
 SYNC_WORKER_TASK_KEY = "delivery_sync_worker_task"
 PICKUP_REMINDER_INTERVAL = 30 * 60
 PICKUP_REMINDER_TASK_KEY = "pickup_reminder_worker_task"
+SALES_CARD_RECOVERY_INTERVAL = 5 * 60
+SALES_CARD_RECOVERY_BATCH_SIZE = 20
 HEALTH_SIGNAL_FILENAME = "delivery-heartbeat"
 
 
@@ -189,6 +192,54 @@ async def reconcile_pending_orders(application: Application) -> None:
         logger.exception("Background cleanup reconciliation failed")
 
 
+def _sales_card_recovery_slot(timestamp: float | None = None) -> int:
+    current = time.time() if timestamp is None else timestamp
+    return int(current // SALES_CARD_RECOVERY_INTERVAL)
+
+
+async def reconcile_sales_card_requests(
+    application: Application,
+    *,
+    slot: int,
+) -> int:
+    """Recover product photos that never acquired a sales-card queue entry."""
+    repo: OrderRepository = application.bot_data["repo"]
+    if not repo.claim_periodic_job("sales_card_autoqueue", slot):
+        return 0
+    context = SimpleNamespace(application=application, bot=application.bot)
+    queued_count = 0
+    for order in repo.list_sales_cards_needing_queue(
+        limit=SALES_CARD_RECOVERY_BATCH_SIZE,
+    ):
+        try:
+            _, queued = await _queue_product_photo_sales_card(
+                context,
+                order,
+                actor_id=0,
+                actor_name="Delivery Bot",
+                actor_role="integration",
+            )
+        except BadRequest:
+            logger.exception(
+                "Could not recover product photo for sales card on order %s",
+                order.id,
+            )
+            continue
+        except (RetryAfter, NetworkError):
+            raise
+        except Exception:
+            logger.exception(
+                "Could not recover sales-card request for order %s",
+                order.id,
+            )
+            continue
+        if queued:
+            queued_count += 1
+    if queued_count:
+        logger.info("Recovered sales-card requests count=%s", queued_count)
+    return queued_count
+
+
 async def _delivery_sync_worker(application: Application) -> None:
     """Continuously retry interrupted Telegram publications."""
     # The first background pass after startup is a full repair. Startup itself
@@ -199,6 +250,35 @@ async def _delivery_sync_worker(application: Application) -> None:
         while True:
             _touch_health_signal(application)
             await asyncio.sleep(SYNC_RECONCILIATION_INTERVAL)
+
+            try:
+                await reconcile_sales_card_requests(
+                    application,
+                    slot=_sales_card_recovery_slot(),
+                )
+            except RetryAfter as error:
+                retry_after = error.retry_after
+                delay = (
+                    retry_after.total_seconds()
+                    if hasattr(retry_after, "total_seconds")
+                    else float(retry_after)
+                )
+                logger.warning(
+                    "Telegram rate-limited sales-card recovery for %.1f seconds",
+                    delay,
+                )
+                await _sleep_with_health_signal(application, delay)
+                continue
+            except NetworkError as error:
+                logger.warning(
+                    "Telegram is temporarily unavailable during sales-card recovery: %s",
+                    error,
+                )
+                continue
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Background sales-card recovery failed")
 
             preflight_validated = application.bot_data.get("delivery_preflight_validated", False)
             if not preflight_validated or cycles_since_full >= FULL_RECONCILIATION_EVERY:
