@@ -1387,6 +1387,115 @@ class CallSourceTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 403)
         request.json.assert_not_awaited()
 
+    def test_telegram_call_messages_are_silent_by_default(self):
+        with mock.patch.object(
+            bot,
+            "telegram_api",
+            return_value={"ok": True},
+        ) as telegram_api:
+            bot.send_text_message(
+                "Call"
+            )
+            bot.send_voice_bytes(
+                b"voice",
+                "Call",
+            )
+
+        text_call = telegram_api.call_args_list[0]
+        voice_call = telegram_api.call_args_list[1]
+
+        self.assertIs(
+            text_call.kwargs["data"][
+                "disable_notification"
+            ],
+            True,
+        )
+        self.assertIs(
+            voice_call.kwargs["data"][
+                "disable_notification"
+            ],
+            True,
+        )
+
+    def test_missed_incoming_call_mentions_abbos_and_stays_silent(self):
+        event = self.event(
+            54,
+            "+998900000054",
+            0,
+        )
+        event.update(
+            {
+                "answered": 0,
+                "answer_time": 0,
+                "recording": "",
+                "upload_time": (
+                    event["end_time"] + 2
+                ),
+                "event_created": (
+                    event["end_time"] + 2
+                ),
+            }
+        )
+
+        request = mock.Mock()
+        request.headers = {}
+        request.query_params = {}
+        request.json = mock.AsyncMock(
+            return_value={
+                "webhook": self.webhook(
+                    "texnikach@gmail.com"
+                ),
+                "event": event,
+            }
+        )
+        sent = {}
+
+        def send_telegram(
+            text,
+            *args,
+            **kwargs,
+        ):
+            sent["text"] = text
+            sent.update(kwargs)
+            return {
+                "result": {
+                    "message_id": 154,
+                    "chat": {"id": 456},
+                }
+            }
+
+        with mock.patch.multiple(
+            bot,
+            AUTO_SMS_ENABLED=False,
+            RATING_SMS_ENABLED=False,
+            MOIZVONKI_WEBHOOK_SECRET="",
+            MISSED_CALL_ALERT_USERNAME=(
+                "@AbbosTch"
+            ),
+        ), mock.patch.object(
+            bot,
+            "send_text_message",
+            side_effect=send_telegram,
+        ):
+            result = asyncio.run(
+                bot.moizvonki_webhook(
+                    request
+                )
+            )
+
+        self.assertEqual(
+            result["telegram"],
+            "sent",
+        )
+        self.assertIn(
+            "@AbbosTch",
+            sent["text"],
+        )
+        self.assertIs(
+            sent["disable_notification"],
+            True,
+        )
+
     def test_webhook_delivers_telegram_before_client_sms(self):
         event = self.event(
             18,
@@ -1409,9 +1518,15 @@ class CallSourceTests(unittest.TestCase):
         )
 
         delivery_order = []
+        notification_flags = []
 
         def send_telegram(*args, **kwargs):
             delivery_order.append("telegram")
+            notification_flags.append(
+                kwargs[
+                    "disable_notification"
+                ]
+            )
             return {
                 "result": {
                     "message_id": 123,
@@ -1449,6 +1564,10 @@ class CallSourceTests(unittest.TestCase):
         self.assertEqual(
             delivery_order,
             ["telegram", "sms", "sms"],
+        )
+        self.assertEqual(
+            notification_flags,
+            [True],
         )
 
     def test_after_hours_sms_uses_call_start_time_boundaries(self):

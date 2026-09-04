@@ -169,6 +169,11 @@ RESULT_COOLDOWN_HOURS = 30
 # Only this Telegram user may set the internal 1–5 manager score.
 MANAGER_RATING_ADMIN_ID = 202134293
 
+MISSED_CALL_ALERT_USERNAME = os.getenv(
+    "MISSED_CALL_ALERT_USERNAME",
+    "@AbbosTch",
+).strip()
+
 AUTO_SMS_ENABLED = (
     os.getenv(
         "AUTO_SMS_ENABLED",
@@ -9428,6 +9433,28 @@ def format_call_time(
     )
 
 
+def is_missed_incoming_call(
+    direction,
+    answered,
+) -> bool:
+
+    try:
+        return (
+            int(
+                direction
+            ) == 0
+            and int(
+                answered
+                or 0
+            ) == 0
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return False
+
+
 # =========================================================
 # TELEGRAM MESSAGE
 # =========================================================
@@ -9608,8 +9635,28 @@ def build_telegram_message(
 
     lines = [
         title,
-        "",
     ]
+
+    if (
+        is_missed_incoming_call(
+            direction,
+            answered,
+        )
+        and MISSED_CALL_ALERT_USERNAME
+    ):
+        lines.extend(
+            [
+                "",
+                "🔔 "
+                + escape(
+                    MISSED_CALL_ALERT_USERNAME
+                ),
+            ]
+        )
+
+    lines.append(
+        ""
+    )
 
     # -------------------------------------------------
     # INTERNAL CONTACT
@@ -10289,6 +10336,7 @@ def telegram_api(
 def send_text_message(
     text: str,
     reply_markup: dict | None = None,
+    disable_notification: bool = True,
 ):
 
     data = {
@@ -10303,6 +10351,11 @@ def send_text_message(
 
         "disable_web_page_preview":
             True,
+
+        "disable_notification":
+            bool(
+                disable_notification
+            ),
     }
 
     if reply_markup:
@@ -10325,6 +10378,7 @@ def send_voice_bytes(
     voice_bytes: bytes,
     caption: str,
     reply_markup: dict | None = None,
+    disable_notification: bool = True,
 ):
 
     data = {
@@ -10336,6 +10390,11 @@ def send_voice_bytes(
 
         "parse_mode":
             "HTML",
+
+        "disable_notification":
+            bool(
+                disable_notification
+            ),
     }
 
     if reply_markup:
@@ -22294,6 +22353,8 @@ async def moizvonki_webhook(
                         text,
                         reply_markup=
                             result_keyboard,
+                        disable_notification=
+                            True,
                     )
                 )
 
@@ -22304,6 +22365,8 @@ async def moizvonki_webhook(
                         text,
                         reply_markup=
                             result_keyboard,
+                        disable_notification=
+                            True,
                     )
                 )
 
