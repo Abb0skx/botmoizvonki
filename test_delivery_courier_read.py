@@ -499,7 +499,7 @@ class ManagerListAndLogTests(unittest.IsolatedAsyncioTestCase):
 
         await _notify_on_way_log(context, order)
 
-        expected_arrival = (started + timedelta(minutes=30)).strftime("%H:%M")
+        expected_arrival = (started + timedelta(minutes=43)).strftime("%H:%M")
         sent = bot.send_message.await_args.kwargs
         self.assertIn("🚗 <b>Abbos</b> едет к заказу №1", sent["text"])
         self.assertIn("📦 Модель: <b>A57</b>", sent["text"])

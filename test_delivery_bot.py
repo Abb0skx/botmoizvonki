@@ -1132,6 +1132,18 @@ class RepositoryTests(unittest.TestCase):
         self.assertTrue(text.startswith("✅✅✅✅✅✅✅\n✅ "))
         self.assertIn("📦 A7 Pro", text)
 
+    def test_completed_card_keeps_estimated_and_actual_delivery_time(self):
+        order = self.repo.create(manager_id=1, manager_name="A", data=self.data)
+        order = self.repo.update(
+            order.id,
+            estimated_delivery_at="2026-09-04T15:35:00+05:00",
+        )
+
+        text = completed_card(order, "15:42")
+
+        self.assertIn("⏱ По расчёту: 15:35", text)
+        self.assertIn("✅ Доставлено: 15:42", text)
+
     def test_existing_database_gets_delivery_migrations(self):
         legacy_path = Path(self.tempdir.name) / "legacy.db"
         migration_names = set(MIGRATION_COLUMNS)

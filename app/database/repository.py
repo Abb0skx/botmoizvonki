@@ -8,7 +8,7 @@ from typing import Any
 
 from app.models import Order, OrderEvent
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 SQLITE_INT_MAX = 2**63 - 1
 KNOWN_STATUSES = frozenset({
     "draft",
@@ -97,6 +97,7 @@ CREATE TABLE IF NOT EXISTS orders (
     courier_read_at TEXT,
     picked_up_at TEXT,
     time_started TEXT,
+    estimated_delivery_at TEXT,
     delivery_chat_id INTEGER,
     delivery_message_id INTEGER,
     location_chat_id INTEGER,
@@ -212,6 +213,7 @@ MIGRATION_COLUMNS = {
     "sync_attempted_at": "TEXT",
     "courier_read_at": "TEXT",
     "picked_up_at": "TEXT",
+    "estimated_delivery_at": "TEXT",
     "product_photo_file_id": "TEXT",
     "product_photo_unique_id": "TEXT",
     "product_photo_path": "TEXT",
@@ -271,7 +273,8 @@ class OrderRepository:
         "cancelled_at", "cancelled_from_status",
         "assigned_courier_id", "assigned_courier_name",
         "courier_id", "courier_name", "delivery_photo", "received_usd",
-        "received_uzs", "delivered_at", "courier_read_at", "picked_up_at", "time_started", "delivery_chat_id",
+        "received_uzs", "delivered_at", "courier_read_at", "picked_up_at", "time_started",
+        "estimated_delivery_at", "delivery_chat_id",
         "delivery_message_id", "location_chat_id", "location_message_id",
         "location_details_message_id", "second_location_chat_id",
         "location_footer_message_id", "second_location_message_id",

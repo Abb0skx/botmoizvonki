@@ -52,6 +52,7 @@ class Order:
     courier_read_at: str | None = None
     picked_up_at: str | None = None
     time_started: str | None = None
+    estimated_delivery_at: str | None = None
     delivery_chat_id: int | None = None
     delivery_message_id: int | None = None
     location_chat_id: int | None = None

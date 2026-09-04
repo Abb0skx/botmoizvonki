@@ -360,6 +360,9 @@ def _compact_order(
         lines.append(f"🕒 {escape(order.delivery_time)}")
     if order.comment:
         lines.append(f"💬 {escape(order.comment)}")
+    estimated = _local_time(order.estimated_delivery_at)
+    if order.status == "on_way" and estimated:
+        lines.append(f"⏱ Будет примерно к <b>{escape(estimated)}</b>")
     return "\n".join(lines) + f"\n\n{locations_text(order)}"
 
 
@@ -467,6 +470,9 @@ def orders_channel_card(order: Order) -> str:
     started = _local_datetime(order.time_started)
     if started:
         lines.append(f"🚗 Начал доставку: {escape(started)}")
+    estimated = _local_datetime(order.estimated_delivery_at)
+    if estimated:
+        lines.append(f"⏱ По расчёту: {escape(estimated)}")
     delivered = _local_datetime(order.delivered_at)
     if delivered:
         lines.append(f"✅ Доставлено: {escape(delivered)}")
@@ -503,12 +509,18 @@ def completed_card(order: Order, local_time: str) -> str:
     else:
         payment_result = f"💰 {money(order.amount_usd, order.amount_uzs)}"
     photo_result = "\n📸 Фото получено" if order.delivery_photo else ""
+    estimated = _local_time(order.estimated_delivery_at)
+    timing = (
+        f"⏱ По расчёту: {escape(estimated)}\n✅ Доставлено: {escape(local_time)}"
+        if estimated
+        else f"✅ Доставлено: {escape(local_time)}"
+    )
     return (
         "✅✅✅✅✅✅✅\n"
         f"✅ <b>Заказ №{order.order_number} доставлен</b>{photo_result}\n"
         f"📦 {escape(order.product)}\n"
         f"{payment_result}\n"
-        f"👤 {escape(order.courier_name or '—')}\n🕒 {local_time}"
+        f"👤 {escape(order.courier_name or '—')}\n{timing}"
     )
 
 

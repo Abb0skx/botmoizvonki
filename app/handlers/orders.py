@@ -307,7 +307,19 @@ async def _estimated_delivery_time(
     context: ContextTypes.DEFAULT_TYPE,
     order,
 ) -> str | None:
-    """Estimate arrival using the same road route as the manager monitor."""
+    """Estimate arrival using road time plus a 20% and seven-minute reserve."""
+    if order.estimated_delivery_at:
+        try:
+            stored = datetime.fromisoformat(order.estimated_delivery_at)
+            if stored.tzinfo is None:
+                stored = stored.replace(tzinfo=ZoneInfo("Asia/Tashkent"))
+            return stored.astimezone(ZoneInfo("Asia/Tashkent")).strftime("%H:%M")
+        except ValueError:
+            logger.warning(
+                "Invalid stored delivery estimate for order %s: %r",
+                order.id,
+                order.estimated_delivery_at,
+            )
     routing = context.application.bot_data.get("routing_service")
     if routing is None or not order.time_started:
         return None
@@ -323,7 +335,8 @@ async def _estimated_delivery_time(
         if len(points) < 2:
             return None
         road_route = await routing.route(points)
-        duration_seconds = max(60, int(road_route.get("duration_s") or 0))
+        route_seconds = max(60, int(road_route.get("duration_s") or 0))
+        duration_seconds = round(route_seconds * 1.20) + 7 * 60
         started = datetime.fromisoformat(order.time_started)
         if started.tzinfo is None:
             started = started.replace(tzinfo=ZoneInfo("Asia/Tashkent"))
@@ -332,6 +345,31 @@ async def _estimated_delivery_time(
     except Exception:
         logger.exception("Could not estimate arrival time for order %s", order.id)
         return None
+
+
+async def _store_estimated_delivery_time(
+    context: ContextTypes.DEFAULT_TYPE,
+    order,
+):
+    """Calculate and persist the estimate once so every card shows one value."""
+    arrival_time = await _estimated_delivery_time(context, order)
+    if not arrival_time or order.estimated_delivery_at:
+        return order
+    started = datetime.fromisoformat(order.time_started)
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=ZoneInfo("Asia/Tashkent"))
+    local_started = started.astimezone(ZoneInfo("Asia/Tashkent"))
+    hours, minutes = (int(value) for value in arrival_time.split(":"))
+    arrival = local_started.replace(hour=hours, minute=minutes, second=0, microsecond=0)
+    if arrival < local_started:
+        arrival += timedelta(days=1)
+    repo: OrderRepository = context.application.bot_data["repo"]
+    updated = repo.update(
+        order.id,
+        expected_updated_at=order.updated_at,
+        estimated_delivery_at=arrival.isoformat(timespec="seconds"),
+    )
+    return updated or repo.get(order.id)
 
 
 async def _notify_on_way_log(
@@ -2776,6 +2814,7 @@ async def manager_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             courier_name=None,
             courier_read_at=None,
             time_started=None,
+            estimated_delivery_at=None,
             actor_id=query.from_user.id,
             actor_name=_name(query.from_user),
             actor_role="manager",
@@ -2970,6 +3009,7 @@ async def courier_assignment_action(update: Update, context: ContextTypes.DEFAUL
             courier_read_at=None,
             picked_up_at=None,
             time_started=None,
+            estimated_delivery_at=None,
             delivery_photo=None,
             received_usd=None,
             received_uzs=None,
@@ -3014,6 +3054,7 @@ async def courier_assignment_action(update: Update, context: ContextTypes.DEFAUL
             courier_read_at=None,
             picked_up_at=None,
             time_started=None,
+            estimated_delivery_at=None,
             delivery_photo=None,
             received_usd=None,
             received_uzs=None,
@@ -3194,6 +3235,7 @@ async def manager_pickup_action(update: Update, context: ContextTypes.DEFAULT_TY
                 courier_id=None,
                 courier_name=None,
                 time_started=None,
+                estimated_delivery_at=None,
                 actor_id=user.id,
                 actor_name=_name(user),
                 actor_role="manager",
@@ -3383,7 +3425,11 @@ async def group_cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE
         if target_status == "on_way":
             if not effective_courier_id:
                 target_status = "picked_up" if current.picked_up_at else "pending"
-                transition_fields = {"status": target_status, "time_started": None}
+                transition_fields = {
+                    "status": target_status,
+                    "time_started": None,
+                    "estimated_delivery_at": None,
+                }
             else:
                 transition_fields["courier_id"] = effective_courier_id
                 transition_options = {
@@ -3480,7 +3526,12 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "delivered_at": None,
         }
         if target_status == "pending":
-            reset.update(courier_id=None, courier_name=None, time_started=None)
+            reset.update(
+                courier_id=None,
+                courier_name=None,
+                time_started=None,
+                estimated_delivery_at=None,
+            )
         order = repo.transition(
             order.id,
             {"awaiting_photo", "awaiting_amount", "completed"},
@@ -3520,6 +3571,7 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         reset = {
             "status": target_status,
             "time_started": None,
+            "estimated_delivery_at": None,
         }
         if target_status == "pending":
             reset.update(courier_id=None, courier_name=None)
@@ -3577,6 +3629,7 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 show_alert=True,
             )
             return
+        order = await _store_estimated_delivery_time(context, order)
         await query.answer("Статус обновлён")
         await _finish_status_change(
             context,

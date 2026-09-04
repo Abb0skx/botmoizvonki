@@ -358,7 +358,7 @@ class DeliveryRepositorySafetyTests(unittest.TestCase):
         self.assertIn("next_attempt_at", cleanup_columns)
         self.assertIn("terminal", cleanup_columns)
 
-    def test_periodic_job_claim_table_is_initialized_at_schema_v4(self) -> None:
+    def test_periodic_job_claim_table_is_initialized_at_current_schema(self) -> None:
         with self.repo.connect() as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
             table = db.execute(
@@ -366,8 +366,8 @@ class DeliveryRepositorySafetyTests(unittest.TestCase):
                 ("periodic_job_claims",),
             ).fetchone()
 
-        self.assertEqual(SCHEMA_VERSION, 4)
-        self.assertEqual(version, 4)
+        self.assertEqual(SCHEMA_VERSION, 5)
+        self.assertEqual(version, 5)
         self.assertIsNotNone(table)
 
     def test_periodic_job_claim_is_idempotent_per_job_and_slot(self) -> None:
