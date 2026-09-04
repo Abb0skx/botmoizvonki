@@ -3572,6 +3572,7 @@ class SalesPhotoRepository:
         product_label: str | None,
         supplier_price_filled: bool | None = None,
         phone_field_filled: bool | None = None,
+        preserve_phones: bool = False,
         at: datetime | None = None,
     ) -> bool:
         """Persist customer identity for call and sales analytics.
@@ -3593,14 +3594,18 @@ class SalesPhotoRepository:
         with self._connect() as db:
             cursor = db.execute(
                 """UPDATE sales_photo_jobs
-                   SET client_phone=?,client_phone_2=?,product_label=?,
+                   SET client_phone=CASE WHEN ? THEN client_phone ELSE ? END,
+                       client_phone_2=CASE WHEN ? THEN client_phone_2 ELSE ? END,
+                       product_label=?,
                        supplier_price_filled=COALESCE(?,supplier_price_filled),
                        phone_field_filled=COALESCE(?,phone_field_filled),
                        updated_at=?
                    WHERE chat_id=? AND replacement_message_id=?
                      AND status IN ('reposted','delete_pending','complete')""",
                 (
+                    int(bool(preserve_phones)),
                     first_phone,
+                    int(bool(preserve_phones)),
                     second_phone,
                     product,
                     (

@@ -53,14 +53,29 @@ _PHONE_RUN_RE = re.compile(
     r"(?<!\w)(?:\+|00)?[0-9]"
     r"(?:[0-9 \t\u00a0().\-\u2010-\u2015\u2212]*[0-9])?(?!\w)"
 )
-_CARD_HEADER_RE = re.compile(r"^[ \t\u2063]*🛒💵[ \t]*:")
-_EXPENSE_LINE_RE = re.compile(r"^[ \t]*rasxod[ \t]*:", re.IGNORECASE)
+_LINE_PREFIX = r"[ \t\u2063\u2064\ufeff]*"
+_CARD_HEADER_RE = re.compile(rf"^{_LINE_PREFIX}🛒💵[ \t]*:")
+_EXPENSE_LINE_RE = re.compile(
+    rf"^{_LINE_PREFIX}rasxod[ \t]*:",
+    re.IGNORECASE,
+)
 _PHONE_LINE_RE = re.compile(
-    r"^(?P<prefix>[ \t\u2063]*)📞[ \t]*:"
+    rf"^(?P<prefix>{_LINE_PREFIX})📞[ \t]*:"
+)
+_CASH_HEADER_RE = re.compile(rf"^{_LINE_PREFIX}Наличка[ \t]*$", re.IGNORECASE)
+_CARD_PAYMENT_HEADER_RE = re.compile(
+    rf"^{_LINE_PREFIX}Card/Terminal/Paynet[ \t]*$",
+    re.IGNORECASE,
+)
+_MONEY_LINE_RE = re.compile(rf"^{_LINE_PREFIX}(?:💵|🇺🇿)[ \t]*:")
+_DELIVERY_LINE_RE = re.compile(
+    rf"^{_LINE_PREFIX}(?:Доставка|Статус)[ \t]*:",
+    re.IGNORECASE,
 )
 _PHONE_FIELD_SEPARATORS_RE = re.compile(
     r"^[\s/|,;.()\-\u2010-\u2015\u2212]*$"
 )
+_NO_PHONE_VALUES = frozenset({"-", "–", "—", "без номера"})
 _PRODUCT_TRIM_RE = re.compile(
     r"^[\s/|,;:.()\-\u2010-\u2015\u2212]+|"
     r"[\s/|,;:.()\-\u2010-\u2015\u2212]+$"
@@ -185,18 +200,112 @@ def extract_uzbek_phones(value: object, limit: int = 2) -> tuple[str, ...]:
     return result if len(result) <= maximum else ()
 
 
-def extract_caption_phones(value: object) -> tuple[str, ...]:
-    """Extract only the generated card's canonical phone field."""
+@dataclass(frozen=True)
+class CaptionPhoneField:
+    """A fail-closed structural reading of the generated card's phone row."""
+
+    state: str
+    phones: tuple[str, ...] = ()
+    start: int | None = None
+    end: int | None = None
+    prefix: str = ""
+    value: str = ""
+
+    @property
+    def conclusive(self) -> bool:
+        return self.state in {"valid", "empty"}
+
+
+def _is_structural_barrier(line: str) -> bool:
+    return any(
+        pattern.match(line) is not None
+        for pattern in (
+            _PHONE_LINE_RE,
+            _CASH_HEADER_RE,
+            _CARD_PAYMENT_HEADER_RE,
+            _MONEY_LINE_RE,
+            _DELIVERY_LINE_RE,
+        )
+    )
+
+
+def parse_caption_phone_field(value: object) -> CaptionPhoneField:
+    """Locate and validate only the canonical ``📞:`` field.
+
+    Supplier/price text may span multiple lines between ``🛒💵:`` and
+    ``rasxod:``. Structural ambiguity remains fail-closed so phone-like prices,
+    expenses, payment values, IMEIs, and notes are never used for matching.
+    """
 
     caption = str(value or "")
-    span = _canonical_phone_span(caption)
-    if span is None:
-        return ()
-    start, end, match = span
+    lines = _line_spans(caption)
+    header_indexes = [
+        index
+        for index, (_, _, line) in enumerate(lines)
+        if _CARD_HEADER_RE.match(line) is not None
+    ]
+    if len(header_indexes) != 1:
+        return CaptionPhoneField("malformed")
+    header_index = header_indexes[0]
+
+    expense_indexes = [
+        index
+        for index, (_, _, line) in enumerate(lines)
+        if _EXPENSE_LINE_RE.match(line) is not None
+    ]
+    phone_indexes = [
+        index
+        for index, (_, _, line) in enumerate(lines)
+        if _PHONE_LINE_RE.match(line) is not None
+    ]
+    if len(expense_indexes) != 1 or len(phone_indexes) != 1:
+        return CaptionPhoneField("malformed")
+    expense_index = expense_indexes[0]
+    phone_index = phone_indexes[0]
+    if not header_index < expense_index < phone_index:
+        return CaptionPhoneField("malformed")
+    if any(
+        _is_structural_barrier(lines[index][2])
+        for index in range(header_index + 1, expense_index)
+    ):
+        return CaptionPhoneField("malformed")
+
+    first_nonblank_after_expense = next(
+        (
+            index
+            for index in range(expense_index + 1, len(lines))
+            if lines[index][2].strip(" \t\u2063\u2064\ufeff")
+        ),
+        None,
+    )
+    if first_nonblank_after_expense != phone_index:
+        return CaptionPhoneField("malformed")
+
+    start, end, line = lines[phone_index]
+    match = _PHONE_LINE_RE.match(line)
+    if match is None:
+        return CaptionPhoneField("malformed")
     field_value = caption[start + match.end() : end]
+    stripped = field_value.strip()
+    base = CaptionPhoneField(
+        "empty",
+        start=start,
+        end=end,
+        prefix=match.group("prefix"),
+        value=field_value,
+    )
+    if not stripped or stripped.casefold() in _NO_PHONE_VALUES:
+        return base
+
     phones, accepted_spans = _scan_uzbek_phones(field_value, stop_after=3)
     if not phones or len(phones) > 2:
-        return ()
+        return CaptionPhoneField(
+            "invalid",
+            start=start,
+            end=end,
+            prefix=match.group("prefix"),
+            value=field_value,
+        )
     residual = []
     previous_end = 0
     for span_start, span_end in accepted_spans:
@@ -204,8 +313,28 @@ def extract_caption_phones(value: object) -> tuple[str, ...]:
         previous_end = span_end
     residual.append(field_value[previous_end:])
     if _PHONE_FIELD_SEPARATORS_RE.fullmatch("".join(residual)) is None:
-        return ()
-    return phones
+        return CaptionPhoneField(
+            "invalid",
+            start=start,
+            end=end,
+            prefix=match.group("prefix"),
+            value=field_value,
+        )
+    return CaptionPhoneField(
+        "valid",
+        phones=phones,
+        start=start,
+        end=end,
+        prefix=match.group("prefix"),
+        value=field_value,
+    )
+
+
+def extract_caption_phones(value: object) -> tuple[str, ...]:
+    """Extract phones only from a structurally valid generated card."""
+
+    parsed = parse_caption_phone_field(value)
+    return parsed.phones if parsed.state == "valid" else ()
 
 
 def extract_product_label(value: object, limit: int = 120) -> str | None:
@@ -263,37 +392,6 @@ def _line_spans(value: str) -> tuple[tuple[int, int, str], ...]:
     return tuple(result)
 
 
-def _canonical_phone_span(
-    caption: str,
-) -> tuple[int, int, re.Match[str]] | None:
-    """Locate the generated card's phone row, not arbitrary phone-like text."""
-
-    lines = _line_spans(caption)
-    header_index = next(
-        (
-            index
-            for index, (_, _, line) in enumerate(lines[:8])
-            if _CARD_HEADER_RE.match(line) is not None
-        ),
-        None,
-    )
-    if header_index is None or len(lines) <= header_index + 2:
-        return None
-    if _EXPENSE_LINE_RE.match(lines[header_index + 1][2]) is None:
-        return None
-
-    # In the generated layout the phone row is the first non-empty row after
-    # ``rasxod``. Allow extra blank rows because managers edit captions by hand.
-    for start, end, line in lines[header_index + 2 :]:
-        if not line.strip(" \t\u2063"):
-            continue
-        match = _PHONE_LINE_RE.match(line)
-        if match is None:
-            return None
-        return start, end, match
-    return None
-
-
 @dataclass(frozen=True)
 class PhoneCaptionNormalization:
     caption: str
@@ -316,28 +414,16 @@ def normalize_caption_phone_field(
 
     original = str(caption or "")
     original_entities = tuple(entities or ())
-    phone_span = _canonical_phone_span(original)
-    if phone_span is None:
+    parsed = parse_caption_phone_field(original)
+    if parsed.state in {"malformed", "invalid"}:
         return PhoneCaptionNormalization(original, original_entities)
-    start, end, match = phone_span
-    field_value = original[start + match.end() : end]
-    candidates, accepted_spans = _scan_uzbek_phones(field_value, stop_after=3)
-    if len(candidates) > 2:
+    if parsed.start is None or parsed.end is None:
         return PhoneCaptionNormalization(original, original_entities)
-    # Do not erase incomplete notes while a manager is typing. Empty rows are
-    # canonicalized, and rows with one or two valid numbers are normalized.
-    if field_value.strip() and not candidates:
+    start, end = parsed.start, parsed.end
+    if parsed.state == "empty" and parsed.value.strip():
+        # Keep an intentional no-phone placeholder exactly as the manager typed it.
         return PhoneCaptionNormalization(original, original_entities)
-    if candidates:
-        residual_parts: list[str] = []
-        previous_end = 0
-        for span_start, span_end in accepted_spans:
-            residual_parts.append(field_value[previous_end:span_start])
-            previous_end = span_end
-        residual_parts.append(field_value[previous_end:])
-        if _PHONE_FIELD_SEPARATORS_RE.fullmatch("".join(residual_parts)) is None:
-            return PhoneCaptionNormalization(original, original_entities)
-    replacement = match.group("prefix") + phone_line(candidates)
+    replacement = parsed.prefix + phone_line(parsed.phones)
     if original[start:end] == replacement:
         return PhoneCaptionNormalization(original, original_entities)
 

@@ -91,35 +91,41 @@ class DeliveryEvent:
 class DeliveryIndex:
     orders: tuple[DeliveryOrder, ...]
 
-    def match(
+    def resolve(
         self,
         phones: Iterable[str],
         sale_date: date,
-    ) -> DeliveryOrder | None:
-        keys = frozenset(
-            key for value in phones if (key := _phone_key(value)) is not None
+    ) -> tuple[int, DeliveryOrder | None, str | None]:
+        keyed_phones = tuple(
+            (value, key)
+            for value in dict.fromkeys(str(phone) for phone in phones)
+            if (key := _phone_key(value)) is not None
         )
-        if not keys:
-            return None
+        if not keyed_phones:
+            return 0, None, None
+        keys = frozenset(key for _, key in keyed_phones)
         matched = {
             order.id: order
             for order in self.orders
             if order.created_date == sale_date and order.phones.intersection(keys)
         }
-        return next(iter(matched.values())) if len(matched) == 1 else None
+        if len(matched) != 1:
+            return len(matched), None, None
+        order = next(iter(matched.values()))
+        matched_phone = next(
+            value for value, key in keyed_phones if key in order.phones
+        )
+        return 1, order, matched_phone
+
+    def match(
+        self,
+        phones: Iterable[str],
+        sale_date: date,
+    ) -> DeliveryOrder | None:
+        return self.resolve(phones, sale_date)[1]
 
     def match_count(self, phones: Iterable[str], sale_date: date) -> int:
-        keys = frozenset(
-            key for value in phones if (key := _phone_key(value)) is not None
-        )
-        return len(
-            {
-                order.id
-                for order in self.orders
-                if order.created_date == sale_date
-                and order.phones.intersection(keys)
-            }
-        )
+        return self.resolve(phones, sale_date)[0]
 
 
 class DeliveryReader:

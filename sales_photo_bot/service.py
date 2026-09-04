@@ -58,9 +58,9 @@ from .keyboards import (
 from .models import EMPTY_IDENTIFIERS, ProductIdentifiers
 from .orders import card_order_id, ensure_card_order_id
 from .phones import (
-    extract_caption_phones,
     extract_product_label,
     normalize_caption_phone_field,
+    parse_caption_phone_field,
 )
 from .prices import normalize_card_prices
 from .repository import SalesPhotoRepository, utc_now
@@ -471,7 +471,10 @@ class SalesPhotoService:
     ) -> bool:
         if call_index is None:
             return False
-        match = call_index.match(extract_caption_phones(body), sale_date)
+        phone_field = parse_caption_phone_field(body)
+        if not phone_field.conclusive:
+            return False
+        match = call_index.match(phone_field.phones, sale_date)
         _, changed = self.repository.sync_auto_call_manager(
             chat_id,
             source_message_id,
@@ -495,17 +498,30 @@ class SalesPhotoService:
     ) -> tuple[_CardNormalization, bool]:
         if delivery_index is None:
             return _CardNormalization(body, entities), False
-        phones = extract_caption_phones(body)
-        match_count = delivery_index.match_count(phones, sale_date)
-        order = delivery_index.match(phones, sale_date) if match_count == 1 else None
+        phone_field = parse_caption_phone_field(body)
+        if not phone_field.conclusive:
+            logger.info(
+                "sales_photo_delivery_match source_message_id=%s "
+                "reason=phone_field_%s action=preserved",
+                source_message_id,
+                phone_field.state,
+            )
+            return _CardNormalization(body, entities), False
+
+        match_count, order, matched_phone = delivery_index.resolve(
+            phone_field.phones,
+            sale_date,
+        )
         manager_changed = False
         if order is not None:
+            if matched_phone is None:
+                raise RuntimeError("delivery_match_phone_missing")
             self.repository.upsert_delivery_link(
                 chat_id,
                 source_message_id,
                 delivery_order_id=order.id,
                 delivery_order_number=order.order_number,
-                matched_phone=phones[0],
+                matched_phone=matched_phone,
                 sale_date=sale_date,
             )
             _, manager_changed = self.repository.sync_auto_delivery_manager(
@@ -513,11 +529,25 @@ class SalesPhotoService:
                 source_message_id,
                 self._sales_manager_name(order.manager_name),
             )
+            reason = "exact_match"
         else:
             _, manager_changed = self.repository.unlink_delivery(
                 chat_id,
                 source_message_id,
             )
+            if phone_field.state == "empty":
+                reason = "phone_field_empty"
+            elif match_count == 0:
+                reason = "zero_matches"
+            else:
+                reason = "ambiguous_match"
+        logger.info(
+            "sales_photo_delivery_match source_message_id=%s "
+            "reason=%s match_count=%s",
+            source_message_id,
+            reason,
+            match_count,
+        )
         normalized = normalize_delivery_block(
             body,
             entities,
@@ -1179,13 +1209,15 @@ class SalesPhotoService:
     ) -> None:
         try:
             fill = inspect_fill_fields(body, None)
+            phone_field = parse_caption_phone_field(body)
             self.repository.sync_sale_details(
                 chat_id,
                 replacement_message_id,
-                extract_caption_phones(body),
+                phone_field.phones,
                 product_label_from_card(body),
                 supplier_price_filled=fill.supplier_price,
                 phone_field_filled=fill.phone,
+                preserve_phones=not phone_field.conclusive,
             )
         except Exception as exc:
             logger.warning(

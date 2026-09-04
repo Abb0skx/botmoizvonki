@@ -5,10 +5,12 @@ import unittest
 from telegram import MessageEntity
 
 from sales_photo_bot.phones import (
+    extract_caption_phones,
     extract_product_label,
     extract_uzbek_phones,
     normalize_caption_phone_field,
     normalize_uzbek_phone,
+    parse_caption_phone_field,
     phone_line,
 )
 
@@ -174,6 +176,77 @@ class ProductLabelTests(unittest.TestCase):
 
 
 class CaptionPhoneFieldTests(unittest.TestCase):
+    def test_multiline_supplier_section_is_structurally_valid(self):
+        for extra_lines in (
+            ("Supplier",),
+            ("Supplier", "Keyboard gift"),
+            ("Supplier", "Keyboard gift", "A33 8/256"),
+        ):
+            with self.subTest(extra_lines=extra_lines):
+                caption = (
+                    BOT_CARD_MARKER
+                    + "🆔: 1\n\n🛒💵: Toshkent 170$\n"
+                    + "\n".join(extra_lines)
+                    + "\nrasxod:\n\n📞:+998901234567\n\nНаличка"
+                )
+
+                parsed = parse_caption_phone_field(caption)
+                normalized = normalize_caption_phone_field(caption)
+
+                self.assertEqual(parsed.state, "valid")
+                self.assertEqual(parsed.phones, ("+998 90 123 45 67",))
+                self.assertTrue(normalized.changed)
+                self.assertIn("📞: +998 90 123 45 67", normalized.caption)
+
+    def test_phone_like_values_outside_phone_row_are_ignored(self):
+        caption = (
+            BOT_CARD_MARKER
+            + "🛒💵: Supplier 998901112233\n"
+            "IMEI 490154203237518\n"
+            "rasxod: 998933334455\n\n"
+            "📞: 90 123 45 67\n\n"
+            "Наличка\n💵: 901234567\n🇺🇿: 998901112233"
+        )
+
+        self.assertEqual(
+            extract_caption_phones(caption),
+            ("+998 90 123 45 67",),
+        )
+
+    def test_malformed_structure_is_distinct_from_invalid_phone(self):
+        malformed = (
+            BOT_CARD_MARKER
+            + "🛒💵:\nrasxod:\nmanager note\n📞: 901234567\nНаличка"
+        )
+        duplicate = (
+            BOT_CARD_MARKER
+            + "🛒💵:\n🛒💵:\nrasxod:\n\n📞: 901234567\nНаличка"
+        )
+        invalid = (
+            BOT_CARD_MARKER
+            + "🛒💵:\nrasxod:\n\n📞: Akmal 901234567\nНаличка"
+        )
+
+        self.assertEqual(parse_caption_phone_field(malformed).state, "malformed")
+        self.assertEqual(parse_caption_phone_field(duplicate).state, "malformed")
+        self.assertEqual(parse_caption_phone_field(invalid).state, "invalid")
+
+    def test_empty_and_no_phone_placeholders_are_conclusive(self):
+        for value in ("", "-", "—", "Без номера"):
+            with self.subTest(value=value):
+                caption = (
+                    BOT_CARD_MARKER
+                    + "🛒💵:\nrasxod:\n\n📞: "
+                    + value
+                    + "\n\nНаличка"
+                )
+
+                parsed = parse_caption_phone_field(caption)
+
+                self.assertEqual(parsed.state, "empty")
+                self.assertTrue(parsed.conclusive)
+                self.assertEqual(parsed.phones, ())
+
     def test_text_card_can_use_telegram_4096_character_limit(self):
         caption = (
             BOT_CARD_MARKER
