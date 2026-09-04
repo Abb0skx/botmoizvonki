@@ -434,7 +434,7 @@ class DeliveryServiceTests(unittest.IsolatedAsyncioTestCase):
                     "🛒💵: Toshkent 170$\n"
                     "Keyboard gift\n"
                     "A33 8/256\n"
-                    "rasxod:\n\n"
+                    "rasxod\n\n"
                     "📞:+998901234567\n\n"
                     "Наличка\n💵:\n🇺🇿:\n\n"
                     "Card/Terminal/Paynet\n💵:\n🇺🇿:"

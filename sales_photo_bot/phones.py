@@ -56,7 +56,7 @@ _PHONE_RUN_RE = re.compile(
 _LINE_PREFIX = r"[ \t\u2063\u2064\ufeff]*"
 _CARD_HEADER_RE = re.compile(rf"^{_LINE_PREFIX}🛒💵[ \t]*:")
 _EXPENSE_LINE_RE = re.compile(
-    rf"^{_LINE_PREFIX}rasxod[ \t]*:",
+    rf"^{_LINE_PREFIX}rasxod[ \t]*(?::|$)",
     re.IGNORECASE,
 )
 _PHONE_LINE_RE = re.compile(

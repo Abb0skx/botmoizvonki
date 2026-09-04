@@ -198,6 +198,23 @@ class CaptionPhoneFieldTests(unittest.TestCase):
                 self.assertTrue(normalized.changed)
                 self.assertIn("📞: +998 90 123 45 67", normalized.caption)
 
+    def test_expense_anchor_without_colon_is_accepted(self):
+        caption = (
+            BOT_CARD_MARKER
+            + "🆔: 11\n\n"
+            "🛒💵: Tablet 240$\n"
+            "Keyboard 20$\n"
+            "A33 pen 10$\n"
+            "rasxod\n\n"
+            "📞:+998901234567\n\n"
+            "Наличка\n💵:\n🇺🇿:"
+        )
+
+        parsed = parse_caption_phone_field(caption)
+
+        self.assertEqual(parsed.state, "valid")
+        self.assertEqual(parsed.phones, ("+998 90 123 45 67",))
+
     def test_phone_like_values_outside_phone_row_are_ignored(self):
         caption = (
             BOT_CARD_MARKER
