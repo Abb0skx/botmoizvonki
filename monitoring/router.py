@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -38,6 +39,20 @@ ROOT = Path(__file__).resolve().parent
 TEMPLATES = ROOT / "templates"
 STATIC = ROOT / "static"
 
+_PRICE_ADMIN_GET_PATHS = frozenset({"jobs", "sections"})
+_PRICE_ADMIN_POST_PATHS = (
+    re.compile(
+        r"sections/[a-z0-9][a-z0-9-]{0,127}/"
+        r"(?:send-now|edit-current|schedule)"
+    ),
+    re.compile(r"jobs/[1-9][0-9]*/(?:cancel|reconcile)"),
+    re.compile(r"quick-link-rotations/publish-now"),
+    re.compile(
+        r"quick-link-rotations/[1-9][0-9]*/(?:reconcile|retry)"
+    ),
+    re.compile(r"posts/update-all"),
+)
+
 router = APIRouter(tags=["manager-monitoring"])
 settings = MonitoringSettings.load()
 _store: MonitoringStore | None = None
@@ -71,6 +86,40 @@ def _html(content: str, status_code: int = 200) -> HTMLResponse:
     return monitoring_security_headers(HTMLResponse(content, status_code=status_code))
 
 
+def _login_redirect(request: Request) -> Response:
+    next_path = request.url.path
+    if request.url.query:
+        next_path += "?" + request.url.query
+    return monitoring_security_headers(RedirectResponse(
+        "/monitoring/login?next=" + quote(next_path, safe=""),
+        status_code=303,
+    ))
+
+
+def _inject_price_admin_script(content: bytes) -> bytes:
+    try:
+        document = content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(
+            status_code=502, detail="price_catalog_invalid_encoding"
+        ) from exc
+    script = (
+        '<script src="/monitoring/assets/price-admin-bridge.js"></script>'
+        '<script src="/price/assets/admin.js" defer></script>'
+    )
+    legacy = '<script src="/price/assets/admin.js" defer></script>'
+    if script in document:
+        return content
+    if legacy in document:
+        return document.replace(legacy, script, 1).encode("utf-8")
+    body_index = document.casefold().rfind("</body>")
+    if body_index >= 0:
+        document = document[:body_index] + script + document[body_index:]
+    else:
+        document += script
+    return document.encode("utf-8")
+
+
 def _catalog_html(content: bytes) -> Response:
     response = Response(content, media_type="text/html")
     response.headers["Cache-Control"] = "no-store, private"
@@ -86,6 +135,32 @@ def _catalog_html(content: bytes) -> Response:
         "frame-ancestors 'self'; base-uri 'none'; form-action 'none'"
     )
     return response
+
+
+def _price_manage_html(content: bytes) -> Response:
+    response = Response(content, media_type="text/html")
+    response.headers["Cache-Control"] = "no-store, private"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["X-Robots-Tag"] = "noindex, nofollow, noarchive"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'none'; script-src 'self' 'unsafe-inline'; "
+        "style-src 'unsafe-inline' https:; img-src data: https:; "
+        "font-src data: https:; connect-src 'self'; "
+        "frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+    )
+    return response
+
+
+def _price_admin_target(method: str, path: str) -> str:
+    allowed = path in _PRICE_ADMIN_GET_PATHS if method == "GET" else any(
+        pattern.fullmatch(path) for pattern in _PRICE_ADMIN_POST_PATHS
+    )
+    if not allowed:
+        raise HTTPException(status_code=404, detail="price_action_not_found")
+    return "/price/api/v1/" + path
 
 
 def _meta(source: str, status: str = "ok", **extra: Any) -> dict[str, Any]:
@@ -201,7 +276,9 @@ def auth_logout(request: Request):
 
 @router.get("/monitoring/assets/{filename}")
 def monitoring_asset(filename: str):
-    if filename not in {"monitoring.css", "monitoring.js"}:
+    if filename not in {
+        "monitoring.css", "monitoring.js", "price-admin-bridge.js",
+    }:
         raise HTTPException(status_code=404, detail="asset_not_found")
     path = STATIC / filename
     media_type = "text/css" if filename.endswith(".css") else "application/javascript"
@@ -221,14 +298,15 @@ def monitoring_page(request: Request):
         principal = _principal(request)
     except HTTPException as exc:
         if exc.status_code == 401:
-            next_path = request.url.path
-            if request.url.query:
-                next_path += "?" + request.url.query
-            return monitoring_security_headers(RedirectResponse(
-                "/monitoring/login?next=" + quote(next_path, safe=""),
-                status_code=303,
-            ))
+            return _login_redirect(request)
         raise
+    if (
+        request.url.path == "/monitoring/prices"
+        and settings.can_manage_prices(principal.telegram_user_id)
+    ):
+        return monitoring_security_headers(RedirectResponse(
+            "/monitoring/prices/manage", status_code=303
+        ))
     section = request.url.path.removeprefix("/monitoring/").strip("/")
     if request.url.path == "/monitoring":
         section = ""
@@ -240,6 +318,9 @@ def monitoring_page(request: Request):
                 "id": principal.telegram_user_id,
                 "name": principal.display_name,
                 "role": principal.role,
+                "can_manage_prices": settings.can_manage_prices(
+                    principal.telegram_user_id
+                ),
             },
         },
         ensure_ascii=False,
@@ -358,6 +439,94 @@ async def monitoring_price_catalog(request: Request):
             status_code=502, detail="price_catalog_invalid_media_type"
         )
     return _catalog_html(content)
+
+
+@router.get("/monitoring/prices/manage")
+async def monitoring_price_manage(request: Request):
+    try:
+        principal = _principal(request)
+    except HTTPException as exc:
+        if exc.status_code == 401:
+            return _login_redirect(request)
+        raise
+    if not settings.can_manage_prices(principal.telegram_user_id):
+        raise HTTPException(status_code=403, detail="price_editor_required")
+    try:
+        content, media_type = await prices_adapter.PriceAdapter(
+            settings
+        ).catalog()
+    except (httpx.HTTPError, RuntimeError, ValueError):
+        raise HTTPException(
+            status_code=503, detail="price_catalog_unavailable"
+        ) from None
+    if media_type.split(";", 1)[0].strip().casefold() != "text/html":
+        raise HTTPException(
+            status_code=502, detail="price_catalog_invalid_media_type"
+        )
+    return _price_manage_html(_inject_price_admin_script(content))
+
+
+@router.api_route(
+    "/monitoring/api/prices/admin/{path:path}",
+    methods=["GET", "POST"],
+)
+async def api_price_admin(request: Request, path: str):
+    principal = _principal(request)
+    if not settings.can_manage_prices(principal.telegram_user_id):
+        raise HTTPException(status_code=403, detail="price_editor_required")
+    method = request.method.upper()
+    target = _price_admin_target(method, path)
+    body = b""
+    idempotency_key = request.headers.get("idempotency-key", "")[:128]
+    if method == "POST":
+        get_auth().verify_csrf(request, principal)
+        content_length = request.headers.get("content-length", "")
+        try:
+            if content_length and int(content_length) > 64 * 1024:
+                raise HTTPException(status_code=413, detail="request_too_large")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid_content_length")
+        body = await request.body()
+        if len(body) > 64 * 1024:
+            raise HTTPException(status_code=413, detail="request_too_large")
+    try:
+        status_code, content, media_type = await prices_adapter.PriceAdapter(
+            settings
+        ).admin_request(
+            method,
+            target,
+            body=body,
+            idempotency_key=idempotency_key,
+        )
+    except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+        if method == "POST":
+            get_store().audit(
+                "price_admin_proxy",
+                result="upstream_unavailable",
+                telegram_user_id=principal.telegram_user_id,
+                role=principal.role,
+                route=target,
+                correlation_id=idempotency_key,
+            )
+        return _json(_source_error("prices", exc), status_code=503)
+    if method == "POST":
+        get_store().audit(
+            "price_admin_proxy",
+            result=f"upstream_{status_code}",
+            telegram_user_id=principal.telegram_user_id,
+            role=principal.role,
+            route=target,
+            correlation_id=idempotency_key,
+        )
+    if media_type.split(";", 1)[0].strip().casefold() != "application/json":
+        raise HTTPException(
+            status_code=502, detail="price_admin_invalid_media_type"
+        )
+    return monitoring_security_headers(Response(
+        content,
+        status_code=status_code,
+        media_type="application/json",
+    ))
 
 
 @router.get("/monitoring/api/managers")

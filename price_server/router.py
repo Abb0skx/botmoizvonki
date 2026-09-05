@@ -44,6 +44,14 @@ MONITORING_BASE_URL = os.getenv("MONITORING_BASE_URL", "").strip().rstrip("/")
 MONITORING_PRICE_SERVICE_TOKEN = os.getenv(
     "MONITORING_PRICE_SERVICE_TOKEN", ""
 ).strip()
+MONITORING_PRICE_ADMIN_SERVICE_TOKEN = os.getenv(
+    "MONITORING_PRICE_ADMIN_SERVICE_TOKEN", ""
+).strip()
+MONITORING_PRICE_INTERNAL_HOST = (
+    os.getenv("MONITORING_PRICE_INTERNAL_HOST", "texnikach-price-web")
+    .strip()
+    .casefold()
+)
 
 
 def get_repository() -> PriceRepository:
@@ -88,6 +96,13 @@ def require_internal_monitoring_auth(request: Request) -> None:
             status_code=503,
             detail="monitoring_price_service_token_not_configured",
         )
+    if not _is_internal_monitoring_request(request):
+        raise HTTPException(status_code=403, detail="invalid_service_token")
+
+
+def _is_internal_monitoring_request(request: Request) -> bool:
+    if not MONITORING_PRICE_SERVICE_TOKEN:
+        return False
     authorization = request.headers.get("authorization", "")
     prefix = "Bearer "
     supplied = (
@@ -95,10 +110,41 @@ def require_internal_monitoring_auth(request: Request) -> None:
         if authorization.startswith(prefix)
         else ""
     )
-    if not supplied or not secrets.compare_digest(
-        supplied, MONITORING_PRICE_SERVICE_TOKEN
+    return bool(
+        supplied
+        and secrets.compare_digest(supplied, MONITORING_PRICE_SERVICE_TOKEN)
+    )
+
+
+def _is_internal_monitoring_admin_request(request: Request) -> bool:
+    if not MONITORING_PRICE_ADMIN_SERVICE_TOKEN:
+        return False
+    if (
+        MONITORING_PRICE_SERVICE_TOKEN
+        and secrets.compare_digest(
+            MONITORING_PRICE_ADMIN_SERVICE_TOKEN,
+            MONITORING_PRICE_SERVICE_TOKEN,
+        )
     ):
-        raise HTTPException(status_code=403, detail="invalid_service_token")
+        return False
+    if request.headers.get("host", "").casefold() not in {
+        MONITORING_PRICE_INTERNAL_HOST,
+        MONITORING_PRICE_INTERNAL_HOST + ":8080",
+    }:
+        return False
+    authorization = request.headers.get("authorization", "")
+    prefix = "Bearer "
+    supplied = (
+        authorization[len(prefix):]
+        if authorization.startswith(prefix)
+        else ""
+    )
+    return bool(
+        supplied
+        and secrets.compare_digest(
+            supplied, MONITORING_PRICE_ADMIN_SERVICE_TOKEN
+        )
+    )
 
 
 async def start_price_server() -> None:
@@ -348,6 +394,8 @@ async def sync_price_snapshot(request: Request) -> dict[str, Any]:
 
 def _admin(request: Request, *, action: bool = False) -> None:
     _require_enabled()
+    if _is_internal_monitoring_admin_request(request):
+        return
     if action:
         require_admin_action(request, settings)
     else:

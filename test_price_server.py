@@ -3962,6 +3962,7 @@ class PricePageAuthTests(unittest.TestCase):
                 module._startup_error,
                 module.MONITORING_BASE_URL,
                 module.MONITORING_PRICE_SERVICE_TOKEN,
+                module.MONITORING_PRICE_ADMIN_SERVICE_TOKEN,
             )
             module.settings = configured
             module._repository = repository
@@ -3969,6 +3970,9 @@ class PricePageAuthTests(unittest.TestCase):
             module._startup_error = ""
             module.MONITORING_BASE_URL = ""
             module.MONITORING_PRICE_SERVICE_TOKEN = "portal-service-key"
+            module.MONITORING_PRICE_ADMIN_SERVICE_TOKEN = (
+                "portal-admin-service-key"
+            )
             try:
                 anonymous = Request(
                     {
@@ -3993,6 +3997,47 @@ class PricePageAuthTests(unittest.TestCase):
                 )
                 self.assertEqual(summary["status"], "enabled")
                 self.assertEqual(len(summary["sections"]), 1)
+                with self.assertRaises(HTTPException) as raised:
+                    module._admin(authorized)
+                self.assertEqual(raised.exception.status_code, 401)
+                admin_authorized = Request({
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/price/api/v1/posts/update-all",
+                    "headers": [
+                        (b"host", b"texnikach-price-web:8080"),
+                        (
+                            b"authorization",
+                            b"Bearer portal-admin-service-key",
+                        ),
+                    ],
+                })
+                module._admin(admin_authorized)
+                module._admin(admin_authorized, action=True)
+                module.MONITORING_PRICE_ADMIN_SERVICE_TOKEN = (
+                    "portal-service-key"
+                )
+                with self.assertRaises(HTTPException) as raised:
+                    module._admin(authorized)
+                self.assertEqual(raised.exception.status_code, 401)
+                module.MONITORING_PRICE_ADMIN_SERVICE_TOKEN = (
+                    "portal-admin-service-key"
+                )
+                public_host = Request({
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/price/api/v1/posts/update-all",
+                    "headers": [
+                        (b"host", b"bot.texnikach.uz"),
+                        (
+                            b"authorization",
+                            b"Bearer portal-admin-service-key",
+                        ),
+                    ],
+                })
+                with self.assertRaises(HTTPException) as raised:
+                    module._admin(public_host, action=True)
+                self.assertEqual(raised.exception.status_code, 401)
                 catalog = asyncio.run(
                     module.internal_monitoring_price_catalog(authorized)
                 )
@@ -4015,6 +4060,7 @@ class PricePageAuthTests(unittest.TestCase):
                     module._startup_error,
                     module.MONITORING_BASE_URL,
                     module.MONITORING_PRICE_SERVICE_TOKEN,
+                    module.MONITORING_PRICE_ADMIN_SERVICE_TOKEN,
                 ) = old
 
     def test_update_all_endpoint_requires_auth_csrf_and_is_idempotent(self):

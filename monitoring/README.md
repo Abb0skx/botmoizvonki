@@ -26,6 +26,10 @@ MONITORING_DELIVERY_SERVICE_TOKEN=
 
 MONITORING_PRICE_BASE_URL=http://texnikach-price-web:8080
 MONITORING_PRICE_SERVICE_TOKEN=
+MONITORING_PRICE_ADMIN_SERVICE_TOKEN=
+MONITORING_PRICE_INTERNAL_HOST=texnikach-price-web
+# Explicit Telegram IDs allowed to publish/update the price catalogue.
+MONITORING_PRICE_EDITOR_IDS=202134293
 
 MONITORING_GO_API_URL=
 MONITORING_GO_API_TOKEN=
@@ -37,9 +41,13 @@ replica while the session store is SQLite; use PostgreSQL or Redis before
 adding replicas.
 
 The delivery token belongs only in the main web service and `delivery-stats`.
-The price token belongs only in the main web service and the standalone price
-web service. Both are separate random values. The delivery token must be
-explicitly blanked in the Telegram delivery-bot container.
+The two price tokens belong only in the main web service and the standalone
+price web service. The read token cannot perform publication actions; the
+admin token is accepted only over the private Docker hostname. All service
+tokens are separate random values. The delivery token must be explicitly
+blanked in the Telegram delivery-bot container. If the dedicated price admin
+credential is absent or invalid, the portal stays available and prices fall
+back to read-only mode.
 
 The GO adapter contract is documented in `docs/monitoring-go-api.md`.
 
@@ -50,7 +58,7 @@ The GO adapter contract is documented in `docs/monitoring-go-api.md`.
 | Overview / calls | existing calls SQLite and reporting functions | read-only |
 | Reviews | existing reviews SQLite and analytics functions | read-only |
 | Delivery | delivery web service internal API | read-only |
-| Prices | standalone price service internal API | read-only; full catalogue is proxied by the portal |
+| Prices | standalone price service internal API | read-only by default; explicit price editors retain the original publication controls |
 | GO site | OpenCart internal API | read-only; unavailable until that API is deployed |
 
 `/dashboard` and `/admin/reviews` redirect to the matching portal section when
@@ -60,8 +68,10 @@ webhooks are unchanged. Legacy Basic credentials stay available only as a
 rollback path and must be removed after the migration is accepted.
 
 The standalone `/price` page redirects to `/monitoring/prices` after its
-`MONITORING_BASE_URL` is configured. Price mutations remain in the separate
-administrator-only API and never receive the manager's browser cookie.
+`MONITORING_BASE_URL` is configured. Price mutations pass through a strict
+portal allowlist, session and CSRF check, then use a dedicated write-only
+service credential over the private Docker hostname. The browser never sees
+that credential.
 
 ## Manager identity registry
 

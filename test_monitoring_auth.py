@@ -43,13 +43,17 @@ def settings(path: Path) -> MonitoringSettings:
         session_db_path=path,
         session_ttl_seconds=43_200,
         idle_ttl_seconds=7_200,
-        manager_ids=frozenset({101, 202}),
+        manager_ids=frozenset({101, 202, 303}),
         admin_ids=frozenset({202}),
         telegram_client_id="123456",
         telegram_client_secret="test-secret",
         telegram_redirect_uri=(
             "https://bot.texnikach.uz/monitoring/auth/callback"
         ),
+        price_base_url="http://price-web:8080",
+        price_service_token="price-read-secret",
+        price_admin_service_token="price-write-secret",
+        price_editor_ids=frozenset({101}),
     )
 
 
@@ -131,12 +135,65 @@ class MonitoringSettingsTests(unittest.TestCase):
             "MONITORING_DELIVERY_SERVICE_TOKEN": "delivery-secret",
             "MONITORING_PRICE_BASE_URL": "http://price-web:8080/",
             "MONITORING_PRICE_SERVICE_TOKEN": "price-secret",
+            "MONITORING_PRICE_ADMIN_SERVICE_TOKEN": "price-admin-secret",
+            "MONITORING_PRICE_EDITOR_IDS": "101,202",
         }, clear=False):
             current = MonitoringSettings.load()
         self.assertEqual(current.delivery_base_url, "http://delivery-stats:8080")
         self.assertEqual(current.delivery_service_token, "delivery-secret")
         self.assertEqual(current.price_base_url, "http://price-web:8080")
         self.assertEqual(current.price_service_token, "price-secret")
+        self.assertEqual(
+            current.price_admin_service_token, "price-admin-secret"
+        )
+        self.assertEqual(current.price_editor_ids, frozenset({101, 202}))
+        self.assertTrue(current.can_manage_prices(101))
+
+    def test_price_editors_must_also_be_allowed_portal_users(self):
+        current = MonitoringSettings(
+            **{
+                **settings(Path("unused.db")).__dict__,
+                "price_editor_ids": frozenset({999}),
+            }
+        )
+        with self.assertRaisesRegex(RuntimeError, "subset"):
+            current.validate_auth()
+
+    def test_invalid_price_write_configuration_degrades_to_read_only(self):
+        current = MonitoringSettings(
+            **{
+                **settings(Path("unused.db")).__dict__,
+                "price_admin_service_token": "same-secret",
+                "price_service_token": "same-secret",
+            }
+        )
+        current.validate_auth()
+        self.assertTrue(current.is_price_editor(101))
+        self.assertFalse(current.price_management_configured())
+        self.assertFalse(current.can_manage_prices(101))
+
+        missing = MonitoringSettings(
+            **{
+                **settings(Path("unused.db")).__dict__,
+                "price_admin_service_token": "",
+            }
+        )
+        missing.validate_auth()
+        self.assertFalse(missing.can_manage_prices(101))
+
+        admin_without_price_admin_token = MonitoringSettings(
+            **{
+                **settings(Path("unused.db")).__dict__,
+                "admin_ids": frozenset({202}),
+                "price_editor_ids": frozenset(),
+                "price_admin_service_token": "",
+            }
+        )
+        admin_without_price_admin_token.validate_auth()
+        self.assertTrue(admin_without_price_admin_token.is_price_editor(202))
+        self.assertFalse(
+            admin_without_price_admin_token.can_manage_prices(202)
+        )
 
 
 class MonitoringRouteTests(unittest.TestCase):
@@ -196,6 +253,7 @@ class MonitoringRouteTests(unittest.TestCase):
             **{
                 **monitoring_router.settings.__dict__,
                 "manager_ids": frozenset({999}),
+                "price_editor_ids": frozenset(),
             }
         )
         monitoring_router._auth = MonitoringAuth(
@@ -329,6 +387,153 @@ class MonitoringRouteTests(unittest.TestCase):
         self.assertIn(
             "frame-ancestors 'self'",
             catalog.headers["content-security-policy"],
+        )
+        self.assertIn(
+            "connect-src 'none'",
+            catalog.headers["content-security-policy"],
+        )
+
+        with patch.object(
+            monitoring_router.prices_adapter.PriceAdapter,
+            "catalog",
+            new=AsyncMock(return_value=(
+                b"<html>price</html>",
+                "text/html; charset=utf-8",
+            )),
+        ):
+            manage = self.client.get(
+                "/monitoring/prices/manage"
+            )
+        self.assertIn('/price/assets/admin.js', manage.text)
+        self.assertIn(
+            '/monitoring/assets/price-admin-bridge.js', manage.text
+        )
+        self.assertEqual(manage.headers["x-frame-options"], "DENY")
+        self.assertIn(
+            "frame-ancestors 'none'",
+            manage.headers["content-security-policy"],
+        )
+        self.assertIn(
+            "connect-src 'self'",
+            manage.headers["content-security-policy"],
+        )
+
+        redirect = self.client.get(
+            "/monitoring/prices", follow_redirects=False
+        )
+        self.assertEqual(redirect.status_code, 303)
+        self.assertEqual(
+            redirect.headers["location"], "/monitoring/prices/manage"
+        )
+
+    def test_price_admin_proxy_restores_manager_actions_with_csrf(self):
+        self.assertEqual(self.client.get(
+            "/monitoring/api/prices/admin/sections"
+        ).status_code, 401)
+        anonymous_manage = self.client.get(
+            "/monitoring/prices/manage", follow_redirects=False
+        )
+        self.assertEqual(anonymous_manage.status_code, 303)
+        self.assertIn(
+            "%2Fmonitoring%2Fprices%2Fmanage",
+            anonymous_manage.headers["location"],
+        )
+        csrf = self.login(101)
+        upstream = AsyncMock(return_value=(
+            200,
+            b'{"sections":[]}',
+            "application/json; charset=utf-8",
+        ))
+        with patch.object(
+            monitoring_router.prices_adapter.PriceAdapter,
+            "admin_request",
+            new=upstream,
+        ):
+            response = self.client.get(
+                "/monitoring/api/prices/admin/sections"
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"sections": []})
+        self.assertEqual(
+            upstream.await_args.args,
+            ("GET", "/price/api/v1/sections"),
+        )
+
+        denied = self.client.post(
+            "/monitoring/api/prices/admin/posts/update-all",
+            headers={
+                "X-CSRF-Token": csrf,
+                "Origin": "https://evil.example",
+                "Content-Type": "application/json",
+            },
+            content='{"confirm":true}',
+        )
+        self.assertEqual(denied.status_code, 403)
+
+        upstream = AsyncMock(return_value=(
+            202,
+            b'{"status":"queued","job_count":3}',
+            "application/json",
+        ))
+        with patch.object(
+            monitoring_router.prices_adapter.PriceAdapter,
+            "admin_request",
+            new=upstream,
+        ):
+            allowed = self.client.post(
+                "/monitoring/api/prices/admin/posts/update-all",
+                headers={
+                    "X-CSRF-Token": csrf,
+                    "Origin": "https://bot.texnikach.uz",
+                    "Content-Type": "application/json",
+                    "Idempotency-Key": (
+                        "123e4567-e89b-42d3-a456-426614174000"
+                    ),
+                },
+                content='{"confirm":true}',
+            )
+        self.assertEqual(allowed.status_code, 202)
+        self.assertEqual(allowed.json()["job_count"], 3)
+        self.assertEqual(
+            upstream.await_args.args,
+            ("POST", "/price/api/v1/posts/update-all"),
+        )
+        self.assertEqual(
+            upstream.await_args.kwargs["body"], b'{"confirm":true}'
+        )
+        with sqlite3.connect(monitoring_router.settings.session_db_path) as db:
+            audit = db.execute(
+                """
+                SELECT event, telegram_user_id, route, result, correlation_id
+                FROM monitoring_audit_log
+                WHERE event='price_admin_proxy'
+                ORDER BY id DESC LIMIT 1
+                """
+            ).fetchone()
+        self.assertEqual(audit[0], "price_admin_proxy")
+        self.assertEqual(audit[1], 101)
+        self.assertEqual(audit[2], "/price/api/v1/posts/update-all")
+        self.assertEqual(audit[3], "upstream_202")
+        self.assertEqual(
+            audit[4], "123e4567-e89b-42d3-a456-426614174000"
+        )
+
+    def test_price_admin_proxy_rejects_unlisted_upstream_paths(self):
+        self.login(101)
+        response = self.client.get(
+            "/monitoring/api/prices/admin/state"
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_price_admin_proxy_rejects_manager_without_editor_access(self):
+        self.login(303)
+        response = self.client.get(
+            "/monitoring/api/prices/admin/sections"
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(
+            self.client.get("/monitoring/prices/manage").status_code,
+            403,
         )
 
     def test_overview_survives_one_unavailable_source(self):

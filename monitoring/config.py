@@ -84,6 +84,8 @@ class MonitoringSettings:
     delivery_service_token: str = ""
     price_base_url: str = ""
     price_service_token: str = ""
+    price_admin_service_token: str = ""
+    price_editor_ids: frozenset[int] = frozenset()
     go_api_url: str = ""
     go_api_token: str = ""
 
@@ -148,6 +150,10 @@ class MonitoringSettings:
             price_service_token=os.getenv(
                 "MONITORING_PRICE_SERVICE_TOKEN", ""
             ).strip(),
+            price_admin_service_token=os.getenv(
+                "MONITORING_PRICE_ADMIN_SERVICE_TOKEN", ""
+            ).strip(),
+            price_editor_ids=_ids("MONITORING_PRICE_EDITOR_IDS"),
             go_api_url=_https_url(
                 "MONITORING_GO_API_URL",
                 os.getenv("MONITORING_GO_API_URL", ""),
@@ -170,6 +176,13 @@ class MonitoringSettings:
             missing.append("MONITORING_IDLE_TTL_SECONDS<=MONITORING_SESSION_TTL_SECONDS")
         if missing:
             raise RuntimeError("monitoring_auth_not_configured:" + ",".join(missing))
+        if not self.price_editor_ids.issubset(
+            self.manager_ids | self.admin_ids
+        ):
+            raise RuntimeError(
+                "MONITORING_PRICE_EDITOR_IDS must be a subset of the "
+                "monitoring manager/admin allowlists"
+            )
 
     def role_for(self, telegram_user_id: int) -> str | None:
         if telegram_user_id in self.admin_ids:
@@ -177,3 +190,23 @@ class MonitoringSettings:
         if telegram_user_id in self.manager_ids:
             return "manager"
         return None
+
+    def is_price_editor(self, telegram_user_id: int) -> bool:
+        return (
+            telegram_user_id in self.admin_ids
+            or telegram_user_id in self.price_editor_ids
+        )
+
+    def price_management_configured(self) -> bool:
+        return bool(
+            self.price_base_url
+            and self.price_service_token
+            and self.price_admin_service_token
+            and self.price_admin_service_token != self.price_service_token
+        )
+
+    def can_manage_prices(self, telegram_user_id: int) -> bool:
+        return bool(
+            self.price_management_configured()
+            and self.is_price_editor(telegram_user_id)
+        )
