@@ -238,12 +238,22 @@ class ForwardingService:
 
     def build_post_text(self) -> str:
         states = self.repository.list_device_states()
-        lines = [
-            "<b>📞 Управление переадресацией</b>",
-            "",
-            "Команда выполняется только после нажатия кнопки.",
-            "",
-        ]
+        lines = ["<b>📞 Управление переадресацией</b>", ""]
+        if self.settings.enabled:
+            lines.extend(
+                [
+                    "Команда выполняется только после нажатия кнопки.",
+                    "",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "⛔ <b>Автоматические команды временно отключены.</b>",
+                    "Приложение МоиЗвонки искажает служебный код.",
+                    "",
+                ]
+            )
         for device in states:
             lines.extend(
                 [
@@ -594,7 +604,11 @@ class ForwardingService:
                     "parse_mode": "HTML",
                     "disable_web_page_preview": True,
                     "reply_markup": json.dumps(
-                        self.build_keyboard(),
+                        (
+                            self.build_keyboard()
+                            if self.settings.enabled
+                            else {"inline_keyboard": []}
+                        ),
                         ensure_ascii=False,
                     ),
                 },

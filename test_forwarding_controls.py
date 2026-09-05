@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import sqlite3
@@ -1063,6 +1064,14 @@ class ForwardingControlTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM forwarding_operations"
             ).fetchone()[0]
         self.assertEqual(count, 0)
+        self.assertTrue(disabled.refresh_current_post())
+        method, payload = self.telegram.calls[-1]
+        self.assertEqual(method, "editMessageText")
+        self.assertIn("временно отключены", payload["text"])
+        self.assertEqual(
+            json.loads(payload["reply_markup"]),
+            {"inline_keyboard": []},
+        )
 
     def test_unconfirmed_blocks_repeat_until_correlation_window_ends(self):
         self.activate_post()
