@@ -461,6 +461,12 @@ class ForwardingControlTests(unittest.TestCase):
             frozenset({TECNO_CONTROLLER_ID}),
         )
 
+    def test_forwarding_defaults_to_disabled(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("FORWARDING_ENABLED", None)
+            settings = load_forwarding_settings()
+        self.assertFalse(settings.enabled)
+
     def test_parallel_clicks_create_only_one_active_operation(self):
         self.activate_post()
 
@@ -793,6 +799,60 @@ class ForwardingControlTests(unittest.TestCase):
                 {"user_login": "texnikacholx@gmail.com"},
                 event,
             )
+        )
+
+    def test_encoded_transport_artifact_is_suppressed_and_correlated(self):
+        self.activate_post()
+        queued = self.queue("fwd:redmi:poco")
+        self.service.dispatch_one(self.timestamp(second=2))
+        event = {
+            "direction": 1,
+            # Observed on Redmi after calls.make_call received
+            # **21*%2B998901313999*11%23.
+            "client_number": "+2129989013139991123",
+            "answered": 0,
+            "db_call_id": 7113,
+            "event_pbx_call_id": "encoded-transport-artifact",
+            "start_time": self.timestamp(second=3),
+            "end_time": self.timestamp(second=3),
+            "src_number": "+998908534466",
+            "src_slot": 0,
+        }
+        result = self.service.handle_provider_event(
+            "call.finish",
+            {"user_login": "aashshdjdjdjsj@gmail.com"},
+            event,
+            now_ts=self.timestamp(second=8),
+        )
+        self.assertTrue(result["handled"])
+        self.assertEqual(
+            self.repository.get_operation(
+                queued["operation"]["id"]
+            )["status"],
+            "call_not_completed",
+        )
+        self.assertTrue(
+            self.service.is_known_service_event(
+                {"user_login": "aashshdjdjdjsj@gmail.com"},
+                event,
+            )
+        )
+
+    def test_encoded_transport_artifacts_are_exactly_scoped(self):
+        cancel_event = {
+            "direction": 1,
+            "client_number": "+23232123",
+        }
+        unrelated_event = {
+            "direction": 1,
+            "client_number": "+2129989013139991124",
+        }
+        webhook = {"user_login": "texnikacholx@gmail.com"}
+        self.assertTrue(
+            self.service.is_known_service_event(webhook, cancel_event)
+        )
+        self.assertFalse(
+            self.service.is_known_service_event(webhook, unrelated_event)
         )
 
     def test_legacy_collapsed_service_number_is_also_suppressed(self):
@@ -1340,68 +1400,66 @@ class ForwardingBotIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(filter_instance.filter(record))
         self.assertEqual(record.args[2], "/webhooks/moizvonki")
 
-    async def test_make_call_payload_encodes_hash_for_android_tel_uri(self):
+    async def test_make_call_rejects_mmi_before_http(self):
         import botmoizvonki as bot
 
-        class Response:
-            ok = True
-            status_code = 200
-            text = "Call posted"
-
-            @staticmethod
-            def json():
-                raise ValueError
-
         fake_http = mock.Mock()
-        fake_http.post.return_value = Response()
         with (
             mock.patch.object(bot, "HTTP", fake_http),
             mock.patch.object(bot, "MOIZVONKI_API_URL", "https://example.test/api/v1"),
             mock.patch.object(bot, "MOIZVONKI_API_KEY", "secret"),
         ):
-            result = bot.moizvonki_make_call(
-                "aashshdjdjdjsj@gmail.com",
+            for command in (
                 "**21*+998901313999*11#",
-            )
+                "##21#",
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "безопасную отправку MMI",
+                ):
+                    bot.moizvonki_make_call(
+                        "aashshdjdjdjsj@gmail.com",
+                        command,
+                    )
+        fake_http.post.assert_not_called()
 
-        payload = fake_http.post.call_args.kwargs["json"]
-        self.assertEqual(payload["action"], "calls.make_call")
-        self.assertEqual(
-            payload["to"],
-            "**21*%2B998901313999*11%23",
-        )
-        self.assertEqual(
-            payload["user_name"],
-            "aashshdjdjdjsj@gmail.com",
-        )
-        self.assertEqual(result["body"]["status"], "Call posted")
-
-    async def test_cancel_payload_encodes_every_hash(self):
+    async def test_invalid_e164_number_never_reaches_sms_api(self):
         import botmoizvonki as bot
 
-        class Response:
-            ok = True
-            status_code = 200
-            text = "Call posted"
-
-            @staticmethod
-            def json():
-                raise ValueError
+        malformed = "+2129989013139991123"
+        with mock.patch.object(
+            bot,
+            "connect_db",
+            side_effect=AssertionError("database must not be touched"),
+        ):
+            promo = bot.reserve_client_sms(
+                123,
+                malformed,
+                "aashshdjdjdjsj@gmail.com",
+            )
+            rating = bot.reserve_call_rating(
+                123,
+                malformed,
+                "aashshdjdjdjsj@gmail.com",
+            )
+        self.assertEqual(promo["reason"], "invalid_number")
+        self.assertEqual(rating["reason"], "invalid_number")
 
         fake_http = mock.Mock()
-        fake_http.post.return_value = Response()
         with (
             mock.patch.object(bot, "HTTP", fake_http),
             mock.patch.object(bot, "MOIZVONKI_API_URL", "https://example.test/api/v1"),
             mock.patch.object(bot, "MOIZVONKI_API_KEY", "secret"),
         ):
-            bot.moizvonki_make_call(
-                "texnikacholx@gmail.com",
-                "##21#",
-            )
-
-        payload = fake_http.post.call_args.kwargs["json"]
-        self.assertEqual(payload["to"], "%23%2321%23")
+            with self.assertRaisesRegex(
+                ValueError,
+                "Некорректная длина",
+            ):
+                bot.send_client_sms(
+                    malformed,
+                    "aashshdjdjdjsj@gmail.com",
+                )
+        fake_http.post.assert_not_called()
 
     async def test_matching_service_finish_never_enters_customer_pipeline(self):
         import botmoizvonki as bot

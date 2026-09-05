@@ -227,7 +227,7 @@ def load_forwarding_settings() -> ForwardingSettings:
     return ForwardingSettings(
         enabled=_env_bool(
             "FORWARDING_ENABLED",
-            True,
+            False,
         ),
         post_hour=post_hour,
         post_minute=post_minute,

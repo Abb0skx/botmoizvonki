@@ -17,7 +17,7 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
-from urllib.parse import quote, urlparse
+from urllib.parse import urlparse
 
 import requests
 
@@ -1086,6 +1086,22 @@ def normalize_phone(
         char
         for char in str(phone)
         if char.isdigit()
+    )
+
+
+def is_valid_sms_phone(
+    phone: str | None,
+) -> bool:
+
+    # E.164 numbers contain at most 15 digits. Requiring at least seven
+    # digits also keeps short carrier/service codes out of customer SMS.
+    normalized = normalize_phone(
+        phone
+    )
+
+    return (
+        normalized.isascii()
+        and 7 <= len(normalized) <= 15
     )
 
 
@@ -5016,6 +5032,15 @@ def reserve_client_sms(
             "history_id": None,
         }
 
+    if not is_valid_sms_phone(
+        client_key
+    ):
+        return {
+            "reserved": False,
+            "reason": "invalid_number",
+            "history_id": None,
+        }
+
     if get_internal_contact_name(
         client_key
     ):
@@ -5179,6 +5204,13 @@ def send_client_sms(
             "Пустой номер клиента"
         )
 
+    if not is_valid_sms_phone(
+        phone
+    ):
+        raise ValueError(
+            "Некорректная длина номера клиента"
+        )
+
     payload = {
         "user_name": user_name,
         "api_key": MOIZVONKI_API_KEY,
@@ -5281,22 +5313,20 @@ def moizvonki_make_call(
             "Некорректная строка сервисного набора"
         )
 
-    # The Android app concatenates this value to ``tel:`` without escaping
-    # it. In a URI, a raw ``#`` begins the fragment and never reaches the
-    # dialer. Keep the logical/audit value unchanged, but percent-encode each
-    # hash for transport so Android decodes the full MMI command.
-    android_tel_uri_number = quote(
-        exact_number,
-        # ``*`` is safe in an opaque tel URI. Encode ``+`` and every ``#``
-        # so the decoded scheme-specific part reaches the dialer unchanged.
-        safe="*",
-    )
+    # The current Moizvonki Android app builds Uri.parse("tel:" + value).
+    # A raw hash is lost as a URI fragment, while a percent-encoded hash was
+    # observed being dialled literally as digits 23. Never originate MMI via
+    # this API: it can create an unintended ordinary international call.
+    if "*" in exact_number or "#" in exact_number:
+        raise RuntimeError(
+            "МоиЗвонки не поддерживает безопасную отправку MMI-команд"
+        )
 
     payload = {
         "user_name": normalized_login,
         "api_key": MOIZVONKI_API_KEY,
         "action": "calls.make_call",
-        "to": android_tel_uri_number,
+        "to": exact_number,
     }
 
     response = HTTP.post(
@@ -5514,6 +5544,14 @@ def reserve_call_rating(
         return {
             "reserved": False,
             "reason": "empty_number",
+        }
+
+    if not is_valid_sms_phone(
+        client_key
+    ):
+        return {
+            "reserved": False,
+            "reason": "invalid_number",
         }
 
     if get_internal_contact_name(
@@ -22952,6 +22990,7 @@ async def moizvonki_webhook(
             "cooldown",
             "internal_contact",
             "empty_number",
+            "invalid_number",
         }
     )
 

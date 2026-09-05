@@ -4,7 +4,7 @@ import threading
 
 from datetime import datetime, timezone
 from html import escape
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 import requests
 
@@ -40,6 +40,21 @@ def dial_digit_signature(value: str | None) -> str:
     )
 
 
+def transport_artifact_digit_signature(value: str | None) -> str:
+    """Return digits left when a dialer literalizes URI escape codes.
+
+    ``calls.make_call`` has produced ordinary calls such as
+    ``+212...1123`` from ``**21*%2B...*11%23``.  This signature is used only
+    to identify and suppress those failed service calls; it is never sent to
+    a phone.
+    """
+    encoded = quote(
+        canonical_dial_string(value),
+        safe="*",
+    )
+    return dial_digit_signature(encoded)
+
+
 def service_dial_matches(expected: str, actual: str) -> bool:
     """Match an exact MMI string or the phone-number form made by dialers.
 
@@ -56,9 +71,11 @@ def service_dial_matches(expected: str, actual: str) -> bool:
         return True
     if "*" in actual_canonical or "#" in actual_canonical:
         return False
-    return dial_digit_signature(actual_canonical) == dial_digit_signature(
-        expected_canonical
-    )
+    actual_signature = dial_digit_signature(actual_canonical)
+    return actual_signature in {
+        dial_digit_signature(expected_canonical),
+        transport_artifact_digit_signature(expected_canonical),
+    }
 
 
 def event_timestamp(event: dict, fallback: int) -> int:
@@ -425,6 +442,8 @@ class ForwardingService:
 
     def ensure_daily_post(self, now_ts: int | None = None) -> dict:
         now_ts = int(now_ts or utc_timestamp())
+        if not self.settings.enabled:
+            return {"created": False, "reason": "disabled"}
         local_now = datetime.fromtimestamp(now_ts, self.local_timezone)
         if (local_now.hour, local_now.minute) < (
             self.settings.post_hour,
