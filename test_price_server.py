@@ -3904,9 +3904,12 @@ class PricePageAuthTests(unittest.TestCase):
                 anonymous = Request(
                     {"type": "http", "method": "GET", "path": "/price", "headers": []}
                 )
-                with self.assertRaises(HTTPException) as raised:
-                    asyncio.run(module.price_page(anonymous))
-                self.assertEqual(raised.exception.status_code, 401)
+                anonymous_response = asyncio.run(module.price_page(anonymous))
+                self.assertEqual(anonymous_response.status_code, 303)
+                self.assertEqual(
+                    anonymous_response.headers["location"],
+                    "/monitoring/login?next=%2Fprice",
+                )
 
                 token = base64.b64encode(b"admin:secret").decode()
                 authorized = Request(

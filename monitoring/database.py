@@ -100,9 +100,52 @@ class MonitoringStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_monitoring_audit_created
                 ON monitoring_audit_log(created_at);
+
+                CREATE TABLE IF NOT EXISTS monitoring_login_attempts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ip_hash TEXT NOT NULL,
+                    attempted_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_monitoring_login_attempts
+                ON monitoring_login_attempts(ip_hash, attempted_at);
                 """
             )
             database.execute("PRAGMA optimize")
+
+    def register_login_attempt(
+        self,
+        ip_address: str,
+        *,
+        now: datetime | None = None,
+        window_seconds: int = 900,
+        maximum: int = 8,
+    ) -> bool:
+        current = now or _utc_now()
+        ip_hash = _hash((ip_address or "unknown")[:100])
+        cutoff = _iso(current - timedelta(seconds=window_seconds))
+        with self._connect() as database:
+            database.execute(
+                "DELETE FROM monitoring_login_attempts WHERE attempted_at < ?",
+                (cutoff,),
+            )
+            count = database.execute(
+                "SELECT COUNT(*) FROM monitoring_login_attempts WHERE ip_hash=?",
+                (ip_hash,),
+            ).fetchone()[0]
+            if count >= maximum:
+                return False
+            database.execute(
+                "INSERT INTO monitoring_login_attempts(ip_hash,attempted_at) VALUES (?,?)",
+                (ip_hash, _iso(current)),
+            )
+            return True
+
+    def clear_login_attempts(self, ip_address: str) -> None:
+        with self._connect() as database:
+            database.execute(
+                "DELETE FROM monitoring_login_attempts WHERE ip_hash=?",
+                (_hash((ip_address or "unknown")[:100]),),
+            )
 
     def create_oauth_attempt(
         self,

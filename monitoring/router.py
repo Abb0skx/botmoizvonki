@@ -5,9 +5,10 @@ import json
 import logging
 import re
 from datetime import datetime
+from html import escape
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -21,7 +22,6 @@ from .adapters import reviews as reviews_adapter
 from .adapters.delivery import DeliveryAdapter
 from .adapters.go_site import GoSiteAdapter
 from .auth import (
-    OAUTH_COOKIE,
     SESSION_COOKIE,
     ManagerPrincipal,
     MonitoringAuth,
@@ -210,9 +210,8 @@ def _period(
 
 @router.get("/monitoring/login", response_class=HTMLResponse)
 def login_page(request: Request):
-    login_url = "/monitoring/auth/start?next=" + quote(
-        _safe_next(request.query_params.get("next")), safe=""
-    )
+    next_path = _safe_next(request.query_params.get("next"))
+    safe_next = escape(next_path, quote=True)
     try:
         _principal(request)
     except HTTPException as exc:
@@ -220,40 +219,55 @@ def login_page(request: Request):
             return _html(
                 TEMPLATES.joinpath("login.html").read_text(encoding="utf-8")
                 .replace("__STATE__", "Портал пока не настроен")
-                .replace("__LOGIN_HIDDEN__", "hidden")
-                .replace("__LOGIN_URL__", login_url),
+                .replace("__ERROR__", "")
+                .replace("__NEXT__", safe_next),
                 status_code=503,
             )
     else:
-        return monitoring_security_headers(RedirectResponse("/monitoring", status_code=303))
+        return monitoring_security_headers(RedirectResponse(next_path, status_code=303))
     content = TEMPLATES.joinpath("login.html").read_text(encoding="utf-8")
     return _html(
         content.replace("__STATE__", "Доступ только для менеджеров TEXNIKACH")
-        .replace("__LOGIN_HIDDEN__", "")
-        .replace("__LOGIN_URL__", login_url)
+        .replace("__ERROR__", "")
+        .replace("__NEXT__", safe_next)
     )
 
 
-@router.get("/monitoring/auth/start")
-def auth_start(next: str | None = Query(None, max_length=1000)):
-    return monitoring_security_headers(get_auth().begin_login(next))
-
-
-@router.get("/monitoring/auth/callback")
-async def auth_callback(
-    request: Request,
-    code: str = Query(..., min_length=1, max_length=4096),
-    state: str = Query(..., min_length=16, max_length=512),
-):
-    raw_session, csrf_token, next_path = await get_auth().finish_login(
-        request, code=code, state=state
-    )
+@router.post("/monitoring/login")
+async def password_login(request: Request):
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type != "application/x-www-form-urlencoded":
+        raise HTTPException(status_code=415, detail="form_content_type_required")
+    body = await request.body()
+    if len(body) > 4096:
+        raise HTTPException(status_code=413, detail="login_form_too_large")
+    try:
+        form = parse_qs(body.decode("utf-8", "strict"), keep_blank_values=True)
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="invalid_login_form") from None
+    password = (form.get("password") or [""])[0]
+    next_path = _safe_next((form.get("next") or [""])[0])
+    try:
+        raw_session, csrf_token, next_path = get_auth().password_login(
+            request, password=password, next_path=next_path
+        )
+    except HTTPException as exc:
+        if exc.status_code not in {401, 429}:
+            raise
+        content = TEMPLATES.joinpath("login.html").read_text(encoding="utf-8")
+        return _html(
+            content.replace("__STATE__", "Доступ только для сотрудников TEXNIKACH")
+            .replace(
+                "__ERROR__",
+                "Слишком много попыток. Повторите через 15 минут."
+                if exc.status_code == 429 else "Неверный пароль",
+            )
+            .replace("__NEXT__", escape(next_path, quote=True)),
+            status_code=exc.status_code,
+        )
     response = RedirectResponse(next_path, status_code=303)
     get_auth().attach_session_cookies(
         response, raw_session=raw_session, csrf_token=csrf_token
-    )
-    response.delete_cookie(
-        OAUTH_COOKIE, path="/monitoring/auth", secure=True, samesite="lax"
     )
     return monitoring_security_headers(response)
 

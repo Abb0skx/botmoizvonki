@@ -54,6 +54,7 @@ def settings(path: Path) -> MonitoringSettings:
         price_service_token="price-read-secret",
         price_admin_service_token="price-write-secret",
         price_editor_ids=frozenset({101}),
+        password="test-password",
     )
 
 
@@ -116,6 +117,14 @@ class MonitoringStoreTests(unittest.TestCase):
         )
         self.assertTrue(self.store.revoke_session(raw2, reason="logout", now=now))
         self.assertIsNone(self.store.get_session(raw2, idle_ttl_seconds=50, now=now))
+
+    def test_login_attempts_are_limited_and_can_be_cleared(self):
+        now = datetime(2026, 9, 3, tzinfo=timezone.utc)
+        for _ in range(8):
+            self.assertTrue(self.store.register_login_attempt("127.0.0.1", now=now))
+        self.assertFalse(self.store.register_login_attempt("127.0.0.1", now=now))
+        self.store.clear_login_attempts("127.0.0.1")
+        self.assertTrue(self.store.register_login_attempt("127.0.0.1", now=now))
 
 
 class MonitoringSettingsTests(unittest.TestCase):
@@ -221,7 +230,7 @@ class MonitoringRouteTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def login(self, user_id: int = 101):
+    def login(self, user_id: int = 0):
         raw, csrf = monitoring_router.get_store().create_session(
             telegram_user_id=user_id, display_name="Olmas",
             absolute_ttl_seconds=43_200, idle_ttl_seconds=7_200,
@@ -238,7 +247,28 @@ class MonitoringRouteTests(unittest.TestCase):
         self.assertEqual(api.status_code, 401)
         self.assertNotIn("www-authenticate", api.headers)
 
-    def test_manager_session_opens_portal_without_password_form(self):
+    def test_password_login_remembers_device_and_returns_to_price(self):
+        response = self.client.post(
+            "/monitoring/login",
+            data={"password": "test-password", "next": "/price"},
+            follow_redirects=False,
+        )
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.headers["location"], "/price")
+        self.assertIn(SESSION_COOKIE, response.headers.get("set-cookie", ""))
+        self.assertIn("Max-Age=43200", response.headers.get("set-cookie", ""))
+        self.assertEqual(self.client.get("/monitoring/api/me").status_code, 200)
+
+    def test_wrong_password_does_not_create_session(self):
+        response = self.client.post(
+            "/monitoring/login",
+            data={"password": "wrong", "next": "/monitoring"},
+        )
+        self.assertEqual(response.status_code, 401)
+        self.assertIn("Неверный пароль", response.text)
+        self.assertEqual(self.client.get("/monitoring/api/me").status_code, 401)
+
+    def test_password_session_opens_portal_without_password_form(self):
         self.login()
         response = self.client.get("/monitoring")
         self.assertEqual(response.status_code, 200)
@@ -247,18 +277,8 @@ class MonitoringRouteTests(unittest.TestCase):
         self.assertEqual(response.headers["cache-control"], "no-store, private")
         self.assertEqual(response.headers["x-frame-options"], "DENY")
 
-    def test_allowlist_is_checked_on_every_request(self):
+    def test_old_telegram_session_is_rejected(self):
         self.login(101)
-        monitoring_router.settings = MonitoringSettings(
-            **{
-                **monitoring_router.settings.__dict__,
-                "manager_ids": frozenset({999}),
-                "price_editor_ids": frozenset(),
-            }
-        )
-        monitoring_router._auth = MonitoringAuth(
-            monitoring_router.settings, monitoring_router.get_store()
-        )
         self.assertEqual(self.client.get("/monitoring/api/me").status_code, 401)
 
     def test_logout_requires_origin_and_revokes_session(self):
@@ -287,15 +307,15 @@ class MonitoringRouteTests(unittest.TestCase):
         self.assertEqual(self.client.get("/monitoring/api/me").status_code, 401)
 
     def test_admin_role_is_derived_from_allowlist(self):
-        self.login(202)
+        self.login()
         self.assertEqual(
             self.client.get("/monitoring/api/me").json()["role"], "admin"
         )
 
-    def test_price_read_uses_shared_session_but_actions_require_admin(self):
-        csrf = self.login(101)
+    def test_price_read_and_actions_use_shared_password_session(self):
+        csrf = self.login()
         self.assertEqual(self.client.get("/test/price/read").status_code, 200)
-        denied = self.client.post(
+        allowed = self.client.post(
             "/test/price/action",
             headers={
                 "X-CSRF-Token": csrf,
@@ -304,10 +324,10 @@ class MonitoringRouteTests(unittest.TestCase):
             },
             content="{}",
         )
-        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(allowed.status_code, 200)
 
     def test_price_admin_action_uses_shared_csrf_protection(self):
-        csrf = self.login(202)
+        csrf = self.login()
         denied = self.client.post(
             "/test/price/action",
             headers={
@@ -438,7 +458,7 @@ class MonitoringRouteTests(unittest.TestCase):
             "%2Fmonitoring%2Fprices%2Fmanage",
             anonymous_manage.headers["location"],
         )
-        csrf = self.login(101)
+        csrf = self.login()
         upstream = AsyncMock(return_value=(
             200,
             b'{"sections":[]}',
@@ -511,7 +531,7 @@ class MonitoringRouteTests(unittest.TestCase):
                 """
             ).fetchone()
         self.assertEqual(audit[0], "price_admin_proxy")
-        self.assertEqual(audit[1], 101)
+        self.assertEqual(audit[1], 0)
         self.assertEqual(audit[2], "/price/api/v1/posts/update-all")
         self.assertEqual(audit[3], "upstream_202")
         self.assertEqual(
@@ -519,21 +539,23 @@ class MonitoringRouteTests(unittest.TestCase):
         )
 
     def test_price_admin_proxy_rejects_unlisted_upstream_paths(self):
-        self.login(101)
+        self.login()
         response = self.client.get(
             "/monitoring/api/prices/admin/state"
         )
         self.assertEqual(response.status_code, 404)
 
-    def test_price_admin_proxy_rejects_manager_without_editor_access(self):
+    def test_price_admin_proxy_rejects_old_telegram_session(self):
         self.login(303)
         response = self.client.get(
             "/monitoring/api/prices/admin/sections"
         )
-        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.status_code, 401)
         self.assertEqual(
-            self.client.get("/monitoring/prices/manage").status_code,
-            403,
+            self.client.get(
+                "/monitoring/prices/manage", follow_redirects=False
+            ).status_code,
+            303,
         )
 
     def test_overview_survives_one_unavailable_source(self):

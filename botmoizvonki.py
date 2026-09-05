@@ -118,7 +118,7 @@ _forwarding_service = None
 
 @app.middleware("http")
 async def protect_legacy_manager_routes(request: Request, call_next):
-    """Move human dashboards behind the passwordless monitoring portal.
+    """Move human dashboards behind the shared-password monitoring portal.
 
     Public review forms, webhooks, health checks and the price sync endpoint
     deliberately remain outside this guard.
@@ -128,6 +128,8 @@ async def protect_legacy_manager_routes(request: Request, call_next):
         redirects = {
             "/dashboard": "/monitoring/calls",
             "/admin/reviews": "/monitoring/reviews",
+            "/delivery/monitor": "/monitoring/delivery/live",
+            "/delivery/stats": "/monitoring/delivery/stats",
         }
         if path in redirects and request.method == "GET":
             target = redirects[path]

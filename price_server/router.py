@@ -299,7 +299,19 @@ async def price_page(request: Request) -> Response:
     # Staged rollout: while the new subsystem is explicitly disabled, preserve
     # the existing read-only page exactly as it works today. Enabling the
     # subsystem switches this same route to fail-closed Basic authentication.
-    principal = require_admin(request, settings) if settings.enabled else None
+    if settings.enabled:
+        try:
+            principal = require_admin(request, settings)
+        except HTTPException as exc:
+            from monitoring import router as monitoring_router
+            if exc.status_code == 401 and monitoring_router.settings.enabled:
+                return RedirectResponse(
+                    "/monitoring/login?next=%2Fprice", status_code=303,
+                    headers={"Cache-Control": "no-store"},
+                )
+            raise
+    else:
+        principal = None
     document = _page_html()
     if document is None:
         return _secure_html("<h1>Price page not found</h1>", status_code=404)
