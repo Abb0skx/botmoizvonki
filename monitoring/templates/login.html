@@ -12,11 +12,15 @@
     <div class="brand-mark">T</div>
     <div class="eyebrow">TEXNIKACH · ВНУТРЕННИЙ ПОРТАЛ</div>
     <h1>Рабочие показатели<br>в одном месте</h1>
-    <p class="auth-copy">__STATE__. Вход выполняется через Telegram — отдельный пароль не нужен.</p>
-    <a class="telegram-login" __LOGIN_HIDDEN__ href="__LOGIN_URL__">
-      <span aria-hidden="true">➤</span> Войти через Telegram
-    </a>
-    <p class="auth-note">Доступ получат только Telegram ID, добавленные руководителем.</p>
+    <p class="auth-copy">__STATE__. Введите общий пароль.</p>
+    <form class="password-login" method="post" action="/monitoring/login">
+      <input type="hidden" name="next" value="__NEXT__">
+      <label for="password">Пароль</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
+      <p class="auth-error" role="alert">__ERROR__</p>
+      <button type="submit">Войти</button>
+    </form>
+    <p class="auth-note">После входа это устройство будет запомнено.</p>
   </main>
 </body>
 </html>

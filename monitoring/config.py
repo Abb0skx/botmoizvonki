@@ -65,6 +65,7 @@ class MonitoringSettings:
     telegram_client_id: str
     telegram_client_secret: str
     telegram_redirect_uri: str
+    password: str = ""
     delivery_base_url: str = ""
     delivery_service_token: str = ""
     go_api_url: str = ""
@@ -106,10 +107,10 @@ class MonitoringSettings:
                 )
             ),
             session_ttl_seconds=_positive_int(
-                "MONITORING_SESSION_TTL_SECONDS", 43_200, minimum=300
+                "MONITORING_SESSION_TTL_SECONDS", 15_552_000, minimum=300
             ),
             idle_ttl_seconds=_positive_int(
-                "MONITORING_IDLE_TTL_SECONDS", 7_200, minimum=300
+                "MONITORING_IDLE_TTL_SECONDS", 15_552_000, minimum=300
             ),
             manager_ids=_ids(
                 "MONITORING_MANAGER_IDS", fallback="DELIVERY_MANAGER_IDS"
@@ -122,6 +123,7 @@ class MonitoringSettings:
                 "MONITORING_TELEGRAM_CLIENT_SECRET", ""
             ).strip(),
             telegram_redirect_uri=redirect_uri,
+            password=os.getenv("MONITORING_PASSWORD", "").strip(),
             delivery_base_url=delivery_base,
             delivery_service_token=os.getenv(
                 "MONITORING_DELIVERY_SERVICE_TOKEN", ""
@@ -138,12 +140,8 @@ class MonitoringSettings:
         if not self.enabled:
             raise RuntimeError("monitoring_disabled")
         missing = []
-        if not (self.manager_ids or self.admin_ids):
-            missing.append("MONITORING_MANAGER_IDS|MONITORING_ADMIN_IDS")
-        if not self.telegram_client_id:
-            missing.append("MONITORING_TELEGRAM_CLIENT_ID")
-        if not self.telegram_client_secret:
-            missing.append("MONITORING_TELEGRAM_CLIENT_SECRET")
+        if not self.password:
+            missing.append("MONITORING_PASSWORD")
         if self.idle_ttl_seconds > self.session_ttl_seconds:
             missing.append("MONITORING_IDLE_TTL_SECONDS<=MONITORING_SESSION_TTL_SECONDS")
         if missing:

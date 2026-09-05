@@ -54,6 +54,9 @@ def _safe_next(value: str | None) -> str:
         candidate == "/monitoring"
         or candidate.startswith("/monitoring/")
         or candidate.startswith("/monitoring?")
+        or candidate == "/price"
+        or candidate.startswith("/price?")
+        or candidate.startswith("/price#")
     ):
         return "/monitoring"
     if candidate.startswith("//") or "\\" in candidate or "\x00" in candidate:
@@ -195,6 +198,32 @@ class MonitoringAuth:
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from None
 
+    def password_login(
+        self, request: Request, *, password: str, next_path: str | None
+    ) -> tuple[str, str, str]:
+        self.ensure_configured()
+        client_ip = _client_ip(request)
+        if not self.store.register_login_attempt(client_ip):
+            self.store.audit("password_login", result="rate_limited", route=request.url.path)
+            raise HTTPException(status_code=429, detail="too_many_login_attempts")
+        if not secrets.compare_digest(password, self.settings.password):
+            self.store.audit("password_login", result="invalid", route=request.url.path)
+            raise HTTPException(status_code=401, detail="invalid_password")
+        raw_session, csrf_token = self.store.create_session(
+            telegram_user_id=0,
+            display_name="Сотрудник TEXNIKACH",
+            absolute_ttl_seconds=self.settings.session_ttl_seconds,
+            idle_ttl_seconds=self.settings.idle_ttl_seconds,
+            user_agent=request.headers.get("user-agent", ""),
+            ip_address=_client_ip(request),
+        )
+        self.store.clear_login_attempts(client_ip)
+        self.store.audit(
+            "password_login", result="success", telegram_user_id=0,
+            role="admin", route=request.url.path,
+        )
+        return raw_session, csrf_token, _safe_next(next_path)
+
     def begin_login(self, next_path: str | None) -> RedirectResponse:
         self.ensure_configured()
         state = secrets.token_urlsafe(32)
@@ -291,10 +320,10 @@ class MonitoringAuth:
         )
         if session is None:
             raise HTTPException(status_code=401, detail="monitoring_session_required")
-        role = self.settings.role_for(session.telegram_user_id)
-        if role is None:
-            self.store.revoke_session(raw_token, reason="allowlist_removed")
+        if session.telegram_user_id != 0:
+            self.store.revoke_session(raw_token, reason="telegram_auth_removed")
             raise HTTPException(status_code=401, detail="monitoring_session_required")
+        role = "admin"
         if admin and role != "admin":
             raise HTTPException(status_code=403, detail="monitoring_admin_required")
         return ManagerPrincipal(
@@ -354,7 +383,7 @@ def monitoring_security_headers(response: Response) -> Response:
         "default-src 'self'; script-src 'self'; style-src 'self'; "
         "img-src 'self' data: https://tile.openstreetmap.org; "
         "connect-src 'self'; font-src 'self'; frame-ancestors 'none'; "
-        "base-uri 'self'; form-action 'self' https://oauth.telegram.org"
+        "base-uri 'self'; form-action 'self'"
     )
     return response
 
