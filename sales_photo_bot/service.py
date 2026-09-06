@@ -9,6 +9,7 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from math import isqrt
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Protocol
@@ -90,6 +91,11 @@ MANUAL_RECOVERY_LOOKAHEAD_MESSAGES = 100
 MANUAL_RECOVERY_INTERVAL_SECONDS = 0.05
 REMINDER_CLEANUP_INTERVAL_SECONDS = 300
 REMINDER_CONFIRMATION_TIMEOUT_SECONDS = 600
+REMINDER_RECOVERY_ATTEMPT_BATCH_SIZE = 5
+REMINDER_RECOVERY_BATCH_SIZE = 25
+REMINDER_RECOVERY_TAIL_PROBE = 12
+REMINDER_RECOVERY_INTERVAL_SECONDS = 0.1
+REMINDER_RECOVERY_SETTLE_SECONDS = 60
 TEXT_SOURCE_FILE_ID = "sales-photo:text"
 _SOURCE_CALLBACK_RE = re.compile(
     r"^sp:(?:m:[a-z]+|b):(\d+):(\d+):([0-9a-f]{12})$"
@@ -331,6 +337,22 @@ class SalesPhotoService:
         self._call_sync_task: asyncio.Task[None] | None = None
         self._fill_reminder_task: asyncio.Task[None] | None = None
 
+    def _note_channel_message(self, message: object) -> None:
+        chat_id = _chat_id(message)
+        message_id = getattr(message, "message_id", None)
+        if chat_id != self.settings.chat_id or message_id is None:
+            return
+        try:
+            self.repository.note_channel_message_id(chat_id, int(message_id))
+        except Exception as exc:
+            logger.warning(
+                "sales_photo_channel_high_water_failed chat_id=%s "
+                "message_id=%s error_type=%s",
+                chat_id,
+                message_id,
+                _error_code(exc),
+            )
+
     async def preflight(self, bot: Bot) -> int:
         me = await bot.get_me()
         self.bot_id = int(me.id)
@@ -571,6 +593,7 @@ class SalesPhotoService:
         message = update.effective_message
         if message is None:
             return
+        self._note_channel_message(message)
         if self._is_order_backfill_forward(message):
             chat_id = _chat_id(message)
             message_id = getattr(message, "message_id", None)
@@ -607,6 +630,7 @@ class SalesPhotoService:
         message = update.effective_message
         if message is None:
             return
+        self._note_channel_message(message)
         content = _message_content(message)
         if content is None:
             return
@@ -655,6 +679,7 @@ class SalesPhotoService:
         if chat_id != self.settings.chat_id or command_message_id is None:
             return
         command_message_id = int(command_message_id)
+        self._note_channel_message(message)
         await self._delete_duplicate(context.bot, chat_id, command_message_id)
         status_text = BOT_CARD_MARKER + "✅ Обновление завершено"
         try:
@@ -875,6 +900,7 @@ class SalesPhotoService:
         message = update.edited_channel_post
         if message is None:
             return
+        self._note_channel_message(message)
         await self.handle_edited_photo(
             message,
             context.bot,
@@ -3660,6 +3686,259 @@ class SalesPhotoService:
                 max(0.1, (next_due - now).total_seconds())
             )
 
+    async def _inspect_fill_reminder_candidate(
+        self,
+        bot: Bot | Any,
+        attempt: Any,
+        message_id: int,
+    ) -> tuple[bool, bool]:
+        """Inspect one channel ID and bind it only to its signed attempt.
+
+        The first result says the ID was conclusively inspected. The second
+        says the missing Telegram ID was recovered.
+        """
+
+        forwarded = None
+        try:
+            forwarded = await self._forward_for_inspection(
+                bot,
+                source_chat_id=attempt.chat_id,
+                message_id=message_id,
+            )
+            self.repository.note_channel_message_id(
+                attempt.chat_id,
+                int(message_id),
+            )
+            content = _message_content(forwarded)
+            if content is None:
+                return True, False
+            _, body, entities = content
+            token = extract_reminder_token(body, entities)
+            if token is None or token[0] != attempt.attempt_id:
+                return True, False
+            if not self.repository.valid_fill_reminder_token(*token):
+                logger.warning(
+                    "sales_photo_reminder_recovery_token_rejected "
+                    "message_id=%s",
+                    message_id,
+                )
+                return True, False
+            current = self.repository.fill_reminder_attempt(attempt.attempt_id)
+            if (
+                current is None
+                or current.chat_id != attempt.chat_id
+                or current.replacement_message_id
+                != attempt.replacement_message_id
+                or current.state == "deleted"
+                or (
+                    current.telegram_message_id is not None
+                    and current.telegram_message_id != int(message_id)
+                )
+            ):
+                logger.warning(
+                    "sales_photo_reminder_recovery_binding_rejected "
+                    "message_id=%s",
+                    message_id,
+                )
+                return True, False
+            recovered = self.repository.confirm_fill_reminder_attempt(
+                attempt.attempt_id,
+                int(message_id),
+            )
+            if recovered:
+                logger.info(
+                    "sales_photo_reminder_recovered chat_id=%s "
+                    "source_message_id=%s reminder_message_id=%s",
+                    attempt.chat_id,
+                    attempt.source_message_id,
+                    message_id,
+                )
+            return True, recovered
+        except asyncio.CancelledError:
+            raise
+        except BadRequest as exc:
+            if _message_to_forward_missing(exc):
+                return True, False
+            logger.warning(
+                "sales_photo_reminder_recovery_scan_failed message_id=%s "
+                "error_type=%s",
+                message_id,
+                _error_code(exc),
+            )
+            return False, False
+        except Exception as exc:
+            logger.warning(
+                "sales_photo_reminder_recovery_scan_failed message_id=%s "
+                "error_type=%s",
+                message_id,
+                _error_code(exc),
+            )
+            return False, False
+        finally:
+            if forwarded is not None:
+                temporary_id = getattr(forwarded, "message_id", None)
+                if temporary_id is not None:
+                    await self._delete_duplicate(
+                        bot,
+                        self._inspection_chat_id,
+                        int(temporary_id),
+                    )
+
+    async def _recover_fill_reminder_attempt(
+        self,
+        bot: Bot | Any,
+        attempt: Any,
+        *,
+        probe_tail: bool,
+    ) -> bool:
+        prepared = self.repository.prepare_fill_reminder_recovery(
+            attempt.attempt_id
+        )
+        if (
+            prepared is None
+            or prepared.telegram_message_id is not None
+            or prepared.state == "deleted"
+        ):
+            return bool(
+                prepared is not None
+                and prepared.telegram_message_id is not None
+            )
+        self.repository.touch_fill_reminder_recovery_attempt(
+            prepared.attempt_id
+        )
+        boundary = self.repository.fill_reminder_recovery_boundary(
+            prepared.attempt_id
+        )
+        if boundary is None:
+            return False
+        scan_through, conclusive = boundary
+        start = prepared.recovery_cursor_message_id + 1
+        stop = min(
+            int(scan_through),
+            prepared.recovery_cursor_message_id
+            + REMINDER_RECOVERY_BATCH_SIZE,
+        )
+        for message_id in range(start, stop + 1):
+            inspected, recovered = await self._inspect_fill_reminder_candidate(
+                bot,
+                prepared,
+                message_id,
+            )
+            if not inspected:
+                return False
+            self.repository.advance_fill_reminder_recovery_cursor(
+                prepared.attempt_id,
+                message_id,
+            )
+            if recovered:
+                return True
+            if message_id < stop:
+                await asyncio.sleep(REMINDER_RECOVERY_INTERVAL_SECONDS)
+
+        current = self.repository.fill_reminder_attempt(prepared.attempt_id)
+        if current is None or current.telegram_message_id is not None:
+            return bool(current is not None and current.telegram_message_id is not None)
+        if conclusive and current.recovery_cursor_message_id >= scan_through:
+            self.repository.resolve_unpublished_fill_reminder_attempt(
+                current.attempt_id
+            )
+            logger.info(
+                "sales_photo_reminder_recovery_not_found attempt_id=%s",
+                current.attempt_id,
+            )
+            return False
+        if not probe_tail or current.recovery_cursor_message_id < scan_through:
+            return False
+
+        tail_base = max(
+            current.recovery_from_message_id,
+            current.recovery_cursor_message_id,
+            self.repository.channel_message_high_water(current.chat_id),
+        )
+        uncertain_at = current.uncertain_at or current.created_at
+        if uncertain_at.tzinfo is None:
+            uncertain_at = uncertain_at.replace(tzinfo=UTC)
+        settled = (
+            utc_now() - uncertain_at
+        ).total_seconds() >= REMINDER_RECOVERY_SETTLE_SECONDS
+        # During the request-settlement window, repeat the same nearby probe:
+        # a Telegram request whose response was lost can still become visible.
+        # Afterwards persist a separate speculative frontier so quiet/complete
+        # cards cannot leave an orphan just beyond the first probe. The normal
+        # recovery cursor remains authoritative and will rescan these IDs if a
+        # later observed channel message raises the high-water mark.
+        tail_start = (
+            max(tail_base, current.recovery_probe_message_id) + 1
+            if settled
+            else tail_base + 1
+        )
+        if settled and current.recovery_probe_message_id > tail_base:
+            # Replay 1; 2; 1,2; 1,2,3; ... across successive batches.
+            # Every speculative ID is therefore revisited indefinitely, while
+            # the main tail frontier still advances on every cleanup pass.
+            completed_batches = max(
+                1,
+                (
+                    current.recovery_probe_message_id - tail_base
+                )
+                // REMINDER_RECOVERY_TAIL_PROBE,
+            )
+            replay_round = completed_batches + 1
+            diagonal = (isqrt(8 * replay_round - 7) + 1) // 2
+            replay_offset = (
+                replay_round - diagonal * (diagonal - 1) // 2
+            )
+            replay_message_id = tail_base + replay_offset
+            inspected, recovered = await self._inspect_fill_reminder_candidate(
+                bot,
+                current,
+                replay_message_id,
+            )
+            if not inspected:
+                return False
+            if recovered:
+                return True
+            await asyncio.sleep(REMINDER_RECOVERY_INTERVAL_SECONDS)
+        for offset, message_id in enumerate(
+            range(tail_start, tail_start + REMINDER_RECOVERY_TAIL_PROBE)
+        ):
+            inspected, recovered = await self._inspect_fill_reminder_candidate(
+                bot,
+                current,
+                message_id,
+            )
+            if not inspected:
+                return False
+            if recovered:
+                return True
+            if settled:
+                self.repository.advance_fill_reminder_recovery_probe(
+                    current.attempt_id,
+                    message_id,
+                )
+            if offset + 1 < REMINDER_RECOVERY_TAIL_PROBE:
+                await asyncio.sleep(REMINDER_RECOVERY_INTERVAL_SECONDS)
+        return False
+
+    async def _recover_unlocated_fill_reminders(
+        self,
+        bot: Bot | Any,
+        source_message_id: int | None = None,
+    ) -> set[int]:
+        processed_sources: set[int] = set()
+        for attempt in self.repository.recoverable_fill_reminder_attempts(
+            self.settings.chat_id,
+            source_message_id,
+            limit=REMINDER_RECOVERY_ATTEMPT_BATCH_SIZE,
+        ):
+            processed_sources.add(attempt.source_message_id)
+            await self._recover_fill_reminder_attempt(
+                bot,
+                attempt,
+                probe_tail=True,
+            )
+        return processed_sources
+
     async def _observe_fill_reminder(
         self,
         message: Message | Any,
@@ -3706,17 +3985,15 @@ class SalesPhotoService:
         attempt: Any,
     ) -> bool:
         if attempt.telegram_message_id is None:
-            if attempt.state != "delete_pending":
-                self.repository.mark_fill_reminder_attempt_state(
-                    attempt.attempt_id,
-                    "delete_pending",
-                )
+            # An accepted send can lose its HTTP response. Keep the attempt
+            # recoverable until the signed-message scanner finds its real ID
+            # or conclusively proves that no message was published.
             return False
         if attempt.state == "delete_pending":
             retry_delay = min(
                 3600,
                 self.settings.delete_retry_seconds
-                * (2 ** min(attempt.retry_count, 7)),
+                * (2 ** min(max(attempt.retry_count - 1, 0), 7)),
             )
             updated_at = attempt.updated_at
             if updated_at.tzinfo is None:
@@ -3724,9 +4001,8 @@ class SalesPhotoService:
             if (utc_now() - updated_at).total_seconds() < retry_delay:
                 return False
         if attempt.state != "delete_pending":
-            self.repository.mark_fill_reminder_attempt_state(
-                attempt.attempt_id,
-                "delete_pending",
+            self.repository.begin_fill_reminder_attempt_delete(
+                attempt.attempt_id
             )
         removed = await self._delete_duplicate(
             bot,
@@ -3811,6 +4087,10 @@ class SalesPhotoService:
                 message_id=candidate.replacement_message_id,
                 allow_sending_without_reply=False,
             ),
+            "read_timeout": 30,
+            "write_timeout": 30,
+            "connect_timeout": 10,
+            "pool_timeout": 10,
         }
         try:
             reminder = await bot.send_message(**kwargs)
@@ -3821,12 +4101,28 @@ class SalesPhotoService:
                 "cancelled",
             )
             raise
+        except BadRequest as exc:
+            # BadRequest inherits NetworkError in python-telegram-bot, but it
+            # is a definitive rejection: Telegram did not publish a message.
+            self.repository.mark_fill_reminder_attempt_state(
+                attempt.attempt_id,
+                "failed",
+                _error_code(exc),
+            )
+            raise
         except NetworkError as exc:
             self.repository.mark_fill_reminder_attempt_state(
                 attempt.attempt_id,
                 "ambiguous",
                 _error_code(exc),
             )
+            current = self.repository.fill_reminder_attempt(attempt.attempt_id)
+            if current is not None:
+                return await self._recover_fill_reminder_attempt(
+                    bot,
+                    current,
+                    probe_tail=True,
+                )
             return False
         except Exception as exc:
             self.repository.mark_fill_reminder_attempt_state(
@@ -3842,12 +4138,62 @@ class SalesPhotoService:
                 "ambiguous",
                 "missing_message_id",
             )
+            current = self.repository.fill_reminder_attempt(attempt.attempt_id)
+            if current is not None:
+                return await self._recover_fill_reminder_attempt(
+                    bot,
+                    current,
+                    probe_tail=True,
+                )
             return False
-        self.repository.confirm_fill_reminder_attempt(
+        if not self.repository.confirm_fill_reminder_attempt(
             attempt.attempt_id,
             int(reminder_id),
-        )
+        ):
+            raise RuntimeError("reminder confirmation conflict")
         return True
+
+    async def _collapse_fill_reminder_copies(
+        self,
+        bot: Bot | Any,
+        candidate: Any,
+    ) -> tuple[int, int]:
+        """Recover older uncertain sends and retain only the newest reminder."""
+
+        await self._recover_unlocated_fill_reminders(
+            bot,
+            candidate.source_message_id,
+        )
+        attempts = self.repository.open_fill_reminder_attempts(
+            candidate.chat_id,
+            candidate.source_message_id,
+        )
+        known = [
+            attempt
+            for attempt in attempts
+            if attempt.telegram_message_id is not None
+            and attempt.state in {"confirmed", "delete_pending"}
+        ]
+        if not known:
+            return 0, 1
+        canonical = max(known, key=lambda item: item.created_at)
+        deleted = failures = 0
+        for attempt in known:
+            if attempt.attempt_id == canonical.attempt_id:
+                continue
+            if await self._delete_fill_reminder_attempt(bot, attempt):
+                deleted += 1
+            else:
+                failures += 1
+        if any(
+            attempt.source_message_id == candidate.source_message_id
+            for attempt in self.repository.recoverable_fill_reminder_attempts(
+                candidate.chat_id,
+                candidate.source_message_id,
+            )
+        ):
+            failures += 1
+        return deleted, failures
 
     async def _reconcile_fill_reminder_candidate(
         self,
@@ -3906,9 +4252,21 @@ class SalesPhotoService:
                 else:
                     failures += 1
 
+        # Never add another hourly copy while an older known reminder still
+        # has a pending Telegram deletion.
+        if failures:
+            return 0, deleted, failures
+
         unresolved_send = any(
             attempt.telegram_message_id is None
-            and attempt.state in {"pending", "ambiguous", "delete_pending"}
+            and (
+                attempt.state in {"pending", "ambiguous", "delete_pending"}
+                or (
+                    attempt.state == "failed"
+                    and canonical is not None
+                    and canonical.created_at > attempt.created_at
+                )
+            )
             for attempt in attempts
         )
         if canonical is not None and publish and rotate_existing:
@@ -3921,10 +4279,13 @@ class SalesPhotoService:
                 return 0, deleted, failures
             sent = int(await self._publish_fill_reminder(bot, candidate, check))
             if sent:
-                if await self._delete_fill_reminder_attempt(bot, canonical):
-                    deleted += 1
-                else:
-                    failures += 1
+                new_deleted, new_failures = (
+                    await self._collapse_fill_reminder_copies(bot, candidate)
+                )
+                deleted += new_deleted
+                failures += new_failures
+            else:
+                failures += 1
             return sent, deleted, failures
 
         if canonical is not None:
@@ -3964,13 +4325,29 @@ class SalesPhotoService:
         )
         if any(
             attempt.telegram_message_id is None
-            and attempt.state in {"pending", "ambiguous", "delete_pending"}
+            and (
+                attempt.state in {"pending", "ambiguous", "delete_pending"}
+                or (
+                    attempt.state == "failed"
+                    and canonical is not None
+                    and canonical.created_at > attempt.created_at
+                )
+            )
             for attempt in unresolved
         ):
             return 0, deleted, failures
         if not publish:
             return 0, deleted, failures
         sent = int(await self._publish_fill_reminder(bot, candidate, check))
+        if sent:
+            new_deleted, new_failures = await self._collapse_fill_reminder_copies(
+                bot,
+                candidate,
+            )
+            deleted += new_deleted
+            failures += new_failures
+        else:
+            failures += 1
         return sent, deleted, failures
 
     async def run_fill_reminder_check(
@@ -3986,6 +4363,9 @@ class SalesPhotoService:
 
         async with self._fill_reminder_lock:
             sale_date_from, sale_date_to = _recent_sale_window(reference_date)
+            recovery_processed_sources = (
+                await self._recover_unlocated_fill_reminders(bot)
+            )
             self.repository.expire_unconfirmed_fill_reminders(
                 utc_now()
                 - timedelta(seconds=REMINDER_CONFIRMATION_TIMEOUT_SECONDS)
@@ -4027,6 +4407,16 @@ class SalesPhotoService:
                         candidate.replacement_message_id,
                     )
                     async with self._card_lock(key):
+                        if (
+                            source_message_id is not None
+                            and candidate.has_open_reminder
+                            and candidate.source_message_id
+                            not in recovery_processed_sources
+                        ):
+                            await self._recover_unlocated_fill_reminders(
+                                bot,
+                                candidate.source_message_id,
+                            )
                         cached = FillCheck(
                             supplier_price=candidate.supplier_price_filled,
                             phone=candidate.phone_filled,

@@ -244,6 +244,22 @@ class FillReminderServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(repo.valid_fill_reminder_token(*token))
             self.assertIn(ADMIN_MENTION, payload.text)
 
+    async def test_confirmed_attempt_cannot_be_rebound_to_another_message(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SalesPhotoRepository(root / "sales.db")
+            self._sale(repo)
+            attempt = repo.create_fill_reminder_attempt(CHAT_ID, 10, 200)
+
+            self.assertTrue(
+                repo.confirm_fill_reminder_attempt(attempt.attempt_id, 801)
+            )
+            self.assertFalse(
+                repo.confirm_fill_reminder_attempt(attempt.attempt_id, 802)
+            )
+            confirmed = repo.fill_reminder_attempt(attempt.attempt_id)
+            self.assertEqual(confirmed.telegram_message_id, 801)
+
     async def test_hourly_publish_keeps_one_existing_reminder(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -311,6 +327,13 @@ class FillReminderServiceTests(unittest.IsolatedAsyncioTestCase):
                 rotate_existing=True,
                 reference_date=date(2026, 9, 1),
             )
+
+            async def forward_existing_card_only(**kwargs):
+                if int(kwargs["message_id"]) == 200:
+                    return self._forwarded(901, CARD)
+                raise BadRequest("Message to forward not found")
+
+            bot.forward_message.side_effect = forward_existing_card_only
             bot.send_message.side_effect = NetworkError("lost response")
             await service.run_fill_reminder_check(
                 bot,
@@ -367,6 +390,13 @@ class FillReminderServiceTests(unittest.IsolatedAsyncioTestCase):
             repo = SalesPhotoRepository(root / "sales.db")
             self._sale(repo)
             bot = self._bot(CARD)
+
+            async def forward_existing_card_only(**kwargs):
+                if int(kwargs["message_id"]) == 200:
+                    return self._forwarded(901, CARD)
+                raise BadRequest("Message to forward not found")
+
+            bot.forward_message.side_effect = forward_existing_card_only
             bot.send_message.side_effect = NetworkError("lost response")
             service = SalesPhotoService(settings(root), repo)
 
@@ -385,6 +415,572 @@ class FillReminderServiceTests(unittest.IsolatedAsyncioTestCase):
             attempt = repo.open_fill_reminder_attempts(CHAT_ID, 10)[0]
             self.assertEqual(attempt.state, "ambiguous")
             self.assertIsNone(attempt.telegram_message_id)
+
+    async def test_accepted_send_with_lost_response_is_recovered_immediately(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SalesPhotoRepository(root / "sales.db")
+            self._sale(repo)
+            bot = self._bot(CARD)
+            service = SalesPhotoService(settings(root), repo)
+
+            await service.run_fill_reminder_check(
+                bot,
+                publish=True,
+                rotate_existing=True,
+                reference_date=date(2026, 9, 1),
+            )
+            accepted: dict[str, object] = {}
+
+            async def accepted_but_lost(**kwargs):
+                accepted.update(kwargs)
+                raise NetworkError("accepted but response was lost")
+
+            async def forward_message(**kwargs):
+                message_id = int(kwargs["message_id"])
+                if message_id == 200:
+                    return self._forwarded(901, CARD)
+                if message_id == 802:
+                    return SimpleNamespace(
+                        message_id=902,
+                        text=accepted["text"],
+                        entities=accepted["entities"],
+                        caption=None,
+                        caption_entities=(),
+                    )
+                raise BadRequest("Message to forward not found")
+
+            bot.send_message.side_effect = accepted_but_lost
+            bot.forward_message.side_effect = forward_message
+
+            await service.run_fill_reminder_check(
+                bot,
+                publish=True,
+                rotate_existing=True,
+                reference_date=date(2026, 9, 1),
+            )
+
+            self.assertEqual(bot.send_message.await_count, 2)
+            self.assertEqual(accepted["read_timeout"], 30)
+            self.assertEqual(accepted["write_timeout"], 30)
+            self.assertIn(call(CHAT_ID, 801), bot.delete_message.await_args_list)
+            attempts = repo.open_fill_reminder_attempts(CHAT_ID, 10)
+            self.assertEqual(len(attempts), 1)
+            self.assertEqual(attempts[0].telegram_message_id, 802)
+            self.assertEqual(attempts[0].state, "confirmed")
+
+    async def test_restart_recovers_and_deletes_a_stale_unknown_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SalesPhotoRepository(root / "sales.db")
+            self._sale(repo)
+            attempt = repo.create_fill_reminder_attempt(CHAT_ID, 10, 200)
+            payload = build_signed_fill_reminder(
+                inspect_fill_fields(CARD, None),
+                repo.fill_reminder_token_url(attempt.attempt_id),
+            )
+            repo.mark_fill_reminder_attempt_state(
+                attempt.attempt_id,
+                "ambiguous",
+                "TimedOut",
+                at=attempt.created_at,
+            )
+            repo.note_channel_message_id(CHAT_ID, 202)
+            self.assertTrue(repo.reserve_ui_transition(CHAT_ID, 200, 0))
+            self.assertTrue(
+                repo.commit_reserved_manager_selection(CHAT_ID, 200, "Ali", 0)
+            )
+
+            reopened = SalesPhotoRepository(root / "sales.db")
+            complete = CARD.replace("📞:", "📞: заполнено")
+
+            async def forward_message(**kwargs):
+                message_id = int(kwargs["message_id"])
+                if message_id == 201:
+                    return SimpleNamespace(
+                        message_id=901,
+                        text=payload.text,
+                        entities=payload.entities,
+                        caption=None,
+                        caption_entities=(),
+                    )
+                if message_id == 200:
+                    return self._forwarded(902, complete)
+                raise BadRequest("Message to forward not found")
+
+            bot = self._bot(complete)
+            bot.forward_message.side_effect = forward_message
+            service = SalesPhotoService(settings(root), reopened)
+
+            await service.run_fill_reminder_check(
+                bot,
+                publish=False,
+                reference_date=date(2026, 9, 1),
+            )
+
+            recovered = reopened.fill_reminder_attempt(attempt.attempt_id)
+            self.assertEqual(recovered.state, "deleted")
+            self.assertEqual(recovered.telegram_message_id, 201)
+            self.assertIn(call(CHAT_ID, 201), bot.delete_message.await_args_list)
+
+    async def test_recovery_does_not_bind_an_invalid_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SalesPhotoRepository(root / "sales.db")
+            self._sale(repo)
+            attempt = repo.create_fill_reminder_attempt(
+                CHAT_ID,
+                10,
+                200,
+                at=datetime.now(UTC) - timedelta(minutes=20),
+            )
+            payload = build_signed_fill_reminder(
+                inspect_fill_fields(CARD, None),
+                repo.fill_reminder_token_url(attempt.attempt_id),
+            )
+            forged_entities = tuple(
+                SimpleNamespace(
+                    type=entity.type,
+                    offset=entity.offset,
+                    length=entity.length,
+                    url=str(entity.url)[:-1]
+                    + ("0" if not str(entity.url).endswith("0") else "1"),
+                )
+                for entity in payload.entities
+            )
+            repo.mark_fill_reminder_attempt_state(
+                attempt.attempt_id,
+                "ambiguous",
+                "TimedOut",
+                at=attempt.created_at,
+            )
+            repo.note_channel_message_id(CHAT_ID, 201)
+            later = repo.create_fill_reminder_attempt(CHAT_ID, 10, 200)
+            self.assertTrue(
+                repo.confirm_fill_reminder_attempt(later.attempt_id, 202)
+            )
+
+            async def forward_message(**kwargs):
+                if int(kwargs["message_id"]) == 201:
+                    return SimpleNamespace(
+                        message_id=901,
+                        text=payload.text,
+                        entities=forged_entities,
+                        caption=None,
+                        caption_entities=(),
+                    )
+                if int(kwargs["message_id"]) == 200:
+                    return self._forwarded(902, CARD)
+                raise BadRequest("Message to forward not found")
+
+            bot = self._bot(CARD)
+            bot.forward_message.side_effect = forward_message
+            service = SalesPhotoService(settings(root), repo)
+
+            await service.run_fill_reminder_check(
+                bot,
+                publish=False,
+                reference_date=date(2026, 9, 1),
+            )
+
+            resolved = repo.fill_reminder_attempt(attempt.attempt_id)
+            self.assertEqual(resolved.state, "deleted")
+            self.assertIsNone(resolved.telegram_message_id)
+            self.assertNotIn(call(CHAT_ID, 201), bot.delete_message.await_args_list)
+
+    async def test_tail_probe_never_declares_a_later_real_reminder_absent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SalesPhotoRepository(root / "sales.db")
+            self._sale(repo)
+            attempt = repo.create_fill_reminder_attempt(
+                CHAT_ID,
+                10,
+                200,
+                at=datetime.now(UTC) - timedelta(minutes=20),
+            )
+            payload = build_signed_fill_reminder(
+                inspect_fill_fields(CARD, None),
+                repo.fill_reminder_token_url(attempt.attempt_id),
+            )
+            repo.mark_fill_reminder_attempt_state(
+                attempt.attempt_id,
+                "ambiguous",
+                "TimedOut",
+                at=attempt.created_at,
+            )
+
+            async def forward_message(**kwargs):
+                message_id = int(kwargs["message_id"])
+                if message_id == 200:
+                    return self._forwarded(900, CARD)
+                if message_id == 213:
+                    return SimpleNamespace(
+                        message_id=913,
+                        text=payload.text,
+                        entities=payload.entities,
+                        caption=None,
+                        caption_entities=(),
+                    )
+                raise BadRequest("Message to forward not found")
+
+            bot = self._bot(CARD)
+            bot.forward_message.side_effect = forward_message
+            service = SalesPhotoService(settings(root), repo)
+
+            await service.run_fill_reminder_check(
+                bot,
+                publish=False,
+                reference_date=date(2026, 9, 1),
+            )
+            unresolved = repo.fill_reminder_attempt(attempt.attempt_id)
+            self.assertEqual(unresolved.state, "failed")
+            self.assertIsNone(unresolved.telegram_message_id)
+            self.assertEqual(unresolved.recovery_cursor_message_id, 200)
+            self.assertEqual(unresolved.recovery_probe_message_id, 212)
+
+            repo.note_channel_message_id(CHAT_ID, 213)
+            await service.run_fill_reminder_check(
+                bot,
+                publish=False,
+                reference_date=date(2026, 9, 1),
+            )
+
+            recovered = repo.fill_reminder_attempt(attempt.attempt_id)
+            self.assertEqual(recovered.state, "confirmed")
+            self.assertEqual(recovered.telegram_message_id, 213)
+
+    async def test_settled_tail_probe_widens_and_deletes_complete_card(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SalesPhotoRepository(root / "sales.db")
+            self._sale(repo)
+            attempt = repo.create_fill_reminder_attempt(
+                CHAT_ID,
+                10,
+                200,
+                at=datetime.now(UTC) - timedelta(minutes=20),
+            )
+            payload = build_signed_fill_reminder(
+                inspect_fill_fields(CARD, None),
+                repo.fill_reminder_token_url(attempt.attempt_id),
+            )
+            repo.mark_fill_reminder_attempt_state(
+                attempt.attempt_id,
+                "ambiguous",
+                "TimedOut",
+                at=attempt.created_at,
+            )
+            self.assertTrue(repo.reserve_ui_transition(CHAT_ID, 200, 0))
+            self.assertTrue(
+                repo.commit_reserved_manager_selection(CHAT_ID, 200, "Ali", 0)
+            )
+            complete = CARD.replace("📞:", "📞: заполнено")
+
+            async def forward_message(**kwargs):
+                message_id = int(kwargs["message_id"])
+                if message_id == 200:
+                    return self._forwarded(900, complete)
+                if message_id == 213:
+                    return SimpleNamespace(
+                        message_id=913,
+                        text=payload.text,
+                        entities=payload.entities,
+                        caption=None,
+                        caption_entities=(),
+                    )
+                raise BadRequest("Message to forward not found")
+
+            bot = self._bot(complete)
+            bot.forward_message.side_effect = forward_message
+            service = SalesPhotoService(settings(root), repo)
+
+            await service.run_fill_reminder_check(
+                bot,
+                publish=False,
+                reference_date=date(2026, 9, 1),
+            )
+            first_pass = repo.fill_reminder_attempt(attempt.attempt_id)
+            self.assertEqual(first_pass.state, "failed")
+            self.assertEqual(first_pass.recovery_probe_message_id, 212)
+
+            await service.run_fill_reminder_check(
+                bot,
+                publish=False,
+                reference_date=date(2026, 9, 1),
+            )
+
+            recovered = repo.fill_reminder_attempt(attempt.attempt_id)
+            self.assertEqual(recovered.state, "deleted")
+            self.assertEqual(recovered.telegram_message_id, 213)
+            self.assertIn(call(CHAT_ID, 213), bot.delete_message.await_args_list)
+
+    async def test_tail_settlement_starts_when_send_becomes_ambiguous(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SalesPhotoRepository(root / "sales.db")
+            self._sale(repo)
+            attempt = repo.create_fill_reminder_attempt(
+                CHAT_ID,
+                10,
+                200,
+                at=datetime.now(UTC) - timedelta(minutes=20),
+            )
+            self.assertTrue(
+                repo.mark_fill_reminder_attempt_state(
+                    attempt.attempt_id,
+                    "ambiguous",
+                    "TimedOut",
+                )
+            )
+            bot = self._bot(CARD)
+            bot.forward_message.side_effect = BadRequest(
+                "Message to forward not found"
+            )
+            service = SalesPhotoService(settings(root), repo)
+
+            await service._recover_fill_reminder_attempt(
+                bot,
+                repo.fill_reminder_attempt(attempt.attempt_id),
+                probe_tail=True,
+            )
+
+            current = repo.fill_reminder_attempt(attempt.attempt_id)
+            self.assertIsNotNone(current.uncertain_at)
+            self.assertEqual(current.recovery_cursor_message_id, 200)
+            self.assertEqual(current.recovery_probe_message_id, 200)
+
+    async def test_settled_tail_replays_an_id_that_appears_very_late(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SalesPhotoRepository(root / "sales.db")
+            self._sale(repo)
+            attempt = repo.create_fill_reminder_attempt(
+                CHAT_ID,
+                10,
+                200,
+                at=datetime.now(UTC) - timedelta(minutes=20),
+            )
+            payload = build_signed_fill_reminder(
+                inspect_fill_fields(CARD, None),
+                repo.fill_reminder_token_url(attempt.attempt_id),
+            )
+            repo.mark_fill_reminder_attempt_state(
+                attempt.attempt_id,
+                "ambiguous",
+                "TimedOut",
+                at=attempt.created_at,
+            )
+            available = False
+
+            async def forward_message(**kwargs):
+                if int(kwargs["message_id"]) == 201 and available:
+                    return SimpleNamespace(
+                        message_id=901,
+                        text=payload.text,
+                        entities=payload.entities,
+                        caption=None,
+                        caption_entities=(),
+                    )
+                raise BadRequest("Message to forward not found")
+
+            bot = self._bot(CARD)
+            bot.forward_message.side_effect = forward_message
+            service = SalesPhotoService(settings(root), repo)
+
+            await service._recover_fill_reminder_attempt(
+                bot,
+                repo.fill_reminder_attempt(attempt.attempt_id),
+                probe_tail=True,
+            )
+            self.assertEqual(
+                repo.fill_reminder_attempt(
+                    attempt.attempt_id
+                ).recovery_probe_message_id,
+                212,
+            )
+
+            available = True
+            await service._recover_fill_reminder_attempt(
+                bot,
+                repo.fill_reminder_attempt(attempt.attempt_id),
+                probe_tail=True,
+            )
+
+            recovered = repo.fill_reminder_attempt(attempt.attempt_id)
+            self.assertEqual(recovered.state, "confirmed")
+            self.assertEqual(recovered.telegram_message_id, 201)
+
+    async def test_definitive_failed_send_is_not_recovery_scanned(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SalesPhotoRepository(root / "sales.db")
+            self._sale(repo)
+            attempt = repo.create_fill_reminder_attempt(CHAT_ID, 10, 200)
+            self.assertTrue(
+                repo.mark_fill_reminder_attempt_state(
+                    attempt.attempt_id,
+                    "failed",
+                    "BadRequest",
+                )
+            )
+
+            self.assertEqual(repo.open_fill_reminder_attempts(CHAT_ID, 10), ())
+            self.assertEqual(repo.recoverable_fill_reminder_attempts(CHAT_ID), ())
+
+    async def test_bad_request_publish_is_definitive_not_ambiguous(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SalesPhotoRepository(root / "sales.db")
+            self._sale(repo)
+            bot = self._bot(CARD)
+            bot.send_message.side_effect = BadRequest("reply target missing")
+            service = SalesPhotoService(settings(root), repo)
+
+            await service.run_fill_reminder_check(
+                bot,
+                publish=True,
+                reference_date=date(2026, 9, 1),
+            )
+
+            with repo._connect() as db:
+                row = db.execute(
+                    """SELECT state,last_error_code,uncertain_at
+                       FROM sales_photo_reminder_attempts"""
+                ).fetchone()
+            self.assertEqual(row["state"], "failed")
+            self.assertEqual(row["last_error_code"], "BadRequest")
+            self.assertIsNone(row["uncertain_at"])
+            self.assertEqual(repo.recoverable_fill_reminder_attempts(CHAT_ID), ())
+
+    async def test_recoverable_query_filters_source_before_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SalesPhotoRepository(root / "sales.db")
+            self._sale(repo, source_id=10, replacement_id=200)
+            self._sale(repo, source_id=11, replacement_id=201)
+            first = repo.create_fill_reminder_attempt(CHAT_ID, 10, 200)
+            second = repo.create_fill_reminder_attempt(CHAT_ID, 11, 201)
+
+            attempts = repo.recoverable_fill_reminder_attempts(
+                CHAT_ID,
+                source_message_id=11,
+                limit=1,
+            )
+
+            self.assertEqual(
+                tuple(item.attempt_id for item in attempts),
+                (second.attempt_id,),
+            )
+            self.assertNotEqual(first.attempt_id, second.attempt_id)
+
+    async def test_recovery_queue_rotates_after_an_attempt_is_checked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SalesPhotoRepository(root / "sales.db")
+            self._sale(repo, source_id=10, replacement_id=200)
+            self._sale(repo, source_id=11, replacement_id=201)
+            now = datetime.now(UTC)
+            first = repo.create_fill_reminder_attempt(
+                CHAT_ID,
+                10,
+                200,
+                at=now - timedelta(minutes=2),
+            )
+            second = repo.create_fill_reminder_attempt(
+                CHAT_ID,
+                11,
+                201,
+                at=now - timedelta(minutes=1),
+            )
+            repo.mark_fill_reminder_attempt_state(
+                first.attempt_id,
+                "ambiguous",
+                "TimedOut",
+                at=first.created_at,
+            )
+            repo.mark_fill_reminder_attempt_state(
+                second.attempt_id,
+                "ambiguous",
+                "TimedOut",
+                at=second.created_at,
+            )
+
+            selected = repo.recoverable_fill_reminder_attempts(CHAT_ID, limit=1)
+            self.assertEqual(selected[0].attempt_id, first.attempt_id)
+            self.assertTrue(
+                repo.touch_fill_reminder_recovery_attempt(
+                    first.attempt_id,
+                    at=now,
+                )
+            )
+            selected = repo.recoverable_fill_reminder_attempts(CHAT_ID, limit=1)
+            self.assertEqual(selected[0].attempt_id, second.attempt_id)
+
+    async def test_next_scheduled_send_fences_and_removes_old_unknown_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SalesPhotoRepository(root / "sales.db")
+            self._sale(repo)
+            accepted: dict[str, object] = {}
+            send_count = 0
+
+            async def send_message(**kwargs):
+                nonlocal send_count
+                send_count += 1
+                if send_count == 1:
+                    accepted.update(kwargs)
+                    raise NetworkError("accepted but response was lost")
+                return SimpleNamespace(message_id=214)
+
+            async def forward_message(**kwargs):
+                message_id = int(kwargs["message_id"])
+                if message_id == 200:
+                    return self._forwarded(900, CARD)
+                if message_id == 213:
+                    return SimpleNamespace(
+                        message_id=913,
+                        text=accepted["text"],
+                        entities=accepted["entities"],
+                        caption=None,
+                        caption_entities=(),
+                    )
+                raise BadRequest("Message to forward not found")
+
+            bot = self._bot(CARD)
+            bot.send_message.side_effect = send_message
+            bot.forward_message.side_effect = forward_message
+            service = SalesPhotoService(settings(root), repo)
+
+            await service.run_fill_reminder_check(
+                bot,
+                publish=True,
+                rotate_existing=True,
+                reference_date=date(2026, 9, 1),
+            )
+            old = repo.open_fill_reminder_attempts(CHAT_ID, 10)[0]
+            self.assertTrue(
+                repo.mark_fill_reminder_attempt_state(
+                    old.attempt_id,
+                    "failed",
+                    "confirmation_timeout",
+                )
+            )
+
+            await service.run_fill_reminder_check(
+                bot,
+                publish=True,
+                rotate_existing=True,
+                reference_date=date(2026, 9, 1),
+            )
+
+            old_after = repo.fill_reminder_attempt(old.attempt_id)
+            self.assertEqual(old_after.state, "deleted")
+            self.assertEqual(old_after.telegram_message_id, 213)
+            current = repo.open_fill_reminder_attempts(CHAT_ID, 10)
+            self.assertEqual(len(current), 1)
+            self.assertEqual(current[0].telegram_message_id, 214)
+            self.assertIn(call(CHAT_ID, 213), bot.delete_message.await_args_list)
 
     async def test_observer_recovers_lost_send_response(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -739,6 +1335,41 @@ class FillReminderServiceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FillReminderMigrationTests(unittest.TestCase):
+    def test_recovery_columns_are_added_to_an_existing_attempt_table(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "sales.db"
+            repo = SalesPhotoRepository(path)
+            FillReminderServiceTests._sale(repo)
+            attempt = repo.create_fill_reminder_attempt(CHAT_ID, 10, 200)
+            with repo._connect() as db:
+                db.execute(
+                    "ALTER TABLE sales_photo_reminder_attempts "
+                    "DROP COLUMN uncertain_at"
+                )
+                db.execute(
+                    "ALTER TABLE sales_photo_reminder_attempts "
+                    "DROP COLUMN recovery_probe_message_id"
+                )
+                db.execute(
+                    "ALTER TABLE sales_photo_reminder_attempts "
+                    "DROP COLUMN recovery_cursor_message_id"
+                )
+                db.execute(
+                    "ALTER TABLE sales_photo_reminder_attempts "
+                    "DROP COLUMN recovery_from_message_id"
+                )
+                db.commit()
+
+            migrated = SalesPhotoRepository(path)
+            recovered = migrated.fill_reminder_attempt(attempt.attempt_id)
+
+            self.assertIsNotNone(recovered)
+            self.assertEqual(recovered.recovery_from_message_id, 0)
+            self.assertEqual(recovered.recovery_cursor_message_id, 0)
+            self.assertEqual(recovered.recovery_probe_message_id, 0)
+            self.assertIsNone(recovered.uncertain_at)
+
     def test_legacy_pointer_is_migrated_to_confirmed_attempt(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -151,6 +151,11 @@ class FillReminderAttempt:
     telegram_message_id: int | None
     state: str
     retry_count: int
+    last_error_code: str | None
+    recovery_from_message_id: int
+    recovery_cursor_message_id: int
+    recovery_probe_message_id: int
+    uncertain_at: datetime | None
     created_at: datetime
     updated_at: datetime
 
@@ -522,6 +527,10 @@ class SalesPhotoRepository:
                     )),
                     retry_count INTEGER NOT NULL DEFAULT 0,
                     last_error_code TEXT,
+                    recovery_from_message_id INTEGER NOT NULL DEFAULT 0,
+                    recovery_cursor_message_id INTEGER NOT NULL DEFAULT 0,
+                    recovery_probe_message_id INTEGER NOT NULL DEFAULT 0,
+                    uncertain_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     confirmed_at TEXT,
@@ -633,6 +642,32 @@ class SalesPhotoRepository:
                 db.execute(
                     "ALTER TABLE sales_photo_jobs ADD COLUMN "
                     "order_removed INTEGER NOT NULL DEFAULT 0"
+                )
+            reminder_columns = {
+                str(row[1])
+                for row in db.execute(
+                    "PRAGMA table_info(sales_photo_reminder_attempts)"
+                ).fetchall()
+            }
+            if "recovery_from_message_id" not in reminder_columns:
+                db.execute(
+                    "ALTER TABLE sales_photo_reminder_attempts ADD COLUMN "
+                    "recovery_from_message_id INTEGER NOT NULL DEFAULT 0"
+                )
+            if "recovery_cursor_message_id" not in reminder_columns:
+                db.execute(
+                    "ALTER TABLE sales_photo_reminder_attempts ADD COLUMN "
+                    "recovery_cursor_message_id INTEGER NOT NULL DEFAULT 0"
+                )
+            if "recovery_probe_message_id" not in reminder_columns:
+                db.execute(
+                    "ALTER TABLE sales_photo_reminder_attempts ADD COLUMN "
+                    "recovery_probe_message_id INTEGER NOT NULL DEFAULT 0"
+                )
+            if "uncertain_at" not in reminder_columns:
+                db.execute(
+                    "ALTER TABLE sales_photo_reminder_attempts ADD COLUMN "
+                    "uncertain_at TEXT"
                 )
             if manager_state_added:
                 # Preserve every existing human choice. The only safely
@@ -1564,9 +1599,16 @@ class SalesPhotoRepository:
                               FROM sales_photo_reminder_attempts AS attempt
                              WHERE attempt.chat_id=job.chat_id
                                AND attempt.source_message_id=job.source_message_id
-                               AND attempt.state IN (
-                                   'pending','confirmed','ambiguous',
-                                   'delete_pending')
+                               AND (
+                                   attempt.state IN (
+                                       'pending','confirmed','ambiguous',
+                                       'delete_pending')
+                                   OR (
+                                       attempt.state='failed'
+                                       AND attempt.last_error_code=
+                                           'confirmation_timeout'
+                                   )
+                               )
                           ) AS has_open_reminder
                    FROM sales_photo_jobs AS job
                    WHERE job.chat_id=?
@@ -1727,9 +1769,114 @@ class SalesPhotoRepository:
             ),
             state=str(row["state"]),
             retry_count=int(row["retry_count"]),
+            last_error_code=(
+                str(row["last_error_code"])
+                if row["last_error_code"] is not None
+                else None
+            ),
+            recovery_from_message_id=int(
+                row["recovery_from_message_id"] or 0
+            ),
+            recovery_cursor_message_id=int(
+                row["recovery_cursor_message_id"] or 0
+            ),
+            recovery_probe_message_id=int(
+                row["recovery_probe_message_id"] or 0
+            ),
+            uncertain_at=(
+                datetime.fromisoformat(str(row["uncertain_at"]))
+                if row["uncertain_at"] is not None
+                else None
+            ),
             created_at=datetime.fromisoformat(str(row["created_at"])),
             updated_at=datetime.fromisoformat(str(row["updated_at"])),
         )
+
+    @staticmethod
+    def _channel_message_high_water_key(chat_id: int) -> str:
+        return f"channel_message_high_water:{int(chat_id)}"
+
+    @classmethod
+    def _channel_message_high_water_locked(
+        cls,
+        db: sqlite3.Connection,
+        chat_id: int,
+    ) -> int:
+        key = cls._channel_message_high_water_key(chat_id)
+        meta = db.execute(
+            "SELECT value FROM sales_photo_meta WHERE key=?",
+            (key,),
+        ).fetchone()
+        try:
+            meta_value = max(0, int(meta["value"])) if meta is not None else 0
+        except (TypeError, ValueError):
+            meta_value = 0
+        derived = db.execute(
+            """SELECT MAX(message_id) AS message_id FROM (
+                   SELECT source_message_id AS message_id
+                     FROM sales_photo_jobs WHERE chat_id=?
+                   UNION ALL
+                   SELECT replacement_message_id AS message_id
+                     FROM sales_photo_jobs
+                    WHERE chat_id=? AND replacement_message_id IS NOT NULL
+                   UNION ALL
+                   SELECT member_message_id AS message_id
+                     FROM sales_photo_source_members WHERE chat_id=?
+                   UNION ALL
+                   SELECT message_id FROM sales_photo_output_members
+                    WHERE chat_id=?
+                   UNION ALL
+                   SELECT telegram_message_id AS message_id
+                     FROM sales_photo_reminder_attempts
+                    WHERE chat_id=? AND telegram_message_id IS NOT NULL
+               )""",
+            (int(chat_id),) * 5,
+        ).fetchone()
+        derived_value = int(derived["message_id"] or 0)
+        return max(meta_value, derived_value)
+
+    @classmethod
+    def _note_channel_message_id_locked(
+        cls,
+        db: sqlite3.Connection,
+        chat_id: int,
+        message_id: int,
+        *,
+        at: datetime | None = None,
+    ) -> None:
+        value = max(0, int(message_id))
+        db.execute(
+            """INSERT INTO sales_photo_meta(key,value,updated_at)
+               VALUES(?,?,?)
+               ON CONFLICT(key) DO UPDATE SET
+                   value=excluded.value,updated_at=excluded.updated_at
+               WHERE CAST(sales_photo_meta.value AS INTEGER)
+                     < CAST(excluded.value AS INTEGER)""",
+            (
+                cls._channel_message_high_water_key(chat_id),
+                str(value),
+                _iso(at or utc_now()),
+            ),
+        )
+
+    def note_channel_message_id(
+        self,
+        chat_id: int,
+        message_id: int,
+        at: datetime | None = None,
+    ) -> None:
+        with self._connect() as db:
+            self._note_channel_message_id_locked(
+                db,
+                int(chat_id),
+                int(message_id),
+                at=at,
+            )
+            db.commit()
+
+    def channel_message_high_water(self, chat_id: int) -> int:
+        with self._connect() as db:
+            return self._channel_message_high_water_locked(db, int(chat_id))
 
     def create_fill_reminder_attempt(
         self,
@@ -1744,6 +1891,7 @@ class SalesPhotoRepository:
         now = _iso(now_value)
         attempt_id = secrets.token_hex(12)
         with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             row = db.execute(
                 """SELECT replacement_message_id FROM sales_photo_jobs
                    WHERE chat_id=? AND source_message_id=?
@@ -1755,19 +1903,28 @@ class SalesPhotoRepository:
                 ),
             ).fetchone()
             if row is None:
+                db.rollback()
                 raise RuntimeError("reminder target does not exist")
+            recovery_from_message_id = max(
+                int(replacement_message_id),
+                self._channel_message_high_water_locked(db, int(chat_id)),
+            )
             db.execute(
                 """INSERT INTO sales_photo_reminder_attempts(
                        attempt_id,chat_id,source_message_id,
                        replacement_message_id,telegram_message_id,state,
-                       retry_count,last_error_code,created_at,updated_at,
-                       confirmed_at,deleted_at)
-                   VALUES(?,?,?,?,NULL,'pending',0,NULL,?,?,NULL,NULL)""",
+                       retry_count,last_error_code,recovery_from_message_id,
+                       recovery_cursor_message_id,recovery_probe_message_id,
+                       uncertain_at,created_at,updated_at,confirmed_at,deleted_at)
+                   VALUES(?,?,?,?,NULL,'pending',0,NULL,?,?,?,NULL,?,?,NULL,NULL)""",
                 (
                     attempt_id,
                     int(chat_id),
                     int(source_message_id),
                     int(replacement_message_id),
+                    recovery_from_message_id,
+                    recovery_from_message_id,
+                    recovery_from_message_id,
                     now,
                     now,
                 ),
@@ -1781,6 +1938,11 @@ class SalesPhotoRepository:
             telegram_message_id=None,
             state="pending",
             retry_count=0,
+            last_error_code=None,
+            recovery_from_message_id=recovery_from_message_id,
+            recovery_cursor_message_id=recovery_from_message_id,
+            recovery_probe_message_id=recovery_from_message_id,
+            uncertain_at=None,
             created_at=now_value.astimezone(UTC),
             updated_at=now_value.astimezone(UTC),
         )
@@ -1824,8 +1986,15 @@ class SalesPhotoRepository:
                 """SELECT * FROM sales_photo_reminder_attempts
                    WHERE chat_id=?
                      AND (? IS NULL OR source_message_id=?)
-                     AND state IN (
-                         'pending','confirmed','ambiguous','delete_pending')
+                     AND (
+                         state IN (
+                             'pending','confirmed','ambiguous','delete_pending'
+                         )
+                         OR (
+                             state='failed'
+                             AND last_error_code='confirmation_timeout'
+                         )
+                     )
                    ORDER BY created_at,attempt_id""",
                 (
                     int(chat_id),
@@ -1834,6 +2003,250 @@ class SalesPhotoRepository:
                 ),
             ).fetchall()
         return tuple(self._reminder_attempt_from_row(row) for row in rows)
+
+    def recoverable_fill_reminder_attempts(
+        self,
+        chat_id: int,
+        source_message_id: int | None = None,
+        limit: int = 50,
+    ) -> tuple[FillReminderAttempt, ...]:
+        """Return reminder sends whose Telegram message ID is still unknown."""
+
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT * FROM sales_photo_reminder_attempts
+                   WHERE chat_id=?
+                     AND (? IS NULL OR source_message_id=?)
+                     AND telegram_message_id IS NULL
+                     AND (
+                         state IN ('pending','ambiguous','delete_pending')
+                         OR (
+                             state='failed'
+                             AND last_error_code='confirmation_timeout'
+                         )
+                     )
+                     AND COALESCE(last_error_code,'')
+                         != 'recovery_scanned_not_found'
+                   ORDER BY updated_at,created_at,attempt_id LIMIT ?""",
+                (
+                    int(chat_id),
+                    source_message_id,
+                    source_message_id,
+                    max(1, min(int(limit), 200)),
+                ),
+            ).fetchall()
+        return tuple(self._reminder_attempt_from_row(row) for row in rows)
+
+    def touch_fill_reminder_recovery_attempt(
+        self,
+        attempt_id: str,
+        at: datetime | None = None,
+    ) -> bool:
+        """Move one attempted recovery to the back of the fair work queue."""
+
+        with self._connect() as db:
+            cursor = db.execute(
+                """UPDATE sales_photo_reminder_attempts
+                   SET updated_at=?
+                   WHERE attempt_id=? AND telegram_message_id IS NULL
+                     AND (
+                         state IN ('pending','ambiguous','delete_pending')
+                         OR (
+                             state='failed'
+                             AND last_error_code='confirmation_timeout'
+                         )
+                     )""",
+                (_iso(at or utc_now()), str(attempt_id)),
+            )
+            db.commit()
+        return cursor.rowcount == 1
+
+    def prepare_fill_reminder_recovery(
+        self,
+        attempt_id: str,
+    ) -> FillReminderAttempt | None:
+        """Initialize a durable scan floor for an attempt created pre-migration."""
+
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM sales_photo_reminder_attempts WHERE attempt_id=?",
+                (str(attempt_id),),
+            ).fetchone()
+            if row is None:
+                db.rollback()
+                return None
+            if int(row["recovery_from_message_id"] or 0) <= 0:
+                previous = db.execute(
+                    """SELECT MAX(telegram_message_id) AS message_id
+                       FROM sales_photo_reminder_attempts
+                       WHERE chat_id=? AND telegram_message_id IS NOT NULL
+                         AND (created_at<? OR (
+                              created_at=? AND attempt_id<?))""",
+                    (
+                        int(row["chat_id"]),
+                        str(row["created_at"]),
+                        str(row["created_at"]),
+                        str(row["attempt_id"]),
+                    ),
+                ).fetchone()
+                recovery_from = max(
+                    int(row["replacement_message_id"]),
+                    int(previous["message_id"] or 0),
+                )
+                db.execute(
+                    """UPDATE sales_photo_reminder_attempts
+                       SET recovery_from_message_id=?,
+                           recovery_cursor_message_id=MAX(
+                               recovery_cursor_message_id,?
+                           ),
+                           recovery_probe_message_id=MAX(
+                               recovery_probe_message_id,?
+                           )
+                       WHERE attempt_id=?""",
+                    (
+                        recovery_from,
+                        recovery_from,
+                        recovery_from,
+                        str(attempt_id),
+                    ),
+                )
+                row = db.execute(
+                    "SELECT * FROM sales_photo_reminder_attempts WHERE attempt_id=?",
+                    (str(attempt_id),),
+                ).fetchone()
+            db.commit()
+        return self._reminder_attempt_from_row(row)
+
+    def fill_reminder_recovery_boundary(
+        self,
+        attempt_id: str,
+    ) -> tuple[int, bool] | None:
+        """Return the last ID to inspect and whether it proves send absence."""
+
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT chat_id,attempt_id,created_at,
+                          recovery_from_message_id
+                   FROM sales_photo_reminder_attempts WHERE attempt_id=?""",
+                (str(attempt_id),),
+            ).fetchone()
+            if row is None:
+                return None
+            later = db.execute(
+                """SELECT MIN(telegram_message_id) AS message_id
+                   FROM sales_photo_reminder_attempts
+                   WHERE chat_id=? AND telegram_message_id IS NOT NULL
+                     AND telegram_message_id>?
+                     AND (created_at>? OR (
+                          created_at=? AND attempt_id>?))""",
+                (
+                    int(row["chat_id"]),
+                    int(row["recovery_from_message_id"] or 0),
+                    str(row["created_at"]),
+                    str(row["created_at"]),
+                    str(row["attempt_id"]),
+                ),
+            ).fetchone()
+            later_message_id = int(later["message_id"] or 0)
+            if later_message_id > 0:
+                return max(
+                    int(row["recovery_from_message_id"] or 0),
+                    later_message_id - 1,
+                ), True
+            high_water = self._channel_message_high_water_locked(
+                db,
+                int(row["chat_id"]),
+            )
+            recovery_from = int(row["recovery_from_message_id"] or 0)
+            # An unrelated channel post can race ahead of the uncertain
+            # request. Only a later reminder send (serialized by the service)
+            # is a strict upper boundary for proving that no reminder exists.
+            return max(recovery_from, high_water), False
+
+    def advance_fill_reminder_recovery_cursor(
+        self,
+        attempt_id: str,
+        message_id: int,
+    ) -> bool:
+        with self._connect() as db:
+            cursor = db.execute(
+                """UPDATE sales_photo_reminder_attempts
+                   SET recovery_cursor_message_id=?,updated_at=?
+                   WHERE attempt_id=? AND telegram_message_id IS NULL
+                     AND (
+                         state IN ('pending','ambiguous','delete_pending')
+                         OR (
+                             state='failed'
+                             AND last_error_code='confirmation_timeout'
+                         )
+                     )
+                     AND recovery_cursor_message_id<?""",
+                (
+                    int(message_id),
+                    _iso(utc_now()),
+                    str(attempt_id),
+                    int(message_id),
+                ),
+            )
+            db.commit()
+        return cursor.rowcount == 1
+
+    def advance_fill_reminder_recovery_probe(
+        self,
+        attempt_id: str,
+        message_id: int,
+    ) -> bool:
+        """Persist the speculative tail frontier without moving the fence."""
+
+        with self._connect() as db:
+            cursor = db.execute(
+                """UPDATE sales_photo_reminder_attempts
+                   SET recovery_probe_message_id=?,updated_at=?
+                   WHERE attempt_id=? AND telegram_message_id IS NULL
+                     AND (
+                         state IN ('pending','ambiguous','delete_pending')
+                         OR (
+                             state='failed'
+                             AND last_error_code='confirmation_timeout'
+                         )
+                     )
+                     AND recovery_probe_message_id<?""",
+                (
+                    int(message_id),
+                    _iso(utc_now()),
+                    str(attempt_id),
+                    int(message_id),
+                ),
+            )
+            db.commit()
+        return cursor.rowcount == 1
+
+    def resolve_unpublished_fill_reminder_attempt(
+        self,
+        attempt_id: str,
+        at: datetime | None = None,
+    ) -> bool:
+        """Close a send after every later channel ID was safely inspected."""
+
+        now = _iso(at or utc_now())
+        with self._connect() as db:
+            cursor = db.execute(
+                """UPDATE sales_photo_reminder_attempts
+                   SET state='deleted',deleted_at=?,updated_at=?,
+                       last_error_code='recovery_scanned_not_found'
+                   WHERE attempt_id=? AND telegram_message_id IS NULL
+                     AND (
+                         state IN ('pending','ambiguous','delete_pending')
+                         OR (
+                             state='failed'
+                             AND last_error_code='confirmation_timeout'
+                         )
+                     )""",
+                (now, now, str(attempt_id)),
+            )
+            db.commit()
+        return cursor.rowcount == 1
 
     def confirm_fill_reminder_attempt(
         self,
@@ -1849,18 +2262,53 @@ class SalesPhotoRepository:
                        SET telegram_message_id=?,state='confirmed',
                            confirmed_at=COALESCE(confirmed_at,?),
                            last_error_code=NULL,updated_at=?
-                       WHERE attempt_id=? AND state!='deleted'""",
+                       WHERE attempt_id=? AND state!='deleted'
+                         AND (telegram_message_id IS NULL
+                              OR telegram_message_id=?)""",
                     (
                         int(telegram_message_id),
                         now,
                         now,
                         str(attempt_id),
+                        int(telegram_message_id),
                     ),
                 )
+                if cursor.rowcount == 1:
+                    row = db.execute(
+                        """SELECT chat_id FROM sales_photo_reminder_attempts
+                           WHERE attempt_id=?""",
+                        (str(attempt_id),),
+                    ).fetchone()
+                    if row is not None:
+                        self._note_channel_message_id_locked(
+                            db,
+                            int(row["chat_id"]),
+                            int(telegram_message_id),
+                            at=at,
+                        )
                 db.commit()
             except sqlite3.IntegrityError:
                 db.rollback()
                 return False
+        return cursor.rowcount == 1
+
+    def begin_fill_reminder_attempt_delete(
+        self,
+        attempt_id: str,
+        at: datetime | None = None,
+    ) -> bool:
+        """Persist deletion intent without counting it as a failed attempt."""
+
+        now = _iso(at or utc_now())
+        with self._connect() as db:
+            cursor = db.execute(
+                """UPDATE sales_photo_reminder_attempts
+                   SET state='delete_pending',last_error_code=NULL,updated_at=?
+                   WHERE attempt_id=? AND telegram_message_id IS NOT NULL
+                     AND state IN ('pending','confirmed','ambiguous','failed')""",
+                (now, str(attempt_id)),
+            )
+            db.commit()
         return cursor.rowcount == 1
 
     def mark_fill_reminder_attempt_state(
@@ -1883,12 +2331,14 @@ class SalesPhotoRepository:
             cursor = db.execute(
                 f"""UPDATE sales_photo_reminder_attempts
                    SET state=?,retry_count=retry_count+1,
-                       last_error_code=?,updated_at=?
+                       last_error_code=?,updated_at=?,
+                       uncertain_at=COALESCE(uncertain_at,?)
                    WHERE attempt_id=? AND state IN ({placeholders})""",
                 (
                     state,
                     str(error_code or "")[:80] or None,
                     now,
+                    now if state == "ambiguous" else None,
                     str(attempt_id),
                     *allowed_previous,
                 ),
@@ -1922,7 +2372,8 @@ class SalesPhotoRepository:
             cursor = db.execute(
                 """UPDATE sales_photo_reminder_attempts
                    SET state='failed',last_error_code='confirmation_timeout',
-                       updated_at=?
+                       updated_at=?,
+                       uncertain_at=COALESCE(uncertain_at,created_at)
                    WHERE state IN ('pending','ambiguous') AND created_at<?""",
                 (now, _iso(older_than)),
             )
