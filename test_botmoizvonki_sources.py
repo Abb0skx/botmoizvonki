@@ -1496,6 +1496,95 @@ class CallSourceTests(unittest.TestCase):
             True,
         )
 
+    def test_missed_incoming_call_mentions_assigned_device_user(self):
+        cases = (
+            (
+                "aashshdjdjdjsj@gmail.com",
+                "@turgunboev_098",
+                "@Otabek_1smailov",
+            ),
+            (
+                "texnikacholx@gmail.com",
+                "@Otabek_1smailov",
+                "@turgunboev_098",
+            ),
+        )
+
+        with mock.patch.multiple(
+            bot,
+            MISSED_CALL_ALERT_USERNAME=(
+                "@AbbosTch"
+            ),
+            MISSED_CALL_ALERT_USERNAMES_BY_DEVICE={
+                "redmi": "@turgunboev_098",
+                "tecno": "@Otabek_1smailov",
+            },
+        ):
+            for index, (
+                login,
+                expected_username,
+                other_username,
+            ) in enumerate(
+                cases,
+                start=1,
+            ):
+                with self.subTest(
+                    login=login
+                ):
+                    event = self.event(
+                        540 + index,
+                        f"+998900000{540 + index}",
+                        0,
+                    )
+                    event.update(
+                        {
+                            "answered": 0,
+                            "answer_time": 0,
+                            "recording": "",
+                        }
+                    )
+
+                    message = (
+                        bot.build_telegram_message(
+                            event,
+                            self.webhook(
+                                login
+                            ),
+                            0,
+                        )
+                    )
+
+                    self.assertIn(
+                        "@AbbosTch",
+                        message,
+                    )
+                    self.assertIn(
+                        expected_username,
+                        message,
+                    )
+                    self.assertNotIn(
+                        other_username,
+                        message,
+                    )
+
+    def test_answered_call_does_not_mention_assigned_device_user(self):
+        message = bot.build_telegram_message(
+            self.event(
+                550,
+                "+998900000550",
+                0,
+            ),
+            self.webhook(
+                "aashshdjdjdjsj@gmail.com"
+            ),
+            9,
+        )
+
+        self.assertNotIn(
+            "@turgunboev_098",
+            message,
+        )
+
     def test_webhook_delivers_telegram_before_client_sms(self):
         event = self.event(
             18,

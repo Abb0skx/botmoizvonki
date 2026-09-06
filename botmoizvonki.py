@@ -267,6 +267,17 @@ MISSED_CALL_ALERT_USERNAME = os.getenv(
     "@AbbosTch",
 ).strip()
 
+MISSED_CALL_ALERT_USERNAMES_BY_DEVICE = {
+    "redmi": os.getenv(
+        "REDMI_MISSED_CALL_ALERT_USERNAME",
+        "@turgunboev_098",
+    ).strip(),
+    "tecno": os.getenv(
+        "TECNO_MISSED_CALL_ALERT_USERNAME",
+        "@Otabek_1smailov",
+    ).strip(),
+}
+
 FORWARDING_SETTINGS = load_forwarding_settings()
 
 
@@ -9711,6 +9722,45 @@ def is_missed_incoming_call(
         return False
 
 
+def get_missed_call_alert_usernames(
+    device_name: str | None,
+) -> list[str]:
+
+    candidates = [
+        MISSED_CALL_ALERT_USERNAME,
+        MISSED_CALL_ALERT_USERNAMES_BY_DEVICE.get(
+            str(
+                device_name
+                or ""
+            ).strip().casefold(),
+            "",
+        ),
+    ]
+
+    usernames = []
+    seen = set()
+
+    for candidate in candidates:
+        username = str(
+            candidate
+            or ""
+        ).strip()
+
+        key = username.casefold()
+
+        if not username or key in seen:
+            continue
+
+        seen.add(
+            key
+        )
+        usernames.append(
+            username
+        )
+
+    return usernames
+
+
 # =========================================================
 # TELEGRAM MESSAGE
 # =========================================================
@@ -9893,19 +9943,29 @@ def build_telegram_message(
         title,
     ]
 
-    if (
-        is_missed_incoming_call(
+    missed_alert_usernames = (
+        get_missed_call_alert_usernames(
+            device["device_name"]
+        )
+        if is_missed_incoming_call(
             direction,
             answered,
         )
-        and MISSED_CALL_ALERT_USERNAME
-    ):
+        else []
+    )
+
+    if missed_alert_usernames:
         lines.extend(
             [
                 "",
                 "🔔 "
-                + escape(
-                    MISSED_CALL_ALERT_USERNAME
+                + " ".join(
+                    escape(
+                        username
+                    )
+                    for username in (
+                        missed_alert_usernames
+                    )
                 ),
             ]
         )
