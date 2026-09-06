@@ -112,10 +112,6 @@ class TelegramBusinessStateTests(unittest.TestCase):
                 row["name"]
                 for row in migrated.execute("PRAGMA table_info(business_requests)")
             }
-            client_columns = {
-                row["name"]
-                for row in migrated.execute("PRAGMA table_info(business_clients)")
-            }
             receipt_columns = {
                 row["name"]
                 for row in migrated.execute(
@@ -128,14 +124,6 @@ class TelegramBusinessStateTests(unittest.TestCase):
             <= tables
         )
         self.assertIn("origin_update_id", request_columns)
-        self.assertTrue(
-            {
-                "phone",
-                "phone_verified",
-                "phone_owner_user_id",
-                "location_phone_pending",
-            }.issubset(client_columns)
-        )
         self.assertIn("result", receipt_columns)
 
     def test_update_claim_is_atomic_and_stale_lease_recovers(self):

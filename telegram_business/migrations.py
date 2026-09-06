@@ -18,9 +18,6 @@ CREATE TABLE IF NOT EXISTS business_clients (
  chat_id TEXT PRIMARY KEY, telegram_user_id TEXT, first_name TEXT, last_name TEXT, username TEXT,
  language TEXT, language_confidence REAL, bot_paused INTEGER NOT NULL DEFAULT 0, pause_reason TEXT,
  manager_lock_until TEXT, last_credit_reply_at TEXT, last_ack_at TEXT, last_client_message_at TEXT,
- phone TEXT, phone_verified INTEGER NOT NULL DEFAULT 0, phone_owner_user_id TEXT,
- phone_source TEXT, phone_verified_at TEXT, location_phone_pending INTEGER NOT NULL DEFAULT 0,
- location_phone_requested_at TEXT,
  created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS business_sessions (
  session_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, business_date TEXT NOT NULL, started_at TEXT NOT NULL,
@@ -181,17 +178,7 @@ def migrate(path: Path | str) -> None:
         _ensure_columns(
             db,
             "business_clients",
-            {
-                "last_ack_at": "TEXT",
-                "last_client_message_at": "TEXT",
-                "phone": "TEXT",
-                "phone_verified": "INTEGER NOT NULL DEFAULT 0",
-                "phone_owner_user_id": "TEXT",
-                "phone_source": "TEXT",
-                "phone_verified_at": "TEXT",
-                "location_phone_pending": "INTEGER NOT NULL DEFAULT 0",
-                "location_phone_requested_at": "TEXT",
-            },
+            {"last_ack_at": "TEXT", "last_client_message_at": "TEXT"},
         )
         _ensure_columns(
             db,

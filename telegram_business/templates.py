@@ -79,18 +79,6 @@ TEMPLATES: dict[str, dict[str, str]] = {
         "ru": "Локацию получили. Напишите, пожалуйста, название нужной модели. Менеджер проверит данные {manager_time_phrase_ru}.",
         "uz": "Lokatsiyani oldik. Kerakli model nomini yozing. Menejer ma’lumotlarni {manager_time_phrase_uz} tekshiradi.",
     },
-    "location_phone_value": {
-        "ru": "{phone}",
-        "uz": "{phone}",
-    },
-    "location_phone_label": {
-        "ru": "Ваш номер",
-        "uz": "Sizi nomeriz",
-    },
-    "location_phone_request": {
-        "ru": "Можете отправить свой номер телефона?\nОтправьте его через 📎 → Контакт.",
-        "uz": "Telefon nomerizi yozvorolismi?\n📎 → Kontakt orqali yuboring.",
-    },
     "final": {
         "ru": "Цена и наличие требуют подтверждения менеджера {manager_time_phrase_ru}. Бот не оформляет заказ и не резервирует товар.",
         "uz": "Narx va mavjudlikni menejer {manager_time_phrase_uz} tasdiqlaydi. Bot buyurtma rasmiylashtirmaydi va mahsulotni band qilmaydi.",

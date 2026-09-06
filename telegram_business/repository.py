@@ -299,7 +299,6 @@ class BusinessRepository:
                             """UPDATE scheduled_actions SET status='cancelled',
                                generation=generation+1,lease_token=NULL,
                                lease_expires_at=NULL,executed_at=? WHERE chat_id=?
-                               AND action_type!='location_phone'
                                AND status IN ('pending','running')""",
                             (iso(now), str(chat_id)),
                         )
@@ -581,55 +580,6 @@ class BusinessRepository:
                 (chat_id, str(user.get("id", "")), user.get("first_name"), user.get("last_name"),
                  user.get("username"), iso(now), iso(now)),
             )
-
-    def save_verified_client_phone(
-        self, chat_id: str, phone: str, owner_user_id: str, now: datetime
-    ) -> bool:
-        """Persist only a Telegram contact owned by this private-chat user."""
-
-        owner = str(owner_user_id or "")
-        if not owner or not str(phone or "").strip():
-            return False
-        with connect(self.path) as db:
-            changed = db.execute(
-                """UPDATE business_clients
-                   SET phone=?,phone_verified=1,phone_owner_user_id=?,
-                       phone_source='telegram_contact',phone_verified_at=?,updated_at=?
-                   WHERE chat_id=? AND telegram_user_id=?""",
-                (str(phone), owner, iso(now), iso(now), str(chat_id), owner),
-            ).rowcount
-        return changed == 1
-
-    def verified_client_phone(self, chat_id: str) -> str | None:
-        row = self.client(str(chat_id))
-        if not row or not row["phone_verified"] or not row["phone"]:
-            return None
-        if str(row["phone_owner_user_id"] or "") != str(
-            row["telegram_user_id"] or ""
-        ):
-            return None
-        return str(row["phone"])
-
-    def set_location_phone_pending(
-        self, chat_id: str, pending: bool, now: datetime
-    ) -> bool:
-        with connect(self.path) as db:
-            changed = db.execute(
-                """UPDATE business_clients
-                   SET location_phone_pending=?,location_phone_requested_at=?,updated_at=?
-                   WHERE chat_id=?""",
-                (
-                    int(pending),
-                    iso(now) if pending else None,
-                    iso(now),
-                    str(chat_id),
-                ),
-            ).rowcount
-        return changed == 1
-
-    def location_phone_pending(self, chat_id: str) -> bool:
-        row = self.client(str(chat_id))
-        return bool(row and row["location_phone_pending"])
 
     # Night sessions.
     @staticmethod
@@ -1458,8 +1408,7 @@ class BusinessRepository:
                 )
             if manager_is_current:
                 db.execute("""UPDATE scheduled_actions SET status='cancelled',generation=generation+1,
-                    lease_token=NULL,lease_expires_at=NULL,executed_at=? WHERE chat_id=?
-                    AND action_type!='location_phone' AND status IN ('pending','running')""",
+                    lease_token=NULL,lease_expires_at=NULL,executed_at=? WHERE chat_id=? AND status IN ('pending','running')""",
                     (iso(now), chat_id))
             else:
                 # The answer can still close an older, fully covered cycle, but it
@@ -1471,7 +1420,6 @@ class BusinessRepository:
                         """UPDATE scheduled_actions SET status='cancelled',
                            generation=generation+1,lease_token=NULL,
                            lease_expires_at=NULL,executed_at=? WHERE session_id=?
-                           AND action_type!='location_phone'
                            AND status IN ('pending','running')""",
                         (iso(now), affected_session),
                     )
@@ -1841,7 +1789,7 @@ class BusinessRepository:
 
     def cancel_chat_actions(self, chat_id: str, now: datetime) -> int:
         with connect(self.path) as db:
-            return db.execute("UPDATE scheduled_actions SET status='cancelled',generation=generation+1,lease_token=NULL,lease_expires_at=NULL,executed_at=? WHERE chat_id=? AND action_type!='location_phone' AND status IN ('pending','running')",
+            return db.execute("UPDATE scheduled_actions SET status='cancelled',generation=generation+1,lease_token=NULL,lease_expires_at=NULL,executed_at=? WHERE chat_id=? AND status IN ('pending','running')",
                               (iso(now), chat_id)).rowcount
 
     # Automation state and audited anti-spam hooks.
@@ -1941,8 +1889,7 @@ class BusinessRepository:
             db.execute(
                 """UPDATE scheduled_actions SET status='cancelled',generation=generation+1,
                    lease_token=NULL,lease_expires_at=NULL,executed_at=?
-                   WHERE session_id=? AND action_type!='location_phone'
-                   AND status IN ('pending','running')""",
+                   WHERE session_id=? AND status IN ('pending','running')""",
                 (iso(now), session_id),
             )
             requests = db.execute(
@@ -2045,29 +1992,9 @@ class BusinessRepository:
             return db.execute(sql, params).fetchone() is not None
 
     def bot_message_count(self, chat_id: str, session_id: str, now: datetime) -> tuple[int, int]:
-        # The mandatory post-location phone flow is deliberately outside the
-        # ordinary conversational anti-spam budget. It must remain available
-        # after a manager reply and must not suppress a following safety or
-        # credit response.
-        excluded = (
-            "location_phone_value",
-            "location_phone_label",
-            "location_phone_request",
-        )
-        placeholders = ",".join("?" for _ in excluded)
         with connect(self.path) as db:
-            ten = db.execute(
-                f"""SELECT count(*) FROM business_messages
-                    WHERE chat_id=? AND sender_type='business_bot'
-                    AND created_at>=? AND template_code NOT IN ({placeholders})""",
-                (chat_id, iso(now - timedelta(minutes=10)), *excluded),
-            ).fetchone()[0]
-            session = db.execute(
-                f"""SELECT count(*) FROM business_messages
-                    WHERE session_id=? AND sender_type='business_bot'
-                    AND template_code NOT IN ({placeholders})""",
-                (session_id, *excluded),
-            ).fetchone()[0]
+            ten = db.execute("SELECT count(*) FROM business_messages WHERE chat_id=? AND sender_type='business_bot' AND created_at>=?", (chat_id, iso(now - timedelta(minutes=10)))).fetchone()[0]
+            session = db.execute("SELECT count(*) FROM business_messages WHERE session_id=? AND sender_type='business_bot'", (session_id,)).fetchone()[0]
             return ten, session
 
     def begin_outbound_delivery(
