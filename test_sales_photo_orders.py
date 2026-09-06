@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
 from dataclasses import replace
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -441,6 +442,62 @@ class DailyOrderRepositoryTests(unittest.TestCase):
 
 
 class ExistingCardBackfillTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unrelated_job_update_does_not_starve_order_backfill(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SalesPhotoRepository(root / "sales.db")
+            sale_day = tashkent_today()
+            repo.claim_photo(
+                CHAT_ID,
+                10,
+                "legacy",
+                source_file_id="file",
+                sale_date=sale_day,
+            )
+            repo.mark_reposted(CHAT_ID, 10, 200)
+            attempted_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+            repo.mark_order_backfill_failed(CHAT_ID, 10, at=attempted_at)
+
+            # Manager/delivery synchronization legitimately touches the job's
+            # generic timestamp. It must not postpone this independent retry.
+            with sqlite3.connect(repo.path) as db:
+                db.execute(
+                    """UPDATE sales_photo_jobs SET updated_at=?
+                       WHERE chat_id=? AND source_message_id=?""",
+                    (
+                        (
+                            datetime.now(timezone.utc) + timedelta(days=1)
+                        ).isoformat(),
+                        CHAT_ID,
+                        10,
+                    ),
+                )
+                db.commit()
+
+            forwarded = SimpleNamespace(
+                message_id=900,
+                chat_id=CHECK_CHAT_ID,
+                caption=BOT_CARD_MARKER + "Шт: 1\n🆔: 1\n\n🛒💵:",
+                caption_entities=(),
+                text=None,
+                reply_markup=None,
+            )
+            bot = SimpleNamespace(
+                forward_message=AsyncMock(return_value=forwarded),
+                edit_message_caption=AsyncMock(),
+                edit_message_text=AsyncMock(),
+                delete_message=AsyncMock(return_value=True),
+            )
+            service = SalesPhotoService(
+                replace(settings(root), check_chat_id=CHECK_CHAT_ID),
+                repo,
+            )
+
+            await service.backfill_order_cards(bot)
+
+            bot.forward_message.assert_awaited_once()
+            self.assertEqual(repo.pending_order_backfills(CHAT_ID), ())
+
     async def test_history_backfill_stops_on_channel_rate_limit(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

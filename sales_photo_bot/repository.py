@@ -66,6 +66,7 @@ class PendingOrderBackfill:
     global_id: int
     attempts: int
     updated_at: datetime
+    attempted_at: datetime | None
 
 
 @dataclass(frozen=True)
@@ -75,6 +76,7 @@ class PendingPriceBackfill:
     replacement_message_id: int
     attempts: int
     updated_at: datetime
+    attempted_at: datetime | None
 
 
 @dataclass(frozen=True)
@@ -420,8 +422,10 @@ class SalesPhotoRepository:
                     global_order_id INTEGER,
                     order_card_applied INTEGER NOT NULL DEFAULT 0,
                     order_backfill_attempts INTEGER NOT NULL DEFAULT 0,
+                    order_backfill_attempted_at TEXT,
                     price_card_applied INTEGER NOT NULL DEFAULT 0,
                     price_backfill_attempts INTEGER NOT NULL DEFAULT 0,
+                    price_backfill_attempted_at TEXT,
                     order_removed INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL CHECK(status IN (
                         'processing','reposted','delete_pending','complete','failed'
@@ -635,6 +639,11 @@ class SalesPhotoRepository:
                     "ALTER TABLE sales_photo_jobs ADD COLUMN "
                     "order_backfill_attempts INTEGER NOT NULL DEFAULT 0"
                 )
+            if "order_backfill_attempted_at" not in columns:
+                db.execute(
+                    "ALTER TABLE sales_photo_jobs ADD COLUMN "
+                    "order_backfill_attempted_at TEXT"
+                )
             if "price_card_applied" not in columns:
                 db.execute(
                     "ALTER TABLE sales_photo_jobs ADD COLUMN "
@@ -644,6 +653,11 @@ class SalesPhotoRepository:
                 db.execute(
                     "ALTER TABLE sales_photo_jobs ADD COLUMN "
                     "price_backfill_attempts INTEGER NOT NULL DEFAULT 0"
+                )
+            if "price_backfill_attempted_at" not in columns:
+                db.execute(
+                    "ALTER TABLE sales_photo_jobs ADD COLUMN "
+                    "price_backfill_attempted_at TEXT"
                 )
             if "order_removed" not in columns:
                 db.execute(
@@ -757,7 +771,9 @@ class SalesPhotoRepository:
                 counters[counter_key] = next_id
                 db.execute(
                     """UPDATE sales_photo_jobs
-                       SET sale_date=?,daily_order_id=?,order_card_applied=0
+                       SET sale_date=?,daily_order_id=?,order_card_applied=0,
+                           order_backfill_attempts=0,
+                           order_backfill_attempted_at=NULL
                        WHERE chat_id=? AND source_message_id=?""",
                     (
                         sale_day,
@@ -823,6 +839,10 @@ class SalesPhotoRepository:
                                order_backfill_attempts=CASE
                                  WHEN order_removed=0 THEN 0
                                  ELSE order_backfill_attempts
+                               END,
+                               order_backfill_attempted_at=CASE
+                                 WHEN order_removed=0 THEN NULL
+                                 ELSE order_backfill_attempted_at
                                END
                            WHERE chat_id=? AND source_message_id=?
                              AND global_order_id IS NULL""",
@@ -937,11 +957,22 @@ class SalesPhotoRepository:
                     SELECT RAISE(ABORT, 'global_order_id is immutable');
                 END;
 
-                CREATE INDEX IF NOT EXISTS idx_sales_photo_order_backfill
-                ON sales_photo_jobs(order_card_applied,order_backfill_attempts,updated_at);
+                CREATE INDEX IF NOT EXISTS
+                idx_sales_photo_order_backfill_attempted
+                ON sales_photo_jobs(
+                    order_card_applied,order_backfill_attempts,
+                    order_backfill_attempted_at
+                );
 
                 CREATE INDEX IF NOT EXISTS idx_sales_photo_price_backfill
                 ON sales_photo_jobs(price_card_applied,price_backfill_attempts,updated_at);
+
+                CREATE INDEX IF NOT EXISTS
+                idx_sales_photo_price_backfill_attempted
+                ON sales_photo_jobs(
+                    price_card_applied,price_backfill_attempts,
+                    price_backfill_attempted_at
+                );
 
                 CREATE INDEX IF NOT EXISTS idx_sales_photo_recent_cards
                 ON sales_photo_jobs(chat_id,sale_date,order_removed,daily_order_id);
@@ -1365,7 +1396,9 @@ class SalesPhotoRepository:
             for expected, active_row in enumerate(active_rows, start=1):
                 db.execute(
                     """UPDATE sales_photo_jobs
-                       SET daily_order_id=?,order_card_applied=?
+                       SET daily_order_id=?,order_card_applied=?,
+                           order_backfill_attempts=0,
+                           order_backfill_attempted_at=NULL
                        WHERE chat_id=? AND source_message_id=?
                          AND order_removed=0
                          AND (replacement_message_id IS NOT NULL OR status='processing')""",
@@ -1451,7 +1484,9 @@ class SalesPhotoRepository:
         next_id = max(stored_counter, maximum_id) + 1
         cursor = db.execute(
             """UPDATE sales_photo_jobs
-               SET global_order_id=?,order_card_applied=0
+               SET global_order_id=?,order_card_applied=0,
+                   order_backfill_attempts=0,
+                   order_backfill_attempted_at=NULL
                WHERE chat_id=? AND source_message_id=?
                  AND global_order_id IS NULL""",
             (next_id, int(chat_id), int(source_message_id)),
@@ -1598,7 +1633,8 @@ class SalesPhotoRepository:
         with self._connect() as db:
             cursor = db.execute(
                 """UPDATE sales_photo_jobs
-                   SET order_card_applied=1,order_backfill_attempts=0,updated_at=?
+                   SET order_card_applied=1,order_backfill_attempts=0,
+                       order_backfill_attempted_at=NULL,updated_at=?
                    WHERE chat_id=? AND source_message_id=?
                      AND replacement_message_id IS NOT NULL
                      AND daily_order_id IS NOT NULL
@@ -1646,7 +1682,8 @@ class SalesPhotoRepository:
             rows = db.execute(
                 """SELECT chat_id,source_message_id,replacement_message_id,
                           sale_date,daily_order_id,global_order_id,
-                          order_backfill_attempts,updated_at
+                          order_backfill_attempts,updated_at,
+                          order_backfill_attempted_at
                    FROM sales_photo_jobs
                    WHERE chat_id=? AND replacement_message_id IS NOT NULL
                      AND sale_date IS NOT NULL AND daily_order_id IS NOT NULL
@@ -1655,7 +1692,10 @@ class SalesPhotoRepository:
                      AND order_card_applied=0 AND order_backfill_attempts<8
                      AND (? IS NULL OR sale_date>=?)
                      AND (? IS NULL OR sale_date<=?)
-                   ORDER BY created_at,source_message_id
+                   ORDER BY order_backfill_attempted_at IS NOT NULL,
+                            order_backfill_attempts,
+                            order_backfill_attempted_at,
+                            created_at,source_message_id
                    LIMIT ?""",
                 (
                     int(chat_id),
@@ -1676,6 +1716,13 @@ class SalesPhotoRepository:
                 global_id=int(row["global_order_id"]),
                 attempts=int(row["order_backfill_attempts"]),
                 updated_at=datetime.fromisoformat(str(row["updated_at"])),
+                attempted_at=(
+                    datetime.fromisoformat(
+                        str(row["order_backfill_attempted_at"])
+                    )
+                    if row["order_backfill_attempted_at"] is not None
+                    else None
+                ),
             )
             for row in rows
         )
@@ -1689,7 +1736,8 @@ class SalesPhotoRepository:
         with self._connect() as db:
             cursor = db.execute(
                 """UPDATE sales_photo_jobs
-                   SET price_card_applied=1,price_backfill_attempts=0,updated_at=?
+                   SET price_card_applied=1,price_backfill_attempts=0,
+                       price_backfill_attempted_at=NULL,updated_at=?
                    WHERE chat_id=? AND source_message_id=?
                      AND replacement_message_id IS NOT NULL""",
                 (
@@ -1712,14 +1760,18 @@ class SalesPhotoRepository:
         with self._connect() as db:
             rows = db.execute(
                 """SELECT chat_id,source_message_id,replacement_message_id,
-                          price_backfill_attempts,updated_at
+                          price_backfill_attempts,updated_at,
+                          price_backfill_attempted_at
                    FROM sales_photo_jobs
                    WHERE chat_id=? AND replacement_message_id IS NOT NULL
                      AND order_removed=0
                      AND price_card_applied=0 AND price_backfill_attempts<8
                      AND (? IS NULL OR sale_date>=?)
                      AND (? IS NULL OR sale_date<=?)
-                   ORDER BY created_at,source_message_id
+                   ORDER BY price_backfill_attempted_at IS NOT NULL,
+                            price_backfill_attempts,
+                            price_backfill_attempted_at,
+                            created_at,source_message_id
                    LIMIT ?""",
                 (
                     int(chat_id),
@@ -1737,6 +1789,13 @@ class SalesPhotoRepository:
                 replacement_message_id=int(row["replacement_message_id"]),
                 attempts=int(row["price_backfill_attempts"]),
                 updated_at=datetime.fromisoformat(str(row["updated_at"])),
+                attempted_at=(
+                    datetime.fromisoformat(
+                        str(row["price_backfill_attempted_at"])
+                    )
+                    if row["price_backfill_attempted_at"] is not None
+                    else None
+                ),
             )
             for row in rows
         )
@@ -3238,7 +3297,9 @@ class SalesPhotoRepository:
                 # or reordered legacy rows while the transaction stays atomic.
                 db.execute(
                     """UPDATE sales_photo_jobs
-                       SET daily_order_id=NULL,order_card_applied=0,updated_at=?
+                       SET daily_order_id=NULL,order_card_applied=0,
+                           order_backfill_attempts=0,
+                           order_backfill_attempted_at=NULL,updated_at=?
                        WHERE chat_id=? AND sale_date=? AND order_removed=0
                          AND replacement_message_id IS NOT NULL""",
                     (now, int(chat_id), sale_day),
@@ -3246,7 +3307,9 @@ class SalesPhotoRepository:
                 for expected, row in enumerate(rows, start=1):
                     db.execute(
                         """UPDATE sales_photo_jobs
-                           SET daily_order_id=?,order_card_applied=0,updated_at=?
+                           SET daily_order_id=?,order_card_applied=0,
+                               order_backfill_attempts=0,
+                               order_backfill_attempted_at=NULL,updated_at=?
                            WHERE chat_id=? AND source_message_id=?
                              AND replacement_message_id IS NOT NULL
                              AND order_removed=0""",
@@ -3284,7 +3347,9 @@ class SalesPhotoRepository:
                 """UPDATE sales_photo_jobs
                    SET daily_order_id=NULL,order_removed=1,
                        order_card_applied=1,order_backfill_attempts=0,
+                       order_backfill_attempted_at=NULL,
                        price_card_applied=1,price_backfill_attempts=0,
+                       price_backfill_attempted_at=NULL,
                        updated_at=?
                    WHERE chat_id=? AND source_message_id=?""",
                 (
@@ -3310,7 +3375,8 @@ class SalesPhotoRepository:
                 cursor = db.execute(
                     """UPDATE sales_photo_jobs
                        SET daily_order_id=?,order_card_applied=0,
-                           order_backfill_attempts=0,updated_at=?
+                           order_backfill_attempts=0,
+                           order_backfill_attempted_at=NULL,updated_at=?
                        WHERE chat_id=? AND source_message_id=?
                          AND order_removed=0""",
                     (
@@ -3330,14 +3396,17 @@ class SalesPhotoRepository:
         source_message_id: int,
         at: datetime | None = None,
     ) -> None:
+        attempted_at = _iso(at or utc_now())
         with self._connect() as db:
             db.execute(
                 """UPDATE sales_photo_jobs
-                   SET order_backfill_attempts=order_backfill_attempts+1,updated_at=?
+                   SET order_backfill_attempts=order_backfill_attempts+1,
+                       order_backfill_attempted_at=?,updated_at=?
                    WHERE chat_id=? AND source_message_id=?
                      AND order_card_applied=0""",
                 (
-                    _iso(at or utc_now()),
+                    attempted_at,
+                    attempted_at,
                     int(chat_id),
                     int(source_message_id),
                 ),
@@ -3350,15 +3419,17 @@ class SalesPhotoRepository:
         source_message_id: int,
         at: datetime | None = None,
     ) -> None:
+        attempted_at = _iso(at or utc_now())
         with self._connect() as db:
             db.execute(
                 """UPDATE sales_photo_jobs
                    SET price_backfill_attempts=price_backfill_attempts+1,
-                       updated_at=?
+                       price_backfill_attempted_at=?,updated_at=?
                    WHERE chat_id=? AND source_message_id=?
                      AND price_card_applied=0""",
                 (
-                    _iso(at or utc_now()),
+                    attempted_at,
+                    attempted_at,
                     int(chat_id),
                     int(source_message_id),
                 ),

@@ -3023,11 +3023,15 @@ class SalesPhotoService:
             sale_date_from=sale_date_from,
             sale_date_to=sale_date_to,
         ):
-            updated_at = job.updated_at
-            if updated_at.tzinfo is None:
-                updated_at = updated_at.replace(tzinfo=UTC)
+            attempted_at = job.attempted_at
+            if attempted_at is not None and attempted_at.tzinfo is None:
+                attempted_at = attempted_at.replace(tzinfo=UTC)
             delay = min(3600, 5 * (2 ** min(job.attempts, 8)))
-            if not ignore_delay and (now - updated_at).total_seconds() < delay:
+            if (
+                not ignore_delay
+                and attempted_at is not None
+                and (now - attempted_at).total_seconds() < delay
+            ):
                 continue
 
             card_key = (job.chat_id, job.replacement_message_id)
@@ -3199,11 +3203,15 @@ class SalesPhotoService:
             sale_date_from=sale_date_from,
             sale_date_to=sale_date_to,
         ):
-            updated_at = job.updated_at
-            if updated_at.tzinfo is None:
-                updated_at = updated_at.replace(tzinfo=UTC)
+            attempted_at = job.attempted_at
+            if attempted_at is not None and attempted_at.tzinfo is None:
+                attempted_at = attempted_at.replace(tzinfo=UTC)
             delay = min(3600, 5 * (2 ** min(job.attempts, 8)))
-            if not ignore_delay and (now - updated_at).total_seconds() < delay:
+            if (
+                not ignore_delay
+                and attempted_at is not None
+                and (now - attempted_at).total_seconds() < delay
+            ):
                 continue
 
             forwarded = None
@@ -3259,6 +3267,14 @@ class SalesPhotoService:
                 )
             except asyncio.CancelledError:
                 raise
+            except RetryAfter as exc:
+                logger.warning(
+                    "sales_photo_price_backfill_rate_limited "
+                    "retry_after=%s message_id=%s",
+                    _retry_after_seconds(exc),
+                    job.replacement_message_id,
+                )
+                break
             except BadRequest as exc:
                 if "message is not modified" in str(exc).casefold():
                     self.repository.mark_price_card_applied(
@@ -5304,6 +5320,7 @@ class SalesPhotoService:
                         all_history=True,
                     ),
                 ),
+                ("price_backfill", self.backfill_price_cards),
             ):
                 try:
                     await stage(bot)

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import unittest
+import sqlite3
 import tempfile
-from datetime import date
+import unittest
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -190,6 +191,60 @@ class PriceCardFormattingTests(unittest.TestCase):
 
 
 class ExistingPriceBackfillTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unrelated_job_update_does_not_starve_price_backfill(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SalesPhotoRepository(root / "sales.db")
+            repo.claim_photo(
+                CHAT_ID,
+                10,
+                "legacy",
+                source_file_id="file",
+                sale_date=tashkent_today(),
+            )
+            repo.mark_reposted(CHAT_ID, 10, 200)
+            repo.mark_order_card_applied(CHAT_ID, 10)
+            attempted_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+            repo.mark_price_backfill_failed(CHAT_ID, 10, at=attempted_at)
+
+            with sqlite3.connect(repo.path) as db:
+                db.execute(
+                    """UPDATE sales_photo_jobs SET updated_at=?
+                       WHERE chat_id=? AND source_message_id=?""",
+                    (
+                        (
+                            datetime.now(timezone.utc) + timedelta(days=1)
+                        ).isoformat(),
+                        CHAT_ID,
+                        10,
+                    ),
+                )
+                db.commit()
+
+            forwarded = SimpleNamespace(
+                message_id=900,
+                chat_id=CHAT_ID,
+                caption=(
+                    BOT_CARD_MARKER
+                    + "Шт: 1\n🆔: 1\n\n🛒💵: ACME 87$\nrasxod:\n\n📞:"
+                ),
+                caption_entities=(),
+                text=None,
+                reply_markup=None,
+            )
+            bot = SimpleNamespace(
+                forward_message=AsyncMock(return_value=forwarded),
+                edit_message_caption=AsyncMock(),
+                edit_message_text=AsyncMock(),
+                delete_message=AsyncMock(return_value=True),
+            )
+            service = SalesPhotoService(settings(root), repo)
+
+            await service.backfill_price_cards(bot)
+
+            bot.forward_message.assert_awaited_once()
+            self.assertEqual(repo.pending_price_backfills(CHAT_ID), ())
+
     async def test_active_card_is_normalized_without_losing_comments(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
