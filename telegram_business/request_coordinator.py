@@ -258,7 +258,7 @@ class NightRequestCoordinator:
                 masked = masked_phone(_value(request, "phone"))
                 extra_ru.append(f"Телефон: {masked}")
                 extra_uz.append(f"Telefon: {masked}")
-            elif fulfillment == "pickup":
+            else:
                 extra_ru.append("Связь: этот Telegram-чат")
                 extra_uz.append("Aloqa: shu Telegram chati")
             if fulfillment == "delivery":
@@ -1188,7 +1188,7 @@ class NightRequestCoordinator:
             )
             state = (
                 "review"
-                if has_phone and has_location
+                if has_location
                 else "delivery_location"
                 if has_phone
                 else "delivery_phone"
@@ -1196,7 +1196,8 @@ class NightRequestCoordinator:
             updated = self._update_state(
                 request, now, callback_id, message_id, state,
                 status="ready" if state == "review" else "collecting",
-                fulfillment_method="delivery", contact_method="phone",
+                fulfillment_method="delivery",
+                contact_method="phone" if has_phone else "telegram",
             )
             step = (
                 self._review_step(updated, language)
@@ -1690,62 +1691,89 @@ class NightRequestCoordinator:
         if state in {"delivery_phone", "pickup_phone"}:
             phone, source = phone_from_message(raw_message, text)
             if not phone:
-                step = (
-                    build_delivery_phone_step(language)
+                parsed = (
+                    location_from_message(raw_message, text, expected=True)
                     if state == "delivery_phone"
-                    else self._pickup_phone_step(language)
+                    else None
                 )
-                invalid = self.service._render_message(
-                    "request_invalid_phone", language, now,
-                )
-                if invalid:
-                    step = WizardStep(
-                        step.code, invalid + "\n\n" + step.text,
-                        step.choices, step.keyboard,
+                if parsed:
+                    updated = self.repo.update_business_request(
+                        str(_value(request, "request_id")),
+                        int(_value(request, "revision")),
+                        now,
+                        state="review",
+                        status="ready",
+                        contact_method="telegram",
+                        location_url=parsed.url,
+                        address=parsed.address,
+                        selections={"outside_tashkent": parsed.outside_tashkent},
+                        event_type="location_received",
+                        event_key=f"message:{message_id}:location",
+                        telegram_update_id=update_id,
+                        telegram_message_id=message_id,
+                        client_at=event_at,
                     )
-                if wizard_message_id:
-                    self._edit_screen(
-                        request, step, connection_id, chat_id,
-                        wizard_message_id, now,
-                    )
+                    if not updated:
+                        return True
+                    step = self._review_step(updated, language)
                 else:
-                    self.service.send(
-                        connection_id, chat_id, session_id, step.text,
-                        "request_invalid_phone", now,
-                        parse_mode=step.parse_mode,
-                        reply_markup=self.markup(request, step, now),
-                        delivery_key=f"client-message:{message_id}:invalid-phone",
+                    step = (
+                        build_delivery_phone_step(language)
+                        if state == "delivery_phone"
+                        else self._pickup_phone_step(language)
                     )
-                return True
-            has_location = bool(
-                _value(request, "location_url") or _value(request, "address")
-            )
-            next_state = (
-                "review"
-                if state == "pickup_phone" or has_location
-                else "delivery_location"
-            )
-            updated = self.repo.update_business_request(
-                str(_value(request, "request_id")),
-                int(_value(request, "revision")),
-                now,
-                state=next_state,
-                status="ready" if next_state == "review" else "collecting",
-                phone=phone,
-                contact_method=source or "typed",
-                event_type="phone_received",
-                event_key=f"message:{message_id}:phone",
-                telegram_update_id=update_id,
-                telegram_message_id=message_id,
-                client_at=event_at,
-            )
-            if not updated:
-                return True
-            step = (
-                build_delivery_location_step(language)
-                if next_state == "delivery_location"
-                else self._review_step(updated, language)
-            )
+                    invalid = self.service._render_message(
+                        "request_invalid_phone", language, now,
+                    )
+                    if invalid:
+                        step = WizardStep(
+                            step.code, invalid + "\n\n" + step.text,
+                            step.choices, step.keyboard,
+                        )
+                    if wizard_message_id:
+                        self._edit_screen(
+                            request, step, connection_id, chat_id,
+                            wizard_message_id, now,
+                        )
+                    else:
+                        self.service.send(
+                            connection_id, chat_id, session_id, step.text,
+                            "request_invalid_phone", now,
+                            parse_mode=step.parse_mode,
+                            reply_markup=self.markup(request, step, now),
+                            delivery_key=f"client-message:{message_id}:invalid-phone",
+                        )
+                    return True
+            else:
+                has_location = bool(
+                    _value(request, "location_url") or _value(request, "address")
+                )
+                next_state = (
+                    "review"
+                    if state == "pickup_phone" or has_location
+                    else "delivery_location"
+                )
+                updated = self.repo.update_business_request(
+                    str(_value(request, "request_id")),
+                    int(_value(request, "revision")),
+                    now,
+                    state=next_state,
+                    status="ready" if next_state == "review" else "collecting",
+                    phone=phone,
+                    contact_method=source or "typed",
+                    event_type="phone_received",
+                    event_key=f"message:{message_id}:phone",
+                    telegram_update_id=update_id,
+                    telegram_message_id=message_id,
+                    client_at=event_at,
+                )
+                if not updated:
+                    return True
+                step = (
+                    build_delivery_location_step(language)
+                    if next_state == "delivery_location"
+                    else self._review_step(updated, language)
+                )
         else:
             parsed = location_from_message(raw_message, text, expected=True)
             if not parsed:

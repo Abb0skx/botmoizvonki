@@ -69,13 +69,17 @@ def test_native_location_is_saved_as_safe_link_and_outside_is_only_a_hint():
     assert parsed.url == "https://www.google.com/maps?q=39.650000,66.960000"
 
 
-def test_pickup_does_not_require_phone_or_location_but_delivery_does():
+def test_pickup_requires_neither_phone_nor_location_and_delivery_only_location():
     pickup = request(
         fulfillment_method="pickup", phone=None, location_url=None, address=None,
     )
     assert missing_request_fields(pickup) == ()
     delivery = request(phone=None, location_url=None, address=None)
-    assert missing_request_fields(delivery) == ("phone", "location")
+    assert missing_request_fields(delivery) == ("location",)
+    delivery_with_location = request(
+        phone=None, location_url=None, address="Tashkent, Chilanzar 10",
+    )
+    assert missing_request_fields(delivery_with_location) == ()
 
 
 def test_summary_uses_size_and_never_calls_request_an_order():

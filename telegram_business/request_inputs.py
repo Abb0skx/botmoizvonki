@@ -209,8 +209,6 @@ def missing_request_fields(request: Mapping[str, Any] | Any) -> tuple[str, ...]:
     if fulfillment not in {"delivery", "pickup"}:
         missing.append("fulfillment")
     elif fulfillment == "delivery":
-        if not str(_value(request, "phone", "")).strip():
-            missing.append("phone")
         if not (
             str(_value(request, "location_url", "")).strip()
             or str(_value(request, "address", "")).strip()

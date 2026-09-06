@@ -330,16 +330,16 @@ def test_delivery_location_accepts_supported_manual_formats():
     assert actions(step) == ["back", "cancel"]
 
 
-def test_delivery_review_requires_phone_and_location():
+def test_delivery_review_requires_location_but_phone_is_optional():
     base = dict(model="Phone X", fulfillment="delivery")
 
-    with pytest.raises(ValueError, match="requires a phone"):
-        build_review_step(WizardReviewData(**base), "ru")
     with pytest.raises(ValueError, match="requires a location"):
-        build_review_step(
-            WizardReviewData(**base, phone="+998 90 123 45 67"),
-            "ru",
-        )
+        build_review_step(WizardReviewData(**base), "ru")
+    step = build_review_step(
+        WizardReviewData(**base, location="Tashkent, Chilanzar 10"),
+        "ru",
+    )
+    assert "Связь:</b> этот Telegram-чат" in step.text
 
 
 def test_delivery_review_links_only_safe_model_and_has_disclaimers():

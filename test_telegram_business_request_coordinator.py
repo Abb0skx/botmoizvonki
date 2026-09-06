@@ -363,6 +363,37 @@ def enter_text(
     )
 
 
+def adapter_to_fulfillment(
+    harness: Harness,
+    *,
+    chat_id: str,
+    session_id: str,
+    callback_prefix: str,
+) -> dict:
+    screen = prepare(
+        harness,
+        chat_id,
+        session_id,
+        harness.products.search("Apple Adapter 20W"),
+        model_query="Apple Adapter 20W",
+    )
+    cart = click(
+        harness,
+        callback_data(screen.reply_markup, "Добавить в заявку"),
+        chat_id=chat_id,
+        callback_id=f"{callback_prefix}-add",
+    )
+    assert cart is not None
+    fulfillment = click(
+        harness,
+        callback_data(cart["reply_markup"], "Продолжить"),
+        chat_id=chat_id,
+        callback_id=f"{callback_prefix}-continue",
+    )
+    assert fulfillment is not None
+    return fulfillment
+
+
 def test_ambiguous_callback_selects_exact_model_and_fences_old_buttons(
     harness: Harness,
 ):
@@ -511,6 +542,92 @@ def test_exact_model_memory_color_delivery_phone_location_and_submit(
     assert request["phone"] == "+998901234567"
     assert request["address"] == "Ташкент, Чиланзар 10"
     assert request["needs_manager_reply"] == 1
+
+
+def test_delivery_after_early_location_skips_phone_and_uses_telegram(
+    harness: Harness,
+):
+    chat_id = "108"
+    session_id = open_chat(harness, chat_id)
+    fulfillment = adapter_to_fulfillment(
+        harness,
+        chat_id=chat_id,
+        session_id=session_id,
+        callback_prefix="early-location",
+    )
+
+    enter_text(
+        harness,
+        chat_id=chat_id,
+        session_id=session_id,
+        text="Адрес: Ташкент, Чиланзар 10",
+        message_id=2,
+        at=harness.now + timedelta(seconds=10),
+    )
+    fulfillment = harness.api.edits[-1]
+    review = click(
+        harness,
+        callback_data(fulfillment["reply_markup"], "Доставка"),
+        chat_id=chat_id,
+        callback_id="early-location-delivery",
+        at=harness.now + timedelta(seconds=11),
+    )
+
+    request = harness.repo.active_business_request(chat_id, session_id)
+    assert review is not None
+    assert "Заказ не оформлен" in review["text"]
+    assert "номер или контакт" not in review["text"]
+    assert "Связь: этот Telegram-чат" in review["text"]
+    assert request["wizard_state"] == "review"
+    assert request["phone"] is None
+    assert request["contact_method"] == "telegram"
+
+
+def test_location_sent_on_phone_step_finishes_delivery_without_phone(
+    harness: Harness,
+):
+    chat_id = "109"
+    session_id = open_chat(harness, chat_id)
+    fulfillment = adapter_to_fulfillment(
+        harness,
+        chat_id=chat_id,
+        session_id=session_id,
+        callback_prefix="location-on-phone-step",
+    )
+    phone_step = click(
+        harness,
+        callback_data(fulfillment["reply_markup"], "Доставка"),
+        chat_id=chat_id,
+        callback_id="location-on-phone-step-delivery",
+    )
+    assert phone_step is not None and "номер или контакт" in phone_step["text"]
+
+    enter_text(
+        harness,
+        chat_id=chat_id,
+        session_id=session_id,
+        text="Ташкент, Юнусабад 12",
+        message_id=2,
+        at=harness.now + timedelta(seconds=10),
+    )
+    review = harness.api.edits[-1]
+    request = harness.repo.active_business_request(chat_id, session_id)
+    assert "Заказ не оформлен" in review["text"]
+    assert "номер или контакт" not in review["text"]
+    assert "Связь: этот Telegram-чат" in review["text"]
+    assert request["wizard_state"] == "review"
+    assert request["phone"] is None
+    assert request["contact_method"] == "telegram"
+
+    submitted = click(
+        harness,
+        callback_data(review["reply_markup"], "Передать менеджеру"),
+        chat_id=chat_id,
+        callback_id="location-on-phone-step-submit",
+        at=harness.now + timedelta(seconds=11),
+    )
+    assert submitted is not None
+    assert harness.repo.active_business_request(chat_id, session_id)["status"] == "submitted"
 
 
 def test_watch_memory_column_becomes_mm_size(harness: Harness):

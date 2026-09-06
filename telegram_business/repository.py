@@ -2752,8 +2752,6 @@ class BusinessRepository:
                 except (TypeError, ValueError):
                     return None
             if fulfillment == "delivery":
-                if not (row["phone"] or "").strip():
-                    raise ValueError("phone_required_for_complete_delivery")
                 if not ((row["location_url"] or "").strip() or (row["address"] or "").strip()):
                     raise ValueError("location_required_for_complete_delivery")
             try:

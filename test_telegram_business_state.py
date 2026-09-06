@@ -1773,7 +1773,7 @@ class TelegramBusinessStateTests(unittest.TestCase):
             self.repo.update_business_request(
                 delivery["request_id"], 1, self.now, phone="8600123412341234"
             )
-        with self.assertRaisesRegex(ValueError, "phone_required"):
+        with self.assertRaisesRegex(ValueError, "location_required"):
             self.repo.complete_business_request(
                 delivery["request_id"], "complete_delivery", 1, self.now
             )
@@ -1781,7 +1781,6 @@ class TelegramBusinessStateTests(unittest.TestCase):
             delivery["request_id"],
             1,
             self.now,
-            phone="+998901112233",
             exact_model="iPhone 16 Pro Max",
         )
         with self.assertRaisesRegex(ValueError, "location_required"):
@@ -1800,6 +1799,7 @@ class TelegramBusinessStateTests(unittest.TestCase):
         )
         self.assertEqual(submitted["status"], "submitted")
         self.assertEqual(submitted["wizard_state"], "complete_delivery")
+        self.assertIsNone(submitted["phone"])
         self.assertEqual(
             self.repo.complete_business_request(
                 delivery["request_id"],

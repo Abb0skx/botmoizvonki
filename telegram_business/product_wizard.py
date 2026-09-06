@@ -775,8 +775,6 @@ def _validate_review_data(
     if _text_present(data.color) and data.any_color:
         raise ValueError("specific color and any_color are mutually exclusive")
     if require_complete and data.fulfillment == "delivery":
-        if not _text_present(data.phone):
-            raise ValueError("delivery review requires a phone")
         if not _text_present(data.location):
             raise ValueError("delivery review requires a location")
 
@@ -826,7 +824,7 @@ def _review_lines(
             f"<b>{'Телефон' if language == 'ru' else 'Telefon'}:</b> "
             f"{_escaped_value(data.phone, 80)}"
         )
-    elif data.fulfillment == "pickup":
+    else:
         rows.append(
             "<b>Связь:</b> этот Telegram-чат"
             if language == "ru"
