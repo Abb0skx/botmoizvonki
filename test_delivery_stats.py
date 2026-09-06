@@ -787,8 +787,12 @@ class DeliveryStatsWebTests(unittest.TestCase):
         ), patch.object(
             self.stats,
             "enrich_stats_routes",
-            AsyncMock(side_effect=lambda report, _service: report),
-        ):
+            AsyncMock(
+                side_effect=AssertionError(
+                    "routing must stay out of portal JSON"
+                )
+            ),
+        ) as enrich:
             denied = self.client.get(
                 "/internal/monitoring/v1/delivery/report?day=today"
             )
@@ -797,8 +801,39 @@ class DeliveryStatsWebTests(unittest.TestCase):
                 "/internal/monitoring/v1/delivery/report?day=today",
                 headers={"Authorization": "Bearer portal-service-key"},
             )
+        enrich.assert_not_awaited()
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["summary"]["orders"], 1)
+
+    def test_internal_monitoring_live_skips_routing_enrichment(self):
+        with patch.object(
+            self.stats, "MONITORING_DELIVERY_SERVICE_TOKEN", "portal-service-key"
+        ), patch.object(
+            self.stats,
+            "enrich_monitor_routes",
+            AsyncMock(
+                side_effect=AssertionError(
+                    "routing must stay out of portal JSON"
+                )
+            ),
+        ) as enrich:
+            response = self.client.get(
+                "/internal/monitoring/v1/delivery/live",
+                headers={"Authorization": "Bearer portal-service-key"},
+            )
+        enrich.assert_not_awaited()
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("summary", response.json())
+
+    def test_legacy_report_keeps_routing_enrichment(self):
+        enrich = AsyncMock(side_effect=lambda report, _service: report)
+        with patch.object(self.stats, "enrich_stats_routes", enrich):
+            response = self.client.get(
+                "/delivery/stats/api/report?day=today",
+                headers=self._auth(),
+            )
+        enrich.assert_awaited_once()
+        self.assertEqual(response.status_code, 200)
 
     def test_legacy_page_redirects_to_monitoring_with_filters(self):
         with patch.object(

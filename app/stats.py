@@ -228,8 +228,7 @@ def monitor_page(request: Request):
 async def internal_monitoring_live(request: Request):
     require_internal_monitoring_auth(request)
     repository = _repository()
-    state = await run_in_threadpool(build_delivery_monitor, repository)
-    return await enrich_monitor_routes(state, _routing_service())
+    return await run_in_threadpool(build_delivery_monitor, repository)
 
 
 @app.get("/internal/monitoring/v1/delivery/report")
@@ -239,8 +238,7 @@ async def internal_monitoring_report(
     courier_id: int | None = Query(None),
 ):
     require_internal_monitoring_auth(request)
-    report = await run_in_threadpool(_report, day, courier_id)
-    return await enrich_stats_routes(report, _routing_service())
+    return await run_in_threadpool(_report, day, courier_id)
 
 
 @app.get("/internal/monitoring/v1/delivery/analytics")

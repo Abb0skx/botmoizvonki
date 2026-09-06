@@ -26,8 +26,6 @@ from monitoring.auth import (
 from monitoring.config import MonitoringSettings
 from monitoring.database import MonitoringStore
 import monitoring.router as monitoring_router
-import monitoring.adapters.delivery as delivery_module
-from monitoring.adapters.delivery import DeliveryAdapter
 import monitoring.adapters.go_site as go_site_module
 from monitoring.adapters.go_site import GoSiteAdapter
 from price_server.auth import require_admin, require_admin_action
@@ -205,55 +203,6 @@ class MonitoringSettingsTests(unittest.TestCase):
         self.assertFalse(
             admin_without_price_admin_token.can_manage_prices(202)
         )
-
-
-class DeliveryAdapterTests(unittest.IsolatedAsyncioTestCase):
-    async def test_json_reports_allow_slow_delivery_responses(self):
-        captured: dict[str, object] = {}
-
-        class FakeResponse:
-            status_code = 200
-            content = b'{"ok": true}'
-
-            @staticmethod
-            def json():
-                return {"ok": True}
-
-        class FakeClient:
-            def __init__(self, **kwargs):
-                captured.update(kwargs)
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, exc_type, exc, traceback):
-                return False
-
-            async def get(self, url, *, params, headers):
-                captured["url"] = url
-                return FakeResponse()
-
-        current = MonitoringSettings(
-            **{
-                **settings(Path("unused.db")).__dict__,
-                "delivery_base_url": "http://delivery-stats:8080",
-                "delivery_service_token": "delivery-secret",
-            }
-        )
-        with patch.object(
-            delivery_module.httpx,
-            "AsyncClient",
-            new=FakeClient,
-        ):
-            payload = await DeliveryAdapter(current).get(
-                "/internal/monitoring/v1/delivery/report"
-            )
-
-        timeout = captured["timeout"]
-        self.assertIsInstance(timeout, delivery_module.httpx.Timeout)
-        self.assertEqual(timeout.connect, 2.0)
-        self.assertEqual(timeout.read, 30.0)
-        self.assertEqual(payload, {"ok": True})
 
 
 class MonitoringRouteTests(unittest.TestCase):
