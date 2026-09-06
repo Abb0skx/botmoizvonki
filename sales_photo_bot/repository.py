@@ -63,6 +63,7 @@ class PendingOrderBackfill:
     replacement_message_id: int
     sale_date: date
     order_id: int
+    global_id: int
     attempts: int
     updated_at: datetime
 
@@ -83,6 +84,7 @@ class OrderAuditCandidate:
     replacement_message_id: int
     sale_date: date
     order_id: int
+    global_id: int
 
 
 @dataclass(frozen=True)
@@ -415,6 +417,7 @@ class SalesPhotoRepository:
                     ui_generation INTEGER NOT NULL DEFAULT 0,
                     sale_date TEXT,
                     daily_order_id INTEGER,
+                    global_order_id INTEGER,
                     order_card_applied INTEGER NOT NULL DEFAULT 0,
                     order_backfill_attempts INTEGER NOT NULL DEFAULT 0,
                     price_card_applied INTEGER NOT NULL DEFAULT 0,
@@ -618,6 +621,10 @@ class SalesPhotoRepository:
                 db.execute(
                     "ALTER TABLE sales_photo_jobs ADD COLUMN daily_order_id INTEGER"
                 )
+            if "global_order_id" not in columns:
+                db.execute(
+                    "ALTER TABLE sales_photo_jobs ADD COLUMN global_order_id INTEGER"
+                )
             if "order_card_applied" not in columns:
                 db.execute(
                     "ALTER TABLE sales_photo_jobs ADD COLUMN "
@@ -759,6 +766,86 @@ class SalesPhotoRepository:
                         int(legacy_row["source_message_id"]),
                     ),
                 )
+            # Permanent sale IDs follow the real Telegram publication order.
+            # Deleted cards remain in this ledger, so their IDs stay consumed.
+            # Existing non-NULL values are never rewritten, making this
+            # migration safe to run again after a partial deployment.
+            published_chats = db.execute(
+                """SELECT DISTINCT chat_id FROM sales_photo_jobs
+                   WHERE replacement_message_id IS NOT NULL
+                      OR global_order_id IS NOT NULL
+                   ORDER BY chat_id"""
+            ).fetchall()
+            for chat_row in published_chats:
+                published_chat_id = int(chat_row["chat_id"])
+                counter_key = f"global_order_counter:{published_chat_id}"
+                counter_row = db.execute(
+                    "SELECT value FROM sales_photo_meta WHERE key=?",
+                    (counter_key,),
+                ).fetchone()
+                try:
+                    stored_counter = (
+                        max(0, int(counter_row["value"]))
+                        if counter_row is not None
+                        else 0
+                    )
+                except (TypeError, ValueError):
+                    stored_counter = 0
+                maximum_row = db.execute(
+                    """SELECT MAX(global_order_id) AS maximum
+                       FROM sales_photo_jobs WHERE chat_id=?""",
+                    (published_chat_id,),
+                ).fetchone()
+                maximum_id = (
+                    int(maximum_row["maximum"])
+                    if maximum_row is not None
+                    and maximum_row["maximum"] is not None
+                    else 0
+                )
+                permanent_counter = max(stored_counter, maximum_id)
+                unnumbered_rows = db.execute(
+                    """SELECT source_message_id,order_removed
+                       FROM sales_photo_jobs
+                       WHERE chat_id=? AND replacement_message_id IS NOT NULL
+                         AND global_order_id IS NULL
+                       ORDER BY replacement_message_id,created_at,source_message_id""",
+                    (published_chat_id,),
+                ).fetchall()
+                for unnumbered_row in unnumbered_rows:
+                    permanent_counter += 1
+                    db.execute(
+                        """UPDATE sales_photo_jobs
+                           SET global_order_id=?,
+                               order_card_applied=CASE
+                                 WHEN order_removed=0 THEN 0
+                                 ELSE order_card_applied
+                               END,
+                               order_backfill_attempts=CASE
+                                 WHEN order_removed=0 THEN 0
+                                 ELSE order_backfill_attempts
+                               END
+                           WHERE chat_id=? AND source_message_id=?
+                             AND global_order_id IS NULL""",
+                        (
+                            permanent_counter,
+                            published_chat_id,
+                            int(unnumbered_row["source_message_id"]),
+                        ),
+                    )
+                db.execute(
+                    """INSERT INTO sales_photo_meta(key,value,updated_at)
+                       VALUES(?,?,?)
+                       ON CONFLICT(key) DO UPDATE SET
+                         value=CASE
+                           WHEN CAST(value AS INTEGER)<CAST(excluded.value AS INTEGER)
+                           THEN excluded.value ELSE value
+                         END,
+                         updated_at=CASE
+                           WHEN CAST(value AS INTEGER)<CAST(excluded.value AS INTEGER)
+                           THEN excluded.updated_at ELSE updated_at
+                         END""",
+                    (counter_key, str(permanent_counter), _iso(utc_now())),
+                )
             migration_time = _iso(utc_now())
             db.execute(
                 """INSERT OR IGNORE INTO sales_photo_reminder_attempts(
@@ -837,6 +924,18 @@ class SalesPhotoRepository:
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_sales_photo_daily_order
                 ON sales_photo_jobs(chat_id,sale_date,daily_order_id)
                 WHERE sale_date IS NOT NULL AND daily_order_id IS NOT NULL;
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_sales_photo_global_order
+                ON sales_photo_jobs(chat_id,global_order_id)
+                WHERE global_order_id IS NOT NULL;
+
+                CREATE TRIGGER IF NOT EXISTS trg_sales_photo_global_order_immutable
+                BEFORE UPDATE OF global_order_id ON sales_photo_jobs
+                WHEN OLD.global_order_id IS NOT NULL
+                 AND NEW.global_order_id IS NOT OLD.global_order_id
+                BEGIN
+                    SELECT RAISE(ABORT, 'global_order_id is immutable');
+                END;
 
                 CREATE INDEX IF NOT EXISTS idx_sales_photo_order_backfill
                 ON sales_photo_jobs(order_card_applied,order_backfill_attempts,updated_at);
@@ -1310,6 +1409,153 @@ class SalesPhotoRepository:
             db.commit()
         return result
 
+    @staticmethod
+    def _ensure_global_order_locked(
+        db: sqlite3.Connection,
+        chat_id: int,
+        source_message_id: int,
+    ) -> int:
+        row = db.execute(
+            """SELECT global_order_id FROM sales_photo_jobs
+               WHERE chat_id=? AND source_message_id=?""",
+            (int(chat_id), int(source_message_id)),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("Не найдена карточка для постоянного ID")
+        if row["global_order_id"] is not None:
+            return int(row["global_order_id"])
+
+        counter_key = f"global_order_counter:{int(chat_id)}"
+        counter_row = db.execute(
+            "SELECT value FROM sales_photo_meta WHERE key=?",
+            (counter_key,),
+        ).fetchone()
+        try:
+            stored_counter = (
+                max(0, int(counter_row["value"]))
+                if counter_row is not None
+                else 0
+            )
+        except (TypeError, ValueError):
+            stored_counter = 0
+        maximum_row = db.execute(
+            """SELECT MAX(global_order_id) AS maximum
+               FROM sales_photo_jobs WHERE chat_id=?""",
+            (int(chat_id),),
+        ).fetchone()
+        maximum_id = (
+            int(maximum_row["maximum"])
+            if maximum_row is not None and maximum_row["maximum"] is not None
+            else 0
+        )
+        next_id = max(stored_counter, maximum_id) + 1
+        cursor = db.execute(
+            """UPDATE sales_photo_jobs
+               SET global_order_id=?,order_card_applied=0
+               WHERE chat_id=? AND source_message_id=?
+                 AND global_order_id IS NULL""",
+            (next_id, int(chat_id), int(source_message_id)),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("Не удалось назначить постоянный ID")
+        db.execute(
+            """INSERT INTO sales_photo_meta(key,value,updated_at)
+               VALUES(?,?,?)
+               ON CONFLICT(key) DO UPDATE SET
+                 value=excluded.value,updated_at=excluded.updated_at""",
+            (counter_key, str(next_id), _iso(utc_now())),
+        )
+        return next_id
+
+    def ensure_order_numbers(
+        self,
+        chat_id: int,
+        source_message_id: int,
+        sale_date: date,
+    ) -> tuple[date, int, int]:
+        """Atomically assign the mutable daily count and immutable sale ID."""
+
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            effective_date, daily_id = self._ensure_daily_order_locked(
+                db,
+                int(chat_id),
+                int(source_message_id),
+                sale_date,
+            )
+            global_id = self._ensure_global_order_locked(
+                db,
+                int(chat_id),
+                int(source_message_id),
+            )
+            db.commit()
+        return effective_date, daily_id, global_id
+
+    def order_numbers_for_source(
+        self,
+        chat_id: int,
+        source_message_id: int,
+    ) -> tuple[date, int, int] | None:
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT sale_date,daily_order_id,global_order_id
+                   FROM sales_photo_jobs
+                   WHERE chat_id=? AND source_message_id=?""",
+                (int(chat_id), int(source_message_id)),
+            ).fetchone()
+        if (
+            row is None
+            or row["sale_date"] is None
+            or row["daily_order_id"] is None
+            or row["global_order_id"] is None
+        ):
+            return None
+        return (
+            date.fromisoformat(str(row["sale_date"])),
+            int(row["daily_order_id"]),
+            int(row["global_order_id"]),
+        )
+
+    def order_numbers_for_replacement(
+        self,
+        chat_id: int,
+        replacement_message_id: int,
+    ) -> tuple[date, int, int] | None:
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT sale_date,daily_order_id,global_order_id
+                   FROM sales_photo_jobs
+                   WHERE chat_id=? AND replacement_message_id=?""",
+                (int(chat_id), int(replacement_message_id)),
+            ).fetchone()
+        if (
+            row is None
+            or row["sale_date"] is None
+            or row["daily_order_id"] is None
+            or row["global_order_id"] is None
+        ):
+            return None
+        return (
+            date.fromisoformat(str(row["sale_date"])),
+            int(row["daily_order_id"]),
+            int(row["global_order_id"]),
+        )
+
+    def global_order_for_source(
+        self,
+        chat_id: int,
+        source_message_id: int,
+    ) -> int | None:
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT global_order_id FROM sales_photo_jobs
+                   WHERE chat_id=? AND source_message_id=?""",
+                (int(chat_id), int(source_message_id)),
+            ).fetchone()
+        if row is None or row["global_order_id"] is None:
+            return None
+        return int(row["global_order_id"])
+
     def daily_order_for_source(
         self,
         chat_id: int,
@@ -1345,6 +1591,9 @@ class SalesPhotoRepository:
         chat_id: int,
         source_message_id: int,
         at: datetime | None = None,
+        *,
+        expected_order_id: int | None = None,
+        expected_global_id: int | None = None,
     ) -> bool:
         with self._connect() as db:
             cursor = db.execute(
@@ -1352,11 +1601,34 @@ class SalesPhotoRepository:
                    SET order_card_applied=1,order_backfill_attempts=0,updated_at=?
                    WHERE chat_id=? AND source_message_id=?
                      AND replacement_message_id IS NOT NULL
-                     AND daily_order_id IS NOT NULL""",
+                     AND daily_order_id IS NOT NULL
+                     AND global_order_id IS NOT NULL
+                     AND (? IS NULL OR daily_order_id=?)
+                     AND (? IS NULL OR global_order_id=?)""",
                 (
                     _iso(at or utc_now()),
                     int(chat_id),
                     int(source_message_id),
+                    (
+                        int(expected_order_id)
+                        if expected_order_id is not None
+                        else None
+                    ),
+                    (
+                        int(expected_order_id)
+                        if expected_order_id is not None
+                        else None
+                    ),
+                    (
+                        int(expected_global_id)
+                        if expected_global_id is not None
+                        else None
+                    ),
+                    (
+                        int(expected_global_id)
+                        if expected_global_id is not None
+                        else None
+                    ),
                 ),
             )
             db.commit()
@@ -1373,10 +1645,12 @@ class SalesPhotoRepository:
         with self._connect() as db:
             rows = db.execute(
                 """SELECT chat_id,source_message_id,replacement_message_id,
-                          sale_date,daily_order_id,order_backfill_attempts,updated_at
+                          sale_date,daily_order_id,global_order_id,
+                          order_backfill_attempts,updated_at
                    FROM sales_photo_jobs
                    WHERE chat_id=? AND replacement_message_id IS NOT NULL
                      AND sale_date IS NOT NULL AND daily_order_id IS NOT NULL
+                     AND global_order_id IS NOT NULL
                      AND order_removed=0
                      AND order_card_applied=0 AND order_backfill_attempts<8
                      AND (? IS NULL OR sale_date>=?)
@@ -1399,6 +1673,7 @@ class SalesPhotoRepository:
                 replacement_message_id=int(row["replacement_message_id"]),
                 sale_date=date.fromisoformat(str(row["sale_date"])),
                 order_id=int(row["daily_order_id"]),
+                global_id=int(row["global_order_id"]),
                 attempts=int(row["order_backfill_attempts"]),
                 updated_at=datetime.fromisoformat(str(row["updated_at"])),
             )
@@ -1477,10 +1752,11 @@ class SalesPhotoRepository:
         with self._connect() as db:
             rows = db.execute(
                 """SELECT chat_id,source_message_id,replacement_message_id,
-                          sale_date,daily_order_id
+                          sale_date,daily_order_id,global_order_id
                    FROM sales_photo_jobs
                    WHERE chat_id=? AND replacement_message_id IS NOT NULL
                      AND sale_date IS NOT NULL AND daily_order_id IS NOT NULL
+                     AND global_order_id IS NOT NULL
                      AND order_removed=0
                      AND (? IS NULL OR sale_date>=?)
                      AND (? IS NULL OR sale_date<=?)
@@ -1502,6 +1778,7 @@ class SalesPhotoRepository:
                 replacement_message_id=int(row["replacement_message_id"]),
                 sale_date=date.fromisoformat(str(row["sale_date"])),
                 order_id=int(row["daily_order_id"]),
+                global_id=int(row["global_order_id"]),
             )
             for row in rows
         )
@@ -3199,6 +3476,11 @@ class SalesPhotoRepository:
                     int(source_message_id),
                     date.fromisoformat(str(row["sale_date"])),
                 )
+            self._ensure_global_order_locked(
+                db,
+                int(chat_id),
+                int(source_message_id),
+            )
             self._note_auto_correction_new_card_locked(
                 db,
                 int(chat_id),

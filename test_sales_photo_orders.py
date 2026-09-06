@@ -9,11 +9,18 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from telegram import MessageEntity
-from telegram.error import BadRequest
+from telegram.error import BadRequest, RetryAfter
 
 from sales_photo_bot.config import Settings
 from sales_photo_bot.dates import tashkent_today
-from sales_photo_bot.orders import card_order_id, ensure_card_order_id
+from sales_photo_bot.orders import (
+    card_daily_quantity,
+    card_global_id,
+    card_numbers_match,
+    card_order_id,
+    ensure_card_numbers,
+    ensure_card_order_id,
+)
 from sales_photo_bot.repository import SalesPhotoRepository
 from sales_photo_bot.service import BOT_CARD_MARKER, SalesPhotoService
 
@@ -41,6 +48,133 @@ def utf16_offset(value: str, needle: str) -> int:
 
 
 class CardOrderFormattingTests(unittest.TestCase):
+    def test_two_number_header_replaces_legacy_and_duplicate_fields(self):
+        body = (
+            BOT_CARD_MARKER
+            + "📆: 31/08/2026\n"
+            + "🆔: 7\n\n"
+            + "📦 A16\n"
+            + "Шт: wrong\n"
+            + "🆔: 999\n\n"
+            + "🛒💵:\nrasxod:"
+        )
+
+        result = ensure_card_numbers(body, (), 3, 48, max_length=1024)
+
+        self.assertTrue(result.changed)
+        self.assertTrue(
+            result.body.startswith(
+                BOT_CARD_MARKER
+                + "📆: 31/08/2026\nШт: 3\n🆔: 48\n\n📦 A16\n"
+            )
+        )
+        self.assertEqual(result.body.count("Шт:"), 1)
+        self.assertEqual(result.body.count("🆔:"), 1)
+        self.assertEqual(card_daily_quantity(result.body), 3)
+        self.assertEqual(card_global_id(result.body), 48)
+        self.assertEqual(card_order_id(result.body), 3)
+        self.assertTrue(card_numbers_match(result.body, 3, 48))
+
+    def test_two_number_header_preserves_utf16_entity_offsets(self):
+        body = BOT_CARD_MARKER + "🛒💵:\n\nНаличка"
+        entity = MessageEntity(
+            type=MessageEntity.BOLD,
+            offset=utf16_offset(body, "Наличка"),
+            length=len("Наличка"),
+        )
+
+        result = ensure_card_numbers(body, (entity,), 1, 101, max_length=1024)
+
+        self.assertTrue(result.changed)
+        self.assertTrue(result.body.startswith(BOT_CARD_MARKER + "Шт: 1\n🆔: 101\n\n"))
+        self.assertEqual(result.entities[0].offset, utf16_offset(result.body, "Наличка"))
+
+    def test_two_number_header_leaves_card_unchanged_when_edit_is_unsafe(self):
+        body = BOT_CARD_MARKER + "🆔: old\n\n🛒💵:"
+        crossing = MessageEntity(
+            type=MessageEntity.BOLD,
+            offset=0,
+            length=utf16_offset(body, "🛒"),
+        )
+
+        result = ensure_card_numbers(body, (crossing,), 1, 2, max_length=1024)
+
+        self.assertFalse(result.changed)
+        self.assertEqual(result.body, body)
+        self.assertEqual(result.entities, (crossing,))
+
+    def test_number_match_is_strict_and_legacy_parser_remains_compatible(self):
+        legacy = BOT_CARD_MARKER + "🆔: 9\n\n🛒💵:"
+        malformed_daily = BOT_CARD_MARKER + "Шт: wrong\n🆔: 9\n\n🛒💵:"
+        missing_separator = BOT_CARD_MARKER + "Шт: 4\n🆔: 9\n🛒💵:"
+        trailing_separator = BOT_CARD_MARKER + "Шт: 4\n🆔: 9\n\n"
+        whitespace_body = BOT_CARD_MARKER + "Шт: 4\n🆔: 9\n\n \n"
+        duplicate = (
+            BOT_CARD_MARKER
+            + "Шт: 4\n🆔: 9\n🆔: wrong\n\n🛒💵:"
+        )
+
+        self.assertEqual(card_order_id(legacy), 9)
+        self.assertIsNone(card_daily_quantity(legacy))
+        self.assertEqual(card_global_id(legacy), 9)
+        self.assertFalse(card_numbers_match(legacy, 9, 9))
+        self.assertIsNone(card_order_id(malformed_daily))
+        self.assertFalse(card_numbers_match(missing_separator, 4, 9))
+        self.assertFalse(card_numbers_match(trailing_separator, 4, 9))
+        self.assertFalse(card_numbers_match(whitespace_body, 4, 9))
+        self.assertFalse(card_numbers_match(duplicate, 4, 9))
+
+    def test_malformed_canonical_global_id_does_not_fall_through(self):
+        body = BOT_CARD_MARKER + "Шт: 2\n🆔: bad\n🆔: 99\n\n🛒💵:"
+
+        self.assertIsNone(card_global_id(body))
+
+    def test_legacy_order_normalizer_updates_daily_field_on_new_cards(self):
+        body = BOT_CARD_MARKER + "Шт: 2\n🆔: 99\n\n🛒💵:"
+
+        result = ensure_card_order_id(body, (), 3, max_length=1024)
+
+        self.assertIn("Шт: 3\n🆔: 99", result.body)
+        self.assertEqual(card_order_id(result.body), 3)
+        self.assertEqual(card_global_id(result.body), 99)
+
+    def test_manual_quantity_text_after_finance_header_is_preserved(self):
+        body = (
+            BOT_CARD_MARKER
+            + "Шт: 2\n🆔: 99\n\n"
+            + "🛒💵: Поставщик\nШт: 20\nrasxod:"
+        )
+
+        result = ensure_card_numbers(body, (), 3, 99, max_length=1024)
+
+        self.assertTrue(result.changed)
+        self.assertIn("Шт: 3\n🆔: 99", result.body)
+        self.assertIn("🛒💵: Поставщик\nШт: 20\nrasxod:", result.body)
+        self.assertTrue(card_numbers_match(result.body, 3, 99))
+
+    def test_legacy_order_normalizer_does_not_treat_manual_quantity_as_header(self):
+        body = (
+            BOT_CARD_MARKER
+            + "🆔: 7\n\n🛒💵:\nШт: 20\nrasxod:"
+        )
+
+        result = ensure_card_order_id(body, (), 8, max_length=1024)
+
+        self.assertTrue(result.body.startswith(BOT_CARD_MARKER + "🆔: 8\n\n"))
+        self.assertIn("🛒💵:\nШт: 20\nrasxod:", result.body)
+        self.assertEqual(card_order_id(result.body), 8)
+
+    def test_daily_normalizer_preserves_manual_quantity_after_finance_header(self):
+        body = (
+            BOT_CARD_MARKER
+            + "Шт: 2\n🆔: 99\n\n🛒💵:\nШт: 20\nrasxod:"
+        )
+
+        result = ensure_card_order_id(body, (), 3, max_length=1024)
+
+        self.assertTrue(result.body.startswith(BOT_CARD_MARKER + "Шт: 3\n🆔: 99"))
+        self.assertIn("🛒💵:\nШт: 20\nrasxod:", result.body)
+
     def test_inserts_id_after_marker_and_preserves_entities(self):
         body = BOT_CARD_MARKER + "🛒💵:\nrasxod:\n\n📞:\n\nНаличка"
         entity = MessageEntity(
@@ -307,6 +441,38 @@ class DailyOrderRepositoryTests(unittest.TestCase):
 
 
 class ExistingCardBackfillTests(unittest.IsolatedAsyncioTestCase):
+    async def test_history_backfill_stops_on_channel_rate_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SalesPhotoRepository(root / "sales.db")
+            sale_day = tashkent_today()
+            for source_id in (10, 11):
+                repo.claim_photo(
+                    CHAT_ID,
+                    source_id,
+                    f"unique-{source_id}",
+                    source_file_id=f"file-{source_id}",
+                    sale_date=sale_day,
+                )
+                repo.mark_reposted(CHAT_ID, source_id, source_id + 190)
+            service = SalesPhotoService(settings(root), repo)
+            bot = SimpleNamespace(
+                forward_message=AsyncMock(side_effect=RetryAfter(61)),
+                delete_message=AsyncMock(),
+            )
+
+            await service.backfill_order_cards(
+                bot,
+                ignore_delay=True,
+                all_history=True,
+            )
+
+            bot.forward_message.assert_awaited_once()
+            self.assertEqual(
+                [job.attempts for job in repo.pending_order_backfills(CHAT_ID)],
+                [0, 0],
+            )
+
     async def test_existing_caption_gets_id_without_losing_manual_finance(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -366,7 +532,9 @@ class ExistingCardBackfillTests(unittest.IsolatedAsyncioTestCase):
             bot.delete_message.assert_awaited_once_with(CHECK_CHAT_ID, 900)
             bot.edit_message_caption.assert_awaited_once()
             edited = bot.edit_message_caption.await_args.kwargs["caption"]
-            self.assertTrue(edited.startswith(BOT_CARD_MARKER + "🆔: 1\n\n"))
+            self.assertTrue(
+                edited.startswith(BOT_CARD_MARKER + "Шт: 1\n🆔: 1\n\n")
+            )
             self.assertIn("🛒💵: ACME $100", edited)
             self.assertIn("rasxod: $3", edited)
             self.assertIn("🇺🇿: 1 250 000", edited)

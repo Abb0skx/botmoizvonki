@@ -57,7 +57,7 @@ from .keyboards import (
     manager_keyboard,
 )
 from .models import EMPTY_IDENTIFIERS, ProductIdentifiers
-from .orders import card_order_id, ensure_card_order_id
+from .orders import card_numbers_match, ensure_card_numbers
 from .phones import (
     extract_product_label,
     normalize_caption_phone_field,
@@ -85,6 +85,8 @@ CAPTION_REVISION_LIMIT = 4096
 PROCESSING_STALE_SECONDS = 180
 ALBUM_SETTLE_SECONDS = 1.0
 ORDER_AUDIT_INTERVAL_SECONDS = 60.0
+ORDER_HISTORY_BACKFILL_BATCH_SIZE = 20
+ORDER_HISTORY_BACKFILL_INTERVAL_SECONDS = 3.2
 AUTO_CORRECTION_RETRY_SECONDS = 60.0
 AUTO_CORRECTION_CARD_INTERVAL_SECONDS = 1.1
 MANUAL_RECOVERY_LOOKAHEAD_MESSAGES = 100
@@ -133,6 +135,7 @@ def _normalize_card_fields(
     *,
     sale_date: date,
     order_id: int,
+    global_id: int,
     max_length: int,
 ) -> _CardNormalization:
     dated = normalize_card_sale_date(
@@ -141,10 +144,11 @@ def _normalize_card_fields(
         sale_date,
         max_length=max_length,
     )
-    ordered = ensure_card_order_id(
+    ordered = ensure_card_numbers(
         dated.body,
         dated.entities,
         order_id,
+        global_id,
         max_length=max_length,
     )
     phoned = normalize_caption_phone_field(
@@ -1062,17 +1066,18 @@ class SalesPhotoService:
                 latest = self._caption_update_ids.get(key)
                 if latest is not None and revision < latest[0]:
                     return
-            daily_order = self.repository.daily_order_for_replacement(
+            order_numbers = self.repository.order_numbers_for_replacement(
                 chat_id,
                 message_id,
             )
             max_length = 1024 if content_kind == "caption" else 4096
-            if daily_order is not None:
+            if order_numbers is not None:
                 final = _normalize_card_fields(
                     body,
                     entities,
-                    sale_date=daily_order[0],
-                    order_id=daily_order[1],
+                    sale_date=order_numbers[0],
+                    order_id=order_numbers[1],
+                    global_id=order_numbers[2],
                     max_length=max_length,
                 )
             else:
@@ -1092,15 +1097,15 @@ class SalesPhotoService:
                     phoned.changed or priced.changed,
                 )
             source_id = self.repository.source_for_replacement(chat_id, message_id)
-            if daily_order is not None and source_id is not None:
+            if order_numbers is not None and source_id is not None:
                 delivery_final, delivery_manager_changed = self._apply_delivery_match(
                     chat_id=chat_id,
                     source_message_id=source_id,
                     body=final.body,
                     entities=final.entities,
-                    sale_date=daily_order[0],
+                    sale_date=order_numbers[0],
                     delivery_index=self._delivery_index(
-                        daily_order[0], daily_order[0]
+                        order_numbers[0], order_numbers[0]
                     ),
                     max_length=max_length,
                 )
@@ -1115,8 +1120,10 @@ class SalesPhotoService:
                     chat_id=chat_id,
                     source_message_id=source_id,
                     body=final.body,
-                    sale_date=daily_order[0],
-                    call_index=self._call_index(daily_order[0], daily_order[0]),
+                    sale_date=order_numbers[0],
+                    call_index=self._call_index(
+                        order_numbers[0], order_numbers[0]
+                    ),
                 )
                 if call_manager_changed:
                     final = _CardNormalization(
@@ -1146,10 +1153,16 @@ class SalesPhotoService:
                         entities=final.entities,
                     )
                     await bot.edit_message_text(**edit_kwargs)
-                if daily_order is not None:
+                if order_numbers is not None and card_numbers_match(
+                    final.body,
+                    order_numbers[1],
+                    order_numbers[2],
+                ):
                     self._mark_order_applied_for_replacement(
                         chat_id,
                         message_id,
+                        expected_order_id=order_numbers[1],
+                        expected_global_id=order_numbers[2],
                     )
                 self._mark_price_applied_for_replacement(chat_id, message_id)
                 self._sync_sale_details(chat_id, message_id, final.body)
@@ -1164,10 +1177,16 @@ class SalesPhotoService:
                 raise
             except BadRequest as exc:
                 if "message is not modified" in str(exc).casefold():
-                    if daily_order is not None and card_order_id(body) == daily_order[1]:
+                    if order_numbers is not None and card_numbers_match(
+                        body,
+                        order_numbers[1],
+                        order_numbers[2],
+                    ):
                         self._mark_order_applied_for_replacement(
                             chat_id,
                             message_id,
+                            expected_order_id=order_numbers[1],
+                            expected_global_id=order_numbers[2],
                         )
                     self._mark_price_applied_for_replacement(chat_id, message_id)
                     self._sync_sale_details(chat_id, message_id, final.body)
@@ -1258,6 +1277,9 @@ class SalesPhotoService:
         self,
         chat_id: int,
         replacement_message_id: int,
+        *,
+        expected_order_id: int,
+        expected_global_id: int,
     ) -> None:
         try:
             source_id = self.repository.source_for_replacement(
@@ -1265,7 +1287,12 @@ class SalesPhotoService:
                 replacement_message_id,
             )
             if source_id is not None:
-                self.repository.mark_order_card_applied(chat_id, source_id)
+                self.repository.mark_order_card_applied(
+                    chat_id,
+                    source_id,
+                    expected_order_id=expected_order_id,
+                    expected_global_id=expected_global_id,
+                )
         except Exception as exc:
             logger.warning(
                 "sales_photo_order_applied_commit_failed chat_id=%s "
@@ -1621,7 +1648,7 @@ class SalesPhotoService:
             # Do not scan existing cards in the publish path. The requested
             # trailing debounce must reset for every new model and start one
             # consolidated repair only after five quiet minutes.
-            _, order_id = self.repository.ensure_daily_order(
+            _, order_id, global_id = self.repository.ensure_order_numbers(
                 chat_id,
                 source_message_id,
                 claim.sale_date,
@@ -1655,7 +1682,8 @@ class SalesPhotoService:
             identifiers,
             product_label=product_label,
             sale_date=(sale_date_match.value if sale_date_match else None),
-            order_id=order_id,
+            daily_quantity=order_id,
+            global_order_id=global_id,
         )
         initial_generation = 0
         source_signature = self.repository.callback_signature(
@@ -1869,7 +1897,21 @@ class SalesPhotoService:
             self._auto_correction_wake.set()
 
         try:
-            self.repository.mark_order_card_applied(chat_id, source_message_id)
+            current_numbers = self.repository.order_numbers_for_source(
+                chat_id,
+                source_message_id,
+            )
+            if current_numbers is not None and card_numbers_match(
+                caption,
+                current_numbers[1],
+                current_numbers[2],
+            ):
+                self.repository.mark_order_card_applied(
+                    chat_id,
+                    source_message_id,
+                    expected_order_id=current_numbers[1],
+                    expected_global_id=current_numbers[2],
+                )
             self.repository.mark_price_card_applied(chat_id, source_message_id)
         except Exception as exc:
             logger.warning(
@@ -2133,7 +2175,26 @@ class SalesPhotoService:
         if outcome == "recorded":
             self._auto_correction_wake.set()
         try:
-            self.repository.mark_order_card_applied(chat_id, source_message_id)
+            content = _message_content(message)
+            current_numbers = self.repository.order_numbers_for_source(
+                chat_id,
+                source_message_id,
+            )
+            if (
+                content is not None
+                and current_numbers is not None
+                and card_numbers_match(
+                    content[1],
+                    current_numbers[1],
+                    current_numbers[2],
+                )
+            ):
+                self.repository.mark_order_card_applied(
+                    chat_id,
+                    source_message_id,
+                    expected_order_id=current_numbers[1],
+                    expected_global_id=current_numbers[2],
+                )
             self.repository.mark_price_card_applied(chat_id, source_message_id)
         except Exception as exc:
             logger.warning(
@@ -2481,18 +2542,19 @@ class SalesPhotoService:
         content_kind, body, entities = content
         chat_id = _chat_id(message)
         message_id = getattr(message, "message_id", None)
-        daily_order = (
-            self.repository.daily_order_for_replacement(chat_id, int(message_id))
+        order_numbers = (
+            self.repository.order_numbers_for_replacement(chat_id, int(message_id))
             if chat_id is not None and message_id is not None
             else None
         )
         max_length = 1024 if content_kind == "caption" else 4096
-        if daily_order is not None:
+        if order_numbers is not None:
             final = _normalize_card_fields(
                 body,
                 entities,
-                sale_date=daily_order[0],
-                order_id=daily_order[1],
+                sale_date=order_numbers[0],
+                order_id=order_numbers[1],
+                global_id=order_numbers[2],
                 max_length=max_length,
             )
         else:
@@ -2516,14 +2578,16 @@ class SalesPhotoService:
             if chat_id is not None and message_id is not None
             else None
         )
-        if apply_delivery and daily_order is not None and source_id is not None:
+        if apply_delivery and order_numbers is not None and source_id is not None:
             delivery_final, _ = self._apply_delivery_match(
                 chat_id=int(chat_id),
                 source_message_id=source_id,
                 body=final.body,
                 entities=final.entities,
-                sale_date=daily_order[0],
-                delivery_index=self._delivery_index(daily_order[0], daily_order[0]),
+                sale_date=order_numbers[0],
+                delivery_index=self._delivery_index(
+                    order_numbers[0], order_numbers[0]
+                ),
                 max_length=max_length,
             )
             final = _CardNormalization(
@@ -2533,10 +2597,16 @@ class SalesPhotoService:
             )
         if not final.changed:
             await self._edit_callback_markup(query, reply_markup)
-            if daily_order is not None and card_order_id(body) == daily_order[1]:
+            if order_numbers is not None and card_numbers_match(
+                body,
+                order_numbers[1],
+                order_numbers[2],
+            ):
                 self._mark_order_applied_for_replacement(
                     int(chat_id),
                     int(message_id),
+                    expected_order_id=order_numbers[1],
+                    expected_global_id=order_numbers[2],
                 )
             if chat_id is not None and message_id is not None:
                 self._mark_price_applied_for_replacement(
@@ -2570,10 +2640,16 @@ class SalesPhotoService:
                     chat_id,
                     message_id,
                 )
-                if daily_order is not None:
+                if order_numbers is not None and card_numbers_match(
+                    final.body,
+                    order_numbers[1],
+                    order_numbers[2],
+                ):
                     self._mark_order_applied_for_replacement(
                         int(chat_id),
                         int(message_id),
+                        expected_order_id=order_numbers[1],
+                        expected_global_id=order_numbers[2],
                     )
                 if chat_id is not None and message_id is not None:
                     self._mark_price_applied_for_replacement(
@@ -2588,10 +2664,16 @@ class SalesPhotoService:
                 return
             except BadRequest as exc:
                 if "message is not modified" in str(exc).casefold():
-                    if daily_order is not None:
+                    if order_numbers is not None and card_numbers_match(
+                        final.body,
+                        order_numbers[1],
+                        order_numbers[2],
+                    ):
                         self._mark_order_applied_for_replacement(
                             int(chat_id),
                             int(message_id),
+                            expected_order_id=order_numbers[1],
+                            expected_global_id=order_numbers[2],
                         )
                     if chat_id is not None and message_id is not None:
                         self._mark_price_applied_for_replacement(
@@ -2926,14 +3008,18 @@ class SalesPhotoService:
         bot: Bot | Any,
         *,
         ignore_delay: bool = False,
+        all_history: bool = False,
     ) -> None:
-        """Add IDs to cards created before daily numbering was introduced."""
+        """Restore both sale numbers without changing managers or finance data."""
 
         now = utc_now()
-        sale_date_from, sale_date_to = _recent_sale_window()
+        if all_history:
+            sale_date_from = sale_date_to = None
+        else:
+            sale_date_from, sale_date_to = _recent_sale_window()
         for job in self.repository.pending_order_backfills(
             self.settings.chat_id,
-            limit=50,
+            limit=(ORDER_HISTORY_BACKFILL_BATCH_SIZE if all_history else 50),
             sale_date_from=sale_date_from,
             sale_date_to=sale_date_to,
         ):
@@ -2944,83 +3030,131 @@ class SalesPhotoService:
             if not ignore_delay and (now - updated_at).total_seconds() < delay:
                 continue
 
-            forwarded = None
-            try:
-                forwarded = await self._forward_for_inspection(
-                    bot,
-                    source_chat_id=job.chat_id,
-                    message_id=job.replacement_message_id,
-                )
-                content = _message_content(forwarded)
-                if content is None:
-                    raise RuntimeError("forwarded_card_has_no_content")
-                content_kind, body, entities = content
-                ordered = ensure_card_order_id(
-                    body,
-                    entities,
-                    job.order_id,
-                    max_length=(1024 if content_kind == "caption" else 4096),
-                )
-                if not ordered.changed:
-                    if card_order_id(body) != job.order_id:
-                        raise RuntimeError("order_card_cannot_be_extended")
-                else:
-                    edit_kwargs: dict[str, Any] = {
-                        "chat_id": job.chat_id,
-                        "message_id": job.replacement_message_id,
-                        "reply_markup": self._current_card_markup(
-                            job.chat_id,
-                            job.replacement_message_id,
-                            forwarded,
+            card_key = (job.chat_id, job.replacement_message_id)
+            async with self._card_lock(card_key):
+                forwarded = None
+                current_numbers: tuple[date, int, int] | None = None
+                try:
+                    forwarded = await self._forward_for_inspection(
+                        bot,
+                        source_chat_id=job.chat_id,
+                        message_id=job.replacement_message_id,
+                    )
+                    content = _message_content(forwarded)
+                    if content is None:
+                        raise RuntimeError("forwarded_card_has_no_content")
+                    content_kind, body, entities = content
+                    # A missing earlier Telegram post can compact the day while
+                    # this batch is running. Always read the current daily
+                    # value; the permanent value can never change.
+                    current_numbers = self.repository.order_numbers_for_source(
+                        job.chat_id,
+                        job.source_message_id,
+                    )
+                    if current_numbers is None:
+                        continue
+                    ordered = ensure_card_numbers(
+                        body,
+                        entities,
+                        current_numbers[1],
+                        current_numbers[2],
+                        max_length=(
+                            1024 if content_kind == "caption" else 4096
                         ),
-                    }
-                    if content_kind == "caption":
-                        edit_kwargs.update(
-                            caption=ordered.body,
-                            caption_entities=ordered.entities,
-                        )
-                        await bot.edit_message_caption(**edit_kwargs)
+                    )
+                    if not ordered.changed:
+                        if not card_numbers_match(
+                            body,
+                            current_numbers[1],
+                            current_numbers[2],
+                        ):
+                            raise RuntimeError("order_card_cannot_be_extended")
                     else:
-                        edit_kwargs.update(
-                            text=ordered.body,
-                            entities=ordered.entities,
-                        )
-                        await bot.edit_message_text(**edit_kwargs)
-                self.repository.mark_order_card_applied(
-                    job.chat_id,
-                    job.source_message_id,
-                )
-                logger.info(
-                    "sales_photo_order_backfill_complete chat_id=%s "
-                    "message_id=%s sale_date=%s order_id=%s",
-                    job.chat_id,
-                    job.replacement_message_id,
-                    job.sale_date.isoformat(),
-                    job.order_id,
-                )
-            except asyncio.CancelledError:
-                raise
-            except BadRequest as exc:
-                if "message is not modified" in str(exc).casefold():
+                        edit_kwargs: dict[str, Any] = {
+                            "chat_id": job.chat_id,
+                            "message_id": job.replacement_message_id,
+                            "reply_markup": self._current_card_markup(
+                                job.chat_id,
+                                job.replacement_message_id,
+                                forwarded,
+                            ),
+                        }
+                        if content_kind == "caption":
+                            edit_kwargs.update(
+                                caption=ordered.body,
+                                caption_entities=ordered.entities,
+                            )
+                            await bot.edit_message_caption(**edit_kwargs)
+                        else:
+                            edit_kwargs.update(
+                                text=ordered.body,
+                                entities=ordered.entities,
+                            )
+                            await bot.edit_message_text(**edit_kwargs)
                     self.repository.mark_order_card_applied(
                         job.chat_id,
                         job.source_message_id,
-                    )
-                elif _message_to_forward_missing(exc):
-                    sale_day, changed = self.repository.mark_order_card_removed(
-                        job.chat_id,
-                        job.source_message_id,
+                        expected_order_id=current_numbers[1],
+                        expected_global_id=current_numbers[2],
                     )
                     logger.info(
-                        "sales_photo_order_backfill_removed chat_id=%s "
-                        "message_id=%s sale_date=%s changed=%s",
+                        "sales_photo_order_backfill_complete chat_id=%s "
+                        "message_id=%s sale_date=%s daily_id=%s global_id=%s",
                         job.chat_id,
                         job.replacement_message_id,
-                        sale_day.isoformat() if sale_day else "unknown",
-                        changed,
+                        current_numbers[0].isoformat(),
+                        current_numbers[1],
+                        current_numbers[2],
                     )
-                    return
-                else:
+                except asyncio.CancelledError:
+                    raise
+                except RetryAfter as exc:
+                    # Flood control applies to the channel, not one card.
+                    # Stop the whole batch without exhausting per-card retry
+                    # counters; the next maintenance pass will resume here.
+                    logger.warning(
+                        "sales_photo_order_backfill_rate_limited "
+                        "retry_after=%s message_id=%s",
+                        _retry_after_seconds(exc),
+                        job.replacement_message_id,
+                    )
+                    break
+                except BadRequest as exc:
+                    if "message is not modified" in str(exc).casefold():
+                        if current_numbers is not None:
+                            self.repository.mark_order_card_applied(
+                                job.chat_id,
+                                job.source_message_id,
+                                expected_order_id=current_numbers[1],
+                                expected_global_id=current_numbers[2],
+                            )
+                    elif _message_to_forward_missing(exc):
+                        sale_day, changed = self.repository.mark_order_card_removed(
+                            job.chat_id,
+                            job.source_message_id,
+                        )
+                        logger.info(
+                            "sales_photo_order_backfill_removed chat_id=%s "
+                            "message_id=%s sale_date=%s changed=%s",
+                            job.chat_id,
+                            job.replacement_message_id,
+                            sale_day.isoformat() if sale_day else "unknown",
+                            changed,
+                        )
+                        continue
+                    else:
+                        self.repository.mark_order_backfill_failed(
+                            job.chat_id,
+                            job.source_message_id,
+                        )
+                        logger.warning(
+                            "sales_photo_order_backfill_failed chat_id=%s "
+                            "message_id=%s error_type=%s",
+                            job.chat_id,
+                            job.replacement_message_id,
+                            _error_code(exc),
+                        )
+                except Exception as exc:
                     self.repository.mark_order_backfill_failed(
                         job.chat_id,
                         job.source_message_id,
@@ -3032,27 +3166,21 @@ class SalesPhotoService:
                         job.replacement_message_id,
                         _error_code(exc),
                     )
-            except Exception as exc:
-                self.repository.mark_order_backfill_failed(
-                    job.chat_id,
-                    job.source_message_id,
-                )
-                logger.warning(
-                    "sales_photo_order_backfill_failed chat_id=%s message_id=%s "
-                    "error_type=%s",
-                    job.chat_id,
-                    job.replacement_message_id,
-                    _error_code(exc),
-                )
-            finally:
-                if forwarded is not None:
-                    temporary_message_id = getattr(forwarded, "message_id", None)
-                    if temporary_message_id is not None:
-                        await self._delete_duplicate(
-                            bot,
-                            self._inspection_chat_id,
-                            int(temporary_message_id),
+                finally:
+                    if forwarded is not None:
+                        temporary_message_id = getattr(
+                            forwarded,
+                            "message_id",
+                            None,
                         )
+                        if temporary_message_id is not None:
+                            await self._delete_duplicate(
+                                bot,
+                                self._inspection_chat_id,
+                                int(temporary_message_id),
+                            )
+            if all_history:
+                await asyncio.sleep(ORDER_HISTORY_BACKFILL_INTERVAL_SECONDS)
             self._touch_heartbeat()
 
     async def backfill_price_cards(
@@ -3316,7 +3444,7 @@ class SalesPhotoService:
                         if content is None:
                             raise RuntimeError("forwarded_card_has_no_content")
                         content_kind, body, entities = content
-                        current_order = self.repository.daily_order_for_replacement(
+                        current_order = self.repository.order_numbers_for_replacement(
                             candidate.chat_id,
                             candidate.replacement_message_id,
                         )
@@ -3327,6 +3455,7 @@ class SalesPhotoService:
                             entities,
                             sale_date=current_order[0],
                             order_id=current_order[1],
+                            global_id=current_order[2],
                             max_length=(
                                 1024 if content_kind == "caption" else 4096
                             ),
@@ -3393,10 +3522,17 @@ class SalesPhotoService:
                             corrected += 1
                         if manager_changed:
                             reminder_sources.add(candidate.source_message_id)
-                        self.repository.mark_order_card_applied(
-                            candidate.chat_id,
-                            candidate.source_message_id,
-                        )
+                        if card_numbers_match(
+                            final.body,
+                            current_order[1],
+                            current_order[2],
+                        ):
+                            self.repository.mark_order_card_applied(
+                                candidate.chat_id,
+                                candidate.source_message_id,
+                                expected_order_id=current_order[1],
+                                expected_global_id=current_order[2],
+                            )
                         self.repository.mark_price_card_applied(
                             candidate.chat_id,
                             candidate.source_message_id,
@@ -5115,7 +5251,11 @@ class SalesPhotoService:
     ) -> None:
         await self._wait_for_startup_drain(startup_ready, update_queue)
         try:
-            await self.backfill_order_cards(bot, ignore_delay=True)
+            await self.backfill_order_cards(
+                bot,
+                ignore_delay=True,
+                all_history=True,
+            )
             await self.backfill_price_cards(bot, ignore_delay=True)
         except asyncio.CancelledError:
             raise
@@ -5157,6 +5297,13 @@ class SalesPhotoService:
                 ("source_delete", self.retry_pending_deletions),
                 ("duplicate_delete", self.retry_duplicate_cleanups),
                 ("photo_retry", self.retry_failed_photos),
+                (
+                    "order_backfill",
+                    lambda active_bot: self.backfill_order_cards(
+                        active_bot,
+                        all_history=True,
+                    ),
+                ),
             ):
                 try:
                     await stage(bot)

@@ -239,6 +239,29 @@ class ConfigTests(unittest.TestCase):
 
 
 class CaptionFormattingTests(unittest.TestCase):
+    def test_card_can_render_daily_quantity_and_permanent_id(self):
+        caption = build_caption(
+            None,
+            ProductIdentifiers(),
+            sale_date=date(2026, 9, 6),
+            daily_quantity=2,
+            global_order_id=481,
+        )
+
+        self.assertTrue(
+            caption.startswith(
+                "📆: 06/09/2026\nШт: 2\n🆔: 481\n\n🛒💵:"
+            )
+        )
+
+        transitional = build_caption(
+            None,
+            ProductIdentifiers(),
+            order_id=3,
+            global_order_id=482,
+        )
+        self.assertTrue(transitional.startswith("Шт: 3\n🆔: 482\n\n🛒💵:"))
+
     def test_complete_card(self):
         caption = build_caption(
             "+998 90 123 45 67",
@@ -831,7 +854,7 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             sent.startswith(
                 BOT_CARD_MARKER
-                + "📆: 31/08/2026\n🆔: 1\n\n📦 A16 8/256\n\n🛒💵:"
+                + "📆: 31/08/2026\nШт: 1\n🆔: 1\n\n📦 A16 8/256\n\n🛒💵:"
             )
         )
         self.assertIn("📞: +998 90 123 45 67", sent)
@@ -854,7 +877,8 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
         caption = bot.send_photo.await_args.kwargs["caption"]
         self.assertTrue(
             caption.startswith(
-                BOT_CARD_MARKER + "📆: 31/08/2026\n🆔: 1\n\n🛒💵:"
+                BOT_CARD_MARKER
+                + "📆: 31/08/2026\nШт: 1\n🆔: 1\n\n🛒💵:"
             )
         )
         self.assertIn("📞: +998 90 123 45 67", caption)
@@ -951,7 +975,8 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
         card = bot.send_message.await_args.kwargs["text"]
         self.assertTrue(
             card.startswith(
-                BOT_CARD_MARKER + "📆: 31/08/2026\n🆔: 1\n\n🛒💵:"
+                BOT_CARD_MARKER
+                + "📆: 31/08/2026\nШт: 1\n🆔: 1\n\n🛒💵:"
             )
         )
 
@@ -1004,6 +1029,46 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("📦", sent["caption"])
         self.assertEqual(len(sent["reply_markup"].inline_keyboard), 2)
         self.assertTrue(repo.is_replacement(CHAT_ID, 200))
+
+    async def test_send_compaction_keeps_stale_daily_caption_pending(self):
+        repo = SalesPhotoRepository(self.root / "db.sqlite")
+        service = SalesPhotoService(settings(self.root), repo)
+        bot = telegram_bot()
+        sale_day = date(2026, 9, 6)
+        self.assertTrue(
+            repo.claim_photo(
+                CHAT_ID,
+                9,
+                "earlier-processing",
+                source_file_id="earlier-file",
+                sale_date=sale_day,
+                allocate_order=False,
+            )
+        )
+        self.assertEqual(
+            repo.ensure_order_numbers(CHAT_ID, 9, sale_day),
+            (sale_day, 1, 1),
+        )
+
+        async def send_after_earlier_failure(**kwargs):
+            repo.mark_failed(CHAT_ID, 9, "failed_while_send_in_flight")
+            return SimpleNamespace(message_id=200)
+
+        bot.send_photo.side_effect = send_after_earlier_failure
+        with patch("sales_photo_bot.service.tashkent_today", return_value=sale_day):
+            await service.handle_photo(photo_message(), bot)
+
+        sent_caption = bot.send_photo.await_args.kwargs["caption"]
+        self.assertIn("Шт: 2", sent_caption)
+        self.assertIn("🆔: 2", sent_caption)
+        self.assertEqual(
+            repo.order_numbers_for_source(CHAT_ID, 10),
+            (sale_day, 1, 2),
+        )
+        self.assertEqual(
+            [job.source_message_id for job in repo.pending_order_backfills(CHAT_ID)],
+            [10],
+        )
 
     async def test_failed_optional_recognizer_reposts_empty_template(self):
         repo = SalesPhotoRepository(self.root / "db.sqlite")
@@ -1833,7 +1898,7 @@ class EditedCaptionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["caption_entities"][0].type, MessageEntity.BOLD)
 
     async def test_manual_edit_restores_the_persisted_order_id(self):
-        self.repo.ensure_daily_order(CHAT_ID, 10, date(2026, 8, 31))
+        self.repo.ensure_order_numbers(CHAT_ID, 10, date(2026, 8, 31))
         caption = (
             BOT_CARD_MARKER
             + "🛒💵: ACME\nrasxod: $3\n\n📞:\n\nНаличка"
@@ -1847,7 +1912,9 @@ class EditedCaptionTests(unittest.IsolatedAsyncioTestCase):
         )
 
         normalized = bot.edit_message_caption.await_args.kwargs["caption"]
-        self.assertTrue(normalized.startswith(BOT_CARD_MARKER + "🆔: 1\n\n"))
+        self.assertTrue(
+            normalized.startswith(BOT_CARD_MARKER + "Шт: 1\n🆔: 1\n\n")
+        )
         self.assertIn("🛒💵: ACME", normalized)
         self.assertIn("rasxod: $3", normalized)
         self.assertEqual(self.repo.pending_order_backfills(CHAT_ID), ())
@@ -2229,7 +2296,7 @@ class ManagerCallbackTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_manager_click_restores_missing_order_id(self):
-        self.repo.ensure_daily_order(CHAT_ID, 10, date(2026, 8, 31))
+        self.repo.ensure_order_numbers(CHAT_ID, 10, date(2026, 8, 31))
         service = SalesPhotoService(settings(self.root), self.repo)
         query = self.query(self.callback("m:olmas", 0), self.base)
 
@@ -2240,7 +2307,9 @@ class ManagerCallbackTests(unittest.IsolatedAsyncioTestCase):
         query.edit_message_reply_markup.assert_not_awaited()
         query.edit_message_caption.assert_awaited_once()
         caption = query.edit_message_caption.await_args.kwargs["caption"]
-        self.assertTrue(caption.startswith(BOT_CARD_MARKER + "🆔: 1\n\n"))
+        self.assertTrue(
+            caption.startswith(BOT_CARD_MARKER + "Шт: 1\n🆔: 1\n\n")
+        )
 
     async def test_manager_click_normalizes_a_text_card(self):
         service = SalesPhotoService(settings(self.root), self.repo)

@@ -321,8 +321,10 @@ class RecentCardCorrectionTests(unittest.IsolatedAsyncioTestCase):
                 int(call.kwargs["message_id"]): call.kwargs["caption"]
                 for call in bot.edit_message_caption.await_args_list
             }
-            self.assertIn("🆔: 1", captions[92])
-            self.assertIn("🆔: 2", captions[93])
+            self.assertIn("Шт: 1", captions[92])
+            self.assertIn("🆔: 2", captions[92])
+            self.assertIn("Шт: 2", captions[93])
+            self.assertIn("🆔: 1", captions[93])
 
     async def test_obnovit_deletes_command_and_runs_forced_reconciliation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -416,9 +418,13 @@ class RecentCardCorrectionTests(unittest.IsolatedAsyncioTestCase):
             }
             self.assertEqual(forwarded_ids, {201, 202, 203})
             self.assertEqual(bot.edit_message_caption.await_count, 3)
-            for call in bot.edit_message_caption.await_args_list:
+            for expected_global_id, call in enumerate(
+                bot.edit_message_caption.await_args_list,
+                start=2,
+            ):
                 normalized = call.kwargs["caption"]
-                self.assertIn("🆔: 1", normalized)
+                self.assertIn("Шт: 1", normalized)
+                self.assertIn(f"🆔: {expected_global_id}", normalized)
                 self.assertIn("🛒💵:A3 Mirsaid 87$", normalized)
                 self.assertIn("📞: +998 90 123 45 67", normalized)
                 self.assertIn("💵:100$", normalized)
@@ -485,8 +491,8 @@ class RecentCardCorrectionTests(unittest.IsolatedAsyncioTestCase):
                 (sale_day, 2),
             )
             edited = bot.edit_message_caption.await_args.kwargs["caption"]
-            self.assertIn("🆔: 2", edited)
-            self.assertNotIn("🆔: 3", edited)
+            self.assertIn("Шт: 2", edited)
+            self.assertIn("🆔: 3", edited)
 
     async def test_registered_forward_without_marker_is_deleted_not_reposted(self):
         with tempfile.TemporaryDirectory() as directory:

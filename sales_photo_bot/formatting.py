@@ -38,6 +38,8 @@ def build_caption(
     product_label: str | None = None,
     sale_date: date | None = None,
     order_id: int | None = None,
+    daily_quantity: int | None = None,
+    global_order_id: int | None = None,
 ) -> str:
     """Build the sales card, retaining only verified phones and identifiers."""
 
@@ -45,8 +47,20 @@ def build_caption(
     lines: list[str] = []
     if sale_date:
         lines.append(f"📆: {sale_date:%d/%m/%Y}")
-    if order_id is not None:
-        lines.extend([f"🆔: {max(1, int(order_id))}", ""])
+    number_lines: list[str] = []
+    effective_daily_quantity = daily_quantity
+    if effective_daily_quantity is None and global_order_id is not None:
+        effective_daily_quantity = order_id
+    if effective_daily_quantity is not None:
+        number_lines.append(f"Шт: {max(1, int(effective_daily_quantity))}")
+    if global_order_id is not None:
+        number_lines.append(f"🆔: {max(1, int(global_order_id))}")
+    # ``order_id`` alone keeps the legacy one-line output. When a permanent ID
+    # is supplied it can also serve as the old name for the daily quantity.
+    if not number_lines and order_id is not None:
+        number_lines.append(f"🆔: {max(1, int(order_id))}")
+    if number_lines:
+        lines.extend([*number_lines, ""])
     elif sale_date:
         lines.append("")
     if product_label:
