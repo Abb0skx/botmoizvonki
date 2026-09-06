@@ -7,6 +7,9 @@ import httpx
 from monitoring.config import MonitoringSettings
 
 
+DELIVERY_JSON_TIMEOUT_SECONDS = 30.0
+
+
 class DeliveryAdapter:
     def __init__(self, settings: MonitoringSettings):
         self.settings = settings
@@ -22,7 +25,10 @@ class DeliveryAdapter:
             raise RuntimeError("delivery_source_not_configured")
         url = self.settings.delivery_base_url + path
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(8.0, connect=2.0),
+            timeout=httpx.Timeout(
+                DELIVERY_JSON_TIMEOUT_SECONDS,
+                connect=2.0,
+            ),
             follow_redirects=False,
         ) as client:
             response = await client.get(
