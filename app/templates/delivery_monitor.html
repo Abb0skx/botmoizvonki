@@ -38,7 +38,7 @@
 <main class="shell">
   <header class="topbar">
     <div class="brand"><div class="logo">🚚</div><div><h1>Мониторинг доставки</h1><div class="subtitle">TEXNIKACH · состояние курьеров и заказов сегодня</div></div></div>
-    <div class="top-actions"><a class="button" href="/delivery/stats">📊 Статистика</a><button class="button primary" id="refresh">↻ Обновить</button><div class="updated" id="updated">Загрузка…</div></div>
+    <div class="top-actions"><a class="button" id="statsLink" href="/delivery/stats">📊 Статистика</a><button class="button primary" id="refresh">↻ Обновить</button><div class="updated" id="updated">Загрузка…</div></div>
   </header>
   <div class="notice"><strong>ℹ️ Позиция расчётная.</strong><span>После «Заказ прочитан» курьер считается выехавшим на склад, после «Еду к заказу» — к клиенту. Маршрут идёт по дорожной сети OpenStreetMap; бот не получает GPS и не учитывает текущие пробки.</span></div>
   <div class="error" id="error"></div>
@@ -57,7 +57,8 @@
         crossorigin="anonymous"></script>
 <script>
   const $=id=>document.getElementById(id), escapeHtml=value=>String(value??"").replace(/[&<>'"]/g,char=>({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[char]));
-  const API_URL=new URL("/delivery/monitor/api/state",location.origin).href;
+  const IS_MONITORING_PORTAL=location.pathname.startsWith("/monitoring/");
+  const API_URL=new URL(IS_MONITORING_PORTAL?"/monitoring/delivery/live/api/state":"/delivery/monitor/api/state",location.origin).href;
   const statusLabels={draft:"Не отправлен курьеру",pending:"Ожидает забора",picked_up:"Товар у курьера",on_way:"Курьер едет",awaiting_photo:"Подтверждение",awaiting_amount:"Подтверждение"};
   const map=L.map("map",{zoomControl:true}).setView([41.31,69.27],11);
   L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",{maxZoom:19,attribution:'&copy; OpenStreetMap'}).addTo(map);
@@ -96,6 +97,7 @@
   function renderCounts(){$("counts").innerHTML=countBlock("Кто создал заказ",data.manager_counts)+countBlock("Чей заказ / продавец",data.seller_counts);}
   function scheduleRefresh(){clearTimeout(refreshTimer);refreshTimer=setTimeout(load,20000);}
   async function load(){const generation=++loadGeneration;clearTimeout(refreshTimer);if(loadController)loadController.abort();loadController=new AbortController();const button=$("refresh");button.classList.add("refreshing");$("error").style.display="none";try{const response=await fetch(API_URL,{cache:"no-store",signal:loadController.signal});if(!response.ok)throw new Error(`Ошибка сервера ${response.status}`);const nextData=await response.json();if(generation!==loadGeneration)return;data=nextData;renderMetrics();renderCouriers();renderOrders();renderCounts();drawMap();$("updated").textContent=`Обновлено ${data.generated_time}`;}catch(error){if(error.name!=="AbortError"&&generation===loadGeneration){$("error").textContent=`Не удалось обновить мониторинг: ${error.message}`;$("error").style.display="block";$("updated").textContent="Нет связи";}}finally{if(generation===loadGeneration){button.classList.remove("refreshing");scheduleRefresh();}}}
+  if(IS_MONITORING_PORTAL)$("statsLink").href="/monitoring/delivery/stats";
   $("refresh").onclick=load;$("showAll").onclick=()=>{selectedCourier=null;renderCouriers();drawMap();};load();setInterval(updateMovement,1000);
 </script>
 </body>

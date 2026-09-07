@@ -825,6 +825,30 @@ class DeliveryStatsWebTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("summary", response.json())
 
+    def test_detailed_monitoring_endpoints_keep_routing_enrichment(self):
+        stats_enrich = AsyncMock(side_effect=lambda report, _service: report)
+        live_enrich = AsyncMock(side_effect=lambda state, _service: state)
+        with patch.object(
+            self.stats, "MONITORING_DELIVERY_SERVICE_TOKEN", "portal-service-key"
+        ), patch.object(
+            self.stats, "enrich_stats_routes", stats_enrich
+        ), patch.object(
+            self.stats, "enrich_monitor_routes", live_enrich
+        ):
+            report = self.client.get(
+                "/internal/monitoring/v1/delivery/report/detailed?day=today",
+                headers={"Authorization": "Bearer portal-service-key"},
+            )
+            live = self.client.get(
+                "/internal/monitoring/v1/delivery/live/detailed",
+                headers={"Authorization": "Bearer portal-service-key"},
+            )
+
+        self.assertEqual(report.status_code, 200)
+        self.assertEqual(live.status_code, 200)
+        stats_enrich.assert_awaited_once()
+        live_enrich.assert_awaited_once()
+
     def test_legacy_report_keeps_routing_enrichment(self):
         enrich = AsyncMock(side_effect=lambda report, _service: report)
         with patch.object(self.stats, "enrich_stats_routes", enrich):

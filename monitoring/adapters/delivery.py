@@ -17,12 +17,18 @@ class DeliveryAdapter:
             and self.settings.delivery_service_token
         )
 
-    async def get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+    async def get(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        *,
+        timeout_seconds: float = 8.0,
+    ) -> Any:
         if not self.configured():
             raise RuntimeError("delivery_source_not_configured")
         url = self.settings.delivery_base_url + path
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(8.0, connect=2.0),
+            timeout=httpx.Timeout(timeout_seconds, connect=2.0),
             follow_redirects=False,
         ) as client:
             response = await client.get(

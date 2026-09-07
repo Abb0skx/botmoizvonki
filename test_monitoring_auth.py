@@ -277,6 +277,84 @@ class MonitoringRouteTests(unittest.TestCase):
         self.assertEqual(response.headers["cache-control"], "no-store, private")
         self.assertEqual(response.headers["x-frame-options"], "DENY")
 
+    def test_delivery_pages_restore_full_legacy_interface(self):
+        anonymous = self.client.get(
+            "/monitoring/delivery/stats?period=today",
+            follow_redirects=False,
+        )
+        self.assertEqual(anonymous.status_code, 303)
+        self.assertIn(
+            "%2Fmonitoring%2Fdelivery%2Fstats%3Fperiod%3Dtoday",
+            anonymous.headers["location"],
+        )
+
+        self.login()
+        stats = self.client.get("/monitoring/delivery/stats?period=today")
+        live = self.client.get("/monitoring/delivery/live")
+
+        self.assertEqual(stats.status_code, 200)
+        self.assertIn("Карта очередности", stats.text)
+        self.assertIn("Хронология дня", stats.text)
+        self.assertIn("Разбивка за день", stats.text)
+        self.assertIn("Заказы по дням месяца", stats.text)
+        self.assertIn("/monitoring/delivery/stats", stats.text)
+        self.assertNotIn("monitoring-bootstrap", stats.text)
+        self.assertIn("nonce-", stats.headers["content-security-policy"])
+        self.assertIn(
+            "https://unpkg.com",
+            stats.headers["content-security-policy"],
+        )
+
+        self.assertEqual(live.status_code, 200)
+        self.assertIn("Карта движения", live.text)
+        self.assertIn("Активные заказы", live.text)
+        self.assertIn("/monitoring/delivery/live/api/state", live.text)
+
+    def test_legacy_delivery_api_shape_uses_detailed_internal_data(self):
+        self.login()
+        report_data = {"summary": {"orders": 3}, "routes": []}
+        live_data = {"summary": {"active": 2}, "routes": []}
+        analytics_data = {"month": {"orders": 4}}
+        upstream = AsyncMock(
+            side_effect=[report_data, live_data, analytics_data]
+        )
+        with patch.object(
+            monitoring_router.DeliveryAdapter,
+            "get",
+            new=upstream,
+        ):
+            report = self.client.get(
+                "/monitoring/delivery/stats/api/report",
+                params={"day": "today", "delivery_courier_id": "42"},
+            )
+            live = self.client.get(
+                "/monitoring/delivery/live/api/state"
+            )
+            analytics = self.client.get(
+                "/monitoring/delivery/stats/api/analytics",
+                params={"month": "2026-09"},
+            )
+
+        self.assertEqual(report.json(), report_data)
+        self.assertEqual(live.json(), live_data)
+        self.assertEqual(analytics.json(), analytics_data)
+        report_call, live_call, analytics_call = upstream.await_args_list
+        self.assertEqual(
+            report_call.args[0],
+            "/internal/monitoring/v1/delivery/report/detailed",
+        )
+        self.assertEqual(report_call.kwargs["params"]["courier_id"], "42")
+        self.assertEqual(report_call.kwargs["timeout_seconds"], 30.0)
+        self.assertEqual(
+            live_call.args[0],
+            "/internal/monitoring/v1/delivery/live/detailed",
+        )
+        self.assertEqual(live_call.kwargs["timeout_seconds"], 30.0)
+        self.assertEqual(
+            analytics_call.args[0],
+            "/internal/monitoring/v1/delivery/analytics",
+        )
+
     def test_old_telegram_session_is_rejected(self):
         self.login(101)
         self.assertEqual(self.client.get("/monitoring/api/me").status_code, 401)
@@ -354,6 +432,10 @@ class MonitoringRouteTests(unittest.TestCase):
             self.client.get("/monitoring/api/delivery/map.png").status_code,
             401,
         )
+        self.assertEqual(
+            self.client.get("/monitoring/delivery/stats/map.png").status_code,
+            401,
+        )
         self.login()
         get_bytes = AsyncMock(return_value=(b"png-data", "image/png"))
         with patch.object(
@@ -362,7 +444,7 @@ class MonitoringRouteTests(unittest.TestCase):
             new=get_bytes,
         ):
             response = self.client.get(
-                "/monitoring/api/delivery/map.png",
+                "/monitoring/delivery/stats/map.png",
                 params={"day": "yesterday", "delivery_courier_id": "42"},
             )
         self.assertEqual(response.status_code, 200)

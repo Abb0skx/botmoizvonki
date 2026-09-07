@@ -130,7 +130,7 @@
   <main class="shell">
     <header class="topbar">
       <div class="brand"><div class="logo">🚚</div><div><h1>Статистика доставки</h1><div class="subtitle">TEXNIKACH · фактическая очередь и маршрут курьеров</div></div></div>
-      <div class="top-actions"><a class="nav-link" href="/delivery/monitor">🚦 Мониторинг</a><div class="secure">🔒 Защищённый раздел</div></div>
+      <div class="top-actions"><a class="nav-link" id="monitorLink" href="/delivery/monitor">🚦 Мониторинг</a><div class="secure">🔒 Защищённый раздел</div></div>
     </header>
 
     <div class="error" id="error"></div>
@@ -181,10 +181,12 @@
           integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
           crossorigin="anonymous"></script>
   <script>
-    const BASE = "/delivery/stats";
+    const IS_MONITORING_PORTAL = location.pathname.startsWith("/monitoring/");
+    const BASE = IS_MONITORING_PORTAL ? "/monitoring/delivery/stats" : "/delivery/stats";
     const params = new URLSearchParams(location.search);
-    let requestedDay = params.get("day") || "today";
-    let requestedCourier = params.get("courier_id") || "";
+    const periodDay = params.get("period");
+    let requestedDay = params.get("day") || (["today", "yesterday"].includes(periodDay) ? periodDay : "today");
+    let requestedCourier = params.get("courier_id") || params.get("delivery_courier_id") || "";
     let requestedMonth = params.get("month") || "";
     let requestedWeek = params.get("week") || "";
     let map, routeLayer, noLocationControl, reportVersion="", photoLoadedKey="", loadGeneration=0;
@@ -396,6 +398,7 @@
     $("weekNext").onclick = () => { requestedWeek=$("weekNext").dataset.value; loadAnalytics().catch(error => showError(error.message)); };
     $("interactiveBtn").onclick = () => { $("map").style.display="block"; $("mapPhoto").style.display="none"; $("interactiveBtn").classList.add("active"); $("photoBtn").classList.remove("active"); setTimeout(()=>map.invalidateSize(),50); };
     $("photoBtn").onclick = () => { $("map").style.display="none"; $("mapPhoto").style.display="block"; $("photoBtn").classList.add("active"); $("interactiveBtn").classList.remove("active"); loadMapPhoto(); };
+    if (IS_MONITORING_PORTAL) $("monitorLink").href = "/monitoring/delivery/live";
     initMap(); load();
   </script>
 </body>

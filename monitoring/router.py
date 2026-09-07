@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+import secrets
 from datetime import datetime
 from html import escape
 from pathlib import Path
@@ -38,6 +39,7 @@ TASHKENT = ZoneInfo("Asia/Tashkent")
 ROOT = Path(__file__).resolve().parent
 TEMPLATES = ROOT / "templates"
 STATIC = ROOT / "static"
+DELIVERY_TEMPLATES = ROOT.parent / "app" / "templates"
 
 _PRICE_ADMIN_GET_PATHS = frozenset({"jobs", "sections"})
 _PRICE_ADMIN_POST_PATHS = (
@@ -84,6 +86,26 @@ def _json(payload: Any, status_code: int = 200) -> JSONResponse:
 
 def _html(content: str, status_code: int = 200) -> HTMLResponse:
     return monitoring_security_headers(HTMLResponse(content, status_code=status_code))
+
+
+def _delivery_html(template_name: str) -> HTMLResponse:
+    nonce = secrets.token_urlsafe(24)
+    content = DELIVERY_TEMPLATES.joinpath(template_name).read_text(
+        encoding="utf-8"
+    )
+    content = content.replace("<script>", f'<script nonce="{nonce}">')
+    response = monitoring_security_headers(HTMLResponse(content))
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        f"script-src 'self' 'nonce-{nonce}' https://unpkg.com; "
+        "style-src 'self' 'unsafe-inline' https://unpkg.com; "
+        "img-src 'self' data: blob: https://tile.openstreetmap.org "
+        "https://unpkg.com; "
+        "connect-src 'self'; font-src 'self' data: https://unpkg.com; "
+        "object-src 'none'; frame-ancestors 'none'; base-uri 'self'; "
+        "form-action 'self'"
+    )
+    return response
 
 
 def _login_redirect(request: Request) -> Response:
@@ -304,8 +326,6 @@ def monitoring_asset(filename: str):
 @router.get("/monitoring/calls", response_class=HTMLResponse)
 @router.get("/monitoring/site", response_class=HTMLResponse)
 @router.get("/monitoring/reviews", response_class=HTMLResponse)
-@router.get("/monitoring/delivery/live", response_class=HTMLResponse)
-@router.get("/monitoring/delivery/stats", response_class=HTMLResponse)
 @router.get("/monitoring/prices", response_class=HTMLResponse)
 def monitoring_page(request: Request):
     try:
@@ -340,6 +360,28 @@ def monitoring_page(request: Request):
         ensure_ascii=False,
     ).replace("<", "\\u003c")
     return _html(template.replace("__BOOTSTRAP__", bootstrap))
+
+
+@router.get("/monitoring/delivery/live", response_class=HTMLResponse)
+def monitoring_delivery_live_page(request: Request):
+    try:
+        _principal(request)
+    except HTTPException as exc:
+        if exc.status_code == 401:
+            return _login_redirect(request)
+        raise
+    return _delivery_html("delivery_monitor.html")
+
+
+@router.get("/monitoring/delivery/stats", response_class=HTMLResponse)
+def monitoring_delivery_stats_page(request: Request):
+    try:
+        _principal(request)
+    except HTTPException as exc:
+        if exc.status_code == 401:
+            return _login_redirect(request)
+        raise
+    return _delivery_html("delivery_stats.html")
 
 
 @router.get("/monitoring/api/me")
@@ -580,6 +622,57 @@ def api_revoke_user_sessions(request: Request, telegram_user_id: int):
     return _json({"revoked": count, "telegram_user_id": telegram_user_id})
 
 
+@router.get("/monitoring/delivery/live/api/state")
+async def monitoring_delivery_live_state(request: Request):
+    _principal(request)
+    try:
+        data = await DeliveryAdapter(settings).get(
+            "/internal/monitoring/v1/delivery/live/detailed",
+            timeout_seconds=30.0,
+        )
+    except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+        return _json(
+            {"detail": _error_code(exc)},
+            status_code=503,
+        )
+    return _json(data)
+
+
+@router.get("/monitoring/delivery/stats/api/report")
+async def monitoring_delivery_stats_report(request: Request):
+    _principal(request)
+    params = _delivery_params(request)
+    try:
+        data = await DeliveryAdapter(settings).get(
+            "/internal/monitoring/v1/delivery/report/detailed",
+            params=params,
+            timeout_seconds=30.0,
+        )
+    except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+        return _json(
+            {"detail": _error_code(exc)},
+            status_code=503,
+        )
+    return _json(data)
+
+
+@router.get("/monitoring/delivery/stats/api/analytics")
+async def monitoring_delivery_stats_analytics(request: Request):
+    _principal(request)
+    params = _delivery_params(request)
+    try:
+        data = await DeliveryAdapter(settings).get(
+            "/internal/monitoring/v1/delivery/analytics",
+            params=params,
+        )
+    except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+        return _json(
+            {"detail": _error_code(exc)},
+            status_code=503,
+        )
+    return _json(data)
+
+
 @router.get("/monitoring/api/delivery/live")
 async def api_delivery_live(request: Request):
     _principal(request)
@@ -618,6 +711,7 @@ async def api_delivery_analytics(request: Request):
     return _json({"data": data, "meta": _meta("delivery")})
 
 
+@router.get("/monitoring/delivery/stats/map.png")
 @router.get("/monitoring/api/delivery/map.png")
 async def api_delivery_map(request: Request):
     _principal(request)
