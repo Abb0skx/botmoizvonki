@@ -629,6 +629,122 @@ class SheetsContentTests(unittest.TestCase):
         self.assertEqual(len(book.worksheet("Сообщения").rows), 4)
         self.assertEqual(book.worksheet("Сообщения").write_calls, 1)
 
+    def test_outbox_batch_grows_bounded_message_sheet_before_append(self):
+        class GridBoundWorksheet(FakeWorksheet):
+            def __init__(self, title, rows, row_count):
+                super().__init__(title, rows)
+                self.row_count = row_count
+                self.add_rows_calls = []
+                self.operations = []
+                self.operator_style = {"header": "keep", "rows": "keep"}
+
+            def add_rows(self, rows):
+                self.operations.append("grow")
+                self.add_rows_calls.append(rows)
+                self.row_count += rows
+
+            def batch_update(self, updates, raw=True):
+                for update in updates:
+                    row_numbers = [
+                        int(value)
+                        for value in re.findall(r"\d+", update["range"])
+                    ]
+                    if row_numbers and max(row_numbers) > self.row_count:
+                        raise AssertionError(
+                            f"write outside grid: {update['range']}"
+                        )
+                self.operations.append("write")
+                return super().batch_update(updates, raw=raw)
+
+        headers = SHEETS["Сообщения"]
+        existing = ["existing-event", "existing-update", "connection", "42"]
+        messages = GridBoundWorksheet(
+            "Сообщения", [headers, existing], row_count=2,
+        )
+        book = FakeBook(
+            [messages]
+            + [
+                FakeWorksheet(title, [sheet_headers])
+                for title, sheet_headers in SHEETS.items()
+                if title != "Сообщения"
+            ]
+        )
+        repo = FakeRepo(
+            [
+                {
+                    "id": number,
+                    "entity_type": "message",
+                    "operation": "upsert",
+                    "attempts": 0,
+                    "payload": '{"event_id":"m%s","chat_id":"42"}' % number,
+                }
+                for number in (1, 2)
+            ]
+        )
+        sheets = BusinessSheets("sheet", repo)
+        sheets.book = book
+        sheets._initialized = True
+        now = datetime(2026, 8, 23, tzinfo=timezone.utc)
+        sheets._next_refresh_at = now + timedelta(seconds=300)
+
+        sheets.sync_once(now, max_rows=2)
+
+        self.assertEqual(messages.add_rows_calls, [2])
+        self.assertEqual(messages.operations, ["grow", "write"])
+        self.assertEqual(messages.row_count, 4)
+        self.assertEqual(messages.rows[1], existing)
+        self.assertEqual(messages.operator_style, {"header": "keep", "rows": "keep"})
+        self.assertEqual([row[0] for row in messages.rows[2:]], ["m1", "m2"])
+        self.assertEqual(repo.done, [1, 2])
+        self.assertFalse(repo.retried)
+
+    def test_existing_row_upsert_at_grid_limit_does_not_grow_sheet(self):
+        class GridBoundWorksheet(FakeWorksheet):
+            def __init__(self, title, rows):
+                super().__init__(title, rows)
+                self.row_count = len(rows)
+                self.add_rows_calls = []
+
+            def add_rows(self, rows):
+                self.add_rows_calls.append(rows)
+                self.row_count += rows
+
+        headers = SHEETS["Сообщения"]
+        existing = ["m1", "old-update", "connection", "42"]
+        messages = GridBoundWorksheet("Сообщения", [headers, existing])
+        book = FakeBook(
+            [messages]
+            + [
+                FakeWorksheet(title, [sheet_headers])
+                for title, sheet_headers in SHEETS.items()
+                if title != "Сообщения"
+            ]
+        )
+        repo = FakeRepo(
+            [
+                {
+                    "id": 1,
+                    "entity_type": "message",
+                    "operation": "upsert",
+                    "attempts": 0,
+                    "payload": '{"event_id":"m1","update_id":"new-update","chat_id":"42"}',
+                }
+            ]
+        )
+        sheets = BusinessSheets("sheet", repo)
+        sheets.book = book
+        sheets._initialized = True
+        now = datetime(2026, 8, 23, tzinfo=timezone.utc)
+        sheets._next_refresh_at = now + timedelta(seconds=300)
+
+        sheets.sync_once(now)
+
+        self.assertEqual(messages.add_rows_calls, [])
+        self.assertEqual(messages.row_count, 2)
+        self.assertEqual(messages.rows[1][0], "m1")
+        self.assertEqual(messages.rows[1][1], "new-update")
+        self.assertEqual(repo.done, [1])
+
     def test_statistics_snapshot_uses_one_remote_read_and_write(self):
         book = FakeBook(
             [FakeWorksheet(title, [headers]) for title, headers in SHEETS.items()]

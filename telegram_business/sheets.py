@@ -971,6 +971,15 @@ class BusinessSheets:
                     block,
                 )
             )
+
+        # ``batch_update`` does not append rows beyond a worksheet's physical
+        # grid.  A busy message sheet can therefore stop forever exactly at its
+        # configured row count (Google returns a 400 for e.g. row 2002 on a
+        # 2001-row sheet).  Grow only when this batch actually needs new rows;
+        # adding rows is non-destructive and preserves all existing values,
+        # formatting, filters, and operator edits.
+        if updates_by_row:
+            _ensure_sheet_rows(ws, max(updates_by_row))
         _ws_batch_update(ws, updates)
 
     def sync_payload(
