@@ -207,7 +207,7 @@ Card/Terminal/Paynet
 - `SALES_PHOTO_CHAT_ID` — отрицательный ID канала продаж;
 - `SALES_PHOTO_CHECK_CHAT_ID` — отрицательный ID отдельного технического канала;
 - `SALES_PHOTO_OCR_URL` — необязательный base URL PaddleOCR-сервиса, например
-  `http://127.0.0.1:8765`;
+  `http://photo-ocr:8765` при запуске через Docker Compose;
 - `SALES_PHOTO_OCR_TIMEOUT_SECONDS` — таймаут одного OCR-запроса, по умолчанию
   `45`, допустимо от `0.5` до `60` секунд. Подключение и ожидание свободного
   соединения ограничены пятью секундами; значение управляет долгим чтением
@@ -269,6 +269,14 @@ SALES_PHOTO_DB_PATH="$PWD/sales_photo.db" python3 -m sales_photo_bot.main
 
 В Docker-образе бота нет Tesseract, PaddleOCR и других OCR-компонентов: OCR
 работает отдельным процессом по `SALES_PHOTO_OCR_URL`.
+
+Оба контейнера соединяются отдельной внутренней сетью без доступа OCR наружу.
+Её нужно один раз создать перед первым запуском обоих Compose-проектов:
+
+```bash
+docker network inspect texnikach-ocr-private >/dev/null 2>&1 \
+  || docker network create --driver bridge --internal texnikach-ocr-private
+```
 
 ```bash
 docker compose --env-file .env.sales-photo -f compose.sales-photo.yaml up -d --build
