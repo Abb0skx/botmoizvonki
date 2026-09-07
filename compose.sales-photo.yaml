@@ -43,6 +43,10 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    networks:
+      default:
+        gw_priority: 1
+      ocr-private:
     logging:
       driver: json-file
       options:
@@ -56,3 +60,8 @@ volumes:
   botmoizvonki-data:
     external: true
     name: ${SALES_PHOTO_CALLS_VOLUME:-nylgfmvjodgie9dga7ngprgl-botmoizvonki-data}
+
+networks:
+  ocr-private:
+    external: true
+    name: texnikach-ocr-private
