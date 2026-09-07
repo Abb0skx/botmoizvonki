@@ -313,6 +313,94 @@ def _ws_batch_update(
         _ws_update(ws, range_name, values)
 
 
+_SEED_CHECKBOX_HEADERS = frozenset({"enabled", "stop_processing"})
+
+
+def _seed_row_is_reusable(row: list[Any], headers: list[str]) -> bool:
+    """Return whether a physical sheet row is empty apart from default checkboxes.
+
+    Google Sheets can materialize every row in a checkbox column as ``FALSE``.
+    Consequently ``get_all_values()`` may return the worksheet's entire 1000-row
+    grid even though those rows contain no operator data.  Only the exact default
+    checkbox value is treated as empty; a note, key, ``TRUE`` value, or any value
+    in another column makes the row operator-owned and therefore untouchable.
+    """
+
+    for index, value in enumerate(row):
+        normalized = str(value or "").strip()
+        if not normalized:
+            continue
+        header = headers[index] if index < len(headers) else ""
+        if header in _SEED_CHECKBOX_HEADERS and normalized.casefold() == "false":
+            continue
+        return False
+    return True
+
+
+def _contiguous_seed_updates(
+    assignments: list[tuple[int, list[Any]]], column_count: int
+) -> list[tuple[str, list[list[Any]]]]:
+    """Group row assignments into the smallest set of contiguous A1 ranges."""
+
+    if not assignments:
+        return []
+    ordered = sorted(assignments, key=lambda item: item[0])
+    updates: list[tuple[str, list[list[Any]]]] = []
+    first_row, first_values = ordered[0]
+    last_row = first_row
+    values = [first_values]
+    for row_number, row_values in ordered[1:]:
+        if row_number == last_row + 1:
+            last_row = row_number
+            values.append(row_values)
+            continue
+        updates.append(
+            (
+                f"A{first_row}:{_column_letter(column_count)}{last_row}",
+                values,
+            )
+        )
+        first_row = last_row = row_number
+        values = [row_values]
+    updates.append(
+        (
+            f"A{first_row}:{_column_letter(column_count)}{last_row}",
+            values,
+        )
+    )
+    return updates
+
+
+def _ensure_sheet_rows(ws, required_last_row: int) -> None:
+    """Grow a bounded worksheet before an unavoidable append past its grid."""
+
+    row_count = getattr(ws, "row_count", None)
+    try:
+        current = int(row_count)
+    except (TypeError, ValueError):
+        return
+    if required_last_row <= current:
+        return
+    missing = required_last_row - current
+    add_rows = getattr(ws, "add_rows", None)
+    if add_rows is not None:
+        add_rows(missing)
+        return
+    resize = getattr(ws, "resize", None)
+    if resize is not None:
+        resize(rows=required_last_row)
+
+
+def _sheet_row_limit(ws, fallback: int) -> int:
+    """Return a safe inclusive last row for layout/validation ranges."""
+
+    row_count = getattr(ws, "row_count", None)
+    try:
+        return max(1, int(row_count))
+    except (TypeError, ValueError):
+        return max(1, int(fallback))
+
+
 def _safe_sync_error(exc: Exception) -> str:
     # Never persist a provider exception that may contain credentials or URLs.
     return f"Google Sheets {type(exc).__name__}"[:200]
@@ -370,6 +458,20 @@ class BusinessSheets:
                     cols=max(20, len(required_headers)),
                 )
                 existing[title] = ws
+
+            # Existing worksheets can have fewer than the conventional 1000
+            # rows. Growing a grid is non-destructive and keeps the standard
+            # filter/validation reach, but provider permissions or limits may
+            # reject it. Initialization must still work against the actual
+            # bounded grid in that case.
+            try:
+                _ensure_sheet_rows(ws, 1000)
+            except Exception as exc:
+                LOG.warning(
+                    "sheet_grid_expand_failed title=%s error_type=%s",
+                    title,
+                    type(exc).__name__,
+                )
             values = ws.get_all_values()
             headers = [str(item).strip() for item in values[0]] if values else []
             if not headers:
@@ -407,13 +509,42 @@ class BusinessSheets:
                     aligned_seed.append([record.get(header, "") for header in headers])
                     existing_keys.add(key)
                 if aligned_seed:
-                    first_row = max(2, len(values) + 1)
-                    last_row = first_row + len(aligned_seed) - 1
-                    _ws_update(
-                        ws,
-                        f"A{first_row}:{_column_letter(len(headers))}{last_row}",
-                        aligned_seed,
+                    reusable_rows = [
+                        row_number
+                        for row_number, row in enumerate(values[1:], start=2)
+                        if _seed_row_is_reusable(row, headers)
+                    ]
+                    assignments: list[tuple[int, list[Any]]] = []
+                    reusable_count = min(len(reusable_rows), len(aligned_seed))
+                    assignments.extend(
+                        zip(
+                            reusable_rows[:reusable_count],
+                            aligned_seed[:reusable_count],
+                        )
                     )
+
+                    # If every returned row is real operator data, append after
+                    # it. Usually no append is needed: checkbox-only FALSE rows
+                    # above are reused even when Google returned the full grid.
+                    remaining = aligned_seed[reusable_count:]
+                    if remaining:
+                        append_at = max(2, len(values) + 1)
+                        assignments.extend(
+                            (append_at + offset, row)
+                            for offset, row in enumerate(remaining)
+                        )
+
+                    required_last_row = max(row for row, _ in assignments)
+                    _ensure_sheet_rows(ws, required_last_row)
+                    _ws_batch_update(
+                        ws,
+                        _contiguous_seed_updates(assignments, len(headers)),
+                    )
+
+            grid_last_row = _sheet_row_limit(
+                ws,
+                fallback=max(1000, len(values)),
+            )
 
             # These operations change layout only, never operator-edited cell data.
             try:
@@ -421,7 +552,9 @@ class BusinessSheets:
             except (AttributeError, TypeError):
                 pass
             try:
-                ws.set_basic_filter(f"A1:{_column_letter(len(headers))}1000")
+                ws.set_basic_filter(
+                    f"A1:{_column_letter(len(headers))}{grid_last_row}"
+                )
             except (AttributeError, TypeError):
                 pass
             try:
@@ -437,7 +570,12 @@ class BusinessSheets:
             except (AttributeError, TypeError):
                 pass
             sheet_numeric_id = getattr(ws, "id", None)
-            if title == "Диалоги" and sheet_numeric_id is not None and "status" in headers:
+            if (
+                title == "Диалоги"
+                and sheet_numeric_id is not None
+                and "status" in headers
+                and grid_last_row > 1
+            ):
                 status_column = headers.index("status")
                 validation_requests.append(
                     {
@@ -445,7 +583,7 @@ class BusinessSheets:
                             "range": {
                                 "sheetId": int(sheet_numeric_id),
                                 "startRowIndex": 1,
-                                "endRowIndex": 1000,
+                                "endRowIndex": grid_last_row,
                                 "startColumnIndex": status_column,
                                 "endColumnIndex": status_column + 1,
                             },

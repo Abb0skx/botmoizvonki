@@ -19,7 +19,13 @@ from telegram_business.products import ProductMatch
 from telegram_business.repository import BusinessRepository
 from telegram_business.service import BusinessService
 from telegram_business.security import redact_payment_data, sanitize_telegram_payload
-from telegram_business.sheets import BusinessSheets, INTENT_SEED, IntentOverride, SHEETS
+from telegram_business.sheets import (
+    BusinessSheets,
+    INTENT_SEED,
+    SHEET_SEEDS,
+    IntentOverride,
+    SHEETS,
+)
 from telegram_business.telegram_api import (
     TelegramAPIError,
     TelegramBusinessAPI,
@@ -312,6 +318,149 @@ class SheetsContentTests(unittest.TestCase):
         stable = copy.deepcopy(after)
         sheets.initialize()
         self.assertEqual(existing.worksheet("Автоответы").rows, stable)
+
+    def test_bootstrap_reuses_full_grid_checkbox_rows_without_overwriting_manual_rows(self):
+        class GridBoundWorksheet(FakeWorksheet):
+            def __init__(self, title, rows, row_count=997, fail_growth=False):
+                super().__init__(title, rows)
+                self.row_count = row_count
+                self.fail_growth = fail_growth
+                self.written_ranges = []
+
+            def _check_range(self, range_name):
+                row_numbers = [
+                    int(value) for value in re.findall(r"\d+", range_name)
+                ]
+                if row_numbers and max(row_numbers) > self.row_count:
+                    raise AssertionError(f"write outside grid: {range_name}")
+                self.written_ranges.append(range_name)
+
+            def update(self, *args, **kwargs):
+                range_name = (
+                    args[0] if isinstance(args[0], str) else kwargs["range_name"]
+                )
+                self._check_range(range_name)
+                return super().update(*args, **kwargs)
+
+            def batch_update(self, updates, raw=True):
+                for update in updates:
+                    self._check_range(update["range"])
+                return super().batch_update(updates, raw=raw)
+
+            def set_basic_filter(self, value):
+                self._check_range(value)
+                return super().set_basic_filter(value)
+
+            def add_rows(self, rows):
+                if self.fail_growth:
+                    raise RuntimeError("grid growth rejected")
+                self.row_count += rows
+
+        headers = SHEETS["Автоответы"]
+        manual_key_row = [
+            "custom", "TRUE", "night", "5", "Ручной RU", "Qo‘lda UZ",
+            "0", "", "",
+        ]
+        manual_note_row = [
+            "", "FALSE", "", "", "", "", "", "Не трогать", "",
+        ]
+        manual_true_row = ["", "TRUE"]
+        checkbox_only_rows = [["", "FALSE"] for _ in range(993)]
+        auto = GridBoundWorksheet(
+            "Автоответы",
+            [
+                headers,
+                manual_key_row,
+                manual_note_row,
+                manual_true_row,
+                *checkbox_only_rows,
+            ],
+        )
+        self.assertEqual(len(auto.rows), 997)
+        book = FakeBook(
+            [auto]
+            + [
+                FakeWorksheet(
+                    title,
+                    [sheet_headers, *SHEET_SEEDS.get(title, [])],
+                )
+                for title, sheet_headers in SHEETS.items()
+                if title != "Автоответы"
+            ]
+        )
+        sheets = BusinessSheets("sheet", FakeRepo())
+        sheets.book = book
+
+        sheets.initialize()
+
+        self.assertEqual(auto.row_count, 1000)
+        self.assertEqual(auto.rows[1], manual_key_row)
+        self.assertEqual(auto.rows[2], manual_note_row)
+        self.assertEqual(auto.rows[3], manual_true_row)
+        self.assertEqual(auto.rows[4][0], SHEET_SEEDS["Автоответы"][0][0])
+        seeded_codes = [str(row[0]) for row in auto.rows[1:] if row]
+        for seed_row in SHEET_SEEDS["Автоответы"]:
+            self.assertEqual(seeded_codes.count(seed_row[0]), 1)
+        self.assertTrue(auto.written_ranges)
+        self.assertTrue(
+            all(
+                max(map(int, re.findall(r"\d+", value))) <= 1000
+                for value in auto.written_ranges
+            )
+        )
+
+        stable = copy.deepcopy(auto.rows)
+        seed_write_count = auto.write_calls
+        sheets.initialize()
+        self.assertEqual(auto.rows, stable)
+        self.assertEqual(auto.write_calls, seed_write_count)
+
+        # Grid expansion is best-effort. If Google rejects it, all later
+        # layout ranges and the status validation must use the actual 997-row
+        # bound instead of reintroducing the original out-of-grid failure.
+        bounded_auto = GridBoundWorksheet(
+            "Автоответы",
+            [
+                headers,
+                *SHEET_SEEDS["Автоответы"],
+                *[
+                    ["", "FALSE"]
+                    for _ in range(997 - 1 - len(SHEET_SEEDS["Автоответы"]))
+                ],
+            ],
+            fail_growth=True,
+        )
+        bounded_dialogs = GridBoundWorksheet(
+            "Диалоги",
+            [SHEETS["Диалоги"]],
+            fail_growth=True,
+        )
+        bounded_book = FakeBook(
+            [bounded_auto, bounded_dialogs]
+            + [
+                FakeWorksheet(
+                    title,
+                    [sheet_headers, *SHEET_SEEDS.get(title, [])],
+                )
+                for title, sheet_headers in SHEETS.items()
+                if title not in {"Автоответы", "Диалоги"}
+            ]
+        )
+        bounded = BusinessSheets("sheet", FakeRepo())
+        bounded.book = bounded_book
+
+        bounded.initialize()
+
+        self.assertEqual(bounded_auto.filter_range, "A1:I997")
+        self.assertEqual(bounded_dialogs.filter_range, "A1:AG997")
+        validation_ranges = [
+            request["setDataValidation"]["range"]
+            for batch in bounded_book.batch_requests
+            for request in batch.get("requests", [])
+            if "setDataValidation" in request
+        ]
+        self.assertEqual(len(validation_ranges), 1)
+        self.assertEqual(validation_ranges[0]["endRowIndex"], 997)
 
     def test_cache_last_known_good_and_builtin_fallback(self):
         book = _content_book()
