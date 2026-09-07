@@ -25,6 +25,7 @@ class Settings:
     courier_ids: frozenset[int]
     stats_url: str = "https://bot.texnikach.uz/monitoring"
     sales_photo_chat_id: int = -1003917243944
+    cash_notification_channel_id: int = -1003927727489
 
     @classmethod
     def load(cls) -> "Settings":
@@ -45,12 +46,23 @@ class Settings:
             parsed_group_id = int(group_id)
             parsed_location_channel_id = int(location_channel_id)
             parsed_orders_channel_id = int(orders_channel_id)
+            parsed_cash_channel_id = int(
+                os.getenv(
+                    "DELIVERY_CASH_NOTIFICATION_CHANNEL_ID",
+                    "-1003927727489",
+                ).strip()
+            )
         except ValueError as error:
             raise RuntimeError("Telegram chat IDs must be integers") from error
         if not str(parsed_location_channel_id).startswith("-100"):
             raise RuntimeError("DELIVERY_LOCATION_CHANNEL_ID must be a channel or supergroup ID starting with -100")
         if not str(parsed_orders_channel_id).startswith("-100"):
             raise RuntimeError("DELIVERY_ORDERS_CHANNEL_ID must be a channel or supergroup ID starting with -100")
+        if not str(parsed_cash_channel_id).startswith("-100"):
+            raise RuntimeError(
+                "DELIVERY_CASH_NOTIFICATION_CHANNEL_ID must be a channel or "
+                "supergroup ID starting with -100"
+            )
         manager_ids = _ids(os.getenv("DELIVERY_MANAGER_IDS", ""))
         courier_ids = _ids(os.getenv("DELIVERY_COURIER_IDS", ""))
         if not manager_ids:
@@ -81,6 +93,7 @@ class Settings:
             sales_photo_chat_id=int(
                 os.getenv("DELIVERY_SALES_PHOTO_CHAT_ID", "-1003917243944").strip()
             ),
+            cash_notification_channel_id=parsed_cash_channel_id,
             stats_url=(
                 os.getenv(
                     "DELIVERY_STATS_URL",

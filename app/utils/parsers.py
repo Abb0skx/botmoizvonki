@@ -1,4 +1,5 @@
 import re
+from dataclasses import dataclass
 from html import unescape
 from urllib.parse import parse_qs, unquote, urlsplit
 
@@ -23,6 +24,96 @@ _EXPLICIT_UZS_RE = re.compile(
     re.I,
 )
 MAX_STORED_AMOUNT = (1 << 63) - 1
+
+
+@dataclass(frozen=True, slots=True)
+class CourierCashAmounts:
+    usd: int
+    uzs: int
+    is_handover: bool
+
+
+_CASH_KEYWORD_RE = re.compile(r"(?<!\w)(?:касса|kassa|cash)(?!\w)", re.I)
+_SIGNED_AMOUNT_PATTERN = rf"[+\-]?(?:\d{{1,3}}(?:[ \t.,]\d{{3}})+|\d+)"
+
+
+def contains_cash_keyword(value: str) -> bool:
+    return bool(_CASH_KEYWORD_RE.search(value or ""))
+
+
+def parse_courier_cash(value: str) -> CourierCashAmounts:
+    """Parse a courier cash delta without weakening normal order-price rules.
+
+    Explicit currency markers win. Unmarked absolute values above 9,000 are
+    UZS; all smaller values are USD. For a normal receipt, negative values are
+    change paid by the courier. A ``касса``/``kassa`` request accepts only
+    positive amounts because its negative ledger delta is applied after an
+    administrator confirms receipt.
+    """
+    clean = value.strip().lower().replace("−", "-").replace("–", "-").replace("—", "-")
+    if not clean or len(clean) > 256:
+        raise ValueError("Напишите сумму коротко. Например: 40 -25000")
+    is_handover = bool(_CASH_KEYWORD_RE.search(clean))
+    clean = _CASH_KEYWORD_RE.sub(" ", clean)
+    # A separated minus is still a sign, never harmless punctuation. Also
+    # split compact mixed input such as ``40-25000`` into two signed amounts.
+    clean = re.sub(r"(?<=\d)([+\-])(?=\s*\d)", r" \1", clean)
+    clean = re.sub(r"(?<!\w)([+\-])\s+(?=\d)", r"\1", clean)
+    if re.search(r"\d+[.,]\d{1,2}(?!\d)", clean):
+        raise ValueError("Копейки не поддерживаются. Введите целые суммы.")
+
+    values: dict[str, list[int]] = {"usd": [], "uzs": []}
+
+    def number(raw: str) -> int:
+        sign = -1 if raw.lstrip().startswith("-") else 1
+        return sign * int(re.sub(r"\D", "", raw))
+
+    # Normalize the useful ``-$5`` shorthand before consuming explicit values.
+    clean = re.sub(r"(?<!\w)([+\-])\s*\$", r"$\1", clean)
+    explicit_patterns = (
+        ("usd", rf"(?<!\w)(?P<amount>{_SIGNED_AMOUNT_PATTERN})[ \t]*{_USD_MARKER}"),
+        ("usd", rf"(?<!\w){_USD_MARKER}[ \t:]*(?P<amount>{_SIGNED_AMOUNT_PATTERN})(?!\w)"),
+        ("uzs", rf"(?<!\w)(?P<amount>{_SIGNED_AMOUNT_PATTERN})[ \t]*{_UZS_MARKER}"),
+        ("uzs", rf"(?<!\w){_UZS_MARKER}[ \t:]*(?P<amount>{_SIGNED_AMOUNT_PATTERN})(?!\w)"),
+    )
+    for currency, pattern in explicit_patterns:
+        def take(match: re.Match, *, target: str = currency) -> str:
+            values[target].append(number(match.group("amount")))
+            return " "
+
+        clean = re.sub(pattern, take, clean, flags=re.I)
+
+    unmarked: list[tuple[int, int, int]] = []
+    for match in re.finditer(rf"(?<!\w){_SIGNED_AMOUNT_PATTERN}(?!\w)", clean):
+        parsed = number(match.group(0))
+        unmarked.append((match.start(), match.end(), parsed))
+    for start, end, _ in reversed(unmarked):
+        clean = clean[:start] + " " * (end - start) + clean[end:]
+    for _, _, parsed in unmarked:
+        currency = "uzs" if abs(parsed) > 9_000 else "usd"
+        values[currency].append(parsed)
+
+    # Labels are accepted, but never used to infer a missing sign.
+    clean = re.sub(
+        r"(?<!\w)(?:получил(?:а)?|получено|сдача|клиент|доставка)(?!\w)",
+        " ",
+        clean,
+        flags=re.I,
+    )
+    if re.search(r"[\w$]", clean, flags=re.UNICODE):
+        raise ValueError("Оставьте только суммы и валюту. Например: 40$ -25000 сум")
+    if any(len(items) > 1 for items in values.values()):
+        raise ValueError("Укажите не больше одной суммы в долларах и одной в сумах.")
+
+    usd = values["usd"][0] if values["usd"] else 0
+    uzs = values["uzs"][0] if values["uzs"] else 0
+    if usd == 0 and uzs == 0:
+        raise ValueError("Сумма не найдена. Например: 40 -25000")
+    if abs(usd) > MAX_STORED_AMOUNT or abs(uzs) > MAX_STORED_AMOUNT:
+        raise ValueError("Сумма слишком большая.")
+    if is_handover and (usd < 0 or uzs < 0):
+        raise ValueError("Для сдачи в кассу укажите положительную сумму.")
+    return CourierCashAmounts(usd=usd, uzs=uzs, is_handover=is_handover)
 
 
 _MAP_PROVIDER_ROOTS: dict[str, tuple[str, ...]] = {

@@ -21,6 +21,7 @@ from telegram.ext._picklepersistence import _BotPickler
 from app.config import Settings
 from app.database import OrderRepository
 from app.handlers import register_handlers
+from app.handlers.cash import reconcile_cash_entries
 from app.handlers.orders import (
     _notify_log,
     _process_cleanup_messages,
@@ -279,6 +280,32 @@ async def _delivery_sync_worker(application: Application) -> None:
                 raise
             except Exception:
                 logger.exception("Background sales-card recovery failed")
+
+            try:
+                await reconcile_cash_entries(application)
+            except RetryAfter as error:
+                retry_after = error.retry_after
+                delay = (
+                    retry_after.total_seconds()
+                    if hasattr(retry_after, "total_seconds")
+                    else float(retry_after)
+                )
+                logger.warning(
+                    "Telegram rate-limited cash reconciliation for %.1f seconds",
+                    delay,
+                )
+                await _sleep_with_health_signal(application, delay)
+                continue
+            except NetworkError as error:
+                logger.warning(
+                    "Telegram is temporarily unavailable during cash reconciliation: %s",
+                    error,
+                )
+                continue
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Background cash reconciliation failed")
 
             preflight_validated = application.bot_data.get("delivery_preflight_validated", False)
             if not preflight_validated or cycles_since_full >= FULL_RECONCILIATION_EVERY:

@@ -113,3 +113,42 @@ class OrderEvent:
             parsed_fields = []
         values["changed_fields"] = tuple(str(value) for value in parsed_fields)
         return cls(**{name: values.get(name) for name in cls.__dataclass_fields__})
+
+
+@dataclass(slots=True)
+class CourierCashEntry:
+    id: int
+    courier_id: int
+    courier_name: str
+    entry_type: str
+    amount_usd: int = 0
+    amount_uzs: int = 0
+    delta_usd: int = 0
+    delta_uzs: int = 0
+    status: str = "recorded"
+    revision: int = 1
+    raw_text: str | None = None
+    source_chat_id: int | None = None
+    source_message_id: int | None = None
+    source_reply_message_id: int | None = None
+    source_deleted_at: str | None = None
+    source_delete_attempts: int = 0
+    source_delete_error: str | None = None
+    source_delete_next_at: str | None = None
+    source_delete_terminal: int = 0
+    notification_chat_id: int | None = None
+    notification_message_id: int | None = None
+    notification_sync_needed: int = 1
+    reviewed_by_id: int | None = None
+    reviewed_by_name: str | None = None
+    reviewed_at: str | None = None
+    corrected_by_id: int | None = None
+    corrected_by_name: str | None = None
+    corrected_at: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+
+    @classmethod
+    def from_row(cls, row: Any) -> "CourierCashEntry":
+        values = dict(row)
+        return cls(**{name: values.get(name) for name in cls.__dataclass_fields__})

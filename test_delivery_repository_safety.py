@@ -366,8 +366,8 @@ class DeliveryRepositorySafetyTests(unittest.TestCase):
                 ("periodic_job_claims",),
             ).fetchone()
 
-        self.assertEqual(SCHEMA_VERSION, 5)
-        self.assertEqual(version, 5)
+        self.assertEqual(SCHEMA_VERSION, 6)
+        self.assertEqual(version, 6)
         self.assertIsNotNone(table)
 
     def test_periodic_job_claim_is_idempotent_per_job_and_slot(self) -> None:

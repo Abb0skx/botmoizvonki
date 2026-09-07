@@ -32,9 +32,12 @@ from app.bot.keyboards import (
 )
 from app.config import Settings
 from app.database import OrderRepository
+from app.handlers.cash import (
+    cash_correction_input, cash_review_action, courier_cash_input,
+)
 from app.monitor_service import build_delivery_monitor
 from app.utils import (
-    completed_card, courier_card, enrich_location, extract_text_address, manager_card,
+    completed_card, contains_cash_keyword, courier_card, enrich_location, extract_text_address, manager_card,
     map_url_provider, normalize_payment, normalize_seller, parse_amount,
     parse_order_details,
 )
@@ -168,6 +171,7 @@ async def _access_guard(
     allowed_chats = _known_delivery_groups(settings) | frozenset({
         settings.location_channel_id,
         settings.orders_channel_id,
+        settings.cash_notification_channel_id,
     })
     if chat and chat.id in allowed_chats:
         return
@@ -1351,6 +1355,15 @@ async def validate_delivery_configuration(application: Application) -> None:
                 "The delivery bot must be an administrator in group "
                 f"{delivery_group_id} to verify who cancels orders"
             )
+        if delivery_member.status != "creator" and not getattr(
+            delivery_member,
+            "can_delete_messages",
+            False,
+        ):
+            raise RuntimeError(
+                "The delivery bot must be allowed to delete cash messages in group "
+                f"{delivery_group_id}"
+            )
 
     # A configured courier who cannot see their own group receives no order at
     # all, so own-group membership is fatal. The private location channel is
@@ -1434,6 +1447,25 @@ async def validate_delivery_configuration(application: Application) -> None:
             False,
         ):
             raise RuntimeError("The delivery bot must be allowed to delete obsolete orders posts")
+
+    cash_channel_id = getattr(settings, "cash_notification_channel_id", None)
+    if cash_channel_id:
+        cash_chat = await application.bot.get_chat(cash_channel_id)
+        if cash_chat.type not in {"channel", "supergroup"}:
+            raise RuntimeError(
+                "DELIVERY_CASH_NOTIFICATION_CHANNEL_ID must point to a channel or supergroup"
+            )
+        cash_member = await application.bot.get_chat_member(
+            cash_channel_id,
+            application.bot.id,
+        )
+        if cash_member.status not in {"administrator", "creator"}:
+            raise RuntimeError("The delivery bot must be an administrator in the cash channel")
+        if cash_chat.type == "channel" and cash_member.status != "creator":
+            if not getattr(cash_member, "can_post_messages", False):
+                raise RuntimeError("The delivery bot must be allowed to post in the cash channel")
+            if not getattr(cash_member, "can_edit_messages", False):
+                raise RuntimeError("The delivery bot must be allowed to edit cash-channel posts")
 
 
 
@@ -3770,6 +3802,25 @@ async def delivery_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await _publish_completed(update, context, order, timestamp)
 
 
+async def courier_group_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Route courier money safely without double-counting legacy evidence."""
+    message = update.effective_message
+    raw = ((message.text or message.caption or "") if message else "").strip()
+    if contains_cash_keyword(raw):
+        await courier_cash_input(update, context)
+        return
+
+    settings: Settings = context.application.bot_data["settings"]
+    user = update.effective_user
+    chat = update.effective_chat
+    if user and chat and user.id in _allowed_courier_ids(settings):
+        active = context.application.bot_data["repo"].get_active_delivery(user.id)
+        if active and active.delivery_chat_id == chat.id:
+            await delivery_input(update, context)
+            return
+    await courier_cash_input(update, context)
+
+
 async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not await _require_manager_flow(update, context):
         return ConversationHandler.END
@@ -3846,6 +3897,10 @@ async def location_label_action(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 def register_handlers(application: Application) -> None:
+    application.add_handler(
+        MessageHandler(filters.TEXT & filters.ChatType.PRIVATE, cash_correction_input),
+        group=-2,
+    )
     application.add_handler(
         TypeHandler(Update, _access_guard),
         group=-1,
@@ -3924,6 +3979,12 @@ def register_handlers(application: Application) -> None:
         daily_delivery_log_action,
         pattern=r"^daily_log:(?:today|\d{4}-\d{2}-\d{2})$",
     ))
+    application.add_handler(
+        CallbackQueryHandler(
+            cash_review_action,
+            pattern=r"^cash_(?:ok|no|other):\d+:\d+$",
+        )
+    )
     application.add_handler(CallbackQueryHandler(orders_page, pattern=r"^orders_page:(?:active|all):\d+$"))
     application.add_handler(CallbackQueryHandler(open_order_from_list, pattern=r"^list_order:\d+$"))
     application.add_handler(CallbackQueryHandler(
@@ -3959,4 +4020,10 @@ def register_handlers(application: Application) -> None:
         pattern=r"^(?:read|onway|undo_onway|complete|undo_complete):\d+$",
     ))
     application.add_handler(edit_conversation, group=1)
-    application.add_handler(MessageHandler(filters.PHOTO | (filters.TEXT & ~filters.COMMAND), delivery_input), group=2)
+    application.add_handler(
+        MessageHandler(
+            filters.PHOTO | (filters.TEXT & ~filters.COMMAND),
+            courier_group_input,
+        ),
+        group=2,
+    )

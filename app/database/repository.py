@@ -6,9 +6,9 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
-from app.models import Order, OrderEvent
+from app.models import CourierCashEntry, Order, OrderEvent
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 SQLITE_INT_MAX = 2**63 - 1
 KNOWN_STATUSES = frozenset({
     "draft",
@@ -173,6 +173,45 @@ CREATE TABLE IF NOT EXISTS telegram_cleanup_queue (
 );
 CREATE INDEX IF NOT EXISTS idx_cleanup_queue_retry
 ON telegram_cleanup_queue(attempts, id);
+CREATE TABLE IF NOT EXISTS courier_cash_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    courier_id INTEGER NOT NULL,
+    courier_name TEXT NOT NULL,
+    entry_type TEXT NOT NULL CHECK(entry_type IN ('receipt', 'handover')),
+    amount_usd INTEGER NOT NULL DEFAULT 0,
+    amount_uzs INTEGER NOT NULL DEFAULT 0,
+    delta_usd INTEGER NOT NULL DEFAULT 0,
+    delta_uzs INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL CHECK(status IN ('recorded', 'pending', 'confirmed', 'rejected')),
+    revision INTEGER NOT NULL DEFAULT 1,
+    raw_text TEXT,
+    source_chat_id INTEGER NOT NULL,
+    source_message_id INTEGER NOT NULL,
+    source_reply_message_id INTEGER,
+    source_deleted_at TEXT,
+    source_delete_attempts INTEGER NOT NULL DEFAULT 0,
+    source_delete_error TEXT,
+    source_delete_next_at TEXT,
+    source_delete_terminal INTEGER NOT NULL DEFAULT 0,
+    notification_chat_id INTEGER,
+    notification_message_id INTEGER,
+    notification_sync_needed INTEGER NOT NULL DEFAULT 1,
+    reviewed_by_id INTEGER,
+    reviewed_by_name TEXT,
+    reviewed_at TEXT,
+    corrected_by_id INTEGER,
+    corrected_by_name TEXT,
+    corrected_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(source_chat_id, source_message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_cash_courier_created
+ON courier_cash_entries(courier_id, created_at, id);
+CREATE INDEX IF NOT EXISTS idx_cash_notification_pending
+ON courier_cash_entries(notification_message_id, status, id);
+CREATE INDEX IF NOT EXISTS idx_cash_source_delete_due
+ON courier_cash_entries(source_delete_terminal, source_delete_next_at, id);
 CREATE TABLE IF NOT EXISTS periodic_job_claims (
     job_name TEXT NOT NULL,
     slot INTEGER NOT NULL CHECK(slot >= 0),
@@ -407,6 +446,297 @@ class OrderRepository:
                 (clean_name, slot, now()),
             )
         return cursor.rowcount == 1
+
+    @staticmethod
+    def _validate_cash_value(value: Any, *, positive_only: bool = False) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("cash amount must be an integer")
+        if abs(value) > SQLITE_INT_MAX:
+            raise ValueError("cash amount exceeds the SQLite integer range")
+        if positive_only and value < 0:
+            raise ValueError("cash handover amount cannot be negative")
+        return value
+
+    def create_cash_entry(
+        self,
+        *,
+        courier_id: int,
+        courier_name: str,
+        entry_type: str,
+        usd: int,
+        uzs: int,
+        raw_text: str,
+        source_chat_id: int,
+        source_message_id: int,
+        source_reply_message_id: int | None = None,
+    ) -> tuple[CourierCashEntry, bool]:
+        """Durably record one Telegram cash message exactly once."""
+        if entry_type not in {"receipt", "handover"}:
+            raise ValueError("unsupported cash entry type")
+        usd = self._validate_cash_value(usd, positive_only=entry_type == "handover")
+        uzs = self._validate_cash_value(uzs, positive_only=entry_type == "handover")
+        if usd == 0 and uzs == 0:
+            raise ValueError("cash entry cannot be empty")
+        clean_name = " ".join(str(courier_name).split())[:200]
+        clean_raw = str(raw_text).strip()[:256]
+        if not clean_name or not clean_raw:
+            raise ValueError("cash courier and source text are required")
+        timestamp = now()
+        status = "pending" if entry_type == "handover" else "recorded"
+        delta_usd = -usd if entry_type == "handover" else usd
+        delta_uzs = -uzs if entry_type == "handover" else uzs
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            cursor = db.execute(
+                """INSERT INTO courier_cash_entries
+                   (courier_id,courier_name,entry_type,amount_usd,amount_uzs,
+                    delta_usd,delta_uzs,status,raw_text,source_chat_id,
+                    source_message_id,source_reply_message_id,created_at,updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(source_chat_id,source_message_id) DO NOTHING""",
+                (
+                    int(courier_id), clean_name, entry_type, abs(usd), abs(uzs),
+                    delta_usd, delta_uzs, status, clean_raw, int(source_chat_id),
+                    int(source_message_id), source_reply_message_id, timestamp, timestamp,
+                ),
+            )
+            row = db.execute(
+                """SELECT * FROM courier_cash_entries
+                   WHERE source_chat_id=? AND source_message_id=?""",
+                (int(source_chat_id), int(source_message_id)),
+            ).fetchone()
+        return CourierCashEntry.from_row(row), cursor.rowcount == 1
+
+    def get_cash_entry(self, entry_id: int) -> CourierCashEntry | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM courier_cash_entries WHERE id=?",
+                (int(entry_id),),
+            ).fetchone()
+        return CourierCashEntry.from_row(row) if row else None
+
+    def cash_balance(self, courier_id: int) -> tuple[int, int]:
+        with self.connect() as db:
+            rows = db.execute(
+                """SELECT delta_usd,delta_uzs
+                   FROM courier_cash_entries
+                   WHERE courier_id=? AND status IN ('recorded','confirmed')""",
+                (int(courier_id),),
+            ).fetchall()
+        # Python integers do not overflow when the ledger grows over time.
+        return (
+            sum(int(row["delta_usd"]) for row in rows),
+            sum(int(row["delta_uzs"]) for row in rows),
+        )
+
+    def list_cash_needing_notification(self, *, limit: int = 50) -> list[CourierCashEntry]:
+        limit, _ = self._page_bounds(limit, 0)
+        with self.connect() as db:
+            rows = db.execute(
+                """SELECT * FROM courier_cash_entries
+                   WHERE notification_message_id IS NULL
+                   ORDER BY id LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        return [CourierCashEntry.from_row(row) for row in rows]
+
+    def list_cash_sources_needing_deletion(self, *, limit: int = 50) -> list[CourierCashEntry]:
+        limit, _ = self._page_bounds(limit, 0)
+        with self.connect() as db:
+            rows = db.execute(
+                """SELECT * FROM courier_cash_entries
+                   WHERE entry_type='handover'
+                     AND notification_message_id IS NOT NULL
+                     AND source_deleted_at IS NULL
+                     AND source_delete_terminal=0
+                     AND (source_delete_next_at IS NULL OR source_delete_next_at<=?)
+                   ORDER BY id LIMIT ?""",
+                (now(), limit),
+            ).fetchall()
+        return [CourierCashEntry.from_row(row) for row in rows]
+
+    def attach_cash_notification(
+        self,
+        entry_id: int,
+        *,
+        chat_id: int,
+        message_id: int,
+    ) -> CourierCashEntry | None:
+        timestamp = now()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            cursor = db.execute(
+                """UPDATE courier_cash_entries
+                   SET notification_chat_id=?,notification_message_id=?,
+                       notification_sync_needed=0,updated_at=?
+                   WHERE id=? AND notification_message_id IS NULL""",
+                (int(chat_id), int(message_id), timestamp, int(entry_id)),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = db.execute(
+                "SELECT * FROM courier_cash_entries WHERE id=?",
+                (int(entry_id),),
+            ).fetchone()
+        return CourierCashEntry.from_row(row)
+
+    def mark_cash_source_deleted(self, entry_id: int) -> bool:
+        timestamp = now()
+        with self.connect() as db:
+            cursor = db.execute(
+                """UPDATE courier_cash_entries
+                   SET source_deleted_at=?,source_delete_error=NULL,
+                       source_delete_next_at=NULL,updated_at=?
+                   WHERE id=? AND source_deleted_at IS NULL""",
+                (timestamp, timestamp, int(entry_id)),
+            )
+        return cursor.rowcount == 1
+
+    def record_cash_source_delete_failure(
+        self,
+        entry_id: int,
+        error: str,
+        *,
+        terminal: bool = False,
+    ) -> CourierCashEntry | None:
+        timestamp = now()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            previous = db.execute(
+                "SELECT source_delete_attempts FROM courier_cash_entries WHERE id=?",
+                (int(entry_id),),
+            ).fetchone()
+            if not previous:
+                return None
+            attempts = int(previous[0]) + 1
+            is_terminal = terminal or attempts >= CLEANUP_MAX_ATTEMPTS
+            next_attempt = None if is_terminal else _retry_at(attempts)
+            db.execute(
+                """UPDATE courier_cash_entries
+                   SET source_delete_attempts=?,source_delete_error=?,
+                       source_delete_next_at=?,source_delete_terminal=?,updated_at=?
+                   WHERE id=? AND source_deleted_at IS NULL""",
+                (
+                    attempts, str(error)[:500], next_attempt, int(is_terminal),
+                    timestamp, int(entry_id),
+                ),
+            )
+            row = db.execute(
+                "SELECT * FROM courier_cash_entries WHERE id=?",
+                (int(entry_id),),
+            ).fetchone()
+        return CourierCashEntry.from_row(row)
+
+    def list_cash_notifications_needing_sync(
+        self,
+        *,
+        limit: int = 50,
+    ) -> list[CourierCashEntry]:
+        limit, _ = self._page_bounds(limit, 0)
+        with self.connect() as db:
+            rows = db.execute(
+                """SELECT * FROM courier_cash_entries
+                   WHERE notification_message_id IS NOT NULL
+                     AND notification_sync_needed=1
+                   ORDER BY id LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        return [CourierCashEntry.from_row(row) for row in rows]
+
+    def mark_cash_notification_synced(
+        self,
+        entry_id: int,
+        *,
+        expected_updated_at: str,
+    ) -> bool:
+        with self.connect() as db:
+            cursor = db.execute(
+                """UPDATE courier_cash_entries
+                   SET notification_sync_needed=0
+                   WHERE id=? AND updated_at=? AND notification_sync_needed=1""",
+                (int(entry_id), expected_updated_at),
+            )
+        return cursor.rowcount == 1
+
+    def clear_cash_notification(self, entry_id: int) -> bool:
+        timestamp = now()
+        with self.connect() as db:
+            cursor = db.execute(
+                """UPDATE courier_cash_entries
+                   SET notification_chat_id=NULL,notification_message_id=NULL,
+                       notification_sync_needed=1,updated_at=?
+                   WHERE id=? AND notification_message_id IS NOT NULL""",
+                (timestamp, int(entry_id)),
+            )
+        return cursor.rowcount == 1
+
+    def review_cash_handover(
+        self,
+        entry_id: int,
+        *,
+        expected_revision: int,
+        decision: str,
+        reviewer_id: int,
+        reviewer_name: str,
+    ) -> CourierCashEntry | None:
+        if decision not in {"confirmed", "rejected"}:
+            raise ValueError("unsupported cash handover decision")
+        timestamp = now()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            cursor = db.execute(
+                """UPDATE courier_cash_entries
+                   SET status=?,reviewed_by_id=?,reviewed_by_name=?,reviewed_at=?,
+                       notification_sync_needed=1,updated_at=?
+                   WHERE id=? AND entry_type='handover' AND status='pending' AND revision=?""",
+                (
+                    decision, int(reviewer_id), str(reviewer_name)[:200], timestamp,
+                    timestamp, int(entry_id), int(expected_revision),
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = db.execute(
+                "SELECT * FROM courier_cash_entries WHERE id=?",
+                (int(entry_id),),
+            ).fetchone()
+        return CourierCashEntry.from_row(row)
+
+    def correct_cash_handover(
+        self,
+        entry_id: int,
+        *,
+        expected_revision: int,
+        usd: int,
+        uzs: int,
+        actor_id: int,
+        actor_name: str,
+    ) -> CourierCashEntry | None:
+        usd = self._validate_cash_value(usd, positive_only=True)
+        uzs = self._validate_cash_value(uzs, positive_only=True)
+        if usd == 0 and uzs == 0:
+            raise ValueError("cash handover cannot be empty")
+        timestamp = now()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            cursor = db.execute(
+                """UPDATE courier_cash_entries
+                   SET amount_usd=?,amount_uzs=?,delta_usd=?,delta_uzs=?,
+                       revision=revision+1,corrected_by_id=?,corrected_by_name=?,
+                       corrected_at=?,notification_sync_needed=1,updated_at=?
+                   WHERE id=? AND entry_type='handover' AND status='pending' AND revision=?""",
+                (
+                    usd, uzs, -usd, -uzs, int(actor_id), str(actor_name)[:200],
+                    timestamp, timestamp, int(entry_id), int(expected_revision),
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = db.execute(
+                "SELECT * FROM courier_cash_entries WHERE id=?",
+                (int(entry_id),),
+            ).fetchone()
+        return CourierCashEntry.from_row(row)
 
     @staticmethod
     def _validate_money(field: str, value: Any) -> None:
