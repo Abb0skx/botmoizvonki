@@ -21,6 +21,7 @@ from telegram_business.delivery_store import DeliveryNotificationStore
 from telegram_business.migrations import connect, migrate
 from telegram_business.service import BusinessService
 from telegram_business.telegram_api import TelegramAPIError
+from telegram_business.templates import REVIEW_URL
 
 
 TZ = ZoneInfo("Asia/Tashkent")
@@ -365,6 +366,40 @@ def test_first_poll_baselines_then_routes_and_deduplicates():
             1,
             1,
         )
+
+
+@pytest.mark.parametrize(
+    "language, call_to_action",
+    (("ru", "оцените нашу работу"), ("uz", "xizmatimizni baholang")),
+)
+def test_completed_delivery_sends_one_localized_review_link(
+    language, call_to_action
+):
+    with tempfile.TemporaryDirectory() as tmp:
+        now = datetime(2026, 9, 7, 20, 0, tzinfo=TZ)
+        api = FakeTelegramAPI()
+        service = BusinessService(
+            business_settings(Path(tmp) / "business.db"),
+            clock=lambda: now,
+            api=api,
+        )
+        feed = FakeFeed(latest=200)
+        service.delivery_client = feed
+        establish_chat(service, now)
+        service.repo.update_language("200", language, 0.99, now)
+        service.delivery_notifications_cycle()
+
+        feed.events.append(delivery_event(201, 201, "completed"))
+        feed.latest = 201
+        service.delivery_notifications_cycle()
+
+        assert len(api.sent) == 1
+        sent_text = api.sent[0][2]
+        assert sent_text.casefold().count(call_to_action) == 1
+        assert sent_text.count(REVIEW_URL) == 1
+
+        service.delivery_notifications_cycle()
+        assert len(api.sent) == 1
 
 
 def test_multiple_orders_same_chat_and_ambiguous_phone_are_safe():

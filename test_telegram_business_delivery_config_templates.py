@@ -7,7 +7,7 @@ import pytest
 
 from telegram_business.config import BusinessSettings
 from telegram_business.sheets import SHEET_SEEDS
-from telegram_business.templates import ALLOWED_PLACEHOLDERS, render
+from telegram_business.templates import ALLOWED_PLACEHOLDERS, REVIEW_URL, render
 
 
 DELIVERY_TEMPLATE_CODES = (
@@ -199,3 +199,43 @@ def test_delivery_status_templates_are_seeded_for_sheets_idempotently():
         assert row[6] == 0
         assert "{order_number}" in row[4]
         assert "{order_number}" in row[5]
+
+
+@pytest.mark.parametrize(
+    "language, call_to_action",
+    (("ru", "оцените нашу работу"), ("uz", "xizmatimizni baholang")),
+)
+def test_completed_delivery_asks_for_review_once(language, call_to_action):
+    text = render(
+        "delivery_status_completed",
+        language,
+        order_number="1542",
+        product="iPhone 16 Pro Max",
+    )
+
+    assert text.casefold().count(call_to_action) == 1
+    assert text.count(REVIEW_URL) == 1
+
+
+@pytest.mark.parametrize(
+    "code",
+    tuple(code for code in DELIVERY_TEMPLATE_CODES if code != "delivery_status_completed"),
+)
+@pytest.mark.parametrize("language", ("ru", "uz"))
+def test_review_link_is_not_sent_for_incomplete_delivery_statuses(code, language):
+    text = render(code, language, order_number="1542", product="iPhone 16 Pro Max")
+
+    assert REVIEW_URL not in text
+
+
+def test_review_link_is_seeded_only_for_completed_delivery():
+    rows = {
+        str(row[0]): row
+        for row in SHEET_SEEDS["Автоответы"]
+        if str(row[0]) in DELIVERY_TEMPLATE_CODES
+    }
+
+    for code, row in rows.items():
+        expected_count = 1 if code == "delivery_status_completed" else 0
+        assert str(row[4]).count(REVIEW_URL) == expected_count
+        assert str(row[5]).count(REVIEW_URL) == expected_count

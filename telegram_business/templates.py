@@ -6,6 +6,7 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 CATALOG_URL = "https://texnikach.uz/go"
+REVIEW_URL = "https://bot.texnikach.uz/review"
 
 # Public sheet codes are deliberately stable. The aliases preserve compatibility
 # with the first BusinessService implementation.
@@ -122,8 +123,14 @@ TEMPLATES: dict[str, dict[str, str]] = {
         "uz": "🚗 Kuryer №{order_number} buyurtma bilan yo‘lga chiqdi.",
     },
     "delivery_status_completed": {
-        "ru": "✅ Заказ №{order_number} доставлен.",
-        "uz": "✅ №{order_number} buyurtma yetkazildi.",
+        "ru": (
+            "✅ Заказ №{order_number} доставлен.\n\n"
+            f"Пожалуйста, оцените нашу работу: {REVIEW_URL}"
+        ),
+        "uz": (
+            "✅ №{order_number} buyurtma yetkazildi.\n\n"
+            f"Iltimos, xizmatimizni baholang: {REVIEW_URL}"
+        ),
     },
     "delivery_status_cancelled": {
         "ru": "❌ Доставка заказа №{order_number} отменена. Подробности уточнит менеджер.",
