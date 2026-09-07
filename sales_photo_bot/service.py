@@ -59,7 +59,10 @@ from .keyboards import (
 from .models import (
     EMPTY_IDENTIFIERS,
     ProductIdentifiers,
+    identifier_imeis,
+    identifier_serial_numbers,
     merge_product_identifiers,
+    product_display_values,
 )
 from .orders import card_numbers_match, ensure_card_numbers
 from .phones import (
@@ -1617,16 +1620,11 @@ class SalesPhotoService:
                 except Exception:
                     pass
                 raise
-        identifier_count = sum(
-            value is not None
-            for value in (
-                identifiers.imei,
-                identifiers.imei2,
-                identifiers.serial_number,
-                identifiers.product_info,
-                identifiers.product_model,
-                *identifiers.phone_numbers,
-            )
+        identifier_count = (
+            len(identifier_imeis(identifiers))
+            + len(identifier_serial_numbers(identifiers))
+            + len(product_display_values(identifiers))
+            + len(identifiers.phone_numbers)
         )
         key = (chat_id, source_message_id)
         if key in self._cancelled_sources:

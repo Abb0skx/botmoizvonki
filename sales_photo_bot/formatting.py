@@ -4,11 +4,20 @@ import html
 import re
 from datetime import date
 
-from .models import ProductIdentifiers, product_display_name
+from .models import (
+    ProductIdentifiers,
+    identifier_imeis,
+    identifier_serial_numbers,
+    product_display_values,
+)
 from .phones import extract_uzbek_phones, phone_line
 
 
 MAX_SERIAL_NUMBER = 64
+MAX_PRODUCT_CARD_LABEL = 900
+# Leave room for the manager and delivery blocks that are appended later.
+MAX_CAPTION_TEXT_UNITS = 800
+_HTML_TAG_RE = re.compile(r"<[^>]*>")
 MANAGER_LINE_RE = re.compile(
     r"(?:\n\n)?👤 Менеджер: <b>[^<>\r\n]{1,64}</b>\s*\Z"
 )
@@ -17,7 +26,7 @@ MANAGER_NAME_RE = re.compile(
 )
 PRODUCT_LINE_RE = re.compile(
     r"(?:^|\n)📦[ \t]+(?:О[ \t]+товаре[ \t]*:[ \t]*)?"
-    r"(?P<product>[^\r\n]{1,768})(?:\n|$)",
+    r"(?P<product>[^\r\n]{1,8192})(?:\n|$)",
     re.IGNORECASE,
 )
 
@@ -31,6 +40,13 @@ def _compact(value: object, limit: int) -> str:
 
 def _safe(value: object, limit: int) -> str:
     return html.escape(_compact(value, limit), quote=True)
+
+
+def _telegram_text_units(value: str) -> int:
+    """Count UTF-16 units after Telegram parses the small HTML subset."""
+
+    plain = html.unescape(_HTML_TAG_RE.sub("", value))
+    return len(plain.encode("utf-16-le")) // 2
 
 
 def build_caption(
@@ -69,50 +85,112 @@ def build_caption(
         lines.extend([*number_lines, ""])
     elif sale_date:
         lines.append("")
-    identifier_lines: list[str] = []
-    if identifiers.imei:
-        identifier_lines.append(
-            f"<blockquote>IMEI: {_safe(identifiers.imei, 15)}</blockquote>"
-        )
-    if identifiers.imei2:
-        identifier_lines.append(
-            f"<blockquote>IMEI2: {_safe(identifiers.imei2, 15)}</blockquote>"
-        )
-    if identifiers.serial_number:
-        identifier_lines.append(
-            f"<blockquote>S/N: {_safe(identifiers.serial_number, MAX_SERIAL_NUMBER)}"
-            "</blockquote>"
-        )
-    product = _compact(product_label, 120) or product_display_name(identifiers)
-    if product:
-        lines.append(f"📦 О товаре: {_safe(product, 120)}")
-        lines.extend(identifier_lines)
-        lines.append("")
-    elif identifier_lines:
-        lines.extend([*identifier_lines, ""])
+    prefix_lines = list(lines)
+    manual_product = _compact(product_label, 120)
+    product_values = (
+        (manual_product,)
+        if manual_product
+        else product_display_values(identifiers)
+    )
+    product_values = tuple(value for value in product_values if value)
+    imeis = identifier_imeis(identifiers)
+    legacy_imei2_only = bool(
+        not identifiers.imeis
+        and not str(identifiers.imei or "").strip()
+        and str(identifiers.imei2 or "").strip()
+    )
+    serial_numbers = identifier_serial_numbers(identifiers)
 
-    lines.extend([
+    tail_lines = [
         "🛒💵:",
         "rasxod:",
         "",
         phone_line(phones),
-    ])
-
-    lines.extend(
-        [
-            "",
-            "<b>Наличка</b>",
-            "💵:",
-            "🇺🇿:",
-            "",
-            "<b>Card/Terminal/Paynet</b>",
-            "💵:",
-            "🇺🇿:",
-        ]
-    )
+        "",
+        "<b>Наличка</b>",
+        "💵:",
+        "🇺🇿:",
+        "",
+        "<b>Card/Terminal/Paynet</b>",
+        "💵:",
+        "🇺🇿:",
+    ]
     if manager:
-        lines.extend(["", f"👤 Менеджер: <b>{_safe(manager, 64)}</b>"])
-    return "\n".join(lines)
+        tail_lines.extend(["", f"👤 Менеджер: <b>{_safe(manager, 64)}</b>"])
+
+    visible_products = list(product_values)
+    visible_imeis = list(imeis)
+    visible_serials = list(serial_numbers)
+    hidden_products = 0
+    hidden_imeis = 0
+    hidden_serials = 0
+    product_value_limit = 160
+
+    def render() -> str:
+        rendered = list(prefix_lines)
+        if visible_products or hidden_products:
+            values = [
+                _safe(value, product_value_limit)
+                for value in visible_products
+            ]
+            if hidden_products:
+                values.append(f"… ещё {hidden_products} товар(а)")
+            rendered.append("📦 О товаре: " + "; ".join(values))
+        for index, value in enumerate(visible_imeis):
+            if legacy_imei2_only and index == 0:
+                label = "IMEI2"
+            else:
+                label = "IMEI" if index == 0 else f"IMEI{index + 1}"
+            rendered.append(
+                f"<blockquote>{label}: {_safe(value, 15)}</blockquote>"
+            )
+        if hidden_imeis:
+            rendered.append(
+                f"<blockquote>IMEI: … ещё {hidden_imeis}</blockquote>"
+            )
+        for index, value in enumerate(visible_serials):
+            label = "S/N" if index == 0 else f"S/N {index + 1}"
+            rendered.append(
+                f"<blockquote>{label}: "
+                f"{_safe(value, MAX_SERIAL_NUMBER)}</blockquote>"
+            )
+        if hidden_serials:
+            rendered.append(
+                f"<blockquote>S/N: … ещё {hidden_serials}</blockquote>"
+            )
+        if (
+            visible_products
+            or hidden_products
+            or visible_imeis
+            or hidden_imeis
+            or visible_serials
+            or hidden_serials
+        ):
+            rendered.append("")
+        rendered.extend(tail_lines)
+        return "\n".join(rendered)
+
+    caption = render()
+    # Valid service responses normally fit in full (including four boxes with
+    # dual IMEIs). Keep a deterministic fail-safe for a pathological album:
+    # retain the sales template and visibly report how many tail values could
+    # not fit instead of letting Telegram reject the entire card.
+    while _telegram_text_units(caption) > MAX_CAPTION_TEXT_UNITS:
+        if visible_products and product_value_limit > 80:
+            product_value_limit = max(80, product_value_limit - 20)
+        elif visible_serials:
+            visible_serials.pop()
+            hidden_serials += 1
+        elif visible_imeis:
+            visible_imeis.pop()
+            hidden_imeis += 1
+        elif len(visible_products) > 1:
+            visible_products.pop()
+            hidden_products += 1
+        else:
+            break
+        caption = render()
+    return caption
 
 
 def remove_manager_selection(caption_html: str) -> str:
@@ -138,4 +216,4 @@ def product_label_from_card(caption_html: str) -> str | None:
     if not match:
         return None
     product = html.unescape(match.group("product")).strip()
-    return product[:120] or None
+    return product[:MAX_PRODUCT_CARD_LABEL] or None

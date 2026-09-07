@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from .models import ProductIdentifiers
+from .models import EMPTY_IDENTIFIERS, ProductIdentifiers
 from .phones import normalize_uzbek_phone
 
 
@@ -22,7 +22,10 @@ MAX_HEALTH_BYTES = 4 * 1024
 MAX_PRODUCT_INFO = 160
 MAX_PRODUCT_MODEL = 80
 MAX_SERIAL_NUMBER = 40
-_RESPONSE_FIELDS = frozenset(
+MAX_PRODUCT_NAMES = 8
+MAX_IMEIS = 16
+MAX_SERIAL_NUMBERS = 16
+_RESPONSE_V1_FIELDS = frozenset(
     {
         "product_info",
         "product_model",
@@ -30,6 +33,14 @@ _RESPONSE_FIELDS = frozenset(
         "imei2",
         "serial_number",
         "phone_numbers",
+    }
+)
+_RESPONSE_V2_FIELDS = _RESPONSE_V1_FIELDS | frozenset(
+    {
+        "product_names",
+        "imeis",
+        "serial_numbers",
+        "warranty_card_detected",
     }
 )
 _IMEI_RE = re.compile(r"^[0-9]{15}$")
@@ -95,6 +106,37 @@ def _text_field(payload: dict[str, Any], name: str, limit: int) -> str | None:
     return compact
 
 
+def _text_list(
+    payload: dict[str, Any],
+    name: str,
+    *,
+    count_limit: int,
+    item_limit: int,
+    product_keys: bool = False,
+) -> tuple[str, ...]:
+    raw_values = payload[name]
+    if type(raw_values) is not list or len(raw_values) > count_limit:
+        raise OCRResponseError(
+            f"OCR поле {name} должно быть списком "
+            f"до {count_limit} значений"
+        )
+    values: list[str] = []
+    keys: set[str] = set()
+    for raw_value in raw_values:
+        item = _text_field({name: raw_value}, name, item_limit)
+        if item is None:
+            raise OCRResponseError(f"OCR поле {name} содержит null")
+        key = (
+            "".join(character for character in item.casefold() if character.isalnum())
+            if product_keys
+            else item.casefold()
+        )
+        if key not in keys:
+            keys.add(key)
+            values.append(item)
+    return tuple(values)
+
+
 def _valid_imei(value: str) -> bool:
     if _IMEI_RE.fullmatch(value) is None:
         return False
@@ -120,8 +162,12 @@ def parse_ocr_response(data: bytes) -> ProductIdentifiers:
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise OCRResponseError("OCR вернул некорректный JSON") from exc
-    if type(payload) is not dict or set(payload) != _RESPONSE_FIELDS:
+    if type(payload) is not dict:
         raise OCRResponseError("OCR JSON не соответствует ожидаемой схеме")
+    fields = frozenset(payload)
+    if fields not in {_RESPONSE_V1_FIELDS, _RESPONSE_V2_FIELDS}:
+        raise OCRResponseError("OCR JSON не соответствует ожидаемой схеме")
+    is_v2 = fields == _RESPONSE_V2_FIELDS
 
     product_info = _text_field(payload, "product_info", MAX_PRODUCT_INFO)
     product_model = _text_field(payload, "product_model", MAX_PRODUCT_MODEL)
@@ -151,6 +197,68 @@ def parse_ocr_response(data: bytes) -> ProductIdentifiers:
         if normalized not in phones:
             phones.append(normalized)
 
+    # The original response shape cannot prove either side of the new trust
+    # boundary: phones must come only from a confirmed warranty-card region,
+    # while product fields and identifiers must come only from the box. Keep
+    # accepting and validating v1 during a rolling deployment, but publish no
+    # values from it.
+    if not is_v2:
+        return EMPTY_IDENTIFIERS
+
+    product_names = _text_list(
+        payload,
+        "product_names",
+        count_limit=MAX_PRODUCT_NAMES,
+        item_limit=MAX_PRODUCT_INFO,
+        product_keys=True,
+    )
+    imeis = _text_list(
+        payload,
+        "imeis",
+        count_limit=MAX_IMEIS,
+        item_limit=15,
+    )
+    if any(not _valid_imei(value) for value in imeis):
+        raise OCRResponseError("OCR поле imeis содержит неверный IMEI")
+    serial_numbers = _text_list(
+        payload,
+        "serial_numbers",
+        count_limit=MAX_SERIAL_NUMBERS,
+        item_limit=MAX_SERIAL_NUMBER,
+    )
+    if any(_SERIAL_RE.fullmatch(value) is None for value in serial_numbers):
+        raise OCRResponseError(
+            "OCR поле serial_numbers содержит неверный серийный номер"
+        )
+    raw_warranty = payload["warranty_card_detected"]
+    if type(raw_warranty) is not bool:
+        raise OCRResponseError(
+            "OCR поле warranty_card_detected должно быть boolean"
+        )
+    warranty_card_detected = raw_warranty
+    if phones and not warranty_card_detected:
+        raise OCRResponseError(
+            "OCR номера допустимы только при обнаруженной гарантийной карточке"
+        )
+
+    # The v2 service keeps the original scalar keys for old clients. Make
+    # their mirror relationship explicit so malformed or mixed responses
+    # cannot silently change meaning during a rolling deployment.
+    if imei != (imeis[0] if imeis else None):
+        raise OCRResponseError("OCR поля imei и imeis не согласованы")
+    if imei2 != (imeis[1] if len(imeis) > 1 else None):
+        raise OCRResponseError("OCR поля imei2 и imeis не согласованы")
+    expected_serial = serial_numbers[0] if len(serial_numbers) == 1 else None
+    if serial_number != expected_serial:
+        raise OCRResponseError(
+            "OCR поля serial_number и serial_numbers не согласованы"
+        )
+    expected_info = product_names[0] if len(product_names) == 1 else None
+    if product_info != expected_info:
+        raise OCRResponseError(
+            "OCR поля product_info и product_names не согласованы"
+        )
+
     return ProductIdentifiers(
         imei=imei,
         imei2=imei2,
@@ -158,6 +266,10 @@ def parse_ocr_response(data: bytes) -> ProductIdentifiers:
         product_info=product_info,
         product_model=product_model,
         phone_numbers=tuple(phones),
+        product_names=product_names,
+        imeis=imeis,
+        serial_numbers=serial_numbers,
+        warranty_card_detected=warranty_card_detected,
     )
 
 

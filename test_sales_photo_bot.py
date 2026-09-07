@@ -467,6 +467,30 @@ class RepositoryTests(unittest.TestCase):
                 ),
             )
 
+    def test_multi_box_product_line_is_not_truncated_to_legacy_model_length(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sales.db"
+            repo = SalesPhotoRepository(path)
+            repo.claim_photo(CHAT_ID, 10, "file", sale_date=date(2026, 9, 2))
+            repo.mark_reposted(CHAT_ID, 10, 200)
+            product = "; ".join(
+                f"Catalog product {index} with memory and color"
+                for index in range(4)
+            )
+
+            self.assertGreater(len(product), 120)
+            self.assertTrue(
+                repo.sync_sale_details(CHAT_ID, 200, (), product)
+            )
+
+            with sqlite3.connect(path) as db:
+                stored = db.execute(
+                    "SELECT product_label FROM sales_photo_jobs "
+                    "WHERE chat_id=? AND source_message_id=?",
+                    (CHAT_ID, 10),
+                ).fetchone()[0]
+            self.assertEqual(stored, product)
+
     def test_obsolete_model_cache_is_removed_during_migration(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "sales.db"
@@ -1035,6 +1059,56 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(repo.is_replacement(CHAT_ID, 300))
         self.assertEqual(repo.output_message_ids(CHAT_ID, 10), (200, 201, 300))
+
+    async def test_album_combines_boxes_with_phone_only_warranty_card(self):
+        class SequenceRecognizer:
+            def __init__(self):
+                self.results = [
+                    ProductIdentifiers(
+                        product_names=(
+                            "Samsung Galaxy Watch Ultra 2",
+                            "Apple iPhone 16 Pro",
+                        ),
+                        imeis=("490154203237518", "352099001761481"),
+                        serial_numbers=("WATCHBOX1", "IPHONEBOX1"),
+                    ),
+                    ProductIdentifiers(
+                        phone_numbers=("+998 97 465 11 59",),
+                        warranty_card_detected=True,
+                    ),
+                ]
+                self.calls = 0
+
+            async def recognize(self, _image: bytes, _mime: str):
+                result = self.results[self.calls]
+                self.calls += 1
+                return result
+
+        repo = SalesPhotoRepository(self.root / "db.sqlite")
+        recognizer = SequenceRecognizer()
+        service = SalesPhotoService(settings(self.root), repo, recognizer)
+        bot = telegram_bot()
+        claim = service._claim_album(
+            (
+                album_photo_message(10),
+                album_photo_message(11),
+            ),
+            "album-1",
+        )
+
+        await service._run_photo_claim(claim, bot)
+
+        self.assertEqual(recognizer.calls, 2)
+        card = bot.send_message.await_args.kwargs["text"]
+        self.assertIn(
+            "📦 О товаре: Samsung Galaxy Watch Ultra 2; Apple iPhone 16 Pro",
+            card,
+        )
+        self.assertIn("IMEI: 490154203237518", card)
+        self.assertIn("IMEI2: 352099001761481", card)
+        self.assertIn("S/N: WATCHBOX1", card)
+        self.assertIn("S/N 2: IPHONEBOX1", card)
+        self.assertIn("📞: +998 97 465 11 59", card)
 
     async def test_album_date_is_added_to_the_shared_card(self):
         repo = SalesPhotoRepository(self.root / "db.sqlite")

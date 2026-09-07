@@ -14,7 +14,7 @@ MAX_PRODUCT_DISPLAY = 120
 class ProductIdentifiers:
     """Optional values read from one product photograph.
 
-    The first three fields intentionally retain their original order so old
+    The original six fields intentionally retain their order so old
     positional construction remains compatible.
     """
 
@@ -24,6 +24,14 @@ class ProductIdentifiers:
     product_info: str | None = None
     product_model: str | None = None
     phone_numbers: tuple[str, ...] = ()
+    # Collection fields are appended so every positional constructor used by
+    # the original six-field OCR contract keeps exactly the same meaning.
+    # They are authoritative when the OCR service sees several product boxes
+    # in one photograph.
+    product_names: tuple[str, ...] = ()
+    imeis: tuple[str, ...] = ()
+    serial_numbers: tuple[str, ...] = ()
+    warranty_card_detected: bool = False
 
 
 def _compact(value: object, limit: int) -> str | None:
@@ -76,12 +84,93 @@ def _compatible_product_values(
     return max(unique, key=lambda item: len(_product_key(item)))
 
 
-def product_display_name(
+def _unique_values(
+    values: object,
+    *,
+    limit: int,
+    product_keys: bool = False,
+) -> tuple[str, ...]:
+    unique: list[str] = []
+    keys: set[str] = set()
+    if isinstance(values, (str, bytes)) or values is None:
+        source = () if values is None else (values,)
+    else:
+        try:
+            source = tuple(values)  # type: ignore[arg-type]
+        except TypeError:
+            source = (values,)
+    for raw in source:
+        value = _compact(raw, limit)
+        if value is None:
+            continue
+        key = _product_key(value) if product_keys else value.casefold()
+        if not key or key in keys:
+            continue
+        keys.add(key)
+        unique.append(value)
+    return tuple(unique)
+
+
+def product_display_values(
+    identifiers: ProductIdentifiers,
+) -> tuple[str, ...]:
+    """Return every distinct product label without losing multi-box results."""
+
+    names = _unique_values(
+        identifiers.product_names,
+        limit=160,
+        product_keys=True,
+    )
+    if names:
+        # A single explicit product may still have a separately printed model
+        # code. With several boxes that code cannot safely be assigned to one
+        # of them, so the catalog names remain unmodified.
+        if len(names) == 1:
+            model = _compact(identifiers.product_model, 80)
+            if model:
+                single = ProductIdentifiers(
+                    product_info=names[0],
+                    product_model=model,
+                )
+                display = _legacy_product_display(single, limit=160)
+                if display:
+                    return (display,)
+        return names
+
+    legacy = _legacy_product_display(identifiers)
+    return (legacy,) if legacy else ()
+
+
+def identifier_imeis(identifiers: ProductIdentifiers) -> tuple[str, ...]:
+    """Return ordered, de-duplicated legacy and collection IMEI values."""
+
+    return _unique_values(
+        (
+            *identifiers.imeis,
+            identifiers.imei,
+            identifiers.imei2,
+        ),
+        limit=15,
+    )
+
+
+def identifier_serial_numbers(
+    identifiers: ProductIdentifiers,
+) -> tuple[str, ...]:
+    """Return ordered, de-duplicated legacy and collection serial values."""
+
+    return _unique_values(
+        (*identifiers.serial_numbers, identifiers.serial_number),
+        limit=40,
+    )
+
+
+def _legacy_product_display(
     identifiers: ProductIdentifiers,
     *,
     limit: int = MAX_PRODUCT_DISPLAY,
 ) -> str | None:
-    """Build a bounded product name/model label suitable for later escaping."""
+    """Build the original product_info/product_model display value."""
 
     info = _compact(identifiers.product_info, 160)
     model = _compact(identifiers.product_model, 80)
@@ -113,6 +202,17 @@ def product_display_name(
     return _compact(display, max(1, int(limit)))
 
 
+def product_display_name(
+    identifiers: ProductIdentifiers,
+    *,
+    limit: int = MAX_PRODUCT_DISPLAY,
+) -> str | None:
+    """Build a bounded product name/model label suitable for later escaping."""
+
+    values = product_display_values(identifiers)
+    return _compact("; ".join(values), max(1, int(limit)))
+
+
 def merge_product_identifiers(
     results: tuple[ProductIdentifiers, ...] | list[ProductIdentifiers],
     *,
@@ -120,9 +220,12 @@ def merge_product_identifiers(
 ) -> ProductIdentifiers:
     """Conservatively merge OCR results from all photographs in an album.
 
-    Conflicting identifiers are omitted instead of choosing an arbitrary
-    value. In receipt-safe album mode, phone-only OCR results are ignored.
-    Product variants must agree exactly after case/punctuation normalization.
+    Legacy scalar conflicts are omitted instead of choosing an arbitrary
+    value. Explicit collection values represent distinct boxes and are
+    therefore unioned in stable order. In receipt-safe album mode, phone-only
+    legacy OCR results are ignored; a positively detected warranty card may
+    contribute its phone number because the v2 recognizer restricts phone
+    extraction to that region.
     """
 
     items = tuple(results)
@@ -138,8 +241,12 @@ def merge_product_identifiers(
                     "imei",
                     "imei2",
                     "serial_number",
+                    "product_names",
+                    "imeis",
+                    "serial_numbers",
                 )
             )
+            or item.warranty_card_detected
         )
         if not items:
             return ProductIdentifiers()
@@ -189,18 +296,71 @@ def merge_product_identifiers(
     if product_models and model is None:
         info = None
 
-    imei = one_value("imei", 15)
-    imei2 = one_value("imei2", 15)
-    if imei is not None and imei2 is not None and imei == imei2:
-        imei2 = None
+    explicit_product_names = _unique_values(
+        (
+            name
+            for item in items
+            for name in item.product_names
+        ),
+        limit=160,
+        product_keys=True,
+    )
+    if explicit_product_names:
+        # product_info mirrors the collection only for a single product. Do
+        # not assign a scalar label when several boxes were recognized.
+        info = (
+            explicit_product_names[0]
+            if len(explicit_product_names) == 1
+            else None
+        )
+
+    has_explicit_imeis = any(item.imeis for item in items)
+    if has_explicit_imeis:
+        merged_imeis = _unique_values(
+            (
+                value
+                for item in items
+                for value in identifier_imeis(item)
+            ),
+            limit=15,
+        )
+        imei = merged_imeis[0] if merged_imeis else None
+        imei2 = merged_imeis[1] if len(merged_imeis) > 1 else None
+    else:
+        imei = one_value("imei", 15)
+        imei2 = one_value("imei2", 15)
+        if imei is not None and imei2 is not None and imei == imei2:
+            imei2 = None
+        merged_imeis = ()
+
+    has_explicit_serials = any(item.serial_numbers for item in items)
+    if has_explicit_serials:
+        merged_serials = _unique_values(
+            (
+                value
+                for item in items
+                for value in identifier_serial_numbers(item)
+            ),
+            limit=40,
+        )
+        serial_number = merged_serials[0] if len(merged_serials) == 1 else None
+    else:
+        serial_number = one_value("serial_number", 40)
+        merged_serials = ()
 
     return ProductIdentifiers(
         imei=imei,
         imei2=imei2,
-        serial_number=one_value("serial_number", 40),
+        serial_number=serial_number,
         product_info=info,
         product_model=model,
         phone_numbers=tuple(phones),
+        product_names=explicit_product_names,
+        imeis=merged_imeis,
+        serial_numbers=merged_serials,
+        warranty_card_detected=any(
+            item.warranty_card_detected for item in items
+        ),
     )
 
 

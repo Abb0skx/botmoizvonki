@@ -4418,7 +4418,10 @@ class SalesPhotoRepository:
         )
         first_phone = distinct_phones[0] if distinct_phones else None
         second_phone = distinct_phones[1] if len(distinct_phones) > 1 else None
-        product = str(product_label or "").strip()[:120] or None
+        # Multi-box OCR keeps every catalog name on the card's single product
+        # line. TEXT has no schema migration cost, so retain the same bounded
+        # value used by the card parser instead of truncating it to one model.
+        product = str(product_label or "").strip()[:900] or None
         with self._connect() as db:
             cursor = db.execute(
                 """UPDATE sales_photo_jobs
