@@ -47,7 +47,7 @@ from .request_coordinator import NightRequestCoordinator
 from .request_inputs import normalize_phone, phones_from_message, selection_fields
 from .sheets import BusinessSheets
 from .telegram_api import TelegramAPIError, TelegramBusinessAPI
-from .templates import TEMPLATES, normalize_template_code, render
+from .templates import REVIEW_URL, TEMPLATES, normalize_template_code, render
 from .timeutils import is_night, manager_phrases, next_night_end, telegram_datetime
 
 LOG = logging.getLogger("telegram_business")
@@ -1049,6 +1049,14 @@ class BusinessService:
 
         if language == "bi":
             parts = [part for selected in ("ru", "uz") if (part := one(selected))]
+            if code == "delivery_status_completed" and len(parts) > 1:
+                review_parts = [
+                    part.replace(REVIEW_URL, "").rstrip(" :") for part in parts
+                ]
+                return (
+                    "\n\n———\n\n".join(review_parts)
+                    + f"\n\n{REVIEW_URL}"
+                )
             return "\n\n———\n\n".join(parts) if parts else None
         return one(language if language in {"ru", "uz"} else "ru")
 

@@ -369,11 +369,15 @@ def test_first_poll_baselines_then_routes_and_deduplicates():
 
 
 @pytest.mark.parametrize(
-    "language, call_to_action",
-    (("ru", "оцените нашу работу"), ("uz", "xizmatimizni baholang")),
+    "language, call_to_actions",
+    (
+        ("ru", ("оцените нашу работу",)),
+        ("uz", ("xizmatimizni baholang",)),
+        ("bi", ("оцените нашу работу", "xizmatimizni baholang")),
+    ),
 )
 def test_completed_delivery_sends_one_localized_review_link(
-    language, call_to_action
+    language, call_to_actions
 ):
     with tempfile.TemporaryDirectory() as tmp:
         now = datetime(2026, 9, 7, 20, 0, tzinfo=TZ)
@@ -395,7 +399,8 @@ def test_completed_delivery_sends_one_localized_review_link(
 
         assert len(api.sent) == 1
         sent_text = api.sent[0][2]
-        assert sent_text.casefold().count(call_to_action) == 1
+        for call_to_action in call_to_actions:
+            assert sent_text.casefold().count(call_to_action) == 1
         assert sent_text.count(REVIEW_URL) == 1
 
         service.delivery_notifications_cycle()
