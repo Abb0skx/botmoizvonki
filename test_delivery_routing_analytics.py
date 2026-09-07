@@ -1,4 +1,5 @@
 import base64
+import calendar
 import tempfile
 import unittest
 from collections import Counter
@@ -16,6 +17,7 @@ from app.stats_service import TASHKENT
 
 ABBOS_ID = 202134293
 MUZROB_ID = 1799690992
+OLMAS_ID = 7636344727
 
 
 def _road_result(points, *, distance=4_200, duration=600):
@@ -142,6 +144,23 @@ class DeliveryAnalyticsTests(unittest.TestCase):
                     "longitude": 69.27,
                     "district": district,
                 },
+            )
+
+    def _complete(self, order, when: datetime, courier_id: int, courier_name: str):
+        timestamp = when.astimezone(timezone.utc).isoformat(timespec="microseconds")
+        with patch("app.database.repository.now", return_value=timestamp):
+            return self.repo.transition(
+                order.id,
+                {order.status},
+                status="completed",
+                assigned_courier_id=courier_id,
+                assigned_courier_name=courier_name,
+                courier_id=courier_id,
+                courier_name=courier_name,
+                delivered_at=timestamp,
+                actor_id=courier_id,
+                actor_name=courier_name,
+                actor_role="courier",
             )
 
     def test_month_week_districts_and_forecasts(self):
@@ -332,6 +351,132 @@ class DeliveryAnalyticsTests(unittest.TestCase):
         self.assertEqual(abbos["month"]["orders"], 1)
         self.assertEqual(muzrob["month"]["orders"], 0)
 
+    def test_monthly_delivery_totals_and_daily_counts_are_per_courier(self):
+        today = datetime.now(TASHKENT).date()
+        selected_month = (today.replace(day=1) - timedelta(days=1)).replace(day=1)
+        created_at = datetime.combine(
+            selected_month - timedelta(days=2),
+            datetime.min.time(),
+            TASHKENT,
+        ) + timedelta(hours=12)
+        abbos_order = self._create(created_at, "Яшнабадский район", "Abbos-delivery")
+        muzrob_first = self._create(created_at, "Чиланзарский район", "Muzrob-1")
+        muzrob_second = self._create(created_at, "Чиланзарский район", "Muzrob-2")
+        self._complete(
+            abbos_order,
+            datetime.combine(selected_month.replace(day=2), datetime.min.time(), TASHKENT)
+            + timedelta(hours=14),
+            ABBOS_ID,
+            "Abbos",
+        )
+        for order, hour in ((muzrob_first, 11), (muzrob_second, 16)):
+            self._complete(
+                order,
+                datetime.combine(selected_month.replace(day=5), datetime.min.time(), TASHKENT)
+                + timedelta(hours=hour),
+                MUZROB_ID,
+                "Muzrob Oka",
+            )
+
+        result = build_delivery_analytics(
+            self.repo,
+            month=selected_month.strftime("%Y-%m"),
+            courier_id=ABBOS_ID,
+        )
+        deliveries = result["month"]["courier_deliveries"]
+        rows = {row["id"]: row for row in deliveries["couriers"]}
+
+        self.assertEqual(deliveries["total"], 3)
+        self.assertEqual(rows[ABBOS_ID]["completed"], 1)
+        self.assertEqual(rows[ABBOS_ID]["daily"][1]["completed"], 1)
+        self.assertEqual(rows[MUZROB_ID]["completed"], 2)
+        self.assertEqual(rows[MUZROB_ID]["daily"][4]["completed"], 2)
+        self.assertEqual(rows[OLMAS_ID]["completed"], 0)
+        self.assertEqual(rows[MUZROB_ID]["active_days"], 1)
+        self.assertEqual(len(rows[ABBOS_ID]["daily"]), calendar.monthrange(
+            selected_month.year,
+            selected_month.month,
+        )[1])
+
+    def test_undone_completion_is_excluded_and_recompletion_counts_once(self):
+        today = datetime.now(TASHKENT).date()
+        selected_month = (today.replace(day=1) - timedelta(days=1)).replace(day=1)
+        created_at = datetime.combine(selected_month, datetime.min.time(), TASHKENT)
+        recompleted = self._create(created_at, "Яшнабадский район", "Recompleted")
+        undone = self._create(created_at, "Яшнабадский район", "Undone")
+        recompleted = self._complete(
+            recompleted,
+            datetime.combine(selected_month.replace(day=3), datetime.min.time(), TASHKENT)
+            + timedelta(hours=12),
+            ABBOS_ID,
+            "Abbos",
+        )
+        undone = self._complete(
+            undone,
+            datetime.combine(selected_month.replace(day=3), datetime.min.time(), TASHKENT)
+            + timedelta(hours=13),
+            ABBOS_ID,
+            "Abbos",
+        )
+        undo_time = datetime.combine(
+            selected_month.replace(day=4), datetime.min.time(), TASHKENT
+        ) + timedelta(hours=10)
+        undo_timestamp = undo_time.astimezone(timezone.utc).isoformat(timespec="microseconds")
+        with patch("app.database.repository.now", return_value=undo_timestamp):
+            recompleted = self.repo.transition(
+                recompleted.id,
+                {"completed"},
+                status="pending",
+                assigned_courier_id=MUZROB_ID,
+                assigned_courier_name="Muzrob Oka",
+                courier_id=None,
+                courier_name=None,
+                delivered_at=None,
+            )
+            self.repo.transition(
+                undone.id,
+                {"completed"},
+                status="pending",
+                delivered_at=None,
+            )
+        self._complete(
+            recompleted,
+            datetime.combine(selected_month.replace(day=6), datetime.min.time(), TASHKENT)
+            + timedelta(hours=15),
+            MUZROB_ID,
+            "Muzrob Oka",
+        )
+
+        deliveries = build_delivery_analytics(
+            self.repo,
+            month=selected_month.strftime("%Y-%m"),
+        )["month"]["courier_deliveries"]
+        rows = {row["id"]: row for row in deliveries["couriers"]}
+
+        self.assertEqual(deliveries["total"], 1)
+        self.assertEqual(rows[ABBOS_ID]["completed"], 0)
+        self.assertEqual(rows[MUZROB_ID]["completed"], 1)
+        self.assertEqual(rows[MUZROB_ID]["daily"][5]["completed"], 1)
+
+    def test_delivery_day_uses_tashkent_timezone(self):
+        created_at = datetime(2026, 7, 20, 12, tzinfo=TASHKENT)
+        order = self._create(created_at, "Юнусабадский район", "Timezone")
+        self._complete(
+            order,
+            datetime(2026, 7, 31, 20, 30, tzinfo=timezone.utc),
+            ABBOS_ID,
+            "Abbos",
+        )
+
+        deliveries = build_delivery_analytics(
+            self.repo,
+            month="2026-08",
+        )["month"]["courier_deliveries"]
+        abbos = next(row for row in deliveries["couriers"] if row["id"] == ABBOS_ID)
+
+        self.assertEqual(deliveries["total"], 1)
+        self.assertEqual(abbos["daily"][0]["completed"], 1)
+
     def test_month_and_week_validation(self):
         today = date(2026, 8, 24)
         self.assertEqual(parse_month("2026-08", today=today), date(2026, 8, 1))
@@ -380,12 +525,23 @@ class DeliveryAnalyticsWebTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["month"]["value"], "2026-08")
         self.assertEqual(response.json()["week"]["value"], "2026-W35")
+        self.assertIn("courier_deliveries", response.json()["month"])
 
         unknown = self.client.get(
             "/delivery/stats/api/analytics?courier_id=999",
             headers=self.auth(),
         )
         self.assertEqual(unknown.status_code, 422)
+
+    def test_statistics_page_contains_monthly_courier_calendar(self):
+        response = self.client.get("/delivery/stats", headers=self.auth())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Доставки курьеров за месяц", response.text)
+        self.assertIn("delivery_courier_id", response.text)
+        self.assertIn('aria-pressed="${active}"', response.text)
+        self.assertIn('scope="col"', response.text)
+        self.assertIn('aria-live="polite"', response.text)
 
 
 if __name__ == "__main__":

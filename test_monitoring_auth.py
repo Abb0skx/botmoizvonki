@@ -296,7 +296,16 @@ class MonitoringRouteTests(unittest.TestCase):
         self.assertIn("Карта очередности", stats.text)
         self.assertIn("Хронология дня", stats.text)
         self.assertIn("Разбивка за день", stats.text)
-        self.assertIn("Заказы по дням месяца", stats.text)
+        self.assertIn("Статистика за месяц", stats.text)
+        self.assertIn("Доставки курьеров за месяц", stats.text)
+        self.assertIn(
+            'let requestedCourier = params.get("courier_id") || "";',
+            stats.text,
+        )
+        self.assertIn(
+            'params.get("delivery_courier_id") || requestedCourier || ""',
+            stats.text,
+        )
         self.assertIn("/monitoring/delivery/stats", stats.text)
         self.assertNotIn("monitoring-bootstrap", stats.text)
         self.assertIn("nonce-", stats.headers["content-security-policy"])
