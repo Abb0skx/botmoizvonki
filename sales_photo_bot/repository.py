@@ -3942,6 +3942,30 @@ class SalesPhotoRepository:
             ).fetchone()
         return row is not None
 
+    def touch_processing(
+        self,
+        chat_id: int,
+        source_message_id: int,
+        at: datetime | None = None,
+    ) -> bool:
+        """Keep a live, bounded OCR step out of stale-job recovery."""
+
+        with self._connect() as db:
+            cursor = db.execute(
+                """UPDATE sales_photo_jobs
+                   SET updated_at=?
+                   WHERE chat_id=? AND source_message_id=?
+                     AND status='processing'
+                     AND replacement_message_id IS NULL""",
+                (
+                    _iso(at or utc_now()),
+                    int(chat_id),
+                    int(source_message_id),
+                ),
+            )
+            db.commit()
+            return cursor.rowcount == 1
+
     def source_pending_deletion(
         self,
         chat_id: int,

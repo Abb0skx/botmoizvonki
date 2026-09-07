@@ -4,7 +4,7 @@ import html
 import re
 from datetime import date
 
-from .models import ProductIdentifiers
+from .models import ProductIdentifiers, product_display_name
 from .phones import extract_uzbek_phones, phone_line
 
 
@@ -16,7 +16,9 @@ MANAGER_NAME_RE = re.compile(
     r"(?:^|\n)👤 Менеджер: <b>([^<>\r\n]{1,64})</b>\s*\Z"
 )
 PRODUCT_LINE_RE = re.compile(
-    r"(?:^|\n)📦[ \t]+(?P<product>[^\r\n]{1,120})(?:\n|$)"
+    r"(?:^|\n)📦[ \t]+(?:О[ \t]+товаре[ \t]*:[ \t]*)?"
+    r"(?P<product>[^\r\n]{1,768})(?:\n|$)",
+    re.IGNORECASE,
 )
 
 
@@ -43,7 +45,11 @@ def build_caption(
 ) -> str:
     """Build the sales card, retaining only verified phones and identifiers."""
 
-    phones = extract_uzbek_phones(client_caption)
+    phone_sources = [str(client_caption or "")]
+    phone_sources.extend(str(value or "") for value in identifiers.phone_numbers)
+    # Scan all sources together. A third distinct number makes the field
+    # ambiguous instead of silently selecting whichever two appeared first.
+    phones = extract_uzbek_phones("\n".join(phone_sources), limit=2)
     lines: list[str] = []
     if sale_date:
         lines.append(f"📆: {sale_date:%d/%m/%Y}")
@@ -63,15 +69,6 @@ def build_caption(
         lines.extend([*number_lines, ""])
     elif sale_date:
         lines.append("")
-    if product_label:
-        lines.extend([f"📦 {_safe(product_label, 120)}", ""])
-    lines.extend([
-        "🛒💵:",
-        "rasxod:",
-        "",
-        phone_line(phones),
-    ])
-
     identifier_lines: list[str] = []
     if identifiers.imei:
         identifier_lines.append(
@@ -86,8 +83,20 @@ def build_caption(
             f"<blockquote>S/N: {_safe(identifiers.serial_number, MAX_SERIAL_NUMBER)}"
             "</blockquote>"
         )
-    if identifier_lines:
-        lines.extend(["", *identifier_lines])
+    product = _compact(product_label, 120) or product_display_name(identifiers)
+    if product:
+        lines.append(f"📦 О товаре: {_safe(product, 120)}")
+        lines.extend(identifier_lines)
+        lines.append("")
+    elif identifier_lines:
+        lines.extend([*identifier_lines, ""])
+
+    lines.extend([
+        "🛒💵:",
+        "rasxod:",
+        "",
+        phone_line(phones),
+    ])
 
     lines.extend(
         [

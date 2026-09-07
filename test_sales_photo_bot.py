@@ -31,6 +31,7 @@ from sales_photo_bot.formatting import (
 )
 from sales_photo_bot.keyboards import manager_keyboard
 from sales_photo_bot.models import ProductIdentifiers
+from sales_photo_bot.ocr_client import RemoteOCRRecognizer
 from sales_photo_bot.repository import SalesPhotoRepository, utc_now
 from sales_photo_bot.service import BOT_CARD_MARKER, SalesPhotoService
 
@@ -196,7 +197,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(parsed.source_edit_grace_seconds, 3)
         self.assertEqual(parsed.startup_drain_seconds, 10)
 
-    def test_settings_require_negative_chat_id_and_no_external_api_keys(self):
+    def test_settings_require_negative_chat_id_and_ocr_is_optional(self):
         with self.assertRaises(ConfigError):
             Settings.from_env(
                 {
@@ -211,7 +212,8 @@ class ConfigTests(unittest.TestCase):
                 "SALES_PHOTO_CHECK_CHAT_ID": str(CHECK_CHAT_ID),
             }
         )
-        self.assertFalse(hasattr(parsed, "ocr_timeout_seconds"))
+        self.assertIsNone(parsed.ocr_base_url)
+        self.assertEqual(parsed.ocr_timeout_seconds, 45.0)
         with self.assertRaisesRegex(ConfigError, "SALES_PHOTO_CHECK_CHAT_ID"):
             Settings.from_env(
                 {
@@ -234,6 +236,29 @@ class ConfigTests(unittest.TestCase):
                     "SALES_PHOTO_BOT_TOKEN": TOKEN,
                     "SALES_PHOTO_CHAT_ID": str(CHAT_ID),
                     "SALES_PHOTO_CHECK_CHAT_ID": str(CHAT_ID),
+                }
+            )
+
+    def test_settings_parse_optional_ocr_service(self):
+        parsed = Settings.from_env(
+            {
+                "SALES_PHOTO_BOT_TOKEN": TOKEN,
+                "SALES_PHOTO_CHAT_ID": str(CHAT_ID),
+                "SALES_PHOTO_CHECK_CHAT_ID": str(CHECK_CHAT_ID),
+                "SALES_PHOTO_OCR_URL": "http://127.0.0.1:8765/",
+                "SALES_PHOTO_OCR_TIMEOUT_SECONDS": "8.5",
+            }
+        )
+        self.assertEqual(parsed.ocr_base_url, "http://127.0.0.1:8765")
+        self.assertEqual(parsed.ocr_timeout_seconds, 8.5)
+
+        with self.assertRaisesRegex(ConfigError, "OCR_URL"):
+            Settings.from_env(
+                {
+                    "SALES_PHOTO_BOT_TOKEN": TOKEN,
+                    "SALES_PHOTO_CHAT_ID": str(CHAT_ID),
+                    "SALES_PHOTO_CHECK_CHAT_ID": str(CHECK_CHAT_ID),
+                    "SALES_PHOTO_OCR_URL": "file:///tmp/ocr.sock",
                 }
             )
 
@@ -273,12 +298,12 @@ class CaptionFormattingTests(unittest.TestCase):
         )
         self.assertEqual(
             caption,
-            "🛒💵:\n"
-            "rasxod:\n\n"
-            "📞: +998 90 123 45 67\n\n"
             "<blockquote>IMEI: 490154203237518</blockquote>\n"
             "<blockquote>IMEI2: 352099001761481</blockquote>\n"
             "<blockquote>S/N: R8YL50R510N</blockquote>\n\n"
+            "🛒💵:\n"
+            "rasxod:\n\n"
+            "📞: +998 90 123 45 67\n\n"
             "<b>Наличка</b>\n"
             "💵:\n"
             "🇺🇿:\n\n"
@@ -299,7 +324,9 @@ class CaptionFormattingTests(unittest.TestCase):
             ProductIdentifiers(),
             product_label="A16 <8/256>",
         )
-        self.assertTrue(caption.startswith("📦 A16 &lt;8/256&gt;\n\n🛒💵:"))
+        self.assertTrue(
+            caption.startswith("📦 О товаре: A16 &lt;8/256&gt;\n\n🛒💵:")
+        )
         self.assertIn("📞: +998 90 123 45 67", caption)
 
     def test_sale_date_is_the_first_card_field(self):
@@ -312,7 +339,7 @@ class CaptionFormattingTests(unittest.TestCase):
 
         self.assertTrue(
             caption.startswith(
-                "📆: 31/08/2026\n\n📦 A16\n\n🛒💵:"
+                "📆: 31/08/2026\n\n📦 О товаре: A16\n\n🛒💵:"
             )
         )
 
@@ -373,6 +400,32 @@ class CaptionFormattingTests(unittest.TestCase):
 
 
 class RepositoryTests(unittest.TestCase):
+    def test_touch_processing_prevents_live_ocr_from_becoming_stale(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = SalesPhotoRepository(Path(directory) / "sales.db")
+            started = datetime(2026, 9, 7, 8, 0, tzinfo=timezone.utc)
+            refreshed = started + timedelta(minutes=4)
+            self.assertTrue(
+                repo.claim_photo(
+                    CHAT_ID,
+                    10,
+                    "photo",
+                    source_file_id="file",
+                    at=started,
+                )
+            )
+
+            self.assertTrue(repo.touch_processing(CHAT_ID, 10, at=refreshed))
+            self.assertEqual(
+                repo.fail_stale_processing(
+                    CHAT_ID,
+                    older_than=refreshed - timedelta(seconds=1),
+                    at=refreshed,
+                ),
+                0,
+            )
+            self.assertTrue(repo.source_accepts_replacement(CHAT_ID, 10))
+
     def test_sale_phone_manager_and_optional_product_are_durable(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "sales.db"
@@ -825,7 +878,7 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
         bot.send_media_group.assert_not_awaited()
         bot.send_message.assert_awaited_once()
         sent = bot.send_message.await_args.kwargs
-        self.assertIn("📦 A16 8/256", sent["text"])
+        self.assertIn("📦 О товаре: A16 8/256", sent["text"])
         self.assertIn("📞: +998 90 123 45 67", sent["text"])
         self.assertIsNotNone(sent["reply_markup"])
         bot.delete_message.assert_awaited_once_with(CHAT_ID, 10)
@@ -854,7 +907,8 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             sent.startswith(
                 BOT_CARD_MARKER
-                + "📆: 31/08/2026\nШт: 1\n🆔: 1\n\n📦 A16 8/256\n\n🛒💵:"
+                + "📆: 31/08/2026\nШт: 1\n🆔: 1\n\n"
+                "📦 О товаре: A16 8/256\n\n🛒💵:"
             )
         )
         self.assertIn("📞: +998 90 123 45 67", sent)
@@ -906,12 +960,24 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
         bot.send_message.assert_awaited_once()
         bot.send_photo.assert_not_awaited()
         bot.send_media_group.assert_not_awaited()
-        self.assertIn("📦 A16", bot.send_message.await_args.kwargs["text"])
+        self.assertIn(
+            "📦 О товаре: A16",
+            bot.send_message.await_args.kwargs["text"],
+        )
         bot.delete_message.assert_awaited_once_with(CHAT_ID, 10)
 
     async def test_photo_album_with_receipt_becomes_one_product(self):
         repo = SalesPhotoRepository(self.root / "db.sqlite")
-        service = SalesPhotoService(settings(self.root), repo)
+        recognizer = StaticRecognizer(
+            ProductIdentifiers(
+                product_info="Redmi Note 14 8/256 Black",
+                product_model="24094RAD4G",
+                imei="490154203237518",
+                serial_number="ABC123",
+                phone_numbers=("+998 91 765 43 21",),
+            )
+        )
+        service = SalesPhotoService(settings(self.root), repo, recognizer)
         bot = telegram_bot()
 
         with patch(
@@ -937,6 +1003,11 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(*tuple(service._photo_tasks))
 
         bot.send_photo.assert_not_awaited()
+        self.assertEqual(recognizer.calls, 2)
+        self.assertEqual(
+            [call.args[0] for call in bot.get_file.await_args_list],
+            ["album-file-10", "album-file-11"],
+        )
         bot.send_media_group.assert_awaited_once()
         media = bot.send_media_group.await_args.kwargs["media"]
         self.assertEqual([item.media for item in media], [
@@ -945,7 +1016,18 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
         ])
         bot.send_message.assert_awaited_once()
         card = bot.send_message.await_args.kwargs
-        self.assertIn("📞: +998 90 123 45 67", card["text"])
+        self.assertIn(
+            "📞: +998 90 123 45 67 / +998 91 765 43 21",
+            card["text"],
+        )
+        self.assertLess(
+            card["text"].index("📦 О товаре: Redmi Note 14"),
+            card["text"].index("<blockquote>IMEI:"),
+        )
+        self.assertLess(
+            card["text"].index("<blockquote>S/N:"),
+            card["text"].index("🛒💵:"),
+        )
         self.assertIsNotNone(card["reply_markup"])
         self.assertEqual(
             [call.args[1] for call in bot.delete_message.await_args_list],
@@ -979,6 +1061,48 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 + "📆: 31/08/2026\nШт: 1\n🆔: 1\n\n🛒💵:"
             )
         )
+
+    async def test_partial_album_ocr_failure_discards_all_fields_but_scans_all(self):
+        class SequenceRecognizer:
+            def __init__(self):
+                self.results = [
+                    TimeoutError("first image failed"),
+                    ProductIdentifiers(
+                        product_info="Receipt device",
+                        product_model="INVOICE-2026",
+                        serial_number="RECEIPT123",
+                        phone_numbers=("+998 71 200 00 00",),
+                    ),
+                ]
+                self.calls = 0
+
+            async def recognize(self, _image: bytes, _mime: str):
+                result = self.results[self.calls]
+                self.calls += 1
+                if isinstance(result, Exception):
+                    raise result
+                return result
+
+        repo = SalesPhotoRepository(self.root / "db.sqlite")
+        recognizer = SequenceRecognizer()
+        service = SalesPhotoService(settings(self.root), repo, recognizer)
+        bot = telegram_bot()
+        claim = service._claim_album(
+            (
+                album_photo_message(10),
+                album_photo_message(11),
+            ),
+            "album-1",
+        )
+
+        await service._run_photo_claim(claim, bot)
+
+        self.assertEqual(recognizer.calls, 2)
+        card = bot.send_message.await_args.kwargs["text"]
+        self.assertNotIn("Receipt device", card)
+        self.assertNotIn("RECEIPT123", card)
+        self.assertNotIn("+998 71", card)
+        self.assertIn("🛒💵:", card)
 
     async def test_album_card_failure_removes_copied_album_and_keeps_sources(self):
         repo = SalesPhotoRepository(self.root / "db.sqlite")
@@ -2617,6 +2741,22 @@ class ManagerCallbackTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ApplicationWiringTests(unittest.TestCase):
+    def test_application_builds_remote_recognizer_when_configured(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            configured = replace(
+                settings(root),
+                ocr_base_url="http://127.0.0.1:8765",
+                ocr_timeout_seconds=7.5,
+            )
+            app = build_application(
+                configured,
+                repository=SalesPhotoRepository(root / "db.sqlite"),
+            )
+            recognizer = app.bot_data["sales_photo_service"].recognizer
+            self.assertIsInstance(recognizer, RemoteOCRRecognizer)
+            asyncio.run(recognizer.aclose())
+
     def test_application_has_photo_callback_handlers_and_concurrency(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

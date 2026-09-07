@@ -56,7 +56,11 @@ from .keyboards import (
     back_keyboard,
     manager_keyboard,
 )
-from .models import EMPTY_IDENTIFIERS, ProductIdentifiers
+from .models import (
+    EMPTY_IDENTIFIERS,
+    ProductIdentifiers,
+    merge_product_identifiers,
+)
 from .orders import card_numbers_match, ensure_card_numbers
 from .phones import (
     extract_product_label,
@@ -177,7 +181,7 @@ class _DeliverySalesPending(RuntimeError):
 
 
 class IdentifierRecognizer(Protocol):
-    """Optional test hook; production does not configure image recognition."""
+    """Optional image recognizer; failures must not block card publication."""
 
     async def recognize(
         self, image_bytes: bytes, mime_type: str
@@ -1597,7 +1601,12 @@ class SalesPhotoService:
             )
         else:
             try:
-                identifiers = await self._run_optional_recognizer(file_id, bot)
+                identifiers = await self._run_optional_recognizers(
+                    claim.file_ids,
+                    bot,
+                    chat_id=chat_id,
+                    source_message_id=source_message_id,
+                )
             except asyncio.CancelledError:
                 try:
                     self.repository.mark_failed(
@@ -1614,6 +1623,9 @@ class SalesPhotoService:
                 identifiers.imei,
                 identifiers.imei2,
                 identifiers.serial_number,
+                identifiers.product_info,
+                identifiers.product_model,
+                *identifiers.phone_numbers,
             )
         )
         key = (chat_id, source_message_id)
@@ -2229,19 +2241,83 @@ class SalesPhotoService:
         self,
         file_id: str,
         bot: Bot | Any,
-    ) -> ProductIdentifiers:
+    ) -> ProductIdentifiers | None:
         recognizer = self.recognizer
         if recognizer is None:
-            return EMPTY_IDENTIFIERS
+            return None
         try:
             telegram_file = await bot.get_file(file_id)
             data = bytes(await telegram_file.download_as_bytearray())
-            return await recognizer.recognize(data, "image/jpeg")
+            result = await recognizer.recognize(data, "image/jpeg")
+            if not isinstance(result, ProductIdentifiers):
+                raise TypeError("recognizer_result_invalid")
+            return result
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.warning(
                 "sales_photo_optional_recognizer_failed error_type=%s",
+                _error_code(exc),
+            )
+            return None
+
+    async def _run_optional_recognizers(
+        self,
+        file_ids: tuple[str, ...],
+        bot: Bot | Any,
+        *,
+        chat_id: int,
+        source_message_id: int,
+    ) -> ProductIdentifiers:
+        """Recognize every album member and merge without guessing conflicts."""
+
+        results: list[ProductIdentifiers] = []
+        recognition_failed = False
+        for file_id in file_ids:
+            try:
+                still_processing = self.repository.touch_processing(
+                    chat_id,
+                    source_message_id,
+                )
+            except Exception as exc:
+                still_processing = True
+                logger.warning(
+                    "sales_photo_processing_touch_failed error_type=%s",
+                    _error_code(exc),
+                )
+            if not still_processing:
+                break
+            try:
+                result = await self._run_optional_recognizer(file_id, bot)
+            finally:
+                try:
+                    self.repository.touch_processing(
+                        chat_id,
+                        source_message_id,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "sales_photo_processing_touch_failed error_type=%s",
+                        _error_code(exc),
+                    )
+            if result is None:
+                # Partial album OCR is not trustworthy: a surviving receipt
+                # must never become the only source of product/card fields.
+                recognition_failed = True
+            else:
+                results.append(result)
+        if recognition_failed:
+            return EMPTY_IDENTIFIERS
+        if not results or all(result == EMPTY_IDENTIFIERS for result in results):
+            return EMPTY_IDENTIFIERS
+        try:
+            return merge_product_identifiers(
+                results,
+                receipt_safe=len(file_ids) > 1,
+            )
+        except Exception as exc:
+            logger.warning(
+                "sales_photo_optional_recognizer_merge_failed error_type=%s",
                 _error_code(exc),
             )
             return EMPTY_IDENTIFIERS

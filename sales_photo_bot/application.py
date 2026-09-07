@@ -18,6 +18,7 @@ from telegram.ext import (
 
 from .config import Settings
 from .keyboards import CALLBACK_PREFIX
+from .ocr_client import RemoteOCRRecognizer
 from .repository import SalesPhotoRepository
 from .service import IdentifierRecognizer, SalesPhotoService
 
@@ -115,9 +116,13 @@ def build_application(
     recognizer: IdentifierRecognizer | None = None,
 ) -> Application:
     repo = repository or SalesPhotoRepository(settings.db_path)
-    # Production intentionally passes no recognizer: Telegram's existing
-    # file_id is reposted without downloading or inspecting the photo.
-    service = SalesPhotoService(settings, repo, recognizer)
+    resolved_recognizer = recognizer
+    if resolved_recognizer is None and settings.ocr_base_url:
+        resolved_recognizer = RemoteOCRRecognizer(
+            settings.ocr_base_url,
+            settings.ocr_timeout_seconds,
+        )
+    service = SalesPhotoService(settings, repo, resolved_recognizer)
 
     async def post_init(application: Application) -> None:
         await _prepare_polling(settings, repo, service, application.bot)

@@ -36,6 +36,23 @@ def _bounded_int(
     return value
 
 
+def _bounded_float(
+    environ: dict[str, str],
+    name: str,
+    default: float,
+    minimum: float,
+    maximum: float,
+) -> float:
+    raw = str(environ.get(name, default)).strip()
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{name} должен быть числом") from exc
+    if not minimum <= value <= maximum:
+        raise ConfigError(f"{name} должен быть от {minimum} до {maximum}")
+    return value
+
+
 def _boolean(environ: dict[str, str], name: str, default: bool) -> bool:
     raw = str(environ.get(name, str(default))).strip().casefold()
     if raw in {"1", "true", "yes", "on"}:
@@ -81,6 +98,8 @@ class Settings:
     delivery_sync_seconds: int = 15
     calls_db_path: Path | None = None
     calls_sync_seconds: int = 30
+    ocr_base_url: str | None = None
+    ocr_timeout_seconds: float = 45.0
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> "Settings":
@@ -129,6 +148,23 @@ class Settings:
         if log_level not in {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}:
             raise ConfigError("SALES_PHOTO_LOG_LEVEL имеет неверное значение")
 
+        primary_ocr_url = str(values.get("SALES_PHOTO_OCR_URL", "")).strip()
+        alias_ocr_url = str(values.get("SALES_PHOTO_OCR_BASE_URL", "")).strip()
+        if primary_ocr_url and alias_ocr_url and primary_ocr_url != alias_ocr_url:
+            raise ConfigError(
+                "SALES_PHOTO_OCR_URL и SALES_PHOTO_OCR_BASE_URL не совпадают"
+            )
+        raw_ocr_url = primary_ocr_url or alias_ocr_url
+        if raw_ocr_url:
+            from .ocr_client import validate_ocr_base_url
+
+            try:
+                ocr_base_url = validate_ocr_base_url(raw_ocr_url)
+            except ValueError as exc:
+                raise ConfigError("SALES_PHOTO_OCR_URL имеет неверный формат") from exc
+        else:
+            ocr_base_url = None
+
         return cls(
             bot_token=token,
             chat_id=chat_id,
@@ -169,5 +205,13 @@ class Settings:
             ),
             calls_sync_seconds=_bounded_int(
                 values, "SALES_PHOTO_CALLS_SYNC_SECONDS", 30, 10, 300
+            ),
+            ocr_base_url=ocr_base_url,
+            ocr_timeout_seconds=_bounded_float(
+                values,
+                "SALES_PHOTO_OCR_TIMEOUT_SECONDS",
+                45.0,
+                0.5,
+                60.0,
             ),
         )
