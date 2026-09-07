@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 from dataclasses import dataclass
 from datetime import time
 from pathlib import Path
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 
@@ -73,10 +75,18 @@ class BusinessSettings:
     bot_id: str = ""
     product_urls_path: Path = Path("/app/data/Bot_URLS.xlsx")
     orders_chat_id: str = ""
+    delivery_notifications_enabled: bool = False
+    delivery_notifications_url: str = ""
+    delivery_notifications_token: str = ""
+    delivery_notifications_poll_seconds: int = 30
+    delivery_notifications_max_event_age_hours: int = 24
 
     @classmethod
     def load(cls) -> "BusinessSettings":
         enabled = _bool("TELEGRAM_BUSINESS_ENABLED")
+        delivery_notifications_enabled = _bool(
+            "BUSINESS_DELIVERY_NOTIFICATIONS_ENABLED"
+        )
 
         def configured(loader, fallback):
             try:
@@ -85,6 +95,16 @@ class BusinessSettings:
                 # A disabled, isolated integration must never prevent the calls
                 # application from starting because of an unused stale value.
                 if enabled:
+                    raise
+                return fallback
+
+        def delivery_configured(loader, fallback):
+            try:
+                return loader()
+            except ValueError:
+                # A disabled optional feed must not prevent the otherwise
+                # healthy Telegram Business integration from starting.
+                if enabled and delivery_notifications_enabled:
                     raise
                 return fallback
 
@@ -121,6 +141,36 @@ class BusinessSettings:
             orders_chat_id=os.getenv(
                 "TELEGRAM_BUSINESS_ORDERS_CHAT_ID", "-1004307725887"
             ).strip(),
+            # The delivery worker is part of Telegram Business. Treat a stale
+            # standalone delivery flag as disabled when the parent integration
+            # is off instead of presenting an impossible enabled state.
+            delivery_notifications_enabled=(
+                delivery_notifications_enabled and enabled
+            ),
+            delivery_notifications_url=(
+                os.getenv("BUSINESS_DELIVERY_NOTIFICATIONS_URL", "").strip()
+                or os.getenv("MONITORING_DELIVERY_BASE_URL", "").strip()
+            ).rstrip("/"),
+            delivery_notifications_token=(
+                os.getenv("BUSINESS_DELIVERY_NOTIFICATIONS_TOKEN", "").strip()
+                or os.getenv("MONITORING_DELIVERY_SERVICE_TOKEN", "").strip()
+            ),
+            delivery_notifications_poll_seconds=delivery_configured(
+                lambda: _int(
+                    "BUSINESS_DELIVERY_NOTIFICATIONS_POLL_SECONDS",
+                    30,
+                    minimum=1,
+                ),
+                30,
+            ),
+            delivery_notifications_max_event_age_hours=delivery_configured(
+                lambda: _int(
+                    "BUSINESS_DELIVERY_NOTIFICATIONS_MAX_EVENT_AGE_HOURS",
+                    24,
+                    minimum=1,
+                ),
+                24,
+            ),
         )
 
     def validate_enabled(self) -> None:
@@ -154,3 +204,46 @@ class BusinessSettings:
             )
         if not self.sheet_id:
             raise RuntimeError("Telegram Business Google workbook ID is missing")
+        if self.delivery_notifications_enabled:
+            if not (
+                self.delivery_notifications_url
+                and self.delivery_notifications_token
+            ):
+                raise RuntimeError(
+                    "Delivery notifications are enabled but the internal "
+                    "delivery URL or service token is missing"
+                )
+            parsed_delivery_url = urlsplit(self.delivery_notifications_url)
+            if (
+                parsed_delivery_url.scheme not in {"http", "https"}
+                or not parsed_delivery_url.netloc
+                or parsed_delivery_url.username is not None
+                or parsed_delivery_url.password is not None
+                or parsed_delivery_url.query
+                or parsed_delivery_url.fragment
+            ):
+                raise RuntimeError(
+                    "BUSINESS_DELIVERY_NOTIFICATIONS_URL must be an HTTP(S) "
+                    "base URL without credentials, query, or fragment"
+                )
+            if parsed_delivery_url.scheme == "http":
+                hostname = parsed_delivery_url.hostname or ""
+                internal_name = (
+                    "." not in hostname
+                    or hostname.endswith((".internal", ".local", ".docker"))
+                )
+                private_address = False
+                try:
+                    address = ipaddress.ip_address(hostname.strip("[]"))
+                    private_address = bool(
+                        address.is_private
+                        or address.is_loopback
+                        or address.is_link_local
+                    )
+                except ValueError:
+                    pass
+                if not (internal_name or private_address):
+                    raise RuntimeError(
+                        "Plain HTTP delivery URL is allowed only for an "
+                        "internal Docker/private host; use HTTPS otherwise"
+                    )

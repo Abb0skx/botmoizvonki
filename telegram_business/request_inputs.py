@@ -10,6 +10,7 @@ from urllib.parse import quote_plus
 
 from .intents import extract_text_location, is_outside_tashkent
 from .products import safe_product_url
+from .security import redact_payment_data
 
 
 _PHONE_ALLOWED = re.compile(r"^[+()\d\s.\-/]{7,32}$")
@@ -25,8 +26,19 @@ _ADDRESS_HINT = re.compile(
     re.IGNORECASE,
 )
 _EXPLICIT_UZ_PHONE = re.compile(
-    r"(?<!\d)(\+998[\s().\-/]*\d{2}[\s().\-/]*\d{3}"
+    r"(?<!\d)(\+?998[\s().\-/]*\d{2}[\s().\-/]*\d{3}"
     r"[\s().\-/]*\d{2}[\s().\-/]*\d{2})(?!\d)"
+)
+_EXPLICIT_INTERNATIONAL_PHONE = re.compile(
+    r"(?<!\w)(\+(?:[\s().\-/]*\d){8,15})(?!\d)"
+)
+_LOCAL_UZ_PHONE = re.compile(
+    r"(?<!\d)(0?\d{2}[\s().\-/]*\d{3}[\s().\-/]*\d{2}"
+    r"[\s().\-/]*\d{2})(?!\d)"
+)
+_PHONE_LABEL = re.compile(
+    r"(?:телефон|тел\.?|номер|phone|contact|aloqa|telefon|tel\.?|raqam|рақам)",
+    re.IGNORECASE,
 )
 _PHONE_MARKER = re.compile(
     r"(?:телефон|тел\.?|номер|phone|contact|aloqa|telefon|tel\.?|raqam|рақам)"
@@ -74,34 +86,137 @@ def masked_phone(value: Any) -> str:
     return f"{country}** *** ** {digits[-2:]}"
 
 
-def phone_from_message(message: Mapping[str, Any] | None, text: str = "") -> tuple[str | None, str | None]:
+def mask_recognized_phones(value: str | None) -> str | None:
+    """Mask phone-shaped evidence before exporting free text.
+
+    SQLite keeps the sanitized original message for the private audit trail,
+    while less trusted secondary stores (currently Google Sheets) receive the
+    same readable text with only numbers accepted by :func:`phones_from_message`
+    masked.  Payment-shaped values stay under the stricter payment redaction.
+    """
+
+    if not value:
+        return value
+    masked = redact_payment_data(value) or ""
+
+    # A message containing only a phone is a supported input even without a
+    # label.  Preserve no copy of that full number in the exported value.
+    if phone := normalize_phone(masked):
+        return masked_phone(phone)
+
+    def replace_group(pattern: re.Pattern[str], text: str) -> str:
+        def replacement(match: re.Match[str]) -> str:
+            raw_phone = match.group(1)
+            phone = normalize_phone(raw_phone)
+            if not phone:
+                return match.group(0)
+            leading = raw_phone[: len(raw_phone) - len(raw_phone.lstrip())]
+            trailing = raw_phone[len(raw_phone.rstrip()) :]
+            start, end = match.span(1)
+            offset = match.start()
+            return (
+                match.group(0)[: start - offset]
+                + leading
+                + masked_phone(phone)
+                + trailing
+                + match.group(0)[end - offset :]
+            )
+
+        return pattern.sub(replacement, text)
+
+    # Keep this recognition order aligned with ``phones_from_message``.  Once
+    # replaced, the short masked representation cannot be detected again.
+    masked = replace_group(_EXPLICIT_UZ_PHONE, masked)
+    masked = replace_group(_EXPLICIT_INTERNATIONAL_PHONE, masked)
+    masked = replace_group(_PHONE_MARKER, masked)
+    if _PHONE_LABEL.search(value):
+        masked = replace_group(_LOCAL_UZ_PHONE, masked)
+    return masked
+
+
+@dataclass(frozen=True)
+class DetectedPhone:
+    """One phone deliberately provided by the client in a message.
+
+    ``owner_verified`` means only that Telegram attached the Contact to the same
+    user who sent the Business message. A number typed as text remains useful
+    for order matching, but Telegram cannot prove who owns it.
+    """
+
+    phone: str
+    source: str
+    owner_verified: bool = False
+
+
+def phones_from_message(
+    message: Mapping[str, Any] | None,
+    text: str = "",
+    *,
+    limit: int = 5,
+) -> tuple[DetectedPhone, ...]:
+    """Extract a bounded, deduplicated set of safely recognizable phones.
+
+    A native Contact is accepted only when ``contact.user_id`` equals the
+    sender. Text accepts a standalone phone, explicit Uzbek country-code
+    numbers and numbers introduced by an unambiguous phone label. Arbitrary
+    digit runs are never scanned, which avoids treating prices/cards as phones.
+    """
+
     message = message or {}
+    maximum = max(1, min(int(limit), 10))
+    detected: list[DetectedPhone] = []
+    seen: set[str] = set()
+
+    def remember(phone: str | None, source: str, verified: bool = False) -> None:
+        if not phone or phone in seen or len(detected) >= maximum:
+            return
+        seen.add(phone)
+        detected.append(DetectedPhone(phone, source, verified))
+
     contact = message.get("contact") if isinstance(message, Mapping) else None
     if isinstance(contact, Mapping):
         sender = message.get("from") if isinstance(message, Mapping) else None
         sender_id = sender.get("id") if isinstance(sender, Mapping) else None
         owner_id = contact.get("user_id")
-        phone = normalize_phone(contact.get("phone_number"))
         if (
-            phone
-            and sender_id is not None
+            sender_id is not None
             and owner_id is not None
             and str(sender_id) == str(owner_id)
         ):
-            return phone, "telegram_contact"
-    phone = normalize_phone(text)
-    if phone:
-        return phone, "typed"
-    # Accept a phone alongside a model/address only when it is either an
-    # explicit +998 number or follows an unambiguous phone label. Never scan
-    # arbitrary digit runs, which could be card or account data.
-    compact = " ".join(str(text or "").split())[:500]
-    explicit = _EXPLICIT_UZ_PHONE.search(compact)
-    if explicit and (phone := normalize_phone(explicit.group(1))):
-        return phone, "typed"
-    marked = _PHONE_MARKER.search(compact)
-    if marked and (phone := normalize_phone(marked.group(1).strip())):
-        return phone, "typed"
+            remember(
+                normalize_phone(contact.get("phone_number")),
+                "telegram_contact",
+                True,
+            )
+
+    # Redact payment-looking material before phone recognition. This is an
+    # intentionally conservative false-negative: payment data must never enter
+    # the reusable phone index.
+    compact = " ".join(str(text or "").split())[:4096]
+    compact = redact_payment_data(compact) or ""
+    standalone = normalize_phone(compact)
+    if standalone:
+        remember(standalone, "typed")
+    else:
+        for match in _EXPLICIT_UZ_PHONE.finditer(compact):
+            remember(normalize_phone(match.group(1)), "typed")
+        for match in _EXPLICIT_INTERNATIONAL_PHONE.finditer(compact):
+            remember(normalize_phone(match.group(1)), "typed")
+        for match in _PHONE_MARKER.finditer(compact):
+            remember(normalize_phone(match.group(1).strip()), "typed")
+        # One label may introduce several local Uzbek numbers. Restrict this
+        # shorter pattern to labelled text so prices and model digits elsewhere
+        # in ordinary messages never become identity evidence.
+        if _PHONE_LABEL.search(compact):
+            for match in _LOCAL_UZ_PHONE.finditer(compact):
+                remember(normalize_phone(match.group(1)), "typed")
+    return tuple(detected)
+
+
+def phone_from_message(message: Mapping[str, Any] | None, text: str = "") -> tuple[str | None, str | None]:
+    detected = phones_from_message(message, text, limit=1)
+    if detected:
+        return detected[0].phone, detected[0].source
     return None, None
 
 

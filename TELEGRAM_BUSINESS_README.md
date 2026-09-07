@@ -87,8 +87,8 @@ and `request_location` are deliberately unsupported.
 5. реальные цвета выводятся кнопками вместе с «Цвет не важен»; при отсутствии
    цветов шаг также пропускается;
 6. клиент выбирает доставку или самовывоз;
-7. для доставки обязательны телефон и локация/адрес, для самовывоза телефон
-   необязателен и связь может остаться в текущем Telegram-чате;
+7. для доставки обязательна локация/адрес; телефон необязателен, и связь может
+   остаться в текущем Telegram-чате; для самовывоза телефон также необязателен;
 8. клиент проверяет сводку и передаёт её менеджеру.
 
 Черновик не является оформленным заказом, не резервирует товар и не подтверждает
@@ -103,12 +103,92 @@ SQLite. Старые и чужие кнопки отклоняются, отве
 в 09:30 незавершённый черновик помечается как переданный менеджеру с уже
 полученными данными. Отмена удаляет телефон и точную локацию из черновика.
 
+## Уведомления о состоянии доставки
+
+Интеграция выключена по умолчанию. После проверки защищённого внутреннего API
+доставки настройте:
+
+```dotenv
+BUSINESS_DELIVERY_NOTIFICATIONS_ENABLED=true
+BUSINESS_DELIVERY_NOTIFICATIONS_URL=http://texnikach-delivery-stats:8080
+BUSINESS_DELIVERY_NOTIFICATIONS_TOKEN=тот-же-секрет-что-MONITORING_DELIVERY_SERVICE_TOKEN
+BUSINESS_DELIVERY_NOTIFICATIONS_POLL_SECONDS=30
+BUSINESS_DELIVERY_NOTIFICATIONS_MAX_EVENT_AGE_HOURS=24
+```
+
+Пустые `BUSINESS_DELIVERY_NOTIFICATIONS_URL` и
+`BUSINESS_DELIVERY_NOTIFICATIONS_TOKEN` используют соответственно
+`MONITORING_DELIVERY_BASE_URL` и `MONITORING_DELIVERY_SERVICE_TOKEN`. URL должен
+указывать на внутренний HTTP(S)-адрес без логина, пароля, query-параметров или
+fragment. Секрет передаётся только как Bearer token и не записывается в логи или
+SQLite. Проще и безопаснее оставить обе специальные переменные пустыми и
+использовать fallback. Если токен задан явно, он обязан точно совпадать с
+`MONITORING_DELIVERY_SERVICE_TOKEN` контейнера `delivery-stats`: endpoint не
+принимает отдельный второй секрет. Оба контейнера должны находиться в одной
+Docker-сети, где имя `texnikach-delivery-stats` разрешается во внутренний адрес.
+Открытый публичный HTTP запрещён; для внешнего адреса используйте HTTPS.
+
+Business-бот связывает доставку с чатом только по номеру, который ранее прислал
+сам клиент во входящем Business-сообщении. Один чат может содержать несколько
+номеров. Если один номер найден в нескольких чатах либо два номера одного заказа
+ведут в разные чаты, совпадение считается неоднозначным и автоматического
+сообщения не будет. Удалённые и заменённые при редактировании сообщения номера,
+платёжные данные, исходящие сообщения менеджера/бота и чужой Telegram Contact не
+используются для сопоставления.
+
+Написанный текстом номер считается заявленным клиентом, но Telegram не умеет
+доказать, кому он принадлежит. Поэтому совпадение используется только при одном
+единственном подходящем чате, активном разрешении `can_reply` и наличии в этом
+чате хотя бы одного предыдущего реального исходящего сообщения менеджера или
+Business-бота. Полный номер хранится только в защищённой SQLite/Telegram;
+свободный текст листа `Сообщения` получает маскированный номер.
+После первой возможной отправки заказ навсегда привязывается к выбранному чату:
+последующие изменения телефонных совпадений не могут перенести его уведомления
+другому Telegram-пользователю.
+
+Telegram разрешает Business-боту ответить только в течение 24 часов после
+последнего входящего сообщения клиента. Поэтому наличие номера и старой
+переписки само по себе не даёт права на отправку. Перед каждой отправкой также
+проверяются активное Business-подключение, `can_reply`, ручной manager lock и
+постоянный `bot_paused`. Пауза с причиной `active_order` блокирует обычного
+ночного помощника, но не служебное уведомление о самой доставке. Номер служит
+только для поиска сохранённых `chat_id` и
+`business_connection_id`; Telegram не позволяет найти или открыть чат по одному
+номеру телефона.
+
+Клиенту отправляются только короткие статусы:
+
+- `pending` — заказ передан в службу доставки;
+- `picked_up` — курьер получил товар;
+- `on_way` — курьер выехал;
+- `completed` — заказ доставлен;
+- `cancelled` — активная доставка подтверждённо отменена.
+
+Служебные `draft`, `awaiting_photo`, `awaiting_amount`, переназначение курьера,
+изменение полей без смены статуса и обратные/восстанавливающие переходы клиенту
+не показываются. Один и тот же публичный статус одного заказа отправляется не
+более одного раза. После временной недоступности источника устаревшие
+промежуточные статусы не рассылаются подряд: остаётся только последнее актуальное
+состояние заказа.
+
+Первый успешный опрос только сохраняет текущую границу событий и не рассылает
+исторические доставки. Последующие события и состояние отправок фиксируются в
+основной Business SQLite, поэтому перезапуск не создаёт дубликаты. Автоматический
+backfill старых событий по умолчанию отсутствует. Уведомление старше
+`BUSINESS_DELIVERY_NOTIFICATIONS_MAX_EVENT_AGE_HOURS` не отправляется. До четырёх
+сообщений бота всего (обычных ответов и служебных статусов вместе) одному чату
+могут быть отправлены за десять минут; остальные служебные статусы остаются в
+устойчивой очереди. Telegram `Retry-After` останавливает всю очередь отправки до
+указанного времени.
+
 ## Persistence
 
 The database creates: `business_connections`, `business_updates`,
-`business_clients`, `business_sessions`, `business_messages`, `response_cycles`,
-`scheduled_actions`, `sheets_outbox`, `business_errors`, and
-`business_model_choices`, plus the lightweight `business_manager_fences` used to
+`business_clients`, `business_sessions`, `business_messages`,
+`business_chat_phones`, `response_cycles`, `scheduled_actions`, `sheets_outbox`,
+`business_errors`, `business_integration_state`,
+`delivery_status_notifications`, and `business_model_choices`, plus the
+lightweight `business_manager_fences` used to
 stop an already queued automatic action as soon as a manual webhook is persisted,
 and `business_outbound_deliveries` for stable automatic-reply delivery fencing.
 The night request flow additionally uses `business_requests`,
@@ -130,12 +210,10 @@ a manager either way. A definite Telegram 429 remains safely retryable with its
 
 Messages that clearly refer to an already placed order or an active delivery are
 handed to a manager and set the client's permanent `bot_paused` flag. The same
-safe hook, `BusinessRepository.set_bot_paused(chat_id, True, now, reason)`, is
-available for staff exclusions and a future delivery integration. The current
-delivery database has no reliable Telegram Business `chat_id`/user mapping, so
-the project deliberately does not guess that relationship. Until such a mapping
-exists, staff can pause an already confirmed order through that hook or an
-operator tool built on top of it.
+safe hook, `BusinessRepository.set_bot_paused(chat_id, True, now, reason)`, remains
+available for staff exclusions. Delivery-status matching never guesses a Telegram
+identity from a phone number: it uses only durable phone evidence from that
+client's existing Business chat and fails closed on ambiguity.
 
 ## Google workbook
 

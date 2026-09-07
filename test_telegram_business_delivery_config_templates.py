@@ -1,0 +1,201 @@
+from __future__ import annotations
+
+import os
+from unittest.mock import patch
+
+import pytest
+
+from telegram_business.config import BusinessSettings
+from telegram_business.sheets import SHEET_SEEDS
+from telegram_business.templates import ALLOWED_PLACEHOLDERS, render
+
+
+DELIVERY_TEMPLATE_CODES = (
+    "delivery_status_pending",
+    "delivery_status_picked_up",
+    "delivery_status_on_way",
+    "delivery_status_completed",
+    "delivery_status_cancelled",
+)
+
+
+def enabled_business_env(**changes: str) -> dict[str, str]:
+    values = {
+        "TELEGRAM_BUSINESS_ENABLED": "true",
+        "TELEGRAM_BUSINESS_BOT_TOKEN": "123456:secret",
+        "TELEGRAM_BUSINESS_WEBHOOK_SECRET": "safe_secret",
+        "TELEGRAM_BUSINESS_ALLOWED_CONNECTION_ID": "connection",
+    }
+    values.update(changes)
+    return values
+
+
+def test_delivery_notification_config_uses_monitoring_fallbacks():
+    env = enabled_business_env(
+        BUSINESS_DELIVERY_NOTIFICATIONS_ENABLED="true",
+        BUSINESS_DELIVERY_NOTIFICATIONS_POLL_SECONDS="17",
+        BUSINESS_DELIVERY_NOTIFICATIONS_MAX_EVENT_AGE_HOURS="12",
+        MONITORING_DELIVERY_BASE_URL="http://delivery-stats:8080/",
+        MONITORING_DELIVERY_SERVICE_TOKEN="internal-secret",
+    )
+    with patch.dict(os.environ, env, clear=True):
+        settings = BusinessSettings.load()
+
+    assert settings.delivery_notifications_enabled is True
+    assert settings.delivery_notifications_url == "http://delivery-stats:8080"
+    assert settings.delivery_notifications_token == "internal-secret"
+    assert settings.delivery_notifications_poll_seconds == 17
+    assert settings.delivery_notifications_max_event_age_hours == 12
+    settings.validate_enabled()
+
+
+def test_delivery_notification_specific_config_overrides_monitoring_values():
+    env = enabled_business_env(
+        BUSINESS_DELIVERY_NOTIFICATIONS_ENABLED="true",
+        BUSINESS_DELIVERY_NOTIFICATIONS_URL="https://delivery.internal/base/",
+        BUSINESS_DELIVERY_NOTIFICATIONS_TOKEN="business-secret",
+        MONITORING_DELIVERY_BASE_URL="http://monitoring-fallback:8080",
+        MONITORING_DELIVERY_SERVICE_TOKEN="fallback-secret",
+    )
+    with patch.dict(os.environ, env, clear=True):
+        settings = BusinessSettings.load()
+
+    assert settings.delivery_notifications_url == "https://delivery.internal/base"
+    assert settings.delivery_notifications_token == "business-secret"
+    settings.validate_enabled()
+
+
+def test_disabled_delivery_feed_ignores_invalid_unused_poll_value():
+    env = enabled_business_env(
+        BUSINESS_DELIVERY_NOTIFICATIONS_ENABLED="false",
+        BUSINESS_DELIVERY_NOTIFICATIONS_POLL_SECONDS="broken",
+    )
+    with patch.dict(os.environ, env, clear=True):
+        settings = BusinessSettings.load()
+
+    assert settings.delivery_notifications_enabled is False
+    assert settings.delivery_notifications_poll_seconds == 30
+    settings.validate_enabled()
+
+
+@pytest.mark.parametrize(
+    "changes, expected",
+    (
+        (
+            {"BUSINESS_DELIVERY_NOTIFICATIONS_URL": "http://delivery:8080"},
+            "service token is missing",
+        ),
+        (
+            {"BUSINESS_DELIVERY_NOTIFICATIONS_TOKEN": "secret"},
+            "delivery URL",
+        ),
+        (
+            {
+                "BUSINESS_DELIVERY_NOTIFICATIONS_URL": "ftp://delivery/feed",
+                "BUSINESS_DELIVERY_NOTIFICATIONS_TOKEN": "secret",
+            },
+            r"HTTP\(S\) base URL",
+        ),
+        (
+            {
+                "BUSINESS_DELIVERY_NOTIFICATIONS_URL": "http://delivery.example.com",
+                "BUSINESS_DELIVERY_NOTIFICATIONS_TOKEN": "secret",
+            },
+            "internal Docker/private host",
+        ),
+        (
+            {
+                "BUSINESS_DELIVERY_NOTIFICATIONS_URL": (
+                    "https://user:password@delivery.internal/feed?secret=value"
+                ),
+                "BUSINESS_DELIVERY_NOTIFICATIONS_TOKEN": "secret",
+            },
+            r"HTTP\(S\) base URL",
+        ),
+    ),
+)
+def test_enabled_delivery_feed_rejects_missing_or_unsafe_config(changes, expected):
+    env = enabled_business_env(
+        BUSINESS_DELIVERY_NOTIFICATIONS_ENABLED="true",
+        **changes,
+    )
+    with patch.dict(os.environ, env, clear=True):
+        settings = BusinessSettings.load()
+
+    with pytest.raises(RuntimeError, match=expected):
+        settings.validate_enabled()
+
+
+def test_enabled_delivery_feed_rejects_invalid_poll_interval():
+    env = enabled_business_env(
+        BUSINESS_DELIVERY_NOTIFICATIONS_ENABLED="true",
+        BUSINESS_DELIVERY_NOTIFICATIONS_URL="http://delivery:8080",
+        BUSINESS_DELIVERY_NOTIFICATIONS_TOKEN="secret",
+        BUSINESS_DELIVERY_NOTIFICATIONS_POLL_SECONDS="0",
+    )
+    with patch.dict(os.environ, env, clear=True):
+        with pytest.raises(
+            ValueError,
+            match="BUSINESS_DELIVERY_NOTIFICATIONS_POLL_SECONDS must be at least 1",
+        ):
+            BusinessSettings.load()
+
+
+def test_enabled_delivery_feed_rejects_invalid_event_age():
+    env = enabled_business_env(
+        BUSINESS_DELIVERY_NOTIFICATIONS_ENABLED="true",
+        BUSINESS_DELIVERY_NOTIFICATIONS_URL="http://delivery:8080",
+        BUSINESS_DELIVERY_NOTIFICATIONS_TOKEN="secret",
+        BUSINESS_DELIVERY_NOTIFICATIONS_MAX_EVENT_AGE_HOURS="0",
+    )
+    with patch.dict(os.environ, env, clear=True):
+        with pytest.raises(
+            ValueError,
+            match=(
+                "BUSINESS_DELIVERY_NOTIFICATIONS_MAX_EVENT_AGE_HOURS "
+                "must be at least 1"
+            ),
+        ):
+            BusinessSettings.load()
+
+
+def test_delivery_flag_is_effectively_off_when_business_integration_is_off():
+    with patch.dict(
+        os.environ,
+        {"BUSINESS_DELIVERY_NOTIFICATIONS_ENABLED": "true"},
+        clear=True,
+    ):
+        settings = BusinessSettings.load()
+
+    assert settings.enabled is False
+    assert settings.delivery_notifications_enabled is False
+
+
+@pytest.mark.parametrize("code", DELIVERY_TEMPLATE_CODES)
+@pytest.mark.parametrize("language", ("ru", "uz"))
+def test_delivery_status_templates_are_short_and_render_order_number(code, language):
+    text = render(
+        code,
+        language,
+        order_number="1542",
+        product="iPhone 16 Pro Max",
+    )
+
+    assert "1542" in text
+    assert "{" not in text
+    assert len(text) <= 180
+
+
+def test_delivery_status_templates_are_seeded_for_sheets_idempotently():
+    rows = SHEET_SEEDS["Автоответы"]
+    rows_by_code = {str(row[0]): row for row in rows}
+
+    assert len(rows_by_code) == len(rows)
+    assert {"order_number", "product"} <= ALLOWED_PLACEHOLDERS
+    for code in DELIVERY_TEMPLATE_CODES:
+        row = rows_by_code[code]
+        assert row[1] is True
+        assert row[2] == "all"
+        assert row[6] == 0
+        assert "{order_number}" in row[4]
+        assert "{order_number}" in row[5]

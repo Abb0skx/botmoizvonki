@@ -43,6 +43,8 @@ class DurableScheduler:
         self.task = None
         self._sheets_task: asyncio.Task | None = None
         self._next_sheets = 0.0
+        self._delivery_task: asyncio.Task | None = None
+        self._next_delivery = 0.0
         self._stop_event: asyncio.Event | None = None
 
     async def start(self):
@@ -89,6 +91,19 @@ class DurableScheduler:
             except asyncio.CancelledError:
                 pass
             self._sheets_task = None
+        delivery_task = self._delivery_task
+        if delivery_task:
+            try:
+                await asyncio.wait_for(asyncio.shield(delivery_task), timeout=30)
+            except asyncio.TimeoutError:
+                delivery_task.cancel()
+                try:
+                    await delivery_task
+                except asyncio.CancelledError:
+                    pass
+            except asyncio.CancelledError:
+                pass
+            self._delivery_task = None
         self._stop_event = None
 
     async def _process_updates(self, now) -> None:
@@ -283,6 +298,39 @@ class DurableScheduler:
             name="telegram-business-sheets",
         )
 
+    async def _delivery_cycle(self) -> None:
+        """Poll and flush delivery notifications outside the Telegram loop."""
+
+        try:
+            cycle = getattr(self.service, "delivery_notifications_cycle", None)
+            if cycle:
+                await asyncio.to_thread(cycle)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            retry_after = retry_after_seconds(exc)
+            if retry_after is not None:
+                # The protected feed may itself rate-limit. Respect its
+                # Retry-After globally instead of polling again at the fixed
+                # interval while the background task is winding down.
+                self._next_delivery = max(
+                    self._next_delivery,
+                    time.monotonic() + retry_after,
+                )
+            self._record_error("delivery_notifications", "background_cycle", exc)
+            LOG.error(
+                "delivery_notifications_background_failed type=%s",
+                type(exc).__name__,
+            )
+
+    def _launch_delivery_cycle(self) -> None:
+        if self._delivery_task is not None and not self._delivery_task.done():
+            return
+        self._delivery_task = asyncio.create_task(
+            self._delivery_cycle(),
+            name="telegram-business-delivery-notifications",
+        )
+
     async def run_once(self, *, sync_sheets: bool = True) -> None:
         now = self.service.clock()
         await self._process_updates(now)
@@ -292,6 +340,26 @@ class DurableScheduler:
             if self._sheets_task is None or self._sheets_task.done():
                 self._next_sheets = monotonic_now + self.service.settings.sheets_sync_seconds
                 self._launch_sheets_cycle()
+        if (
+            getattr(
+                self.service.settings,
+                "delivery_notifications_enabled",
+                False,
+            )
+            and monotonic_now >= self._next_delivery
+            and (self._delivery_task is None or self._delivery_task.done())
+        ):
+            self._next_delivery = monotonic_now + max(
+                1,
+                int(
+                    getattr(
+                        self.service.settings,
+                        "delivery_notifications_poll_seconds",
+                        30,
+                    )
+                ),
+            )
+            self._launch_delivery_cycle()
 
     async def run(self):
         while not (self._stop_event and self._stop_event.is_set()):

@@ -1,6 +1,7 @@
 import json
 import math
 import sqlite3
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
@@ -22,6 +23,32 @@ KNOWN_STATUSES = frozenset({
 })
 KNOWN_PAYMENT_STATUSES = frozenset({"collect_on_delivery", "paid_at_assembly"})
 MONEY_FIELDS = frozenset({"amount_usd", "amount_uzs", "received_usd", "received_uzs"})
+CUSTOMER_VISIBLE_DELIVERY_STATUSES = frozenset({
+    "pending",
+    "picked_up",
+    "on_way",
+    "completed",
+    "cancelled",
+})
+DELIVERY_ACTIVE_STATUSES = frozenset({
+    "pending",
+    "picked_up",
+    "on_way",
+    "awaiting_photo",
+    "awaiting_amount",
+})
+# Internal confirmation states have the same progression rank as ``on_way``:
+# a later completion is customer-visible, but entering either internal state is
+# never exposed by the delivery feed.
+DELIVERY_STATUS_RANK = {
+    "draft": 0,
+    "pending": 1,
+    "picked_up": 2,
+    "on_way": 3,
+    "awaiting_photo": 3,
+    "awaiting_amount": 3,
+    "completed": 4,
+}
 COORDINATE_PAIRS = (
     ("latitude", "longitude"),
     ("second_latitude", "second_longitude"),
@@ -129,6 +156,11 @@ CREATE TABLE IF NOT EXISTS order_events (
 );
 CREATE INDEX IF NOT EXISTS idx_order_events_order ON order_events(order_id, id);
 CREATE INDEX IF NOT EXISTS idx_order_events_created ON order_events(created_at);
+CREATE TABLE IF NOT EXISTS delivery_feed_identity (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    feed_instance_id TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL
+);
 CREATE TRIGGER IF NOT EXISTS order_events_no_update
 BEFORE UPDATE ON order_events
 BEGIN
@@ -272,6 +304,12 @@ class OrderRepository:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as db:
             db.executescript(SCHEMA)
+            db.execute(
+                """INSERT OR IGNORE INTO delivery_feed_identity(
+                   singleton,feed_instance_id,created_at) VALUES(1,?,?)""",
+                (str(uuid.uuid4()), now()),
+            )
+            db.commit()
             existing = {row[1] for row in db.execute("PRAGMA table_info(orders)")}
             for column, definition in MIGRATION_COLUMNS.items():
                 if column not in existing:
@@ -1104,6 +1142,155 @@ class OrderRepository:
                 "SELECT * FROM order_events ORDER BY created_at, id"
             ).fetchall()
         return [OrderEvent.from_row(row) for row in rows]
+
+    @staticmethod
+    def _customer_visible_delivery_transition(row: sqlite3.Row) -> bool:
+        """Return whether one raw audit row is safe to expose to customers.
+
+        The feed deliberately omits no-op/internal events and state reversals.
+        Cancellation is the only non-monotonic public state and is emitted only
+        after an order had entered the active delivery workflow.
+        """
+
+        from_status = row["from_status"]
+        to_status = row["to_status"]
+        if to_status not in CUSTOMER_VISIBLE_DELIVERY_STATUSES:
+            return False
+        if to_status == "cancelled":
+            return from_status in DELIVERY_ACTIVE_STATUSES
+        from_rank = DELIVERY_STATUS_RANK.get(from_status)
+        to_rank = DELIVERY_STATUS_RANK.get(to_status)
+        return (
+            from_rank is not None
+            and to_rank is not None
+            and to_rank > from_rank
+        )
+
+    def delivery_status_event_feed(
+        self,
+        *,
+        after_event_id: int = 0,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """Read one monotonic raw audit batch for Business notifications.
+
+        Pagination is based on every row in ``order_events``, not just the
+        customer-visible subset. This guarantees that a page containing only
+        internal/no-op events still advances ``next_after_event_id`` and cannot
+        trap a polling consumer in a loop. Only the order's latest real status
+        transition is exposed, preventing a recovering consumer from sending a
+        cascade of stale intermediate states.
+        """
+
+        if (
+            isinstance(after_event_id, bool)
+            or not isinstance(after_event_id, int)
+            or after_event_id < 0
+        ):
+            raise ValueError("after_event_id must be a non-negative integer")
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 500
+        ):
+            raise ValueError("limit must be an integer between 1 and 500")
+
+        with self.connect() as db:
+            # Keep the high-water mark and page inside one SQLite read snapshot.
+            # New rows committed after this BEGIN are picked up on the next poll.
+            db.execute("BEGIN")
+            latest_event_id = int(
+                db.execute(
+                    "SELECT COALESCE(MAX(id), 0) FROM order_events"
+                ).fetchone()[0]
+            )
+            identity = db.execute(
+                """SELECT feed_instance_id FROM delivery_feed_identity
+                   WHERE singleton=1"""
+            ).fetchone()
+            if not identity or not identity["feed_instance_id"]:
+                raise RuntimeError("delivery feed identity is not initialized")
+            feed_instance_id = str(identity["feed_instance_id"])
+            rows = db.execute(
+                """SELECT
+                       event.id AS event_id,
+                       event.order_id,
+                       event.order_number,
+                       event.event_type,
+                       event.from_status,
+                       event.to_status,
+                       event.created_at,
+                       orders.client_phone,
+                       orders.client_phone_2,
+                       orders.product,
+                       orders.status AS current_status,
+                       (SELECT MAX(newer.id) FROM order_events AS newer
+                         WHERE newer.order_id=event.order_id
+                           AND COALESCE(newer.from_status,'')
+                               <>COALESCE(newer.to_status,''))
+                         AS latest_transition_event_id
+                   FROM order_events AS event
+                   LEFT JOIN orders ON orders.id=event.order_id
+                   WHERE event.id>? AND event.id<=?
+                   ORDER BY event.id
+                   LIMIT ?""",
+                (after_event_id, latest_event_id, limit),
+            ).fetchall()
+
+        next_after_event_id = int(rows[-1]["event_id"]) if rows else after_event_id
+
+        def payload(row: sqlite3.Row) -> dict[str, Any]:
+            return {
+                "event_id": int(row["event_id"]),
+                "order_id": int(row["order_id"]),
+                "order_number": int(row["order_number"]),
+                "event_type": row["event_type"],
+                "from_status": row["from_status"],
+                "to_status": row["to_status"],
+                "created_at": row["created_at"],
+                "client_phone": row["client_phone"],
+                "client_phone_2": row["client_phone_2"],
+                "product": row["product"],
+                "current_status": row["current_status"],
+            }
+
+        latest_transitions = [
+            row
+            for row in rows
+            if int(row["event_id"]) == int(row["latest_transition_event_id"] or 0)
+        ]
+        events = [
+            payload(row)
+            for row in latest_transitions
+            if row["current_status"] is not None
+            and row["to_status"] == row["current_status"]
+            and self._customer_visible_delivery_transition(row)
+        ]
+        invalidations = [
+            {
+                "event_id": int(row["event_id"]),
+                "order_id": int(row["order_id"]),
+                "current_status": row["current_status"],
+                "to_status": row["to_status"],
+                "created_at": row["created_at"],
+            }
+            for row in latest_transitions
+            if row["current_status"] is not None
+            and not (
+                row["to_status"] == row["current_status"]
+                and self._customer_visible_delivery_transition(row)
+            )
+        ]
+        cursor_reset_required = after_event_id > latest_event_id
+        return {
+            "feed_instance_id": feed_instance_id,
+            "events": events,
+            "invalidations": invalidations,
+            "next_after_event_id": next_after_event_id,
+            "latest_event_id": latest_event_id,
+            "has_more": next_after_event_id < latest_event_id,
+            "cursor_reset_required": cursor_reset_required,
+        }
 
     def list_events_between(
         self,

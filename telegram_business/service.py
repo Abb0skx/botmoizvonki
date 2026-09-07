@@ -6,12 +6,18 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone
 from html.parser import HTMLParser
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 from .config import BusinessSettings
+from .delivery_notifications import (
+    DeliveryStatusClient,
+    delivery_phones,
+    newest_order_events,
+)
+from .delivery_store import DeliveryNotificationStore
 from .intents import (
     ADDRESS_MARKERS_RE,
     CREDIT_NEGATIVE,
@@ -38,7 +44,7 @@ from .products import (
 )
 from .repository import BusinessRepository
 from .request_coordinator import NightRequestCoordinator
-from .request_inputs import selection_fields
+from .request_inputs import normalize_phone, phones_from_message, selection_fields
 from .sheets import BusinessSheets
 from .telegram_api import TelegramAPIError, TelegramBusinessAPI
 from .templates import TEMPLATES, normalize_template_code, render
@@ -292,6 +298,13 @@ class BusinessService:
         self.settings = settings
         self.repo = BusinessRepository(settings.db_path)
         self.clock = clock or (lambda: datetime.now(ZoneInfo(settings.timezone)))
+        try:
+            self.repo.backfill_client_phone_index(self.clock(), limit=500)
+        except Exception as exc:
+            LOG.warning(
+                "business_phone_backfill_failed error_type=%s",
+                type(exc).__name__,
+            )
         self.api = api or TelegramBusinessAPI(settings.bot_token)
         self.products = products or ExistingGoogleProductRepository(
             settings.product_price_max_age_minutes,
@@ -305,6 +318,15 @@ class BusinessService:
         self.bot_id = str(getattr(settings, "bot_id", "") or _token_bot_id(settings.bot_token))
         self._recent_local: dict[tuple[str, str, str], datetime] = {}
         self.requests = NightRequestCoordinator(self)
+        self.delivery_store = DeliveryNotificationStore(settings.db_path)
+        self.delivery_client = (
+            DeliveryStatusClient(
+                settings.delivery_notifications_url,
+                settings.delivery_notifications_token,
+            )
+            if getattr(settings, "delivery_notifications_enabled", False)
+            else None
+        )
 
     def schedule_order_notification(self, request: Any, now: datetime) -> None:
         destination = str(getattr(self.settings, "orders_chat_id", "") or "").strip()
@@ -427,6 +449,510 @@ class BusinessService:
             request_id,
             destination,
         )
+
+    def _delivery_components(self):
+        store = getattr(self, "delivery_store", None)
+        if store is None:
+            store = DeliveryNotificationStore(self.settings.db_path)
+            self.delivery_store = store
+        client = getattr(self, "delivery_client", None)
+        if client is None and getattr(
+            self.settings, "delivery_notifications_enabled", False
+        ):
+            client = DeliveryStatusClient(
+                self.settings.delivery_notifications_url,
+                self.settings.delivery_notifications_token,
+            )
+            self.delivery_client = client
+        return store, client
+
+    def _send_delivery_message(
+        self,
+        connection_id: str,
+        chat_id: str,
+        session_id: str,
+        text: str,
+        template_code: str,
+        order_id: int,
+        public_status: str,
+        now: datetime,
+    ) -> tuple[str, int | None]:
+        """Send a transactional status without changing response-time metrics."""
+
+        delivery_key = (
+            f"delivery-status:{int(order_id)}:{public_status}:{chat_id}"
+        )
+        content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        decision = self.repo.begin_outbound_delivery(
+            delivery_key,
+            chat_id,
+            session_id,
+            template_code,
+            content_hash,
+            now,
+        )
+        if decision == "assumed":
+            delivered = self.repo.outbound_delivery(delivery_key)
+            state = str(_value(delivered, "state", "uncertain"))
+            message_id = _value(delivered, "telegram_message_id")
+            if state == "sent":
+                return "sent", int(message_id) if message_id is not None else None
+            return "uncertain", int(message_id) if message_id is not None else None
+        if decision != "send":
+            return "failed", None
+
+        try:
+            result = self.api.send_message(connection_id, chat_id, text)
+        except Exception as exc:
+            status = getattr(exc, "status", None)
+            retryable = bool(getattr(exc, "retryable", True))
+            ambiguous = bool(getattr(exc, "ambiguous", False) or status is None)
+            self.repo.finish_outbound_delivery(
+                delivery_key,
+                now,
+                error=exc,
+                safe_to_retry=bool(status is not None and retryable and not ambiguous),
+                ambiguous=ambiguous,
+            )
+            raise
+
+        raw_message = result.get("result") if isinstance(result, dict) else None
+        message = raw_message if isinstance(raw_message, dict) else {}
+        message_id = message.get("message_id")
+        if (
+            isinstance(message_id, bool)
+            or not isinstance(message_id, int)
+            or message_id <= 0
+        ):
+            error = TelegramAPIError(
+                "Telegram returned an invalid sendMessage result",
+                status=200,
+                retryable=True,
+                ambiguous=True,
+            )
+            self.repo.finish_outbound_delivery(
+                delivery_key,
+                now,
+                error=error,
+                ambiguous=True,
+            )
+            raise error
+
+        self.repo.finish_outbound_delivery(
+            delivery_key,
+            now,
+            telegram_message_id=message_id,
+        )
+        try:
+            self.repo.record_bot_message(
+                connection_id,
+                chat_id,
+                session_id,
+                message_id,
+                text,
+                template_code,
+                now,
+                model_query=f"delivery_order:{int(order_id)}",
+                count_as_response=False,
+            )
+        except TypeError:
+            # The production repository supports ``count_as_response``. A
+            # narrow legacy adapter must not corrupt manager-response metrics.
+            LOG.warning(
+                "delivery_notification_message_audit_unsupported chat_id=%s",
+                chat_id,
+            )
+        except Exception as exc:
+            # Telegram already accepted the message and the outbound ledger is
+            # terminal. Audit failure is observable but must never resend it.
+            self._record_error(
+                "delivery_message_audit", now, chat_id, session_id, exc
+            )
+        return "sent", message_id
+
+    @staticmethod
+    def _delivery_event_is_fresh(row: Any, now: datetime, max_age_hours: int) -> bool:
+        """Fail closed for malformed, future, or outage-stale source events."""
+
+        raw = str(_value(row, "source_created_at", "") or "").strip()
+        if not raw:
+            return False
+        try:
+            created_at = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            comparable_now = now
+            if comparable_now.tzinfo is None:
+                comparable_now = comparable_now.replace(tzinfo=timezone.utc)
+            age = comparable_now.astimezone(timezone.utc) - created_at.astimezone(
+                timezone.utc
+            )
+        except (TypeError, ValueError, OverflowError):
+            return False
+        return timedelta(minutes=-5) <= age <= timedelta(
+            hours=max(1, int(max_age_hours))
+        )
+
+    def _delivery_preflight(
+        self,
+        phones: tuple[str, ...],
+        now: datetime,
+        *,
+        expected_connection_id: str | None = None,
+        expected_chat_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Resolve identity and repeat every mutable send policy check.
+
+        This helper is deliberately called both while preparing a notification
+        and immediately before ``sendMessage``. Webhook processing runs in
+        parallel with the delivery worker, so phone evidence, manager fences,
+        pauses and Business rights may change between those two points.
+        """
+
+        match = self.repo.match_delivery_phones(phones, now)
+        outcome = str(match.get("outcome") or "unmatched")
+        if outcome != "unique":
+            return {"outcome": "ambiguous" if outcome == "ambiguous" else "unmatched"}
+
+        connection_id = str(match.get("connection_id") or "")
+        chat_id = str(match.get("chat_id") or "")
+        fields: dict[str, Any] = {
+            "outcome": "unique",
+            "connection_id": connection_id,
+            "chat_id": chat_id,
+        }
+        if (
+            not connection_id
+            or not chat_id
+            or connection_id
+            != str(getattr(self.settings, "allowed_connection_id", "") or "")
+            or (
+                expected_connection_id is not None
+                and connection_id != str(expected_connection_id)
+            )
+            or (expected_chat_id is not None and chat_id != str(expected_chat_id))
+        ):
+            fields["outcome"] = "ambiguous"
+            return fields
+
+        client = self.repo.client(chat_id)
+        if not client or not self.repo.within_reply_window(chat_id, now, 24):
+            fields["outcome"] = "expired"
+            return fields
+        if bool(_value(client, "bot_paused", 0)) and str(
+            _value(client, "pause_reason", "") or ""
+        ) != "active_order":
+            fields["outcome"] = "paused"
+            return fields
+
+        policy = self._runtime_policy(now)
+        lock_until = _value(client, "manager_lock_until")
+        if lock_until:
+            try:
+                locked_until = datetime.fromisoformat(str(lock_until))
+            except (TypeError, ValueError):
+                locked_until = now + timedelta(minutes=policy.manager_lock_minutes)
+            if locked_until > now:
+                fields.update(
+                    outcome="deferred",
+                    retry_after=max(1.0, (locked_until - now).total_seconds()),
+                )
+                return fields
+        if self._manager_fence_active(chat_id, now, policy):
+            fields.update(
+                outcome="deferred",
+                retry_after=policy.manager_lock_minutes * 60,
+            )
+            return fields
+        if not self._connection_allows_reply(connection_id):
+            fields.update(outcome="retry", retry_after=60)
+            return fields
+
+        count_recent = getattr(self.repo, "delivery_message_count", None)
+        if count_recent and int(
+            count_recent(chat_id, now, window_seconds=600)
+        ) >= int(policy.max_messages_10m):
+            fields.update(outcome="deferred", retry_after=600)
+            return fields
+
+        fields.update(client=client, policy=policy)
+        return fields
+
+    @staticmethod
+    def _delivery_gate_outcome(gate: Mapping[str, Any], attempts: int) -> str:
+        outcome = str(gate.get("outcome") or "unmatched")
+        # A phone may become matchable after the bounded startup backfill or a
+        # just-arrived Business webhook. Retry unmatched evidence for a bounded
+        # period; ambiguity remains terminal because guessing is unsafe.
+        if outcome == "unmatched" and int(attempts) < 16:
+            return "deferred"
+        return outcome
+
+    def _process_delivery_notification(self, row: Any, now: datetime) -> float | None:
+        store, _ = self._delivery_components()
+        event_id = int(row["source_event_id"])
+        lease_token = str(row["lease_token"] or "")
+        common = {
+            "source_event_id": event_id,
+            "lease_token": lease_token,
+            "now": now,
+        }
+        try:
+            decoded_phones = json.loads(row["phones_json"] or "[]")
+        except (TypeError, ValueError):
+            decoded_phones = []
+        phones = tuple(
+            phone
+            for raw in decoded_phones if (phone := normalize_phone(raw))
+        )
+        max_age_hours = int(
+            getattr(
+                self.settings,
+                "delivery_notifications_max_event_age_hours",
+                24,
+            )
+        )
+        if not self._delivery_event_is_fresh(row, now, max_age_hours):
+            store.finish(**common, outcome="expired")
+            return None
+
+        bound_chat_id: str | None = None
+        recipient_lookup = getattr(self.repo, "delivery_order_recipient", None)
+        if recipient_lookup:
+            recipient = recipient_lookup(int(row["order_id"]))
+            recipient_outcome = str(recipient.get("outcome") or "none")
+            if recipient_outcome == "ambiguous":
+                store.finish(**common, outcome="ambiguous")
+                return None
+            if recipient_outcome == "unique":
+                bound_chat_id = str(recipient.get("chat_id") or "") or None
+
+        gate = self._delivery_preflight(
+            phones,
+            now,
+            expected_chat_id=bound_chat_id,
+        )
+        if gate["outcome"] != "unique":
+            outcome = self._delivery_gate_outcome(gate, int(row["attempts"] or 0))
+            store.finish(
+                **common,
+                connection_id=gate.get("connection_id"),
+                chat_id=gate.get("chat_id"),
+                outcome=outcome,
+                retry_after=(gate.get("retry_after") or (60 if outcome == "deferred" else None)),
+            )
+            return None
+
+        connection_id = str(gate["connection_id"])
+        chat_id = str(gate["chat_id"])
+        match_fields = {
+            "connection_id": connection_id,
+            "chat_id": chat_id,
+        }
+
+        session = self._repo_session(chat_id, now)
+        session_id = str(session["session_id"])
+        language = str(_value(gate.get("client"), "language", "bi") or "bi")
+        public_status = str(row["public_status"])
+        template_code = f"delivery_status_{public_status}"
+        text = self._render_message(
+            template_code,
+            language,
+            now,
+            order_number=str(row["order_number"] or row["order_id"]),
+            product=str(row["product"] or ""),
+        )
+        if not text:
+            store.finish(
+                **common,
+                **match_fields,
+                session_id=session_id,
+                template_code=template_code,
+                outcome="failed",
+                error="delivery template is unavailable",
+            )
+            return None
+
+        # Repeat *all* mutable gates immediately before the network mutation.
+        send_now = self.clock()
+        send_gate = self._delivery_preflight(
+            phones,
+            send_now,
+            expected_connection_id=connection_id,
+            expected_chat_id=chat_id,
+        )
+        if send_gate["outcome"] != "unique":
+            outcome = self._delivery_gate_outcome(
+                send_gate, int(row["attempts"] or 0)
+            )
+            store.finish(
+                **common,
+                **match_fields,
+                session_id=session_id,
+                template_code=template_code,
+                outcome=outcome,
+                retry_after=(
+                    send_gate.get("retry_after")
+                    or (60 if outcome == "deferred" else None)
+                ),
+            )
+            return None
+        try:
+            outcome, message_id = self._send_delivery_message(
+                connection_id,
+                chat_id,
+                session_id,
+                text,
+                template_code,
+                int(row["order_id"]),
+                public_status,
+                now,
+            )
+        except Exception as exc:
+            status = getattr(exc, "status", None)
+            retryable = bool(getattr(exc, "retryable", True))
+            ambiguous = bool(getattr(exc, "ambiguous", False) or status is None)
+            if ambiguous:
+                outcome = "uncertain"
+            elif retryable:
+                outcome = "retry"
+            else:
+                outcome = "failed"
+            store.finish(
+                **common,
+                **match_fields,
+                session_id=session_id,
+                template_code=template_code,
+                outcome=outcome,
+                error=exc,
+                retry_after=getattr(exc, "retry_after", None),
+            )
+            self._record_error(
+                "delivery_status_send", now, chat_id, session_id, exc
+            )
+            retry_after = getattr(exc, "retry_after", None)
+            if status == 429:
+                try:
+                    return max(1.0, float(retry_after or 60.0))
+                except (TypeError, ValueError):
+                    return 60.0
+            return None
+
+        store.finish(
+            **common,
+            **match_fields,
+            session_id=session_id,
+            template_code=template_code,
+            telegram_message_id=message_id,
+            outcome=outcome,
+        )
+        if outcome == "sent":
+            LOG.info(
+                "delivery_status_notification_sent event_id=%s order_id=%s status=%s chat_id=%s",
+                event_id,
+                int(row["order_id"]),
+                public_status,
+                chat_id,
+            )
+        return None
+
+    def delivery_notifications_cycle(self) -> None:
+        """Import delivery events and send eligible notifications durably."""
+
+        if not getattr(self.settings, "delivery_notifications_enabled", False):
+            return
+        store, client = self._delivery_components()
+        if client is None:
+            return
+        now = self.clock()
+        token = store.acquire_cycle_lease(now, lease_seconds=120)
+        if not token:
+            return
+        try:
+            # Continue the bounded startup backfill without delaying webhook
+            # processing. Existing text messages become matchable over a few
+            # polling cycles; native Contacts remain intentionally live-only.
+            self.repo.backfill_client_phone_index(self.clock(), limit=500)
+            cursor = store.cursor()
+            if cursor is None:
+                baseline = client.fetch(0, limit=1)
+                store.reconcile_feed(
+                    baseline.feed_instance_id,
+                    baseline.latest_event_id,
+                    baseline.cursor_reset_required,
+                    now,
+                )
+                LOG.info(
+                    "delivery_notifications_baseline event_id=%s",
+                    baseline.latest_event_id,
+                )
+                return
+
+            caught_up = False
+            for _ in range(10):
+                page = client.fetch(cursor, limit=200)
+                if not store.reconcile_feed(
+                    page.feed_instance_id,
+                    page.latest_event_id,
+                    page.cursor_reset_required,
+                    self.clock(),
+                ):
+                    LOG.warning(
+                        "delivery_notifications_source_rebaselined event_id=%s",
+                        page.latest_event_id,
+                    )
+                    return
+                if not store.renew_cycle_lease(token, self.clock(), 120):
+                    raise RuntimeError("delivery notification cycle lease was lost")
+                selected = newest_order_events(page.events)
+                prepared = []
+                for event in selected:
+                    normalized_phones = tuple(
+                        phone
+                        for raw in delivery_phones(event)
+                        if (phone := normalize_phone(raw))
+                    )
+                    prepared.append({**event, "phones": normalized_phones})
+                store.import_page(
+                    cursor,
+                    page.next_after_event_id,
+                    prepared,
+                    self.clock(),
+                    invalidations=page.invalidations,
+                    feed_instance_id=page.feed_instance_id,
+                )
+                if not page.has_more:
+                    caught_up = True
+                    break
+                if page.next_after_event_id <= cursor:
+                    raise RuntimeError("delivery feed did not advance its cursor")
+                cursor = page.next_after_event_id
+            if not caught_up:
+                # Do not emit from a partial backlog. Later pages may contain a
+                # newer status that must supersede one imported above.
+                return
+
+            telegram_not_before = store.telegram_not_before()
+            if telegram_not_before is not None and telegram_not_before > self.clock():
+                return
+
+            for _ in range(50):
+                if not store.renew_cycle_lease(token, self.clock(), 120):
+                    raise RuntimeError("delivery notification cycle lease was lost")
+                due = store.claim_due(self.clock(), limit=1, lease_seconds=60)
+                if not due:
+                    break
+                retry_after = self._process_delivery_notification(
+                    due[0], self.clock()
+                )
+                if retry_after is not None:
+                    limited_at = self.clock()
+                    store.set_telegram_not_before(
+                        limited_at + timedelta(seconds=retry_after), limited_at
+                    )
+                    break
+        finally:
+            store.release_cycle_lease(token)
 
     def _runtime_policy(self, now: datetime) -> RuntimePolicy:
         try:
@@ -797,6 +1323,35 @@ class BusinessService:
         except TypeError:
             return bool(self.repo.save_message(connection_id, message, session_id, kind, now))
 
+    def _index_client_phones(
+        self,
+        connection_id: str,
+        chat_id: str,
+        message_id: int,
+        message: Mapping[str, Any],
+        text: str,
+        observed_at: datetime,
+        *,
+        edited_at: datetime | None = None,
+    ) -> None:
+        """Persist phone evidence before any reply/automation policy gate."""
+
+        replace = getattr(self.repo, "replace_client_message_phones", None)
+        if not replace:
+            return
+        sender = message.get("from") or {}
+        replace(
+            connection_id,
+            chat_id,
+            message_id,
+            phones_from_message(message, text),
+            observed_at,
+            telegram_user_id=(
+                sender.get("id") if isinstance(sender, Mapping) else None
+            ),
+            edited_at=edited_at,
+        )
+
     def _touch_client(self, chat_id: str, session_id: str, now: datetime, event_at: datetime, message_id: int) -> None:
         policy = self._runtime_policy(now)
         try:
@@ -959,6 +1514,16 @@ class BusinessService:
                         original_at = datetime.fromisoformat(saved["telegram_date"])
                     except (TypeError, ValueError):
                         original_at = event_at
+                    effective_text = saved["text"] or saved["caption"] or ""
+                    self._index_client_phones(
+                        connection_id,
+                        chat_id,
+                        int(message_id),
+                        edited,
+                        effective_text,
+                        original_at,
+                        edited_at=event_at,
+                    )
                     manager_covers = getattr(self.repo, "manager_replied_after", None)
                     manager_already_answered = bool(
                         manager_covers
@@ -1073,6 +1638,19 @@ class BusinessService:
                     (persisted_message["text"] or persisted_message["caption"] or "")
                     if persisted_message else
                     (message.get("text") or message.get("caption") or "")
+                )
+                self._index_client_phones(
+                    connection_id,
+                    chat_id,
+                    int(message["message_id"]),
+                    message,
+                    effective_text,
+                    event_at,
+                    edited_at=(
+                        datetime.fromisoformat(persisted_message["edited_at"])
+                        if persisted_message and persisted_message["edited_at"]
+                        else None
+                    ),
                 )
                 location_url = (
                     _telegram_location_url(message)

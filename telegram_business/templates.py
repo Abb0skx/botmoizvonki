@@ -31,6 +31,8 @@ ALLOWED_PLACEHOLDERS = frozenset(
         "fulfillment",
         "preferred_time",
         "missing_fields",
+        "order_number",
+        "product",
     }
 )
 
@@ -106,6 +108,26 @@ TEMPLATES: dict[str, dict[str, str]] = {
     "availability": {
         "ru": "Наличие подтвердит менеджер {manager_time_phrase_ru}. Напишите точное название модели, и я покажу цены из текущей базы.",
         "uz": "Mavjudligini menejer {manager_time_phrase_uz} tasdiqlaydi. Modelning aniq nomini yozing, men joriy bazadagi narxlarni ko‘rsataman.",
+    },
+    "delivery_status_pending": {
+        "ru": "🚚 Заказ №{order_number} передан в службу доставки.",
+        "uz": "🚚 №{order_number} buyurtma yetkazib berish xizmatiga topshirildi.",
+    },
+    "delivery_status_picked_up": {
+        "ru": "📦 Курьер получил товар по заказу №{order_number}.",
+        "uz": "📦 Kuryer №{order_number} buyurtmadagi mahsulotni oldi.",
+    },
+    "delivery_status_on_way": {
+        "ru": "🚗 Курьер выехал с заказом №{order_number}.",
+        "uz": "🚗 Kuryer №{order_number} buyurtma bilan yo‘lga chiqdi.",
+    },
+    "delivery_status_completed": {
+        "ru": "✅ Заказ №{order_number} доставлен.",
+        "uz": "✅ №{order_number} buyurtma yetkazildi.",
+    },
+    "delivery_status_cancelled": {
+        "ru": "❌ Доставка заказа №{order_number} отменена. Подробности уточнит менеджер.",
+        "uz": "❌ №{order_number} buyurtmani yetkazib berish bekor qilindi. Tafsilotlarni menejer aniqlashtiradi.",
     },
     "request_choose_attribute": {
         "ru": "Вы выбрали {model}.\n\nВыберите {attribute_label}:\n\n{variants}\n\nУказанные суммы — цены из текущей базы. Точную цену и наличие подтвердит менеджер.",

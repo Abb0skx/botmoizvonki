@@ -4,6 +4,7 @@ from telegram_business.request_inputs import (
     missing_request_fields,
     normalize_phone,
     phone_from_message,
+    phones_from_message,
     request_summary,
 )
 
@@ -50,6 +51,43 @@ def test_native_contact_is_accepted_only_when_it_belongs_to_sender():
     assert phone_from_message(own) == ("+998901234567", "telegram_contact")
     assert phone_from_message(foreign) == (None, None)
     assert phone_from_message(unverifiable) == (None, None)
+
+
+def test_multiple_explicit_phones_are_bounded_deduplicated_evidence():
+    detected = phones_from_message(
+        {"from": {"id": 42}},
+        "Телефоны: +998 90 123 45 67 и +998-93-765-43-21; "
+        "дубль +998901234567",
+    )
+    assert [(item.phone, item.source, item.owner_verified) for item in detected] == [
+        ("+998901234567", "typed", False),
+        ("+998937654321", "typed", False),
+    ]
+
+    local = phones_from_message(
+        {}, "Телефоны: 90 123 45 67, 93 765 43 21",
+    )
+    assert [item.phone for item in local] == [
+        "+998901234567", "+998937654321",
+    ]
+
+
+def test_phone_evidence_verifies_only_senders_own_native_contact():
+    own = phones_from_message({
+        "from": {"id": 42},
+        "contact": {"user_id": 42, "phone_number": "+998 90 123 45 67"},
+    })
+    foreign = phones_from_message({
+        "from": {"id": 42},
+        "contact": {"user_id": 99, "phone_number": "+998 90 123 45 67"},
+    })
+    assert len(own) == 1 and own[0].owner_verified is True
+    assert foreign == ()
+
+
+def test_card_like_text_never_becomes_phone_evidence():
+    assert phones_from_message({}, "карта: 8600 1234 5678 9012") == ()
+    assert phones_from_message({}, "номер карты +8600123456789012") == ()
 
 
 def test_explicit_address_step_accepts_short_address_without_opening_links():

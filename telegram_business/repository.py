@@ -8,10 +8,12 @@ import sqlite3
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 from typing import Any, Iterable
 
 from .migrations import connect, migrate
+from .request_inputs import mask_recognized_phones, normalize_phone, phones_from_message
 from .security import redact_payment_data, redact_sensitive_data, sanitize_telegram_payload
 from .timeutils import business_date, is_night, manager_due_at, work_seconds
 
@@ -69,6 +71,19 @@ def telegram_datetime(message: dict[str, Any], fallback: datetime, *, edited: bo
 
 def _backoff_seconds(attempts: int, minimum: float = 2.0, maximum: float = 3600.0) -> float:
     return min(maximum, max(minimum, float(2 ** min(max(attempts, 1), 11))))
+
+
+@dataclass(frozen=True)
+class BusinessChatPhoneMatch:
+    """Result of resolving delivery-order phones to one Business chat."""
+
+    status: str
+    business_connection_id: str | None = None
+    chat_id: str | None = None
+    last_client_message_at: str | None = None
+    matched_phones: tuple[str, ...] = ()
+    candidate_count: int = 0
+    reason: str | None = None
 
 
 class PendingBusinessCallbackError(RuntimeError):
@@ -581,6 +596,345 @@ class BusinessRepository:
                  user.get("username"), iso(now), iso(now)),
             )
 
+    @staticmethod
+    def _phone_observation(value: Any) -> tuple[str, str, bool] | None:
+        """Validate one parser result before it reaches the durable index."""
+
+        if isinstance(value, dict):
+            raw_phone = value.get("phone")
+            raw_source = value.get("source")
+            raw_verified = value.get("owner_verified", False)
+        else:
+            raw_phone = getattr(value, "phone", None)
+            raw_source = getattr(value, "source", None)
+            raw_verified = getattr(value, "owner_verified", False)
+        phone = normalize_phone(raw_phone)
+        source = str(raw_source or "").strip()
+        if not phone or source not in {"typed", "telegram_contact"}:
+            return None
+        verified = bool(raw_verified and source == "telegram_contact")
+        return phone, source, verified
+
+    def replace_client_message_phones(
+        self,
+        business_connection_id: str,
+        chat_id: str,
+        source_message_id: int,
+        phones: Iterable[Any],
+        observed_at: datetime,
+        *,
+        telegram_user_id: str | int | None = None,
+        edited_at: datetime | None = None,
+    ) -> int:
+        """Replace the phone evidence contributed by one incoming message.
+
+        Replacing instead of appending is essential for edited Business
+        messages: a number removed by the client immediately stops matching.
+        Repeating the same original/edit update is idempotent.
+        """
+
+        connection_id = str(business_connection_id or "").strip()
+        normalized_chat_id = str(chat_id or "").strip()
+        if not connection_id or not normalized_chat_id:
+            raise ValueError("business connection and chat are required")
+        if (
+            isinstance(source_message_id, bool)
+            or not isinstance(source_message_id, int)
+            or source_message_id <= 0
+        ):
+            raise ValueError("source_message_id must be a positive integer")
+        parsed: list[tuple[str, str, bool]] = []
+        seen: set[str] = set()
+        for raw in phones:
+            observation = self._phone_observation(raw)
+            if observation is None or observation[0] in seen:
+                continue
+            seen.add(observation[0])
+            parsed.append(observation)
+        changed_at = edited_at or observed_at
+        user_id = (
+            str(telegram_user_id)
+            if telegram_user_id is not None and not isinstance(telegram_user_id, bool)
+            else None
+        )
+        with connect(self.path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            source = db.execute(
+                """SELECT sender_type,edited_at,deleted_at
+                   FROM business_messages WHERE business_connection_id=?
+                   AND chat_id=? AND message_id=?""",
+                (connection_id, normalized_chat_id, source_message_id),
+            ).fetchone()
+            # Serialize against edit/delete persistence. A stale backfill batch
+            # must neither reintroduce an edited number nor resurrect evidence
+            # after Telegram reported the source message deleted.
+            expected_revision = iso(edited_at) if edited_at else None
+            if (
+                source is None
+                or source["sender_type"] != "client"
+                or source["deleted_at"] is not None
+                or source["edited_at"] != expected_revision
+            ):
+                return 0
+            db.execute(
+                """UPDATE business_chat_phones SET deleted_at=?,edited_at=?
+                   WHERE business_connection_id=? AND chat_id=?
+                   AND source_message_id=? AND deleted_at IS NULL""",
+                (
+                    iso(changed_at),
+                    iso(edited_at) if edited_at else None,
+                    connection_id,
+                    normalized_chat_id,
+                    source_message_id,
+                ),
+            )
+            for phone, source, verified in parsed:
+                db.execute(
+                    """INSERT INTO business_chat_phones(
+                       business_connection_id,chat_id,phone_normalized,
+                       source_message_id,source_type,telegram_user_id,
+                       owner_verified,observed_at,edited_at,deleted_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,NULL)
+                       ON CONFLICT(business_connection_id,chat_id,
+                                   phone_normalized,source_message_id)
+                       DO UPDATE SET source_type=excluded.source_type,
+                         telegram_user_id=excluded.telegram_user_id,
+                         owner_verified=excluded.owner_verified,
+                         observed_at=CASE
+                           WHEN julianday(business_chat_phones.observed_at)
+                                <=julianday(excluded.observed_at)
+                           THEN business_chat_phones.observed_at
+                           ELSE excluded.observed_at END,
+                         edited_at=excluded.edited_at,deleted_at=NULL""",
+                    (
+                        connection_id,
+                        normalized_chat_id,
+                        phone,
+                        source_message_id,
+                        source,
+                        user_id,
+                        int(verified),
+                        iso(observed_at),
+                        iso(edited_at) if edited_at else None,
+                    ),
+                )
+            db.execute(
+                """UPDATE business_messages SET phone_indexed_at=?
+                   WHERE business_connection_id=? AND chat_id=?
+                   AND message_id=? AND sender_type='client'""",
+                (
+                    iso(changed_at),
+                    connection_id,
+                    normalized_chat_id,
+                    source_message_id,
+                ),
+            )
+        return len(parsed)
+
+    def backfill_client_phone_index(
+        self,
+        now: datetime,
+        *,
+        limit: int = 500,
+    ) -> int:
+        """Index one bounded batch of pre-existing typed client messages.
+
+        The marker and evidence are committed together by
+        :meth:`replace_client_message_phones`, so a crash merely leaves the row
+        eligible for the next pass. Old native Contact objects are not present
+        in the canonical message table and are deliberately not reconstructed
+        from raw update payloads.
+        """
+
+        if not isinstance(now, datetime):
+            raise TypeError("now must be a datetime")
+        batch_size = min(1000, max(1, int(limit)))
+        with connect(self.path) as db:
+            rows = db.execute(
+                """SELECT m.business_connection_id,m.chat_id,m.message_id,
+                          m.text,m.caption,m.telegram_date,m.edited_at,
+                          c.telegram_user_id
+                   FROM business_messages m
+                   LEFT JOIN business_clients c ON c.chat_id=m.chat_id
+                   WHERE m.sender_type='client' AND m.original_received=1
+                     AND m.deleted_at IS NULL AND m.phone_indexed_at IS NULL
+                   ORDER BY m.id LIMIT ?""",
+                (batch_size,),
+            ).fetchall()
+        for row in rows:
+            try:
+                observed_at = datetime.fromisoformat(row["telegram_date"])
+            except (TypeError, ValueError):
+                observed_at = now
+            try:
+                edited_at = (
+                    datetime.fromisoformat(row["edited_at"])
+                    if row["edited_at"] else None
+                )
+            except (TypeError, ValueError):
+                edited_at = now
+            text = row["text"] or row["caption"] or ""
+            self.replace_client_message_phones(
+                row["business_connection_id"],
+                row["chat_id"],
+                int(row["message_id"]),
+                phones_from_message({}, text),
+                observed_at,
+                telegram_user_id=row["telegram_user_id"],
+                edited_at=edited_at,
+            )
+        return len(rows)
+
+    @staticmethod
+    def _revoke_client_message_phones_in_db(
+        db: sqlite3.Connection,
+        business_connection_id: str,
+        chat_id: str,
+        source_message_id: int,
+        revoked_at: datetime,
+    ) -> int:
+        return db.execute(
+            """UPDATE business_chat_phones SET deleted_at=COALESCE(deleted_at,?)
+               WHERE business_connection_id=? AND chat_id=?
+               AND source_message_id=? AND deleted_at IS NULL""",
+            (
+                iso(revoked_at),
+                str(business_connection_id),
+                str(chat_id),
+                int(source_message_id),
+            ),
+        ).rowcount
+
+    def revoke_client_message_phones(
+        self,
+        business_connection_id: str,
+        chat_id: str,
+        source_message_id: int,
+        revoked_at: datetime,
+    ) -> int:
+        with connect(self.path) as db:
+            return self._revoke_client_message_phones_in_db(
+                db,
+                business_connection_id,
+                chat_id,
+                source_message_id,
+                revoked_at,
+            )
+
+    def match_chat_for_phones(
+        self,
+        phones: Iterable[str],
+    ) -> BusinessChatPhoneMatch:
+        """Resolve order phones only when they identify one established chat.
+
+        Ambiguity is evaluated before reply-window/connection policy. This keeps
+        the matcher from guessing between two people merely because one chat is
+        older. The eventual sender must still enforce Telegram's 24-hour window
+        and current ``can_reply`` right immediately before sending.
+        """
+
+        normalized: list[str] = []
+        for raw in phones:
+            phone = normalize_phone(raw)
+            if phone and phone not in normalized:
+                normalized.append(phone)
+        if not normalized:
+            return BusinessChatPhoneMatch(
+                "unmatched", reason="no_valid_phone",
+            )
+        placeholders = ",".join("?" for _ in normalized)
+        with connect(self.path) as db:
+            targets = db.execute(
+                f"""SELECT phones.business_connection_id,phones.chat_id,
+                            GROUP_CONCAT(DISTINCT phones.phone_normalized) AS phones
+                       FROM business_chat_phones AS phones
+                       JOIN business_connections AS connection
+                         ON connection.connection_id=phones.business_connection_id
+                       WHERE phones.phone_normalized IN ({placeholders})
+                       AND phones.deleted_at IS NULL
+                       AND connection.is_enabled=1 AND connection.can_reply=1
+                       GROUP BY phones.business_connection_id,phones.chat_id
+                       ORDER BY phones.business_connection_id,phones.chat_id""",
+                normalized,
+            ).fetchall()
+            if not targets:
+                return BusinessChatPhoneMatch(
+                    "unmatched", reason="phone_not_seen",
+                )
+            if len(targets) != 1:
+                return BusinessChatPhoneMatch(
+                    "ambiguous",
+                    matched_phones=tuple(normalized),
+                    candidate_count=len(targets),
+                    reason="multiple_chats",
+                )
+            target = targets[0]
+            has_outbound = db.execute(
+                """SELECT 1 FROM business_messages
+                   WHERE business_connection_id=? AND chat_id=?
+                   AND direction='outgoing' AND original_received=1
+                   AND sender_type IN ('manager','business_bot')
+                   AND deleted_at IS NULL LIMIT 1""",
+                (target["business_connection_id"], target["chat_id"]),
+            ).fetchone()
+            if has_outbound is None:
+                return BusinessChatPhoneMatch(
+                    "unmatched",
+                    matched_phones=tuple(
+                        value for value in str(target["phones"] or "").split(",")
+                        if value
+                    ),
+                    candidate_count=1,
+                    reason="no_prior_outbound",
+                )
+            client = db.execute(
+                """SELECT last_client_message_at FROM business_clients
+                   WHERE chat_id=?""",
+                (target["chat_id"],),
+            ).fetchone()
+            matched = tuple(
+                value for value in str(target["phones"] or "").split(",")
+                if value
+            )
+            return BusinessChatPhoneMatch(
+                "unique",
+                business_connection_id=target["business_connection_id"],
+                chat_id=target["chat_id"],
+                last_client_message_at=(
+                    client["last_client_message_at"] if client else None
+                ),
+                matched_phones=matched,
+                candidate_count=1,
+            )
+
+    def match_delivery_phones(
+        self,
+        phones: Iterable[str],
+        now: datetime,
+    ) -> dict[str, str]:
+        """Return the deliberately small contract used by delivery polling.
+
+        ``now`` is accepted so callers use a time-aware API, but reply-window,
+        pause and manager-lock checks intentionally remain send-time policy.
+        This method is concerned only with unambiguous identity evidence and a
+        prior real Business conversation.
+        """
+
+        if not isinstance(now, datetime):
+            raise TypeError("now must be a datetime")
+        match = self.match_chat_for_phones(phones)
+        if (
+            match.status == "unique"
+            and match.business_connection_id
+            and match.chat_id
+        ):
+            return {
+                "outcome": "unique",
+                "connection_id": match.business_connection_id,
+                "chat_id": match.chat_id,
+            }
+        return {"outcome": match.status}
+
     # Night sessions.
     @staticmethod
     def _session_key(value: datetime, night_start: time, night_end: time) -> str:
@@ -719,7 +1073,8 @@ class BusinessRepository:
             "session_id": row["session_id"] or "", "cycle_id": row["cycle_id"] or "",
             "direction": row["direction"], "sender_type": row["sender_type"],
             "telegram_date_uz": row["telegram_date"] or "", "message_type": row["message_type"],
-            "text": row["text"] or row["caption"] or "", "language": row["language"] or "",
+            "text": mask_recognized_phones(row["text"] or row["caption"] or "") or "",
+            "language": row["language"] or "",
             "intent": row["intent"] or "", "model_query": row["model_query"] or "",
             "template_code": row["template_code"] or "",
             "reply_to_message_id": str(row["reply_to_message_id"] or ""),
@@ -940,7 +1295,8 @@ class BusinessRepository:
                 db.execute("""UPDATE business_messages SET message_type=?,text=?,caption=?,file_id=?,
                            reply_to_message_id=?,edited_at=?,
                            update_id=COALESCE(?,update_id),
-                           edit_update_id=COALESCE(?,edit_update_id) WHERE id=?""",
+                           edit_update_id=COALESCE(?,edit_update_id),
+                           phone_indexed_at=NULL WHERE id=?""",
                            (kind, text, caption, file_id, (message.get("reply_to_message") or {}).get("message_id"),
                             iso(edited_at), update_id, update_id, row["id"]))
                 row_id = row["id"]
@@ -981,6 +1337,9 @@ class BusinessRepository:
                         VALUES(?,?,?,?,?,?,?,?,?)""", (connection_id, str(chat_id), message_id, "unknown", "unknown",
                                                        "deleted", iso(event_at), iso(event_at), iso(event_at)))
                     row_id = cursor.lastrowid
+                self._revoke_client_message_phones_in_db(
+                    db, connection_id, str(chat_id), message_id, event_at,
+                )
                 affected += 1
                 self._refresh_message_outbox(db, row_id, event_at, "deleted")
         return affected
@@ -1993,9 +2352,83 @@ class BusinessRepository:
 
     def bot_message_count(self, chat_id: str, session_id: str, now: datetime) -> tuple[int, int]:
         with connect(self.path) as db:
-            ten = db.execute("SELECT count(*) FROM business_messages WHERE chat_id=? AND sender_type='business_bot' AND created_at>=?", (chat_id, iso(now - timedelta(minutes=10)))).fetchone()[0]
-            session = db.execute("SELECT count(*) FROM business_messages WHERE session_id=? AND sender_type='business_bot'", (session_id,)).fetchone()[0]
+            ten = db.execute(
+                """SELECT count(*) FROM business_messages WHERE chat_id=?
+                   AND sender_type='business_bot' AND created_at>=?""",
+                (chat_id, iso(now - timedelta(minutes=10))),
+            ).fetchone()[0]
+            session = db.execute(
+                """SELECT count(*) FROM business_messages WHERE session_id=?
+                   AND sender_type='business_bot'""",
+                (session_id,),
+            ).fetchone()[0]
             return ten, session
+
+    def delivery_message_count(
+        self,
+        chat_id: str,
+        now: datetime,
+        *,
+        window_seconds: int = 600,
+    ) -> int:
+        """Count recent transactional delivery sends for a per-chat throttle.
+
+        The outbound ledger is authoritative here: Telegram may have accepted a
+        message even if writing the secondary ``business_messages`` audit row
+        failed. Counting ``sending`` and ``uncertain`` conservatively also keeps
+        a transport timeout from opening a flood-control gap.
+        """
+
+        cutoff = iso(now - timedelta(seconds=max(1, int(window_seconds))))
+        with connect(self.path) as db:
+            regular = int(
+                db.execute(
+                    """SELECT count(*) FROM business_messages
+                       WHERE chat_id=? AND sender_type='business_bot'
+                         AND COALESCE(template_code,'') NOT LIKE 'delivery_status_%'
+                         AND julianday(created_at)>=julianday(?)""",
+                    (str(chat_id), cutoff),
+                ).fetchone()[0]
+            )
+            transactional = int(
+                db.execute(
+                    """SELECT count(*) FROM business_outbound_deliveries
+                       WHERE chat_id=?
+                         AND template_code LIKE 'delivery_status_%'
+                         AND state IN ('sending','sent','uncertain')
+                         AND julianday(updated_at)>=julianday(?)""",
+                    (str(chat_id), cutoff),
+                ).fetchone()[0]
+            )
+            return regular + transactional
+
+    def delivery_order_recipient(self, order_id: int) -> dict[str, str]:
+        """Return the chat already used for this delivery order, if any.
+
+        Once Telegram may have accepted a status, later statuses for the same
+        order must never migrate to another chat merely because phone evidence
+        was edited. ``sending`` is included because its transport outcome is
+        unknown after a process crash.
+        """
+
+        order = int(order_id)
+        if order <= 0:
+            raise ValueError("order_id must be positive")
+        prefix = f"delivery-status:{order}:"
+        with connect(self.path) as db:
+            rows = db.execute(
+                """SELECT DISTINCT chat_id FROM business_outbound_deliveries
+                   WHERE substr(dedupe_key,1,?)=?
+                     AND template_code LIKE 'delivery_status_%'
+                     AND state IN ('sending','sent','uncertain')
+                   ORDER BY chat_id""",
+                (len(prefix), prefix),
+            ).fetchall()
+        if not rows:
+            return {"outcome": "none"}
+        if len(rows) != 1:
+            return {"outcome": "ambiguous"}
+        return {"outcome": "unique", "chat_id": str(rows[0]["chat_id"])}
 
     def begin_outbound_delivery(
         self,
@@ -2088,21 +2521,34 @@ class BusinessRepository:
                 ),
             ).rowcount == 1
 
-    def record_bot_message(self, connection_id: str, chat_id: str, session_id: str, message_id: int,
-                           text: str, template_code: str, now: datetime, model_query: str | None = None) -> None:
+    def record_bot_message(
+        self,
+        connection_id: str,
+        chat_id: str,
+        session_id: str,
+        message_id: int,
+        text: str,
+        template_code: str,
+        now: datetime,
+        model_query: str | None = None,
+        *,
+        count_as_response: bool = True,
+    ) -> None:
         with connect(self.path) as db:
             db.execute("BEGIN IMMEDIATE")
             # Bind the reply to the cycle that existed for this session when
             # sendMessage started. A newer client cycle may be opened while the
             # network request is in flight and must not inherit the older bot
             # response.
-            cycle = db.execute(
-                """SELECT cycle_id,first_client_at,first_bot_at
-                   FROM response_cycles WHERE chat_id=? AND session_id=?
-                   AND julianday(first_client_at)<=julianday(?)
-                   ORDER BY julianday(first_client_at) DESC LIMIT 1""",
-                (chat_id, session_id, iso(now)),
-            ).fetchone()
+            cycle = None
+            if count_as_response:
+                cycle = db.execute(
+                    """SELECT cycle_id,first_client_at,first_bot_at
+                       FROM response_cycles WHERE chat_id=? AND session_id=?
+                       AND julianday(first_client_at)<=julianday(?)
+                       ORDER BY julianday(first_client_at) DESC LIMIT 1""",
+                    (chat_id, session_id, iso(now)),
+                ).fetchone()
             stored_message_id = message_id
             existing = db.execute(
                 """SELECT * FROM business_messages WHERE business_connection_id=?
@@ -2153,7 +2599,7 @@ class BusinessRepository:
             self._refresh_message_outbox(db, row["id"], now, "sent")
 
             actual_cycle = None
-            if row["cycle_id"]:
+            if count_as_response and row["cycle_id"]:
                 actual_cycle = db.execute(
                     """SELECT cycle_id,first_client_at,first_bot_at
                        FROM response_cycles WHERE cycle_id=?""",

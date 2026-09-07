@@ -239,6 +239,23 @@ async def internal_monitoring_live_detailed(request: Request):
     return await enrich_monitor_routes(state, _routing_service())
 
 
+@app.get("/internal/monitoring/v1/delivery/status-events")
+async def internal_delivery_status_events(
+    request: Request,
+    after_event_id: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+):
+    """Expose a minimal, cursor-safe delivery feed to the Business service."""
+
+    require_internal_monitoring_auth(request)
+    repository = _repository()
+    return await run_in_threadpool(
+        repository.delivery_status_event_feed,
+        after_event_id=after_event_id,
+        limit=limit,
+    )
+
+
 @app.get("/internal/monitoring/v1/delivery/report")
 async def internal_monitoring_report(
     request: Request,

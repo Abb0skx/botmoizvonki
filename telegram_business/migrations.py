@@ -38,7 +38,19 @@ CREATE TABLE IF NOT EXISTS business_messages (
  created_at TEXT NOT NULL, edited_at TEXT, deleted_at TEXT, update_id INTEGER,
  edit_update_id INTEGER,
  original_received INTEGER NOT NULL DEFAULT 1,
+ phone_indexed_at TEXT,
  UNIQUE(business_connection_id, chat_id, message_id));
+CREATE TABLE IF NOT EXISTS business_chat_phones (
+ business_connection_id TEXT NOT NULL, chat_id TEXT NOT NULL,
+ phone_normalized TEXT NOT NULL, source_message_id INTEGER NOT NULL,
+ source_type TEXT NOT NULL, telegram_user_id TEXT,
+ owner_verified INTEGER NOT NULL DEFAULT 0,
+ observed_at TEXT NOT NULL, edited_at TEXT, deleted_at TEXT,
+ PRIMARY KEY(business_connection_id, chat_id, phone_normalized, source_message_id));
+CREATE INDEX IF NOT EXISTS idx_business_chat_phones_lookup
+ ON business_chat_phones(phone_normalized, deleted_at, business_connection_id, chat_id);
+CREATE INDEX IF NOT EXISTS idx_business_chat_phones_source
+ ON business_chat_phones(business_connection_id, chat_id, source_message_id);
 CREATE TABLE IF NOT EXISTS business_manager_fences (
  business_connection_id TEXT NOT NULL, chat_id TEXT NOT NULL, message_id INTEGER NOT NULL,
  telegram_date TEXT NOT NULL, update_id INTEGER NOT NULL UNIQUE, received_at TEXT NOT NULL,
@@ -70,6 +82,22 @@ CREATE TABLE IF NOT EXISTS sheets_outbox (
 CREATE TABLE IF NOT EXISTS business_runtime_leases (
  lease_name TEXT PRIMARY KEY, lease_token TEXT NOT NULL,
  lease_expires_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS business_integration_state (
+ key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS delivery_status_notifications (
+ source_event_id INTEGER PRIMARY KEY, order_id INTEGER NOT NULL,
+ order_number TEXT NOT NULL, public_status TEXT NOT NULL,
+ product TEXT, phones_json TEXT NOT NULL DEFAULT '[]', source_created_at TEXT,
+ state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+ next_attempt_at TEXT NOT NULL, lease_token TEXT, lease_expires_at TEXT,
+ match_outcome TEXT, business_connection_id TEXT, chat_id TEXT, session_id TEXT,
+ template_code TEXT, telegram_message_id INTEGER, last_error TEXT,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL, processed_at TEXT,
+ UNIQUE(order_id, public_status));
+CREATE INDEX IF NOT EXISTS idx_delivery_status_notifications_due
+ ON delivery_status_notifications(state, next_attempt_at, source_event_id);
+CREATE INDEX IF NOT EXISTS idx_delivery_status_notifications_order
+ ON delivery_status_notifications(order_id, source_event_id);
 CREATE TABLE IF NOT EXISTS business_requests (
  request_id TEXT PRIMARY KEY, business_connection_id TEXT, chat_id TEXT NOT NULL,
  session_id TEXT, cycle_id TEXT, business_date TEXT, origin_update_id INTEGER,
@@ -172,6 +200,7 @@ def migrate(path: Path | str) -> None:
                 "update_id": "INTEGER",
                 "edit_update_id": "INTEGER",
                 "original_received": "INTEGER NOT NULL DEFAULT 1",
+                "phone_indexed_at": "TEXT",
             },
         )
         _ensure_columns(db, "response_cycles", {"manager_due_at": "TEXT"})
