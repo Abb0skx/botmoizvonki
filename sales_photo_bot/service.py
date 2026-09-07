@@ -48,7 +48,12 @@ from .delivery import (
     DeliverySalesBridge,
     normalize_delivery_block,
 )
-from .formatting import build_caption, product_label_from_card
+from .formatting import (
+    MAX_CAPTION_TEXT_UNITS,
+    MAX_MESSAGE_TEXT_UNITS,
+    build_caption,
+    product_label_from_card,
+)
 from .keyboards import (
     BACK_CALLBACK,
     MANAGER_CALLBACK_PREFIX,
@@ -1687,6 +1692,11 @@ class SalesPhotoService:
             if claim.source_kind in {"text", "delivery_text", "delivery_photo"}
             else None
         )
+        card_text_budget = (
+            MAX_MESSAGE_TEXT_UNITS
+            if claim.source_kind in {"album", "text", "delivery_text"}
+            else MAX_CAPTION_TEXT_UNITS
+        )
         caption = BOT_CARD_MARKER + build_caption(
             cleaned_caption,
             identifiers,
@@ -1694,6 +1704,7 @@ class SalesPhotoService:
             sale_date=(sale_date_match.value if sale_date_match else None),
             daily_quantity=order_id,
             global_order_id=global_id,
+            max_text_units=card_text_budget,
         )
         initial_generation = 0
         source_signature = self.repository.callback_signature(

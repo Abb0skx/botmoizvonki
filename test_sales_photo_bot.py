@@ -23,6 +23,8 @@ from sales_photo_bot.application import (
 )
 from sales_photo_bot.config import ConfigError, Settings
 from sales_photo_bot.formatting import (
+    MAX_CAPTION_TEXT_UNITS,
+    _telegram_text_units,
     add_manager_selection,
     build_caption,
     product_label_from_card,
@@ -40,6 +42,19 @@ CHAT_ID = -1001234567890
 CHECK_CHAT_ID = -1004340217539
 BOT_ID = 777
 TOKEN = "1234567890:" + "A" * 35
+
+
+def valid_test_imei(number: int) -> str:
+    base = f"860000000{number:05d}"[:14]
+    total = 0
+    for index, character in enumerate(base):
+        digit = int(character)
+        if index % 2:
+            digit *= 2
+            if digit > 9:
+                digit -= 9
+        total += digit
+    return base + str((-total) % 10)
 
 
 class StaticRecognizer:
@@ -475,10 +490,11 @@ class RepositoryTests(unittest.TestCase):
             repo.mark_reposted(CHAT_ID, 10, 200)
             product = "; ".join(
                 f"Catalog product {index} with memory and color"
-                for index in range(4)
+                for index in range(24)
             )
 
-            self.assertGreater(len(product), 120)
+            self.assertGreater(len(product), 900)
+            self.assertLess(len(product), 2048)
             self.assertTrue(
                 repo.sync_sale_details(CHAT_ID, 200, (), product)
             )
@@ -1109,6 +1125,69 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("S/N: WATCHBOX1", card)
         self.assertIn("S/N 2: IPHONEBOX1", card)
         self.assertIn("📞: +998 97 465 11 59", card)
+
+    async def test_album_text_card_keeps_maximum_v2_collections(self):
+        products = tuple(
+            f"Catalog Product {index} " + "X" * 135 for index in range(8)
+        )
+        imeis = tuple(valid_test_imei(index) for index in range(16))
+        serials = tuple(
+            f"SERIAL{index:02d}" + "X" * 30 for index in range(16)
+        )
+        repo = SalesPhotoRepository(self.root / "db.sqlite")
+        recognizer = StaticRecognizer(
+            ProductIdentifiers(
+                product_names=products,
+                imeis=imeis,
+                serial_numbers=serials,
+            )
+        )
+        service = SalesPhotoService(settings(self.root), repo, recognizer)
+        bot = telegram_bot()
+        claim = service._claim_album(
+            (
+                album_photo_message(10),
+                album_photo_message(11),
+            ),
+            "album-maximum-v2",
+        )
+
+        await service._run_photo_claim(claim, bot)
+
+        card = bot.send_message.await_args.kwargs["text"]
+        for value in (*products, *imeis, *serials):
+            self.assertIn(value, card)
+        self.assertNotIn("… ещё", card)
+        self.assertLess(len(card.encode("utf-16-le")) // 2, 4096)
+
+    async def test_single_photo_keeps_the_reserved_caption_budget(self):
+        products = tuple(
+            f"Catalog Product {index} " + "X" * 135 for index in range(8)
+        )
+        imeis = tuple(valid_test_imei(index) for index in range(16))
+        serials = tuple(
+            f"SERIAL{index:02d}" + "X" * 30 for index in range(16)
+        )
+        repo = SalesPhotoRepository(self.root / "db.sqlite")
+        recognizer = StaticRecognizer(
+            ProductIdentifiers(
+                product_names=products,
+                imeis=imeis,
+                serial_numbers=serials,
+            )
+        )
+        service = SalesPhotoService(settings(self.root), repo, recognizer)
+        bot = telegram_bot()
+        claim = service._claim_photo(photo_message(caption=None))
+
+        await service._run_photo_claim(claim, bot)
+
+        caption = bot.send_photo.await_args.kwargs["caption"]
+        self.assertIn("… ещё", caption)
+        self.assertLessEqual(
+            _telegram_text_units(caption),
+            MAX_CAPTION_TEXT_UNITS + len(BOT_CARD_MARKER),
+        )
 
     async def test_album_date_is_added_to_the_shared_card(self):
         repo = SalesPhotoRepository(self.root / "db.sqlite")

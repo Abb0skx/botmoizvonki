@@ -19,6 +19,7 @@ from cryptography.fernet import Fernet, InvalidToken
 
 UTC = timezone.utc
 TASHKENT_TZ = timezone(timedelta(hours=5))
+MAX_PRODUCT_LABEL = 2048
 logger = logging.getLogger(__name__)
 
 
@@ -4421,7 +4422,9 @@ class SalesPhotoRepository:
         # Multi-box OCR keeps every catalog name on the card's single product
         # line. TEXT has no schema migration cost, so retain the same bounded
         # value used by the card parser instead of truncating it to one model.
-        product = str(product_label or "").strip()[:900] or None
+        product = (
+            str(product_label or "").strip()[:MAX_PRODUCT_LABEL] or None
+        )
         with self._connect() as db:
             cursor = db.execute(
                 """UPDATE sales_photo_jobs

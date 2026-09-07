@@ -6,7 +6,13 @@ from datetime import date
 
 import httpx
 
-from sales_photo_bot.formatting import build_caption, product_label_from_card
+from sales_photo_bot.formatting import (
+    MAX_CAPTION_TEXT_UNITS,
+    MAX_MESSAGE_TEXT_UNITS,
+    _telegram_text_units,
+    build_caption,
+    product_label_from_card,
+)
 from sales_photo_bot.models import (
     ProductIdentifiers,
     identifier_imeis,
@@ -307,6 +313,42 @@ class ProductIdentifierTests(unittest.TestCase):
         self.assertIn("… ещё", caption)
         self.assertIn("🛒💵:", caption)
         self.assertIn("<b>Card/Terminal/Paynet</b>", caption)
+        self.assertLessEqual(
+            _telegram_text_units(caption),
+            MAX_CAPTION_TEXT_UNITS,
+        )
+
+    def test_message_budget_keeps_maximum_v2_values_without_overflow(self):
+        products = tuple(
+            f"Catalog Product {index} " + "X" * 135 for index in range(8)
+        )
+        imeis = tuple(valid_imei(index) for index in range(16))
+        serials = tuple(
+            f"SERIAL{index:02d}" + "X" * 30 for index in range(16)
+        )
+        caption = build_caption(
+            None,
+            ProductIdentifiers(
+                product_names=products,
+                imeis=imeis,
+                serial_numbers=serials,
+            ),
+            max_text_units=MAX_MESSAGE_TEXT_UNITS,
+        )
+
+        for value in (*products, *imeis, *serials):
+            self.assertIn(value, caption)
+        self.assertNotIn("… ещё", caption)
+        self.assertLess(_telegram_text_units(caption), 4096)
+
+    def test_caption_budget_rejects_non_integer_or_out_of_range_values(self):
+        for value in (True, 255, 4097, 800.0):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                build_caption(
+                    None,
+                    ProductIdentifiers(),
+                    max_text_units=value,
+                )
 
     def test_album_merge_rejects_third_phone_and_duplicate_second_imei(self):
         merged = merge_product_identifiers(
@@ -388,6 +430,13 @@ class ProductIdentifierTests(unittest.TestCase):
                 build_caption(None, ProductIdentifiers(), product_label=quoted)
             ),
             quoted,
+        )
+        long_product = "X" * 2500
+        self.assertEqual(
+            product_label_from_card(
+                f"📦 О товаре: {long_product}\n\n🛒💵:"
+            ),
+            long_product[:2048],
         )
 
 

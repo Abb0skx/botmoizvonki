@@ -14,9 +14,12 @@ from .phones import extract_uzbek_phones, phone_line
 
 
 MAX_SERIAL_NUMBER = 64
-MAX_PRODUCT_CARD_LABEL = 900
+MAX_PRODUCT_CARD_LABEL = 2048
 # Leave room for the manager and delivery blocks that are appended later.
 MAX_CAPTION_TEXT_UNITS = 800
+MAX_MESSAGE_TEXT_UNITS = 3600
+MIN_CARD_TEXT_UNITS = 256
+MAX_TELEGRAM_TEXT_UNITS = 4096
 _HTML_TAG_RE = re.compile(r"<[^>]*>")
 MANAGER_LINE_RE = re.compile(
     r"(?:\n\n)?👤 Менеджер: <b>[^<>\r\n]{1,64}</b>\s*\Z"
@@ -58,8 +61,21 @@ def build_caption(
     order_id: int | None = None,
     daily_quantity: int | None = None,
     global_order_id: int | None = None,
+    *,
+    max_text_units: int = MAX_CAPTION_TEXT_UNITS,
 ) -> str:
     """Build the sales card, retaining only verified phones and identifiers."""
+
+    if (
+        type(max_text_units) is not int
+        or not MIN_CARD_TEXT_UNITS
+        <= max_text_units
+        <= MAX_TELEGRAM_TEXT_UNITS
+    ):
+        raise ValueError(
+            "max_text_units must be an integer between "
+            f"{MIN_CARD_TEXT_UNITS} and {MAX_TELEGRAM_TEXT_UNITS}"
+        )
 
     phone_sources = [str(client_caption or "")]
     phone_sources.extend(str(value or "") for value in identifiers.phone_numbers)
@@ -172,10 +188,10 @@ def build_caption(
 
     caption = render()
     # Valid service responses normally fit in full (including four boxes with
-    # dual IMEIs). Keep a deterministic fail-safe for a pathological album:
+    # dual IMEIs). Keep a deterministic fail-safe for a pathological card:
     # retain the sales template and visibly report how many tail values could
     # not fit instead of letting Telegram reject the entire card.
-    while _telegram_text_units(caption) > MAX_CAPTION_TEXT_UNITS:
+    while _telegram_text_units(caption) > max_text_units:
         if visible_products and product_value_limit > 80:
             product_value_limit = max(80, product_value_limit - 20)
         elif visible_serials:
