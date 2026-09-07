@@ -65,6 +65,22 @@ def _request_headers(request: Request) -> dict:
 
 
 def _require_admin(request: Request) -> None:
+    # The complete reviews dashboard participates in the shared monitoring
+    # login. Keep Basic authentication as a rollback path when monitoring is
+    # disabled or no shared session cookie is present.
+    try:
+        from monitoring.auth import SESSION_COOKIE
+        from monitoring import router as monitoring_router
+
+        if (
+            monitoring_router.settings.enabled
+            and request.cookies.get(SESSION_COOKIE)
+        ):
+            monitoring_router.get_auth().principal(request, admin=True)
+            return
+    except ImportError:
+        pass
+
     if not REVIEWS_ADMIN_PASSWORD:
         raise HTTPException(
             status_code=503,

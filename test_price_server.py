@@ -4049,6 +4049,25 @@ class PricePageAuthTests(unittest.TestCase):
                 module.MONITORING_BASE_URL = (
                     "https://bot.texnikach.uz/monitoring"
                 )
+                legacy_token = base64.b64encode(b"admin:secret").decode()
+                legacy_basic = Request({
+                    "type": "http",
+                    "method": "GET",
+                    "path": "/price/api/v1/state",
+                    "headers": [
+                        (b"host", b"bot.texnikach.uz"),
+                        (b"authorization", f"Basic {legacy_token}".encode()),
+                    ],
+                })
+                with self.assertRaises(HTTPException) as raised:
+                    module._admin(legacy_basic)
+                self.assertEqual(raised.exception.status_code, 401)
+                self.assertEqual(
+                    raised.exception.detail, "monitoring_session_required"
+                )
+                self.assertNotIn(
+                    "WWW-Authenticate", raised.exception.headers or {}
+                )
                 redirected = asyncio.run(module.price_page(anonymous))
                 self.assertEqual(redirected.status_code, 303)
                 self.assertEqual(

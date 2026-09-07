@@ -400,6 +400,12 @@ class DeliveryMonitorWebTests(unittest.TestCase):
         self.assertIn("Расчётная позиция", page.text)
         self.assertIn("Нет координат", page.text)
         self.assertIn("movementMarkers", page.text)
+        self.assertIn('id="movementSlider"', page.text)
+        self.assertIn('id="movementLive"', page.text)
+        self.assertIn("movementPreviewTime", page.text)
+        self.assertIn("visibleTimedMovements", page.text)
+        self.assertIn("tickMovement", page.text)
+        self.assertIn('movement.kind==="warehouse"', page.text)
         self.assertIn("AbortController", page.text)
         self.assertEqual(page.headers["cache-control"], "no-store")
 

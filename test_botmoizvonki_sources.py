@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import tempfile
 import unittest
@@ -2311,6 +2312,108 @@ class CallSourceTests(unittest.TestCase):
 
         self.assertEqual(rating["score"], 2)
         self.assertEqual(rating["score_source"], "web")
+
+
+class LegacyManagerRouteProtectionTests(unittest.TestCase):
+    @staticmethod
+    def request(path, *, method="GET", query="", headers=None):
+        raw_headers = [(b"host", b"bot.texnikach.uz")]
+        for name, value in (headers or {}).items():
+            raw_headers.append((name.lower().encode(), value.encode()))
+        return bot.Request({
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "scheme": "https",
+            "method": method,
+            "path": path,
+            "raw_path": path.encode(),
+            "query_string": query.encode(),
+            "root_path": "",
+            "headers": raw_headers,
+            "client": ("127.0.0.1", 50000),
+            "server": ("bot.texnikach.uz", 443),
+        })
+
+    @staticmethod
+    async def legacy_response(_request):
+        return bot.HTMLResponse("complete legacy page")
+
+    def test_anonymous_legacy_page_returns_to_same_url_after_login(self):
+        auth = mock.Mock()
+        auth.principal.side_effect = bot.HTTPException(
+            status_code=401, detail="monitoring_session_required"
+        )
+        with mock.patch.object(
+            bot, "monitoring_settings", mock.Mock(enabled=True)
+        ), mock.patch.object(bot, "get_monitoring_auth", return_value=auth):
+            response = asyncio.run(bot.protect_legacy_manager_routes(
+                self.request("/dashboard", query="period=30d"),
+                self.legacy_response,
+            ))
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(
+            response.headers["location"],
+            "/monitoring/login?next=%2Fdashboard%3Fperiod%3D30d",
+        )
+
+    def test_authenticated_legacy_page_is_not_replaced_by_portal_summary(self):
+        auth = mock.Mock()
+        auth.principal.return_value = mock.Mock(role="admin")
+        with mock.patch.object(
+            bot, "monitoring_settings", mock.Mock(enabled=True)
+        ), mock.patch.object(bot, "get_monitoring_auth", return_value=auth):
+            response = asyncio.run(bot.protect_legacy_manager_routes(
+                self.request("/dashboard"), self.legacy_response
+            ))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.body, b"complete legacy page")
+        self.assertEqual(response.headers["cache-control"], "no-store, private")
+        self.assertEqual(response.headers["x-frame-options"], "DENY")
+
+    def test_dashboard_apis_require_session_and_writes_require_csrf(self):
+        denied_auth = mock.Mock()
+        denied_auth.principal.side_effect = bot.HTTPException(
+            status_code=401, detail="monitoring_session_required"
+        )
+        with mock.patch.object(
+            bot, "monitoring_settings", mock.Mock(enabled=True)
+        ), mock.patch.object(
+            bot, "get_monitoring_auth", return_value=denied_auth
+        ):
+            denied = asyncio.run(bot.protect_legacy_manager_routes(
+                self.request("/stats/managers"), self.legacy_response
+            ))
+        self.assertEqual(denied.status_code, 401)
+        self.assertEqual(
+            json.loads(denied.body),
+            {"detail": "monitoring_session_required"},
+        )
+
+        csrf_auth = mock.Mock()
+        csrf_auth.principal.return_value = mock.Mock(role="admin")
+        csrf_auth.verify_csrf.side_effect = bot.HTTPException(
+            status_code=403, detail="csrf_failed"
+        )
+        with mock.patch.object(
+            bot, "monitoring_settings", mock.Mock(enabled=True)
+        ), mock.patch.object(bot, "get_monitoring_auth", return_value=csrf_auth):
+            denied_write = asyncio.run(bot.protect_legacy_manager_routes(
+                self.request(
+                    "/admin/device-managers",
+                    method="POST",
+                    headers={"content-type": "application/json"},
+                ),
+                self.legacy_response,
+            ))
+        self.assertEqual(denied_write.status_code, 403)
+        self.assertEqual(json.loads(denied_write.body), {"detail": "csrf_failed"})
+
+    def test_dashboard_device_manager_javascript_sends_shared_csrf_token(self):
+        html = bot.dashboard()
+        self.assertIn("__Host-texnikach_monitoring_csrf=", html)
+        self.assertIn('options.headers["X-CSRF-Token"]', html)
+        self.assertIn('credentials: "same-origin"', html)
 
 
 if __name__ == "__main__":

@@ -408,6 +408,14 @@ def _admin(request: Request, *, action: bool = False) -> None:
     _require_enabled()
     if _is_internal_monitoring_admin_request(request):
         return
+    if MONITORING_BASE_URL:
+        # Once the shared portal is enabled, the old public Basic password is
+        # no longer a parallel way around the central session. Manager actions
+        # arrive only through the portal proxy with its internal admin token.
+        raise HTTPException(
+            status_code=401,
+            detail="monitoring_session_required",
+        )
     if action:
         require_admin_action(request, settings)
     else:

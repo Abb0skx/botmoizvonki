@@ -17,7 +17,7 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import requests
 
@@ -48,6 +48,7 @@ from price_server.router import (
 )
 from reviews.router import router as reviews_router
 from monitoring.router import router as monitoring_router
+from monitoring.router import get_auth as get_monitoring_auth
 from monitoring.router import settings as monitoring_settings
 from telegram_business.router import router as telegram_business_router
 from telegram_business.router import get_service as get_telegram_business_service
@@ -118,41 +119,70 @@ _forwarding_service = None
 
 @app.middleware("http")
 async def protect_legacy_manager_routes(request: Request, call_next):
-    """Move human dashboards behind the shared-password monitoring portal.
+    """Keep the original manager tools behind the shared-password session.
 
-    Public review forms, webhooks, health checks and the price sync endpoint
+    The portal is only an entry point. The complete legacy dashboards and
+    their APIs stay available after login instead of being replaced by reduced
+    monitoring summaries. Public review forms, webhooks and health checks
     deliberately remain outside this guard.
     """
     path = request.url.path.rstrip("/") or "/"
     if monitoring_settings.enabled:
-        redirects = {
-            "/dashboard": "/monitoring/calls",
-            "/admin/reviews": "/monitoring/reviews",
-            "/delivery/monitor": "/monitoring/delivery/live",
-            "/delivery/stats": "/monitoring/delivery/stats",
-        }
-        if path in redirects and request.method == "GET":
-            target = redirects[path]
-            if request.url.query:
-                target += "?" + request.url.query
-            response = RedirectResponse(target, status_code=303)
-            response.headers["Cache-Control"] = "no-store"
+        html_pages = {"/dashboard", "/admin/reviews"}
+        protected_api = (
+            path == "/stats"
+            or path.startswith("/stats/")
+            or path == "/admin/device-managers"
+            or path.startswith("/api/admin/reviews")
+        )
+        if path in html_pages or protected_api:
+            try:
+                principal = get_monitoring_auth().principal(request)
+            except HTTPException as exc:
+                if (
+                    path in html_pages
+                    and request.method == "GET"
+                    and exc.status_code == 401
+                ):
+                    target = request.url.path
+                    if request.url.query:
+                        target += "?" + request.url.query
+                    response = RedirectResponse(
+                        "/monitoring/login?next=" + quote(target, safe=""),
+                        status_code=303,
+                    )
+                    response.headers["Cache-Control"] = "no-store, private"
+                    response.headers["X-Robots-Tag"] = "noindex, nofollow"
+                    return response
+                return JSONResponse(
+                    {"detail": str(exc.detail)},
+                    status_code=exc.status_code,
+                    headers={
+                        "Cache-Control": "no-store, private",
+                        "X-Robots-Tag": "noindex, nofollow",
+                    },
+                )
+
+            if path == "/admin/device-managers" and request.method not in {
+                "GET", "HEAD", "OPTIONS",
+            }:
+                try:
+                    get_monitoring_auth().verify_csrf(request, principal)
+                except HTTPException as exc:
+                    return JSONResponse(
+                        {"detail": str(exc.detail)},
+                        status_code=exc.status_code,
+                        headers={"Cache-Control": "no-store, private"},
+                    )
+
+            response = await call_next(request)
+            response.headers["Cache-Control"] = "no-store, private"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["X-Frame-Options"] = "DENY"
+            response.headers["Referrer-Policy"] = "no-referrer"
+            response.headers["X-Robots-Tag"] = "noindex, nofollow, noarchive"
             return response
-        if path == "/stats" or path.startswith("/stats/"):
-            return JSONResponse(
-                {"detail": "monitoring_session_required"},
-                status_code=401,
-                headers={
-                    "Cache-Control": "no-store",
-                    "X-Robots-Tag": "noindex, nofollow",
-                },
-            )
-        if path.startswith("/api/admin/reviews"):
-            return JSONResponse(
-                {"detail": "use_monitoring_api"},
-                status_code=410,
-                headers={"Cache-Control": "no-store"},
-            )
     return await call_next(request)
 
 
@@ -20236,12 +20266,24 @@ async function deviceManagerRequest(
     const options = {
         method,
         cache: "no-store",
+        credentials: "same-origin",
         headers: {},
     };
 
     if (payload !== null) {
         options.headers["Content-Type"] =
             "application/json";
+        const csrfPrefix =
+            "__Host-texnikach_monitoring_csrf=";
+        const csrfCookie = document.cookie
+            .split("; ")
+            .find(value => value.startsWith(csrfPrefix));
+        if (csrfCookie) {
+            options.headers["X-CSRF-Token"] =
+                decodeURIComponent(
+                    csrfCookie.slice(csrfPrefix.length)
+                );
+        }
         options.body = JSON.stringify(
             payload
         );

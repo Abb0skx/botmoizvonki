@@ -50,21 +50,46 @@ def _safe_json_segment(value: str) -> dict[str, Any]:
 
 def _safe_next(value: str | None) -> str:
     candidate = (value or "/monitoring").strip()
-    if not (
-        candidate == "/monitoring"
-        or candidate.startswith("/monitoring/")
-        or candidate.startswith("/monitoring?")
-        or candidate == "/price"
-        or candidate.startswith("/price?")
-        or candidate.startswith("/price#")
+    if (
+        len(candidate) > 1000
+        or not candidate.startswith("/")
+        or candidate.startswith("//")
+        or "\\" in candidate
+        or "\x00" in candidate
+        or "\r" in candidate
+        or "\n" in candidate
     ):
         return "/monitoring"
-    if candidate.startswith("//") or "\\" in candidate or "\x00" in candidate:
-        return "/monitoring"
     parsed = urlparse(candidate)
-    if parsed.scheme or parsed.netloc or parsed.path == "/monitoring/auth/callback":
+    allowed_pages = {
+        "/monitoring",
+        "/monitoring/calls",
+        "/monitoring/site",
+        "/monitoring/reviews",
+        "/monitoring/prices",
+        "/monitoring/prices/catalog",
+        "/monitoring/prices/manage",
+        "/monitoring/delivery/live",
+        "/monitoring/delivery/stats",
+        "/dashboard",
+        "/dashboard/",
+        "/admin/reviews",
+        "/admin/reviews/",
+        "/delivery/stats",
+        "/delivery/stats/",
+        "/delivery/monitor",
+        "/delivery/monitor/",
+        "/price",
+        "/price/",
+    }
+    if (
+        parsed.scheme
+        or parsed.netloc
+        or parsed.path == "/monitoring/auth/callback"
+        or parsed.path not in allowed_pages
+    ):
         return "/monitoring"
-    return candidate[:1000]
+    return candidate
 
 
 def _client_ip(request: Request) -> str:

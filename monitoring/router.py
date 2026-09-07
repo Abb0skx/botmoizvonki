@@ -5,7 +5,8 @@ import json
 import logging
 import re
 import secrets
-from datetime import datetime
+import time
+from datetime import date, datetime, timedelta
 from html import escape
 from pathlib import Path
 from typing import Any
@@ -59,6 +60,9 @@ router = APIRouter(tags=["manager-monitoring"])
 settings = MonitoringSettings.load()
 _store: MonitoringStore | None = None
 _auth: MonitoringAuth | None = None
+_go_all_cache: tuple[float, dict[str, Any]] | None = None
+_go_all_lock = asyncio.Lock()
+GO_STATS_EPOCH = date(2026, 1, 1)
 
 
 def get_store() -> MonitoringStore:
@@ -314,6 +318,7 @@ def auth_logout(request: Request):
 def monitoring_asset(filename: str):
     if filename not in {
         "monitoring.css", "monitoring.js", "price-admin-bridge.js",
+        "go-stats.css", "go-stats.js", "login.js",
     }:
         raise HTTPException(status_code=404, detail="asset_not_found")
     path = STATIC / filename
@@ -323,9 +328,6 @@ def monitoring_asset(filename: str):
 
 
 @router.get("/monitoring", response_class=HTMLResponse)
-@router.get("/monitoring/calls", response_class=HTMLResponse)
-@router.get("/monitoring/site", response_class=HTMLResponse)
-@router.get("/monitoring/reviews", response_class=HTMLResponse)
 @router.get("/monitoring/prices", response_class=HTMLResponse)
 def monitoring_page(request: Request):
     try:
@@ -362,7 +364,42 @@ def monitoring_page(request: Request):
     return _html(template.replace("__BOOTSTRAP__", bootstrap))
 
 
+def _legacy_page_redirect(request: Request, target: str) -> Response:
+    try:
+        _principal(request)
+    except HTTPException as exc:
+        if exc.status_code == 401:
+            return _login_redirect(request)
+        raise
+    if request.url.query:
+        target += "?" + request.url.query
+    return monitoring_security_headers(RedirectResponse(target, status_code=303))
+
+
+@router.get("/monitoring/calls", response_class=HTMLResponse)
+def monitoring_calls_legacy_page(request: Request):
+    return _legacy_page_redirect(request, "/dashboard")
+
+
+@router.get("/monitoring/reviews", response_class=HTMLResponse)
+def monitoring_reviews_legacy_page(request: Request):
+    return _legacy_page_redirect(request, "/admin/reviews")
+
+
+@router.get("/monitoring/site", response_class=HTMLResponse)
+def monitoring_go_legacy_page(request: Request):
+    try:
+        _principal(request)
+    except HTTPException as exc:
+        if exc.status_code == 401:
+            return _login_redirect(request)
+        raise
+    return _html(TEMPLATES.joinpath("go_stats.html").read_text(encoding="utf-8"))
+
+
 @router.get("/monitoring/delivery/live", response_class=HTMLResponse)
+@router.get("/delivery/monitor", response_class=HTMLResponse)
+@router.get("/delivery/monitor/", response_class=HTMLResponse, include_in_schema=False)
 def monitoring_delivery_live_page(request: Request):
     try:
         _principal(request)
@@ -374,6 +411,8 @@ def monitoring_delivery_live_page(request: Request):
 
 
 @router.get("/monitoring/delivery/stats", response_class=HTMLResponse)
+@router.get("/delivery/stats", response_class=HTMLResponse)
+@router.get("/delivery/stats/", response_class=HTMLResponse, include_in_schema=False)
 def monitoring_delivery_stats_page(request: Request):
     try:
         _principal(request)
@@ -623,6 +662,7 @@ def api_revoke_user_sessions(request: Request, telegram_user_id: int):
 
 
 @router.get("/monitoring/delivery/live/api/state")
+@router.get("/delivery/monitor/api/state")
 async def monitoring_delivery_live_state(request: Request):
     _principal(request)
     try:
@@ -639,6 +679,7 @@ async def monitoring_delivery_live_state(request: Request):
 
 
 @router.get("/monitoring/delivery/stats/api/report")
+@router.get("/delivery/stats/api/report")
 async def monitoring_delivery_stats_report(request: Request):
     _principal(request)
     params = _delivery_params(request)
@@ -657,6 +698,7 @@ async def monitoring_delivery_stats_report(request: Request):
 
 
 @router.get("/monitoring/delivery/stats/api/analytics")
+@router.get("/delivery/stats/api/analytics")
 async def monitoring_delivery_stats_analytics(request: Request):
     _principal(request)
     params = _delivery_params(request)
@@ -712,6 +754,7 @@ async def api_delivery_analytics(request: Request):
 
 
 @router.get("/monitoring/delivery/stats/map.png")
+@router.get("/delivery/stats/map.png")
 @router.get("/monitoring/api/delivery/map.png")
 async def api_delivery_map(request: Request):
     _principal(request)
@@ -749,6 +792,129 @@ async def api_go_site(
     except (httpx.HTTPError, RuntimeError, ValueError) as exc:
         return _json(_source_error("go_site", exc), status_code=503)
     return _json({"data": data, "meta": _meta("go_site")})
+
+
+@router.get("/monitoring/api/site/all")
+async def api_go_site_all(request: Request):
+    """Aggregate bounded upstream ranges into the legacy all-time period."""
+    global _go_all_cache
+
+    _principal(request)
+    now = time.monotonic()
+    if _go_all_cache and _go_all_cache[0] > now:
+        return _json({
+            "data": _go_all_cache[1],
+            "meta": _meta("go_site", cached=True),
+        })
+
+    async with _go_all_lock:
+        now = time.monotonic()
+        if _go_all_cache and _go_all_cache[0] > now:
+            return _json({
+                "data": _go_all_cache[1],
+                "meta": _meta("go_site", cached=True),
+            })
+
+        today = datetime.now(TASHKENT).date()
+        cursor = GO_STATS_EPOCH
+        ranges: list[tuple[date, date]] = []
+        while cursor <= today:
+            range_end = min(cursor + timedelta(days=365), today)
+            ranges.append((cursor, range_end))
+            cursor = range_end + timedelta(days=1)
+
+        adapter = GoSiteAdapter(settings)
+        try:
+            chunks = []
+            for range_start, range_end in ranges:
+                chunks.append(await adapter.stats({
+                    "period": "custom",
+                    "date_from": range_start.isoformat(),
+                    "date_to": range_end.isoformat(),
+                }))
+        except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+            return _json(_source_error("go_site", exc), status_code=503)
+
+        click_fields = (
+            "click_shop", "click_telegram", "click_manager", "click_phone",
+            "click_location_open", "click_yandex_navi", "click_yandex_maps",
+            "click_google_maps", "click_apple_maps", "click_copy_coordinates",
+            "click_order_ru", "click_order_uz",
+        )
+        totals = {field: 0 for field in ("views", *click_fields)}
+        series_by_date: dict[str, dict[str, Any]] = {}
+        for chunk in chunks:
+            metrics = chunk.get("metrics")
+            if isinstance(metrics, dict):
+                for field in totals:
+                    try:
+                        totals[field] += int(metrics.get(field) or 0)
+                    except (TypeError, ValueError):
+                        continue
+            series = chunk.get("series")
+            if isinstance(series, list):
+                for row in series:
+                    if not isinstance(row, dict):
+                        continue
+                    stat_date = str(row.get("date") or row.get("stat_date") or "")
+                    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", stat_date):
+                        series_by_date[stat_date] = {**row, "date": stat_date}
+
+        totals["main_clicks"] = sum(
+            totals[field] for field in (
+                "click_shop", "click_telegram", "click_manager",
+                "click_phone", "click_location_open",
+            )
+        )
+        totals["map_clicks"] = sum(
+            totals[field] for field in (
+                "click_yandex_navi", "click_yandex_maps", "click_google_maps",
+                "click_apple_maps", "click_copy_coordinates",
+            )
+        )
+        totals["order_clicks"] = (
+            totals["click_order_ru"] + totals["click_order_uz"]
+        )
+        for field in (
+            "click_shop", "click_telegram", "click_manager", "click_phone",
+            "click_location_open", "click_order_ru", "click_order_uz",
+        ):
+            totals[field + "_ctr"] = round(
+                totals[field] / totals["views"] * 100, 1
+            ) if totals["views"] else 0
+
+        restored = {
+            "schema_version": 1,
+            "generated_at": datetime.now(TASHKENT).isoformat(timespec="seconds"),
+            "period": {
+                "type": "all",
+                "date_from": GO_STATS_EPOCH.isoformat(),
+                "date_to": today.isoformat(),
+            },
+            "metrics": totals,
+            "series": [series_by_date[key] for key in sorted(series_by_date)],
+            "breakdowns": {
+                "channels": {
+                    "shop": totals["click_shop"],
+                    "telegram": totals["click_telegram"],
+                    "manager": totals["click_manager"],
+                    "phone": totals["click_phone"],
+                },
+                "maps": {
+                    "yandex_navi": totals["click_yandex_navi"],
+                    "yandex_maps": totals["click_yandex_maps"],
+                    "google_maps": totals["click_google_maps"],
+                    "apple_maps": totals["click_apple_maps"],
+                    "copy_coordinates": totals["click_copy_coordinates"],
+                },
+                "orders": {
+                    "ru": totals["click_order_ru"],
+                    "uz": totals["click_order_uz"],
+                },
+            },
+        }
+        _go_all_cache = (time.monotonic() + 60.0, restored)
+        return _json({"data": restored, "meta": _meta("go_site", cached=False)})
 
 
 @router.get("/monitoring/api/overview")

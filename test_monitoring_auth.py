@@ -212,6 +212,7 @@ class MonitoringRouteTests(unittest.TestCase):
         monitoring_router.settings = current
         monitoring_router._store = None
         monitoring_router._auth = None
+        monitoring_router._go_all_cache = None
         app = FastAPI()
         app.include_router(monitoring_router.router)
 
@@ -248,6 +249,15 @@ class MonitoringRouteTests(unittest.TestCase):
         self.assertNotIn("www-authenticate", api.headers)
 
     def test_password_login_remembers_device_and_returns_to_price(self):
+        login_page = self.client.get(
+            "/monitoring/login?next=%2Fprice", follow_redirects=False
+        )
+        self.assertIn("/monitoring/assets/login.js", login_page.text)
+        fragment_script = self.client.get("/monitoring/assets/login.js")
+        self.assertEqual(fragment_script.status_code, 200)
+        self.assertIn("location.hash", fragment_script.text)
+        self.assertIn('input[name="next"]', fragment_script.text)
+
         response = self.client.post(
             "/monitoring/login",
             data={"password": "test-password", "next": "/price"},
@@ -274,8 +284,169 @@ class MonitoringRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("Olmas", response.text)
         self.assertNotIn('type="password"', response.text)
+        for legacy_url in (
+            "/dashboard",
+            "/admin/reviews",
+            "/rating",
+            "/delivery/monitor",
+            "/delivery/stats",
+            "/price",
+        ):
+            self.assertIn(f'href="{legacy_url}"', response.text)
         self.assertEqual(response.headers["cache-control"], "no-store, private")
         self.assertEqual(response.headers["x-frame-options"], "DENY")
+
+    def test_reduced_portal_sections_return_to_complete_legacy_pages(self):
+        anonymous = self.client.get(
+            "/monitoring/calls?period=30d", follow_redirects=False
+        )
+        self.assertEqual(anonymous.status_code, 303)
+        self.assertIn(
+            "%2Fmonitoring%2Fcalls%3Fperiod%3D30d",
+            anonymous.headers["location"],
+        )
+
+        self.login()
+        calls = self.client.get(
+            "/monitoring/calls?period=30d", follow_redirects=False
+        )
+        reviews = self.client.get(
+            "/monitoring/reviews?period=7d", follow_redirects=False
+        )
+        self.assertEqual(calls.status_code, 303)
+        self.assertEqual(calls.headers["location"], "/dashboard?period=30d")
+        self.assertEqual(reviews.status_code, 303)
+        self.assertEqual(
+            reviews.headers["location"], "/admin/reviews?period=7d"
+        )
+
+    def test_go_page_restores_all_legacy_metrics_and_history(self):
+        anonymous = self.client.get(
+            "/monitoring/site", follow_redirects=False
+        )
+        self.assertEqual(anonymous.status_code, 303)
+
+        self.login()
+        page = self.client.get("/monitoring/site")
+        self.assertEqual(page.status_code, 200)
+        for marker in (
+            "GO Statistics",
+            "Сегодня",
+            "7 дней",
+            "30 дней",
+            "Всё время",
+            "ОСНОВНЫЕ ДЕЙСТВИЯ",
+            "КАРТЫ И НАВИГАЦИЯ",
+            "ЗАКАЗ",
+            "ПОСЛЕДНИЕ 30 ДНЕЙ",
+        ):
+            self.assertIn(marker, page.text)
+        self.assertIn("/monitoring/assets/go-stats.css", page.text)
+        self.assertIn("/monitoring/assets/go-stats.js", page.text)
+        self.assertIn("script-src 'self'", page.headers["content-security-policy"])
+
+        script = self.client.get("/monitoring/assets/go-stats.js")
+        self.assertEqual(script.status_code, 200)
+        for field in (
+            "click_shop",
+            "click_telegram",
+            "click_manager",
+            "click_phone",
+            "click_location_open",
+            "click_yandex_navi",
+            "click_yandex_maps",
+            "click_google_maps",
+            "click_apple_maps",
+            "click_copy_coordinates",
+            "click_order_ru",
+            "click_order_uz",
+        ):
+            self.assertIn(field, script.text)
+        self.assertIn("/monitoring/api/site/all", script.text)
+        for field in ("main_clicks", "map_clicks", "order_clicks"):
+            self.assertIn(field, script.text)
+
+    def test_go_all_time_aggregates_bounded_ranges(self):
+        self.login()
+        current_day = datetime.now(monitoring_router.TASHKENT).date()
+        epoch = current_day - timedelta(days=366)
+        first_chunk = {
+            "schema_version": 1,
+            "metrics": {
+                "views": 10,
+                "click_shop": 2,
+                "click_telegram": 1,
+                "click_manager": 1,
+                "click_phone": 1,
+                "click_location_open": 1,
+                "click_yandex_navi": 1,
+                "click_yandex_maps": 1,
+                "click_google_maps": 0,
+                "click_apple_maps": 0,
+                "click_copy_coordinates": 1,
+                "click_order_ru": 2,
+                "click_order_uz": 1,
+            },
+            "series": [{"date": epoch.isoformat(), "views": 10}],
+        }
+        second_chunk = {
+            "schema_version": 1,
+            "metrics": {
+                "views": 5,
+                "click_shop": 1,
+                "click_telegram": 1,
+                "click_yandex_maps": 1,
+                "click_order_uz": 1,
+            },
+            "series": [{"date": current_day.isoformat(), "views": 5}],
+        }
+        upstream = AsyncMock(side_effect=[first_chunk, second_chunk])
+        with patch.object(
+            monitoring_router, "GO_STATS_EPOCH", epoch
+        ), patch.object(
+            monitoring_router.GoSiteAdapter, "stats", new=upstream
+        ):
+            response = self.client.get("/monitoring/api/site/all")
+            cached = self.client.get("/monitoring/api/site/all")
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()["data"]
+        self.assertEqual(data["period"]["type"], "all")
+        self.assertEqual(data["metrics"]["main_clicks"], 8)
+        self.assertEqual(data["metrics"]["map_clicks"], 4)
+        self.assertEqual(data["metrics"]["order_clicks"], 4)
+        self.assertEqual(data["metrics"]["click_shop_ctr"], 20.0)
+        self.assertEqual(
+            [row["date"] for row in data["series"]],
+            [epoch.isoformat(), current_day.isoformat()],
+        )
+        self.assertEqual(upstream.await_count, 2)
+        calls = upstream.await_args_list
+        self.assertEqual(calls[0].args[0], {
+            "period": "custom",
+            "date_from": epoch.isoformat(),
+            "date_to": (current_day - timedelta(days=1)).isoformat(),
+        })
+        self.assertEqual(calls[1].args[0], {
+            "period": "custom",
+            "date_from": current_day.isoformat(),
+            "date_to": current_day.isoformat(),
+        })
+        self.assertTrue(cached.json()["meta"]["cached"])
+
+    def test_go_all_time_does_not_cache_upstream_failure(self):
+        self.login()
+        with patch.object(
+            monitoring_router.GoSiteAdapter,
+            "stats",
+            new=AsyncMock(side_effect=RuntimeError("temporary")),
+        ):
+            response = self.client.get("/monitoring/api/site/all")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(
+            response.json()["meta"]["status"], "unavailable"
+        )
+        self.assertIsNone(monitoring_router._go_all_cache)
 
     def test_delivery_pages_restore_full_legacy_interface(self):
         anonymous = self.client.get(
@@ -317,7 +488,22 @@ class MonitoringRouteTests(unittest.TestCase):
         self.assertEqual(live.status_code, 200)
         self.assertIn("Карта движения", live.text)
         self.assertIn("Активные заказы", live.text)
+        self.assertIn('id="movementSlider"', live.text)
+        self.assertIn('id="movementLive"', live.text)
+        self.assertIn("movementPreviewTime", live.text)
+        self.assertIn('movement.kind==="warehouse"', live.text)
         self.assertIn("/monitoring/delivery/live/api/state", live.text)
+
+        direct_stats = self.client.get(
+            "/delivery/stats?period=today", follow_redirects=False
+        )
+        direct_live = self.client.get(
+            "/delivery/monitor", follow_redirects=False
+        )
+        self.assertEqual(direct_stats.status_code, 200)
+        self.assertIn("Доставки курьеров за месяц", direct_stats.text)
+        self.assertEqual(direct_live.status_code, 200)
+        self.assertIn('id="movementSlider"', direct_live.text)
 
     def test_legacy_delivery_api_shape_uses_detailed_internal_data(self):
         self.login()
@@ -684,12 +870,28 @@ class MonitoringRouteTests(unittest.TestCase):
 
 
 class SafeNextTests(unittest.TestCase):
-    def test_only_monitoring_relative_paths_are_allowed(self):
-        self.assertEqual(_safe_next("/monitoring/calls?period=7d"), "/monitoring/calls?period=7d")
+    def test_only_portal_and_exact_legacy_relative_paths_are_allowed(self):
+        for safe in (
+            "/monitoring/calls?period=7d",
+            "/monitoring/site",
+            "/monitoring/prices/manage#smartphones-7tech-connect-u7",
+            "/monitoring/delivery/stats?period=today",
+            "/dashboard?period=30d",
+            "/dashboard/",
+            "/admin/reviews?period=7d",
+            "/admin/reviews/",
+            "/delivery/stats?day=yesterday&month=2026-08",
+            "/delivery/monitor",
+            "/price#smartphones-7tech-connect-u7",
+        ):
+            self.assertEqual(_safe_next(safe), safe)
         for unsafe in (
             "https://evil.example", "//evil.example/monitoring",
-            "/dashboard", "/monitoringevil", "/monitoring\\evil",
-            "/monitoring/auth/callback",
+            "/dashboard/other", "/monitoringevil", "/monitoring\\evil",
+            "/monitoring/auth/callback", "/stats", "/api/admin/reviews/stats",
+            "/monitoring/api/me", "/monitoring/assets/monitoring.js",
+            "/monitoring/login", "/monitoring/auth/logout",
+            "/delivery/stats.evil", "/price/admin", "/dashboard\r\nX-Test: yes",
         ):
             self.assertEqual(_safe_next(unsafe), "/monitoring")
 
