@@ -6,6 +6,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from app.database import OrderRepository
+from app.utils.couriers import COURIERS
 
 
 class DeliveryStatusFeedRepositoryTests(unittest.TestCase):
@@ -140,6 +141,126 @@ class DeliveryStatusFeedRepositoryTests(unittest.TestCase):
             ["completed"],
         )
 
+    def test_feed_resolves_all_configured_couriers_from_their_user_id(self) -> None:
+        for courier in COURIERS:
+            with self.subTest(courier=courier.name):
+                order = self.create_order(product=f"Order for {courier.name}")
+                self.repo.transition(
+                    order.id,
+                    {"draft"},
+                    status="pending",
+                    assigned_courier_id=courier.user_id,
+                    assigned_courier_name="untrusted stored name",
+                )
+
+        feed = self.repo.delivery_status_event_feed(limit=100)
+        by_product = {event["product"]: event for event in feed["events"]}
+
+        for courier in COURIERS:
+            with self.subTest(courier=courier.name):
+                event = by_product[f"Order for {courier.name}"]
+                self.assertEqual(event["courier_id"], courier.user_id)
+                self.assertEqual(event["courier_name"], courier.name)
+                self.assertEqual(event["courier_phone"], courier.phone)
+
+    def test_feed_uses_current_assignment_after_pending_reassignment(self) -> None:
+        first, replacement = COURIERS[:2]
+        order = self.create_order()
+        pending = self.repo.transition(
+            order.id,
+            {"draft"},
+            status="pending",
+            assigned_courier_id=first.user_id,
+            assigned_courier_name=first.name,
+        )
+        self.repo.update(
+            order.id,
+            expected_updated_at=pending.updated_at,
+            assigned_courier_id=replacement.user_id,
+            assigned_courier_name="forged replacement name",
+        )
+
+        feed = self.repo.delivery_status_event_feed(limit=100)
+
+        self.assertEqual(len(feed["events"]), 1)
+        event = feed["events"][0]
+        self.assertEqual(event["courier_id"], replacement.user_id)
+        self.assertEqual(event["courier_name"], replacement.name)
+        self.assertEqual(event["courier_phone"], replacement.phone)
+
+    def test_feed_prefers_actual_courier_over_assigned_courier(self) -> None:
+        actual = COURIERS[0]
+        order = self.create_order()
+        self.repo.transition(
+            order.id,
+            {"draft"},
+            status="on_way",
+            assigned_courier_id=actual.user_id,
+            assigned_courier_name="forged assigned name",
+            courier_id=actual.user_id,
+            courier_name="forged actual name",
+        )
+
+        event = self.repo.delivery_status_event_feed(limit=100)["events"][0]
+
+        self.assertEqual(event["courier_id"], actual.user_id)
+        self.assertEqual(event["courier_name"], actual.name)
+        self.assertEqual(event["courier_phone"], actual.phone)
+
+    def test_customer_contact_requires_actual_courier_after_pickup(self) -> None:
+        assigned = COURIERS[0]
+        order = self.create_order()
+        self.repo.transition(
+            order.id,
+            {"draft"},
+            status="picked_up",
+            assigned_courier_id=assigned.user_id,
+            assigned_courier_name=assigned.name,
+            courier_id=None,
+            courier_name=None,
+        )
+
+        event = self.repo.delivery_status_event_feed(limit=100)["events"][0]
+
+        self.assertEqual(event["courier_id"], assigned.user_id)
+        self.assertIsNone(event["courier_name"])
+        self.assertIsNone(event["courier_phone"])
+
+    def test_conflicting_assigned_and_actual_couriers_hide_contact_details(self) -> None:
+        assigned, actual = COURIERS[:2]
+        order = self.create_order()
+        self.repo.transition(
+            order.id,
+            {"draft"},
+            status="on_way",
+            assigned_courier_id=assigned.user_id,
+            assigned_courier_name=assigned.name,
+            courier_id=actual.user_id,
+            courier_name=actual.name,
+        )
+
+        event = self.repo.delivery_status_event_feed(limit=100)["events"][0]
+
+        self.assertEqual(event["courier_id"], actual.user_id)
+        self.assertIsNone(event["courier_name"])
+        self.assertIsNone(event["courier_phone"])
+
+    def test_unknown_courier_never_exposes_untrusted_name_or_phone(self) -> None:
+        order = self.create_order()
+        self.repo.transition(
+            order.id,
+            {"draft"},
+            status="pending",
+            assigned_courier_id=999999999,
+            assigned_courier_name="Unknown Person +998901234567",
+        )
+
+        event = self.repo.delivery_status_event_feed(limit=100)["events"][0]
+
+        self.assertEqual(event["courier_id"], 999999999)
+        self.assertIsNone(event["courier_name"])
+        self.assertIsNone(event["courier_phone"])
+
     def test_feed_validates_cursor_and_page_size(self) -> None:
         with self.assertRaises(ValueError):
             self.repo.delivery_status_event_feed(after_event_id=-1)
@@ -242,6 +363,9 @@ class DeliveryStatusFeedWebTests(unittest.TestCase):
                 "client_phone_2",
                 "product",
                 "current_status",
+                "courier_id",
+                "courier_name",
+                "courier_phone",
             },
         )
 

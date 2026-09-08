@@ -179,6 +179,7 @@ def test_delivery_status_templates_are_short_and_hide_order_number(code, languag
         language,
         order_number="1542",
         product="iPhone 16 Pro Max",
+        courier_name="Muzrob Oka",
         courier_phone="+998948765070",
     )
 
@@ -194,7 +195,7 @@ def test_delivery_status_templates_are_seeded_for_sheets_idempotently():
 
     assert len(rows_by_code) == len(rows)
     assert "order_number" not in ALLOWED_PLACEHOLDERS
-    assert {"product", "courier_phone"} <= ALLOWED_PLACEHOLDERS
+    assert {"product", "courier_name", "courier_phone"} <= ALLOWED_PLACEHOLDERS
     for code in DELIVERY_TEMPLATE_CODES:
         row = rows_by_code[code]
         assert row[1] is True
@@ -214,6 +215,7 @@ def test_completed_delivery_asks_for_review_once(language, call_to_action):
         language,
         order_number="1542",
         product="iPhone 16 Pro Max",
+        courier_name="Muzrob Oka",
         courier_phone="+998948765070",
     )
 
@@ -232,6 +234,7 @@ def test_review_link_is_not_sent_for_incomplete_delivery_statuses(code, language
         language,
         order_number="1542",
         product="iPhone 16 Pro Max",
+        courier_name="Muzrob Oka",
         courier_phone="+998948765070",
     )
 
@@ -256,18 +259,26 @@ def test_review_link_is_seeded_only_for_completed_delivery():
     (
         ("delivery_status_pending", "ru", "⏳ Ожидаем курьера."),
         ("delivery_status_pending", "uz", "⏳ Kuryerni kutyapmiz."),
-        ("delivery_status_picked_up", "ru", "📦 Курьер забрал товар."),
-        ("delivery_status_picked_up", "uz", "📦 Kuryer mahsulotni olib ketdi."),
+        (
+            "delivery_status_picked_up",
+            "ru",
+            "📦 Курьер Muzrob Oka забрал товар.",
+        ),
+        (
+            "delivery_status_picked_up",
+            "uz",
+            "📦 Kuryer Muzrob Oka mahsulotni olib ketdi.",
+        ),
         (
             "delivery_status_on_way",
             "ru",
-            "🚗 Курьер выехал. Пожалуйста, будьте по указанному адресу и готовы "
+            "🚗 Курьер Muzrob Oka выехал. Пожалуйста, будьте по указанному адресу и готовы "
             "получить товар.\n\nТелефон курьера: +998948765070",
         ),
         (
             "delivery_status_on_way",
             "uz",
-            "🚗 Kuryer yo‘lga chiqdi. Iltimos, ko‘rsatilgan manzilda bo‘ling va "
+            "🚗 Kuryer Muzrob Oka yo‘lga chiqdi. Iltimos, ko‘rsatilgan manzilda bo‘ling va "
             "mahsulotni qabul qilishga tayyor turing.\n\n"
             "Kuryer raqami: +998948765070",
         ),
@@ -296,30 +307,23 @@ def test_review_link_is_seeded_only_for_completed_delivery():
     ),
 )
 def test_delivery_status_copy_is_exact(code, language, expected):
-    assert render(code, language, courier_phone="+998948765070") == expected
+    assert render(
+        code,
+        language,
+        courier_name="Muzrob Oka",
+        courier_phone="+998948765070",
+    ) == expected
 
 
-def test_delivery_courier_phone_is_configurable_and_validated():
+def test_delivery_courier_phone_is_not_a_global_business_setting():
     env = enabled_business_env(
         BUSINESS_DELIVERY_NOTIFICATIONS_ENABLED="true",
         BUSINESS_DELIVERY_NOTIFICATIONS_URL="http://delivery:8080",
         BUSINESS_DELIVERY_NOTIFICATIONS_TOKEN="secret",
-        BUSINESS_DELIVERY_COURIER_PHONE="+998 94 876 50 70",
+        BUSINESS_DELIVERY_COURIER_PHONE="+998000000000",
     )
     with patch.dict(os.environ, env, clear=True):
         settings = BusinessSettings.load()
-    assert settings.delivery_courier_phone == "+998 94 876 50 70"
+
     settings.validate_enabled()
-
-
-def test_delivery_courier_phone_rejects_template_injection():
-    env = enabled_business_env(
-        BUSINESS_DELIVERY_NOTIFICATIONS_ENABLED="true",
-        BUSINESS_DELIVERY_NOTIFICATIONS_URL="http://delivery:8080",
-        BUSINESS_DELIVERY_NOTIFICATIONS_TOKEN="secret",
-        BUSINESS_DELIVERY_COURIER_PHONE="+998\nBAD",
-    )
-    with patch.dict(os.environ, env, clear=True):
-        settings = BusinessSettings.load()
-    with pytest.raises(RuntimeError, match="display-safe phone"):
-        settings.validate_enabled()
+    assert not hasattr(settings, "delivery_courier_phone")

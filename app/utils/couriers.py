@@ -6,12 +6,28 @@ class CourierOption:
     user_id: int
     name: str
     group_id: int
+    phone: str
 
 
 COURIERS: tuple[CourierOption, ...] = (
-    CourierOption(user_id=7636344727, name="Olmas", group_id=-5111626405),
-    CourierOption(user_id=202134293, name="Abbos", group_id=-5216093690),
-    CourierOption(user_id=1799690992, name="Muzrob Oka", group_id=-5125237049),
+    CourierOption(
+        user_id=7636344727,
+        name="Olmas",
+        group_id=-5111626405,
+        phone="+998900979898",
+    ),
+    CourierOption(
+        user_id=202134293,
+        name="Abbos",
+        group_id=-5216093690,
+        phone="+998901333999",
+    ),
+    CourierOption(
+        user_id=1799690992,
+        name="Muzrob Oka",
+        group_id=-5125237049,
+        phone="+998948765070",
+    ),
 )
 COURIERS_BY_ID = {courier.user_id: courier for courier in COURIERS}
 

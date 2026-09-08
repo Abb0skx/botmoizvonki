@@ -11,6 +11,8 @@ from html.parser import HTMLParser
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
+from app.utils.couriers import COURIERS, COURIERS_BY_ID
+
 from .config import BusinessSettings
 from .delivery_notifications import (
     DeliveryStatusClient,
@@ -475,12 +477,18 @@ class BusinessService:
         template_code: str,
         order_id: int,
         public_status: str,
+        source_event_id: int,
         now: datetime,
+        *,
+        outbound_dedupe_key: str | None = None,
     ) -> tuple[str, int | None]:
         """Send a transactional status without changing response-time metrics."""
 
-        delivery_key = (
-            f"delivery-status:{int(order_id)}:{public_status}:{chat_id}"
+        delivery_key = outbound_dedupe_key or self.delivery_store.outbound_key_for(
+            source_event_id,
+            order_id,
+            public_status,
+            chat_id,
         )
         content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
         decision = self.repo.begin_outbound_delivery(
@@ -897,17 +905,49 @@ class BusinessService:
         language = str(_value(gate.get("client"), "language", "bi") or "bi")
         public_status = str(row["public_status"])
         template_code = f"delivery_status_{public_status}"
+        courier_id = (
+            int(row["courier_id"]) if row["courier_id"] is not None else None
+        )
+        courier_name = str(row["courier_name"] or "").strip()
+        courier_phone = str(row["courier_phone"] or "").strip()
+        configured_courier = COURIERS_BY_ID.get(courier_id)
+        if public_status in {"picked_up", "on_way"}:
+            exact_name = bool(
+                configured_courier
+                and courier_name == configured_courier.name
+            )
+            exact_phone = bool(
+                configured_courier
+                and courier_phone == configured_courier.phone
+            )
+            if not exact_name or (public_status == "on_way" and not exact_phone):
+                error = "trusted delivery courier contact is unavailable"
+                store.finish(
+                    **common,
+                    **match_fields,
+                    session_id=session_id,
+                    template_code=template_code,
+                    outcome="failed",
+                    error=error,
+                )
+                self._record_error(
+                    "delivery_courier_contact", now, chat_id, session_id,
+                    RuntimeError(error),
+                )
+                return None
+        delivery_key = store.outbound_key_for(
+            event_id,
+            int(row["order_id"]),
+            public_status,
+            chat_id,
+        )
         text = self._render_message(
             template_code,
             language,
             now,
-            courier_phone=str(
-                getattr(
-                    self.settings,
-                    "delivery_courier_phone",
-                    "+998948765070",
-                )
-            ),
+            courier_id=courier_id,
+            courier_name=courier_name,
+            courier_phone=courier_phone,
         )
         if not text:
             store.finish(
@@ -953,7 +993,9 @@ class BusinessService:
                 template_code,
                 int(row["order_id"]),
                 public_status,
+                event_id,
                 now,
+                outbound_dedupe_key=delivery_key,
             )
         except Exception as exc:
             status = getattr(exc, "status", None)
@@ -971,6 +1013,7 @@ class BusinessService:
                 session_id=session_id,
                 template_code=template_code,
                 outcome=outcome,
+                outbound_dedupe_key=delivery_key,
                 error=exc,
                 retry_after=getattr(exc, "retry_after", None),
             )
@@ -1004,6 +1047,7 @@ class BusinessService:
                 template_code=template_code,
                 telegram_message_id=message_id,
                 outcome=outcome,
+                outbound_dedupe_key=delivery_key,
             )
         if outcome == "sent" and finished:
             LOG.info(
@@ -1205,6 +1249,61 @@ class BusinessService:
         now: datetime,
         **values: Any,
     ) -> str | None:
+        try:
+            courier_id = int(values.get("courier_id"))
+        except (TypeError, ValueError):
+            courier_id = 0
+        configured_courier = COURIERS_BY_ID.get(courier_id)
+        expected_name = str(values.get("courier_name") or "").strip()
+        expected_phone = str(values.get("courier_phone") or "").strip()
+
+        def trusted_delivery_copy(result: str | None) -> bool:
+            if not result or code not in {
+                "delivery_status_picked_up",
+                "delivery_status_on_way",
+            }:
+                return bool(result)
+            if not configured_courier or expected_name != configured_courier.name:
+                return False
+            if expected_name not in result:
+                return False
+            if code == "delivery_status_on_way":
+                if expected_phone != configured_courier.phone:
+                    return False
+                if expected_phone not in result:
+                    return False
+            phone_numbers = {
+                re.sub(r"\D", "", match)
+                for match in re.findall(r"\+?\d(?:[ ().-]*\d){7,}", result)
+            }
+            expected_digits = re.sub(r"\D", "", expected_phone)
+            if code == "delivery_status_picked_up" and phone_numbers:
+                return False
+            if code == "delivery_status_on_way" and phone_numbers - {
+                expected_digits
+            }:
+                return False
+            folded = result.casefold()
+            digits = re.sub(r"\D", "", result)
+            for other in COURIERS:
+                if other.user_id == courier_id:
+                    continue
+                if other.name.casefold() in folded:
+                    return False
+                other_digits = re.sub(r"\D", "", other.phone)
+                if other_digits and other_digits in digits:
+                    return False
+            return True
+
+        def builtin(selected: str) -> str | None:
+            try:
+                result = render(code, selected, **values)
+            except (KeyError, RuntimeError, ValueError):
+                return None
+            if code in {"delivery_status_picked_up", "delivery_status_on_way"}:
+                return result if trusted_delivery_copy(result) else None
+            return result
+
         def one(selected: str) -> str | None:
             try:
                 cached = getattr(self.sheets, "render_cached", None)
@@ -1215,24 +1314,17 @@ class BusinessService:
             except Exception:
                 # Cached sheet content must never make Telegram processing fail.
                 # Invalid rows fall back to the approved built-in text.
-                try:
-                    result = render(code, selected, **values)
-                except (KeyError, RuntimeError, ValueError):
-                    return None
+                result = builtin(selected)
 
             if not result:
                 return result
 
-            # Operators may customize the surrounding copy in Google Sheets,
-            # but these two transactional details are mandatory.  Append them
-            # when an older or shortened override omitted the placeholder/link.
-            if code == "delivery_status_on_way":
-                courier_phone = str(values.get("courier_phone") or "").strip()
-                if courier_phone and courier_phone not in result:
-                    label = (
-                        "Kuryer raqami" if selected == "uz" else "Телефон курьера"
-                    )
-                    result = f"{result.rstrip()}\n\n{label}: {courier_phone}"
+            # A stale Sheet row may still contain the former static courier
+            # phone. Never append the correct details to mixed/incorrect copy:
+            # replace the whole override with the trusted built-in template.
+            if code in {"delivery_status_picked_up", "delivery_status_on_way"}:
+                if not trusted_delivery_copy(result):
+                    result = builtin(selected)
             elif code == "delivery_status_completed" and REVIEW_URL not in result:
                 review_prompt = (
                     "Iltimos, xizmatimizni baholang:"
@@ -1252,23 +1344,29 @@ class BusinessService:
                     "\n\n———\n\n".join(review_parts)
                     + f"\n\n{REVIEW_URL}"
                 )
-            if code == "delivery_status_on_way" and len(parts) > 1:
-                courier_phone = str(values.get("courier_phone") or "").strip()
-                if courier_phone:
+            if code in {
+                "delivery_status_picked_up",
+                "delivery_status_on_way",
+            } and len(parts) > 1:
+                if configured_courier and expected_name:
                     standalone_label = re.compile(
-                        r"(?m)^(?:Телефон курьера|Kuryer raqami):[ \t]*$\n?"
+                        r"(?m)^(?:Телефон курьера|Kuryer raqami|"
+                        r"Курьер|Kuryer):[ \t]*$\n?"
                     )
                     clean_parts = []
                     for part in parts:
-                        cleaned = part.replace(courier_phone, "")
+                        cleaned = part.replace(expected_name, "")
+                        if expected_phone:
+                            cleaned = cleaned.replace(expected_phone, "")
                         cleaned = standalone_label.sub("", cleaned)
                         cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
                         if cleaned:
                             clean_parts.append(cleaned)
-                    return (
-                        "\n\n———\n\n".join(filter(None, clean_parts))
-                        + f"\n\n📞 {courier_phone}"
-                    )
+                    contact = f"👤 {expected_name}"
+                    if code == "delivery_status_on_way" and expected_phone:
+                        contact += f"\n📞 {expected_phone}"
+                    return "\n\n———\n\n".join(clean_parts) + f"\n\n{contact}"
+                return None
             return "\n\n———\n\n".join(parts) if parts else None
         return one(language if language in {"ru", "uz"} else "ru")
 

@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 import pytest
 import requests
 
+from app.utils.couriers import COURIERS_BY_ID
 from telegram_business.config import BusinessSettings
 from telegram_business.delivery_notifications import (
     DeliveryFeedError,
@@ -26,6 +27,8 @@ from telegram_business.templates import REVIEW_URL
 
 TZ = ZoneInfo("Asia/Tashkent")
 FEED_ID = "11111111-1111-4111-8111-111111111111"
+DEFAULT_COURIER = COURIERS_BY_ID[1799690992]
+OLMAS = COURIERS_BY_ID[7636344727]
 
 
 class FakeTelegramAPI:
@@ -153,6 +156,9 @@ def delivery_event(event_id: int, order_id: int, status="pending", **extra):
         "product": "iPhone 16 Pro Max",
         "client_phone": "+998901112233",
         "client_phone_2": "",
+        "courier_id": DEFAULT_COURIER.user_id,
+        "courier_name": DEFAULT_COURIER.name,
+        "courier_phone": DEFAULT_COURIER.phone,
         "created_at": "2026-09-07T10:00:00+05:00",
         **extra,
     }
@@ -367,17 +373,20 @@ def test_first_poll_baselines_then_routes_and_deduplicates():
         notification = service.delivery_store.notification(101)
         assert notification["state"] == "sent"
 
-        # A repeated delivery status for the same order is not a second client
-        # notification even when the source journal has a new event id.
+        # A distinct authenticated source event is a new occurrence even when
+        # its public status is unchanged.  This covers a rollback/reassignment
+        # that happened entirely between two polls. Replaying the same page is
+        # still idempotent by source_event_id.
         feed.events.append(delivery_event(102, 2))
         feed.latest = 102
         service.delivery_notifications_cycle()
         service.delivery_notifications_cycle()
-        assert len(api.sent) == 1
+        assert len(api.sent) == 2
+        assert api.deleted == [("connection", (7001,))]
         with connect(service.repo.path) as db:
             assert db.execute(
                 "SELECT count(*) FROM delivery_status_notifications"
-            ).fetchone()[0] == 1
+            ).fetchone()[0] == 2
             cycle = db.execute(
                 "SELECT first_bot_at FROM response_cycles WHERE session_id=?",
                 (session_id,),
@@ -388,10 +397,7 @@ def test_first_poll_baselines_then_routes_and_deduplicates():
                    WHERE template_code='delivery_status_pending'"""
             ).fetchone()
             assert audit["cycle_id"] is None
-        assert service.repo.bot_message_count("200", session_id, now_box[0]) == (
-            1,
-            1,
-        )
+        assert service.repo.bot_message_count("200", session_id, now_box[0]) == (2, 1)
 
 
 @pytest.mark.parametrize(
@@ -469,7 +475,7 @@ def test_delivery_status_sequence_replaces_only_its_previous_bot_message():
         ]
         texts = [item[2] for item in api.sent]
         assert texts[0] == "⏳ Ожидаем курьера."
-        assert texts[1] == "📦 Курьер забрал товар."
+        assert texts[1] == "📦 Курьер Muzrob Oka забрал товар."
         assert "+998948765070" in texts[2]
         assert "будьте по указанному адресу" in texts[2]
         assert texts[3].count(REVIEW_URL) == 1
@@ -501,6 +507,211 @@ def test_delivery_status_sequence_replaces_only_its_previous_bot_message():
         ]
 
 
+def test_same_status_courier_reassignment_sends_replacement_before_cleanup():
+    with tempfile.TemporaryDirectory() as tmp:
+        now = datetime(2026, 9, 7, 20, 0, tzinfo=TZ)
+        api = FakeTelegramAPI()
+        service = BusinessService(
+            business_settings(Path(tmp) / "business.db"),
+            clock=lambda: now,
+            api=api,
+        )
+        feed = FakeFeed(latest=0)
+        service.delivery_client = feed
+        establish_chat(service, now)
+        service.delivery_notifications_cycle()
+
+        feed.events.append(delivery_event(1, 91, "on_way"))
+        feed.latest = 1
+        service.delivery_notifications_cycle()
+
+        # The source can contain only the latest transition when rollback and
+        # reassignment both happened between polls. A distinct source event
+        # must replace the old courier contact even without an invalidation.
+        feed.events.append(
+            delivery_event(
+                2,
+                91,
+                "on_way",
+                courier_id=OLMAS.user_id,
+                courier_name=OLMAS.name,
+                courier_phone=OLMAS.phone,
+            )
+        )
+        feed.latest = 2
+        service.delivery_notifications_cycle()
+
+        assert api.actions == [
+            ("send", 7001),
+            ("send", 7002),
+            ("delete", 7001),
+        ]
+        assert "Muzrob Oka" in api.sent[0][2]
+        assert DEFAULT_COURIER.phone in api.sent[0][2]
+        assert "Olmas" in api.sent[1][2]
+        assert OLMAS.phone in api.sent[1][2]
+        assert "Muzrob Oka" not in api.sent[1][2]
+        assert DEFAULT_COURIER.phone not in api.sent[1][2]
+        assert all("1091" not in text for _, _, text in api.sent)
+        assert service.delivery_store.notification(1)["state"] == "sent"
+        assert service.delivery_store.notification(2)["state"] == "sent"
+        with connect(service.repo.path) as db:
+            keys = [
+                row[0]
+                for row in db.execute(
+                    """SELECT outbound_dedupe_key
+                       FROM delivery_status_notifications
+                       WHERE order_id=91 ORDER BY source_event_id"""
+                )
+            ]
+        assert keys == [
+            "delivery-status:91:on_way:1:200",
+            "delivery-status:91:on_way:2:200",
+        ]
+
+
+def test_failed_reassignment_still_removes_old_courier_contact():
+    with tempfile.TemporaryDirectory() as tmp:
+        now = datetime(2026, 9, 7, 20, 0, tzinfo=TZ)
+        api = FakeTelegramAPI()
+        service = BusinessService(
+            business_settings(Path(tmp) / "business.db"),
+            clock=lambda: now,
+            api=api,
+        )
+        feed = FakeFeed(latest=0)
+        service.delivery_client = feed
+        establish_chat(service, now)
+        service.delivery_notifications_cycle()
+
+        feed.events.append(delivery_event(1, 93, "on_way"))
+        feed.latest = 1
+        service.delivery_notifications_cycle()
+
+        feed.events.append(
+            delivery_event(
+                2,
+                93,
+                "on_way",
+                courier_id=OLMAS.user_id,
+                courier_name=OLMAS.name,
+                courier_phone=DEFAULT_COURIER.phone,
+            )
+        )
+        feed.latest = 2
+        service.delivery_notifications_cycle()
+
+        assert api.actions == [("send", 7001), ("delete", 7001)]
+        assert service.delivery_store.notification(2)["state"] == "failed"
+        with connect(service.repo.path) as db:
+            deletion = db.execute(
+                """SELECT target_source_event_id,replacement_source_event_id,state
+                   FROM delivery_status_message_deletions"""
+            ).fetchone()
+        assert tuple(deletion) == (1, 2, "deleted")
+
+
+def test_invalidation_and_courier_reassignment_in_one_page_send_then_delete():
+    with tempfile.TemporaryDirectory() as tmp:
+        now = datetime(2026, 9, 7, 20, 0, tzinfo=TZ)
+        api = FakeTelegramAPI()
+        service = BusinessService(
+            business_settings(Path(tmp) / "business.db"),
+            clock=lambda: now,
+            api=api,
+        )
+        feed = FakeFeed(latest=0)
+        service.delivery_client = feed
+        establish_chat(service, now)
+        service.delivery_notifications_cycle()
+
+        feed.events.append(delivery_event(1, 92, "on_way"))
+        feed.latest = 1
+        service.delivery_notifications_cycle()
+
+        feed.invalidations.append(
+            {
+                "event_id": 2,
+                "order_id": 92,
+                "current_status": "picked_up",
+                "to_status": "picked_up",
+                "created_at": "2026-09-07T10:01:00+05:00",
+            }
+        )
+        feed.events.append(
+            delivery_event(
+                3,
+                92,
+                "on_way",
+                courier_id=OLMAS.user_id,
+                courier_name=OLMAS.name,
+                courier_phone=OLMAS.phone,
+            )
+        )
+        feed.latest = 3
+        service.delivery_notifications_cycle()
+
+        # Replacement is sent before any customer-visible old contact is
+        # deleted, including when an invalidation pre-queued the cleanup row.
+        assert api.actions == [
+            ("send", 7001),
+            ("send", 7002),
+            ("delete", 7001),
+        ]
+        assert "Olmas" in api.sent[-1][2]
+        assert OLMAS.phone in api.sent[-1][2]
+        assert "Muzrob Oka" not in api.sent[-1][2]
+        assert DEFAULT_COURIER.phone not in api.sent[-1][2]
+        assert service.delivery_store.notification(1)["state"] == "invalidated"
+        assert service.delivery_store.notification(3)["state"] == "sent"
+        with connect(service.repo.path) as db:
+            deletion = db.execute(
+                """SELECT target_source_event_id,replacement_source_event_id,state
+                   FROM delivery_status_message_deletions"""
+            ).fetchone()
+        assert tuple(deletion) == (1, 3, "deleted")
+
+
+@pytest.mark.parametrize(
+    "courier_fields",
+    (
+        {"courier_id": None},
+        {"courier_name": ""},
+        {"courier_phone": ""},
+        {"courier_phone": OLMAS.phone},
+    ),
+)
+def test_on_way_fails_closed_without_exact_courier_contact(courier_fields):
+    with tempfile.TemporaryDirectory() as tmp:
+        now = datetime(2026, 9, 7, 20, 0, tzinfo=TZ)
+        api = FakeTelegramAPI()
+        service = BusinessService(
+            business_settings(Path(tmp) / "business.db"),
+            clock=lambda: now,
+            api=api,
+        )
+        feed = FakeFeed(latest=0)
+        service.delivery_client = feed
+        establish_chat(service, now)
+        service.delivery_notifications_cycle()
+
+        feed.events.append(delivery_event(1, 93, "on_way", **courier_fields))
+        feed.latest = 1
+        service.delivery_notifications_cycle()
+
+        assert api.sent == []
+        notification = service.delivery_store.notification(1)
+        assert notification["state"] == "failed"
+        assert notification["last_error"] == (
+            "trusted delivery courier contact is unavailable"
+        )
+        with connect(service.repo.path) as db:
+            assert db.execute(
+                """SELECT count(*) FROM business_outbound_deliveries
+                   WHERE dedupe_key LIKE 'delivery-status:%'"""
+            ).fetchone()[0] == 0
+
+
 def test_bilingual_on_way_message_shows_courier_phone_once():
     with tempfile.TemporaryDirectory() as tmp:
         now = datetime(2026, 9, 7, 20, 0, tzinfo=TZ)
@@ -514,7 +725,9 @@ def test_bilingual_on_way_message_shows_courier_phone_once():
             "delivery_status_on_way",
             "bi",
             now,
-            courier_phone="+998948765070",
+            courier_id=DEFAULT_COURIER.user_id,
+            courier_name=DEFAULT_COURIER.name,
+            courier_phone=DEFAULT_COURIER.phone,
         )
 
         assert text is not None
@@ -553,21 +766,22 @@ def test_sheet_override_cannot_omit_mandatory_delivery_detail(
             template_code,
             language,
             now,
-            courier_phone="+998948765070",
+            courier_id=DEFAULT_COURIER.user_id,
+            courier_name=DEFAULT_COURIER.name,
+            courier_phone=DEFAULT_COURIER.phone,
         )
 
         assert text is not None
         assert text.count(required_value) == 1
 
 
-def test_bilingual_sheet_override_keeps_text_when_phone_was_inline():
-    class InlinePhoneSheetOverride:
+def test_static_sheet_courier_contact_is_replaced_by_exact_row_contact():
+    class StaleStaticCourierSheetOverride:
         @staticmethod
-        def render_cached(_code, selected, values):
-            phone = values["courier_phone"]
+        def render_cached(_code, selected, _values):
             if selected == "uz":
-                return f"Kuryer {phone} bilan yo‘lga chiqdi."
-            return f"Курьер с номером {phone} уже выехал."
+                return "Kuryer Muzrob Oka yo‘lga chiqdi. +998948765070"
+            return "Курьер Muzrob Oka уже выехал. +998948765070"
 
     with tempfile.TemporaryDirectory() as tmp:
         now = datetime(2026, 9, 7, 20, 0, tzinfo=TZ)
@@ -576,19 +790,91 @@ def test_bilingual_sheet_override_keeps_text_when_phone_was_inline():
             clock=lambda: now,
             api=FakeTelegramAPI(),
         )
-        service.sheets = InlinePhoneSheetOverride()
+        service.sheets = StaleStaticCourierSheetOverride()
 
         text = service._render_message(
             "delivery_status_on_way",
             "bi",
             now,
-            courier_phone="+998948765070",
+            courier_id=OLMAS.user_id,
+            courier_name=OLMAS.name,
+            courier_phone=OLMAS.phone,
         )
 
         assert text is not None
-        assert "Курьер с номером уже выехал." in text
-        assert "Kuryer bilan yo‘lga chiqdi." in text
-        assert text.count("+998948765070") == 1
+        assert "Muzrob Oka" not in text
+        assert "+998948765070" not in text
+        assert text.count("Olmas") == 1
+        assert text.count("+998900979898") == 1
+        assert "будьте по указанному адресу" in text
+        assert "ko‘rsatilgan manzilda bo‘ling" in text
+
+
+def test_static_sheet_wrong_courier_name_is_replaced_for_picked_up():
+    class StaleStaticCourierSheetOverride:
+        @staticmethod
+        def render_cached(_code, selected, _values):
+            if selected == "uz":
+                return "Kuryer Muzrob Oka mahsulotni olib ketdi."
+            return "Курьер Muzrob Oka забрал товар."
+
+    with tempfile.TemporaryDirectory() as tmp:
+        now = datetime(2026, 9, 7, 20, 0, tzinfo=TZ)
+        service = BusinessService(
+            business_settings(Path(tmp) / "business.db"),
+            clock=lambda: now,
+            api=FakeTelegramAPI(),
+        )
+        service.sheets = StaleStaticCourierSheetOverride()
+
+        text = service._render_message(
+            "delivery_status_picked_up",
+            "bi",
+            now,
+            courier_id=OLMAS.user_id,
+            courier_name=OLMAS.name,
+            courier_phone=OLMAS.phone,
+        )
+
+        assert text is not None
+        assert "Muzrob Oka" not in text
+        assert text.count("Olmas") == 1
+        assert "забрал товар" in text
+        assert "mahsulotni olib ketdi" in text
+
+
+def test_sheet_override_with_extra_unknown_phone_is_replaced():
+    class UnsafeCourierSheetOverride:
+        @staticmethod
+        def render_cached(_code, selected, values):
+            name = values["courier_name"]
+            phone = values["courier_phone"]
+            if selected == "uz":
+                return f"Kuryer {name} yo‘lga chiqdi. {phone} / +998000000000"
+            return f"Курьер {name} выехал. {phone} / +998000000000"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        now = datetime(2026, 9, 7, 20, 0, tzinfo=TZ)
+        service = BusinessService(
+            business_settings(Path(tmp) / "business.db"),
+            clock=lambda: now,
+            api=FakeTelegramAPI(),
+        )
+        service.sheets = UnsafeCourierSheetOverride()
+
+        text = service._render_message(
+            "delivery_status_on_way",
+            "bi",
+            now,
+            courier_id=OLMAS.user_id,
+            courier_name=OLMAS.name,
+            courier_phone=OLMAS.phone,
+        )
+
+        assert text is not None
+        assert "+998000000000" not in text
+        assert text.count(OLMAS.name) == 1
+        assert text.count(OLMAS.phone) == 1
 
 
 def test_cleanup_waits_for_delete_right_then_resumes_without_resending():
@@ -995,7 +1281,7 @@ def test_hidden_rollback_invalidation_supersedes_deferred_status(tmp_path):
     assert store.claim_due(now + timedelta(minutes=10), limit=10) == []
 
 
-def test_repeated_public_status_reuses_only_never_delivered_row(tmp_path):
+def test_repeated_public_status_keeps_event_history_and_replaces_unsent_row(tmp_path):
     path = tmp_path / "business.db"
     migrate(path)
     store = DeliveryNotificationStore(path)
@@ -1037,14 +1323,14 @@ def test_repeated_public_status_reuses_only_never_delivered_row(tmp_path):
         feed_instance_id=FEED_ID,
     ) == 1
 
-    assert store.notification(1) is None
+    assert store.notification(1)["state"] == "superseded"
     replacement = store.notification(3)
     assert replacement["state"] == "pending"
     with connect(path) as db:
         assert db.execute(
             """SELECT count(*) FROM delivery_status_notifications
                WHERE order_id=72 AND public_status='on_way'"""
-        ).fetchone()[0] == 1
+        ).fetchone()[0] == 2
 
 
 def test_feed_instance_change_and_cursor_reset_rebaseline_without_history(tmp_path):

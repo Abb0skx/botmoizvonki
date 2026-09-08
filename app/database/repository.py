@@ -8,6 +8,7 @@ from threading import Lock
 from typing import Any
 
 from app.models import Order, OrderEvent
+from app.utils.couriers import courier_option
 
 SCHEMA_VERSION = 1
 SQLITE_INT_MAX = 2**63 - 1
@@ -1224,6 +1225,8 @@ class OrderRepository:
                        orders.client_phone_2,
                        orders.product,
                        orders.status AS current_status,
+                       orders.assigned_courier_id,
+                       orders.courier_id,
                        (SELECT MAX(newer.id) FROM order_events AS newer
                          WHERE newer.order_id=event.order_id
                            AND COALESCE(newer.from_status,'')
@@ -1240,6 +1243,31 @@ class OrderRepository:
         next_after_event_id = int(rows[-1]["event_id"]) if rows else after_event_id
 
         def payload(row: sqlite3.Row) -> dict[str, Any]:
+            def positive_id(value: Any) -> int | None:
+                try:
+                    parsed = int(value) if value is not None else None
+                except (TypeError, ValueError):
+                    return None
+                return parsed if parsed is not None and parsed > 0 else None
+
+            assigned_courier_id = positive_id(row["assigned_courier_id"])
+            actual_courier_id = positive_id(row["courier_id"])
+            courier_id = actual_courier_id or assigned_courier_id
+            requires_actual_courier = str(row["current_status"] or "") in {
+                "picked_up",
+                "on_way",
+            }
+            identity_conflict = (
+                actual_courier_id is not None
+                and assigned_courier_id is not None
+                and actual_courier_id != assigned_courier_id
+            )
+            configured_courier = (
+                None
+                if identity_conflict
+                or (requires_actual_courier and actual_courier_id is None)
+                else courier_option(courier_id)
+            )
             return {
                 "event_id": int(row["event_id"]),
                 "order_id": int(row["order_id"]),
@@ -1252,6 +1280,13 @@ class OrderRepository:
                 "client_phone_2": row["client_phone_2"],
                 "product": row["product"],
                 "current_status": row["current_status"],
+                "courier_id": courier_id,
+                "courier_name": (
+                    configured_courier.name if configured_courier else None
+                ),
+                "courier_phone": (
+                    configured_courier.phone if configured_courier else None
+                ),
             }
 
         latest_transitions = [

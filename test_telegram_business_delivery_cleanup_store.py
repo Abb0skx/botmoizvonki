@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from app.utils.couriers import COURIERS_BY_ID
 from telegram_business.delivery_store import DeliveryNotificationStore
 from telegram_business.migrations import connect, migrate
 from telegram_business.repository import BusinessRepository
@@ -11,6 +13,7 @@ from telegram_business.repository import BusinessRepository
 
 TZ = ZoneInfo("Asia/Tashkent")
 FEED_ID = "11111111-1111-4111-8111-111111111111"
+DEFAULT_COURIER = COURIERS_BY_ID[1799690992]
 
 
 def _insert_notification(
@@ -499,6 +502,179 @@ def test_cleanup_migration_is_additive_and_idempotent(tmp_path):
             )
         }
         assert "business_connection_id" in outbound_columns
+
+
+def test_event_identity_migration_preserves_legacy_sent_row_and_dedupe(tmp_path):
+    path = tmp_path / "business.db"
+    now = datetime(2026, 9, 8, 10, 0, tzinfo=TZ).isoformat()
+    with sqlite3.connect(path) as db:
+        db.execute(
+            """CREATE TABLE delivery_status_notifications (
+               source_event_id INTEGER PRIMARY KEY, order_id INTEGER NOT NULL,
+               order_number TEXT NOT NULL, public_status TEXT NOT NULL,
+               product TEXT, phones_json TEXT NOT NULL DEFAULT '[]',
+               source_created_at TEXT, courier_id INTEGER, courier_name TEXT,
+               courier_phone TEXT, outbound_dedupe_key TEXT,
+               state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+               next_attempt_at TEXT NOT NULL, lease_token TEXT, lease_expires_at TEXT,
+               match_outcome TEXT, business_connection_id TEXT, chat_id TEXT,
+               session_id TEXT, template_code TEXT, telegram_message_id INTEGER,
+               last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+               processed_at TEXT, UNIQUE(order_id, public_status))"""
+        )
+        db.execute(
+            """INSERT INTO delivery_status_notifications(
+               source_event_id,order_id,order_number,public_status,product,
+               phones_json,source_created_at,courier_id,courier_name,courier_phone,
+               outbound_dedupe_key,state,attempts,next_attempt_at,match_outcome,
+               business_connection_id,chat_id,session_id,template_code,
+               telegram_message_id,created_at,updated_at,processed_at)
+               VALUES(7,44,'private-order','on_way','phone','["+998901112233"]',
+                      ?,?,?,?,?,'sent',2,?,'sent','connection','200','session',
+                      'delivery_status_on_way',7011,?,?,?)""",
+            (
+                now,
+                DEFAULT_COURIER.user_id,
+                DEFAULT_COURIER.name,
+                DEFAULT_COURIER.phone,
+                "delivery-status:44:on_way:200",
+                now,
+                now,
+                now,
+                now,
+            ),
+        )
+
+    migrate(path)
+    migrate(path)
+
+    with connect(path) as db:
+        row = db.execute(
+            """SELECT * FROM delivery_status_notifications
+               WHERE source_event_id=7"""
+        ).fetchone()
+        assert row["state"] == "sent"
+        assert row["telegram_message_id"] == 7011
+        assert row["courier_id"] == DEFAULT_COURIER.user_id
+        assert row["courier_name"] == DEFAULT_COURIER.name
+        assert row["courier_phone"] == DEFAULT_COURIER.phone
+        assert row["outbound_dedupe_key"] == "delivery-status:44:on_way:200"
+        unique_indexes = []
+        for index in db.execute(
+            "PRAGMA index_list(delivery_status_notifications)"
+        ):
+            if int(index["unique"]):
+                unique_indexes.append(
+                    tuple(
+                        item["name"]
+                        for item in db.execute(
+                            f"PRAGMA index_info({index['name']})"
+                        )
+                    )
+                )
+        assert ("order_id", "public_status") not in unique_indexes
+        db.execute(
+            """INSERT INTO delivery_status_notifications(
+               source_event_id,order_id,order_number,public_status,phones_json,
+               state,next_attempt_at,created_at,updated_at)
+               VALUES(8,44,'private-order','on_way','[]','pending',?,?,?)""",
+            (now, now, now),
+        )
+
+    store = DeliveryNotificationStore(path)
+    assert store.outbound_key_for(7, 44, "on_way", "200") == (
+        "delivery-status:44:on_way:200"
+    )
+    assert store.outbound_key_for(8, 44, "on_way", "200") == (
+        "delivery-status:44:on_way:8:200"
+    )
+
+
+def test_event_identity_migration_upgrades_exact_previous_release_schema(tmp_path):
+    path = tmp_path / "business.db"
+    now = datetime(2026, 9, 8, 10, 0, tzinfo=TZ).isoformat()
+    with sqlite3.connect(path) as db:
+        db.execute(
+            """CREATE TABLE business_integration_state (
+               key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)"""
+        )
+        db.execute(
+            """INSERT INTO business_integration_state(key,value,updated_at)
+               VALUES('delivery_status_event_cursor','20',?)""",
+            (now,),
+        )
+        db.execute(
+            """CREATE TABLE delivery_status_notifications (
+               source_event_id INTEGER PRIMARY KEY, order_id INTEGER NOT NULL,
+               order_number TEXT NOT NULL, public_status TEXT NOT NULL,
+               product TEXT, phones_json TEXT NOT NULL DEFAULT '[]',
+               source_created_at TEXT,
+               state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+               next_attempt_at TEXT NOT NULL, lease_token TEXT, lease_expires_at TEXT,
+               match_outcome TEXT, business_connection_id TEXT, chat_id TEXT,
+               session_id TEXT, template_code TEXT, telegram_message_id INTEGER,
+               last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+               processed_at TEXT, UNIQUE(order_id, public_status))"""
+        )
+        db.execute(
+            """INSERT INTO delivery_status_notifications(
+               source_event_id,order_id,order_number,public_status,phones_json,
+               state,next_attempt_at,match_outcome,business_connection_id,
+               chat_id,session_id,template_code,telegram_message_id,
+               created_at,updated_at,processed_at)
+               VALUES(9,45,'private-order','picked_up','[]','retry',?,NULL,
+                      'connection','201','session','delivery_status_picked_up',
+                      NULL,?,?,NULL)""",
+            (now, now, now),
+        )
+
+    migrate(path)
+
+    with connect(path) as db:
+        row = db.execute(
+            """SELECT * FROM delivery_status_notifications
+               WHERE source_event_id=9"""
+        ).fetchone()
+        assert row["state"] == "retry"
+        assert row["telegram_message_id"] is None
+        assert row["courier_id"] is None
+        assert row["courier_name"] is None
+        assert row["courier_phone"] is None
+        assert row["outbound_dedupe_key"] == (
+            "delivery-status:45:picked_up:201"
+        )
+        cursor = db.execute(
+            """SELECT value FROM business_integration_state
+               WHERE key='delivery_status_event_cursor'"""
+        ).fetchone()
+        assert cursor["value"] == "8"
+
+    store = DeliveryNotificationStore(path)
+    assert store.import_page(
+        8,
+        9,
+        [
+            {
+                "event_id": 9,
+                "order_id": 45,
+                "order_number": "private-order",
+                "status": "picked_up",
+                "current_status": "picked_up",
+                "product": "phone",
+                "phones": (),
+                "courier_id": DEFAULT_COURIER.user_id,
+                "courier_name": DEFAULT_COURIER.name,
+                "courier_phone": DEFAULT_COURIER.phone,
+                "created_at": now,
+            }
+        ],
+        datetime.fromisoformat(now),
+    ) == 0
+    refreshed = store.notification(9)
+    assert refreshed["state"] == "retry"
+    assert refreshed["courier_id"] == DEFAULT_COURIER.user_id
+    assert refreshed["courier_name"] == DEFAULT_COURIER.name
+    assert refreshed["courier_phone"] == DEFAULT_COURIER.phone
 
 
 def test_local_cleanup_audit_cannot_tombstone_client_or_manager_messages(tmp_path):

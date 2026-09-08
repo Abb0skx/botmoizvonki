@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from app.utils.couriers import COURIERS_BY_ID
 from telegram_business.config import BusinessSettings
 from telegram_business.delivery_notifications import DeliveryFeedPage
 from telegram_business.migrations import connect
@@ -18,6 +19,7 @@ from telegram_business.telegram_api import TelegramAPIError
 TZ = ZoneInfo("Asia/Tashkent")
 FEED_INSTANCE_ID = str(UUID("8fe74570-c699-4f2e-b410-1f35debf7961"))
 PHONE = "+998901112233"
+DEFAULT_COURIER = COURIERS_BY_ID[1799690992]
 
 
 class RecordingTelegramAPI:
@@ -271,6 +273,9 @@ def delivery_event(
         "phones": (phone,),
         "client_phone": phone,
         "client_phone_2": "",
+        "courier_id": DEFAULT_COURIER.user_id,
+        "courier_name": DEFAULT_COURIER.name,
+        "courier_phone": DEFAULT_COURIER.phone,
         "created_at": created_at.isoformat(),
     }
 

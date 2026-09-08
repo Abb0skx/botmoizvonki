@@ -33,6 +33,7 @@ ALLOWED_PLACEHOLDERS = frozenset(
         "preferred_time",
         "missing_fields",
         "product",
+        "courier_name",
         "courier_phone",
     }
 )
@@ -115,16 +116,16 @@ TEMPLATES: dict[str, dict[str, str]] = {
         "uz": "⏳ Kuryerni kutyapmiz.",
     },
     "delivery_status_picked_up": {
-        "ru": "📦 Курьер забрал товар.",
-        "uz": "📦 Kuryer mahsulotni olib ketdi.",
+        "ru": "📦 Курьер {courier_name} забрал товар.",
+        "uz": "📦 Kuryer {courier_name} mahsulotni olib ketdi.",
     },
     "delivery_status_on_way": {
         "ru": (
-            "🚗 Курьер выехал. Пожалуйста, будьте по указанному адресу "
+            "🚗 Курьер {courier_name} выехал. Пожалуйста, будьте по указанному адресу "
             "и готовы получить товар.\n\nТелефон курьера: {courier_phone}"
         ),
         "uz": (
-            "🚗 Kuryer yo‘lga chiqdi. Iltimos, ko‘rsatilgan manzilda bo‘ling "
+            "🚗 Kuryer {courier_name} yo‘lga chiqdi. Iltimos, ko‘rsatilgan manzilda bo‘ling "
             "va mahsulotni qabul qilishga tayyor turing.\n\n"
             "Kuryer raqami: {courier_phone}"
         ),

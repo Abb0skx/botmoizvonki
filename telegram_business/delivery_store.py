@@ -19,6 +19,31 @@ def _backoff(attempts: int) -> int:
     return min(900, max(5, 2 ** min(max(int(attempts), 1), 9)))
 
 
+def delivery_outbound_key(
+    order_id: int,
+    public_status: str,
+    source_event_id: int,
+    chat_id: str,
+) -> str:
+    """Return an event-scoped key while retaining the legacy order prefix."""
+
+    order = int(order_id)
+    event = int(source_event_id)
+    status = str(public_status or "").strip()
+    chat = str(chat_id or "").strip()
+    if order <= 0 or event <= 0 or not status or not chat:
+        raise ValueError("delivery outbound identity is incomplete")
+    return f"delivery-status:{order}:{status}:{event}:{chat}"
+
+
+def legacy_delivery_outbound_key(
+    order_id: int,
+    public_status: str,
+    chat_id: str,
+) -> str:
+    return f"delivery-status:{int(order_id)}:{public_status}:{chat_id}"
+
+
 class DeliveryNotificationStore:
     """Durable cursor and outbox for delivery-to-Business notifications."""
 
@@ -232,6 +257,189 @@ class DeliveryNotificationStore:
     def _safe_text(value: Any, maximum: int) -> str:
         return (redact_sensitive_data(str(value or "")) or "")[:maximum]
 
+    @staticmethod
+    def _queue_invalidated_sent_messages_in_db(
+        db: sqlite3.Connection,
+        *,
+        order_id: int,
+        before_event_id: int,
+        current_status: str,
+        invalidation_event_id: int,
+        now: datetime,
+    ) -> int:
+        """Queue only locally proven bot statuses made false by a rollback.
+
+        A hidden rollback/reassignment has no customer-visible replacement to
+        send first.  Keeping an old "courier is on the way" message would be
+        materially wrong, so the invalidation itself is the replacement fence.
+        Messages that still describe the current public state are retained.
+        """
+
+        rows = db.execute(
+            """SELECT notification.source_event_id,
+                      notification.business_connection_id,
+                      notification.chat_id,
+                      notification.telegram_message_id
+                 FROM delivery_status_notifications AS notification
+                 JOIN business_outbound_deliveries AS outbound
+                   ON outbound.dedupe_key=COALESCE(
+                        notification.outbound_dedupe_key,
+                        'delivery-status:' || notification.order_id || ':' ||
+                        notification.public_status || ':' || notification.chat_id)
+                  AND outbound.chat_id=notification.chat_id
+                  AND outbound.template_code=(
+                        'delivery_status_' || notification.public_status)
+                  AND outbound.state='sent'
+                  AND outbound.telegram_message_id=
+                        notification.telegram_message_id
+                  AND (
+                        outbound.business_connection_id=
+                            notification.business_connection_id
+                        OR outbound.business_connection_id IS NULL)
+                WHERE notification.order_id=?
+                  AND notification.source_event_id<?
+                  AND notification.public_status<>?
+                  AND notification.state='sent'
+                  AND notification.business_connection_id IS NOT NULL
+                  AND notification.chat_id IS NOT NULL
+                  AND notification.telegram_message_id IS NOT NULL
+                  AND notification.telegram_message_id>0
+                ORDER BY notification.source_event_id""",
+            (int(order_id), int(before_event_id), str(current_status)),
+        ).fetchall()
+        queued = 0
+        for row in rows:
+            queued += int(
+                db.execute(
+                    """INSERT INTO delivery_status_message_deletions(
+                       order_id,business_connection_id,chat_id,
+                       telegram_message_id,target_source_event_id,
+                       replacement_source_event_id,state,next_attempt_at,
+                       created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,'pending',?,?,?)
+                       ON CONFLICT(business_connection_id,chat_id,
+                                   telegram_message_id) DO UPDATE SET
+                       replacement_source_event_id=MAX(
+                         delivery_status_message_deletions.replacement_source_event_id,
+                         excluded.replacement_source_event_id),
+                       updated_at=excluded.updated_at""",
+                    (
+                        int(order_id),
+                        str(row["business_connection_id"]),
+                        str(row["chat_id"]),
+                        int(row["telegram_message_id"]),
+                        int(row["source_event_id"]),
+                        int(invalidation_event_id),
+                        _iso(now),
+                        _iso(now),
+                        _iso(now),
+                    ),
+                ).rowcount
+                == 1
+            )
+        return queued
+
+    @staticmethod
+    def _queue_changed_courier_message_in_db(
+        db: sqlite3.Connection,
+        *,
+        order_id: int,
+        before_event_id: int,
+        public_status: str,
+        courier_id: int | None,
+        courier_name: str | None,
+        courier_phone: str | None,
+        now: datetime,
+    ) -> int:
+        """Remove a proven old contact once the source assigns another courier.
+
+        This cleanup is intentionally independent of replacement delivery. If
+        the new notification cannot be sent, retaining a known-wrong courier
+        name or phone is less safe than temporarily showing no status message.
+        """
+
+        status = str(public_status)
+        if status not in {"picked_up", "on_way"}:
+            return 0
+        rows = db.execute(
+            """SELECT notification.source_event_id,
+                      notification.business_connection_id,
+                      notification.chat_id,
+                      notification.telegram_message_id,
+                      notification.courier_id,
+                      notification.courier_name,
+                      notification.courier_phone
+                 FROM delivery_status_notifications AS notification
+                 JOIN business_outbound_deliveries AS outbound
+                   ON outbound.dedupe_key=COALESCE(
+                        notification.outbound_dedupe_key,
+                        'delivery-status:' || notification.order_id || ':' ||
+                        notification.public_status || ':' || notification.chat_id)
+                  AND outbound.chat_id=notification.chat_id
+                  AND outbound.template_code=(
+                        'delivery_status_' || notification.public_status)
+                  AND outbound.state='sent'
+                  AND outbound.telegram_message_id=
+                        notification.telegram_message_id
+                  AND (
+                        outbound.business_connection_id=
+                            notification.business_connection_id
+                        OR outbound.business_connection_id IS NULL)
+                WHERE notification.order_id=?
+                  AND notification.source_event_id<?
+                  AND notification.public_status=?
+                  AND notification.state='sent'
+                  AND notification.business_connection_id IS NOT NULL
+                  AND notification.chat_id IS NOT NULL
+                  AND notification.telegram_message_id IS NOT NULL
+                  AND notification.telegram_message_id>0
+                ORDER BY notification.source_event_id""",
+            (int(order_id), int(before_event_id), status),
+        ).fetchall()
+        replacement = (
+            int(courier_id) if courier_id is not None else None,
+            str(courier_name or ""),
+            str(courier_phone or "") if status == "on_way" else "",
+        )
+        queued = 0
+        for row in rows:
+            previous = (
+                int(row["courier_id"]) if row["courier_id"] is not None else None,
+                str(row["courier_name"] or ""),
+                str(row["courier_phone"] or "") if status == "on_way" else "",
+            )
+            if previous == replacement:
+                continue
+            queued += int(
+                db.execute(
+                    """INSERT INTO delivery_status_message_deletions(
+                       order_id,business_connection_id,chat_id,
+                       telegram_message_id,target_source_event_id,
+                       replacement_source_event_id,state,next_attempt_at,
+                       created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,'pending',?,?,?)
+                       ON CONFLICT(business_connection_id,chat_id,
+                                   telegram_message_id) DO UPDATE SET
+                       replacement_source_event_id=MAX(
+                         delivery_status_message_deletions.replacement_source_event_id,
+                         excluded.replacement_source_event_id),
+                       updated_at=excluded.updated_at""",
+                    (
+                        int(order_id),
+                        str(row["business_connection_id"]),
+                        str(row["chat_id"]),
+                        int(row["telegram_message_id"]),
+                        int(row["source_event_id"]),
+                        int(before_event_id),
+                        _iso(now),
+                        _iso(now),
+                        _iso(now),
+                    ),
+                ).rowcount
+                == 1
+            )
+        return queued
+
     def import_page(
         self,
         expected_cursor: int,
@@ -293,6 +501,30 @@ class DeliveryNotificationStore:
                     (_iso(now), _iso(now), order_id, event_id),
                 )
                 if is_invalidation:
+                    self._queue_invalidated_sent_messages_in_db(
+                        db,
+                        order_id=order_id,
+                        before_event_id=event_id,
+                        current_status=str(event.get("current_status") or ""),
+                        invalidation_event_id=event_id,
+                        now=now,
+                    )
+                    db.execute(
+                        """UPDATE delivery_status_notifications
+                           SET state='invalidated',match_outcome='invalidated',
+                               processed_at=COALESCE(processed_at,?),updated_at=?,
+                               lease_token=NULL,lease_expires_at=NULL
+                           WHERE order_id=? AND source_event_id<?
+                             AND public_status<>?
+                             AND state IN ('sent','uncertain')""",
+                        (
+                            _iso(now),
+                            _iso(now),
+                            order_id,
+                            event_id,
+                            str(event.get("current_status") or ""),
+                        ),
+                    )
                     continue
 
                 public_status = str(event["status"])
@@ -312,58 +544,60 @@ class DeliveryNotificationStore:
                     self._safe_text(event.get("product"), 500),
                     json.dumps(phones, ensure_ascii=False),
                     self._safe_text(event.get("created_at"), 80),
+                    (
+                        int(event["courier_id"])
+                        if event.get("courier_id") is not None
+                        else None
+                    ),
+                    self._safe_text(event.get("courier_name"), 80) or None,
+                    self._safe_text(event.get("courier_phone"), 32) or None,
                 )
-                existing = db.execute(
-                    """SELECT source_event_id,state,chat_id
-                       FROM delivery_status_notifications
-                       WHERE order_id=? AND public_status=?""",
-                    (order_id, public_status),
-                ).fetchone()
-                if existing is not None:
-                    existing_id = int(existing["source_event_id"])
-                    existing_state = str(existing["state"])
-                    if existing_id >= event_id or existing_state in {
-                        "sent", "uncertain", "running"
-                    }:
-                        continue
-                    changed = db.execute(
-                        """UPDATE delivery_status_notifications SET
-                           source_event_id=?,order_number=?,product=?,phones_json=?,
-                           source_created_at=?,state='pending',attempts=0,
-                           next_attempt_at=?,lease_token=NULL,lease_expires_at=NULL,
-                           match_outcome=NULL,business_connection_id=NULL,chat_id=NULL,
-                           session_id=NULL,template_code=NULL,telegram_message_id=NULL,
-                           last_error=NULL,created_at=?,updated_at=?,processed_at=NULL
-                           WHERE source_event_id=?
-                             AND state NOT IN ('sent','uncertain','running')""",
-                        (
-                            event_id,
-                            *values,
-                            _iso(now),
-                            _iso(now),
-                            _iso(now),
-                            existing_id,
-                        ),
-                    ).rowcount
-                    if changed and existing_state == "failed" and existing["chat_id"]:
-                        dedupe_key = (
-                            f"delivery-status:{order_id}:{public_status}:"
-                            f"{existing['chat_id']}"
-                        )
-                        db.execute(
-                            """UPDATE business_outbound_deliveries SET state='retry',
-                               last_error=NULL,updated_at=?
-                               WHERE dedupe_key=? AND state='failed'""",
-                            (_iso(now), dedupe_key),
-                        )
-                    inserted += int(changed == 1)
-                    continue
+                self._queue_changed_courier_message_in_db(
+                    db,
+                    order_id=order_id,
+                    before_event_id=event_id,
+                    public_status=public_status,
+                    courier_id=values[4],
+                    courier_name=values[5],
+                    courier_phone=values[6],
+                    now=now,
+                )
+                # A migration may have rewound the source cursor to enrich an
+                # already queued event from the previous release. Refresh only
+                # unsent rows; sent/uncertain audit records remain immutable.
+                db.execute(
+                    """UPDATE delivery_status_notifications SET
+                       order_number=?,product=?,phones_json=?,source_created_at=?,
+                       courier_id=?,courier_name=?,courier_phone=?,updated_at=?
+                       WHERE source_event_id=?
+                         AND state IN ('pending','retry','deferred')""",
+                    (
+                        values[0],
+                        values[1],
+                        values[2],
+                        values[3],
+                        values[4],
+                        values[5],
+                        values[6],
+                        _iso(now),
+                        event_id,
+                    ),
+                )
+                # ``source_event_id`` is the authenticated, monotonic delivery
+                # event identity.  Do not collapse two occurrences merely
+                # because their public status matches: a rollback and courier
+                # reassignment can both happen between polls, in which case the
+                # feed legitimately exposes only the newer public transition.
+                # Replayed web requests remain harmless because this column is
+                # the primary key.  The older visible message is removed only
+                # after this replacement is confirmed sent.
                 changed = db.execute(
                     """INSERT OR IGNORE INTO delivery_status_notifications(
                        source_event_id,order_id,order_number,public_status,
-                       product,phones_json,source_created_at,state,
+                       product,phones_json,source_created_at,courier_id,
+                       courier_name,courier_phone,state,
                        next_attempt_at,created_at,updated_at)
-                       VALUES(?,?,?,?,?,?,?,'pending',?,?,?)""",
+                       VALUES(?,?,?,?,?,?,?,?,?,?,'pending',?,?,?)""",
                     (
                         event_id,
                         order_id,
@@ -372,6 +606,9 @@ class DeliveryNotificationStore:
                         values[1],
                         values[2],
                         values[3],
+                        values[4],
+                        values[5],
+                        values[6],
                         _iso(now),
                         _iso(now),
                         _iso(now),
@@ -457,6 +694,7 @@ class DeliveryNotificationStore:
         session_id: str | None = None,
         template_code: str | None = None,
         telegram_message_id: int | None = None,
+        outbound_dedupe_key: str | None = None,
         error: Exception | str | None = None,
         retry_after: float | None = None,
     ) -> bool:
@@ -485,6 +723,7 @@ class DeliveryNotificationStore:
                    chat_id=COALESCE(?,chat_id),session_id=COALESCE(?,session_id),
                    template_code=COALESCE(?,template_code),
                    telegram_message_id=COALESCE(?,telegram_message_id),
+                   outbound_dedupe_key=COALESCE(?,outbound_dedupe_key),
                    next_attempt_at=?,last_error=?,processed_at=?,updated_at=?,
                    lease_token=NULL,lease_expires_at=NULL
                    WHERE source_event_id=? AND state='running' AND lease_token=?""",
@@ -496,6 +735,7 @@ class DeliveryNotificationStore:
                     session_id,
                     template_code,
                     telegram_message_id,
+                    outbound_dedupe_key,
                     next_attempt_at,
                     safe_error,
                     processed_at,
@@ -504,6 +744,48 @@ class DeliveryNotificationStore:
                     lease_token,
                 ),
             ).rowcount == 1
+
+    def outbound_key_for(
+        self,
+        source_event_id: int,
+        order_id: int,
+        public_status: str,
+        chat_id: str,
+    ) -> str:
+        """Choose the event key, adopting one unambiguous legacy send if present.
+
+        A deployment can find an old ``sending`` ledger after a crash. Reusing
+        that key preserves at-most-once delivery. Once another event occurrence
+        exists for the same order/status, the legacy key belongs to the older
+        occurrence and must never suppress the new replacement.
+        """
+
+        event_id = int(source_event_id)
+        preferred = delivery_outbound_key(
+            order_id, public_status, event_id, chat_id
+        )
+        legacy = legacy_delivery_outbound_key(order_id, public_status, chat_id)
+        with connect(self.path) as db:
+            row = db.execute(
+                """SELECT outbound_dedupe_key FROM delivery_status_notifications
+                   WHERE source_event_id=?""",
+                (event_id,),
+            ).fetchone()
+            if row is not None and row["outbound_dedupe_key"]:
+                return str(row["outbound_dedupe_key"])
+            legacy_send = db.execute(
+                "SELECT 1 FROM business_outbound_deliveries WHERE dedupe_key=?",
+                (legacy,),
+            ).fetchone()
+            another_occurrence = db.execute(
+                """SELECT 1 FROM delivery_status_notifications
+                   WHERE order_id=? AND public_status=? AND source_event_id<>?
+                   LIMIT 1""",
+                (int(order_id), str(public_status), event_id),
+            ).fetchone()
+        if legacy_send is not None and another_occurrence is None:
+            return legacy
+        return preferred
 
     def finish_sent_and_queue_cleanup(
         self,
@@ -542,7 +824,8 @@ class DeliveryNotificationStore:
         with connect(self.path) as db:
             db.execute("BEGIN IMMEDIATE")
             current = db.execute(
-                """SELECT order_id,public_status FROM delivery_status_notifications
+                """SELECT order_id,public_status,outbound_dedupe_key
+                   FROM delivery_status_notifications
                    WHERE source_event_id=? AND state='running' AND lease_token=?""",
                 (event_id, lease_token),
             ).fetchone()
@@ -550,24 +833,48 @@ class DeliveryNotificationStore:
                 return False
 
             order_id = int(current["order_id"])
-            delivery_key = (
-                f"delivery-status:{order_id}:{current['public_status']}:{chat}"
+            preferred_key = delivery_outbound_key(
+                order_id,
+                str(current["public_status"]),
+                event_id,
+                chat,
             )
+            legacy_key = legacy_delivery_outbound_key(
+                order_id, str(current["public_status"]), chat
+            )
+            stored_key = str(current["outbound_dedupe_key"] or "")
+            candidate_keys = tuple(
+                dict.fromkeys(key for key in (stored_key, preferred_key, legacy_key) if key)
+            )
+            placeholders = ",".join("?" for _ in candidate_keys)
             confirmed = db.execute(
-                """SELECT 1 FROM business_outbound_deliveries
-                   WHERE dedupe_key=? AND chat_id=? AND template_code=?
+                f"""SELECT dedupe_key FROM business_outbound_deliveries
+                   WHERE dedupe_key IN ({placeholders})
+                     AND chat_id=? AND template_code=?
                      AND business_connection_id=?
-                     AND state='sent' AND telegram_message_id=?""",
-                (delivery_key, chat, template, connection, message_id),
+                     AND state='sent' AND telegram_message_id=?
+                   ORDER BY CASE dedupe_key WHEN ? THEN 0 WHEN ? THEN 1 ELSE 2 END
+                   LIMIT 1""",
+                (
+                    *candidate_keys,
+                    chat,
+                    template,
+                    connection,
+                    message_id,
+                    stored_key,
+                    preferred_key,
+                ),
             ).fetchone()
             if confirmed is None:
                 return False
+            delivery_key = str(confirmed["dedupe_key"])
 
             changed = db.execute(
                 """UPDATE delivery_status_notifications SET
                    state='sent',match_outcome='sent',
                    business_connection_id=?,chat_id=?,session_id=?,
                    template_code=?,telegram_message_id=?,next_attempt_at=?,
+                   outbound_dedupe_key=?,
                    last_error=NULL,processed_at=?,updated_at=?,
                    lease_token=NULL,lease_expires_at=NULL
                    WHERE source_event_id=? AND state='running' AND lease_token=?""",
@@ -578,6 +885,7 @@ class DeliveryNotificationStore:
                     template,
                     message_id,
                     _iso(now),
+                    delivery_key,
                     _iso(now),
                     _iso(now),
                     event_id,
@@ -592,7 +900,8 @@ class DeliveryNotificationStore:
                           outbound.telegram_message_id
                    FROM delivery_status_notifications AS previous
                    JOIN business_outbound_deliveries AS outbound
-                     ON outbound.dedupe_key=(
+                     ON outbound.dedupe_key=COALESCE(
+                       previous.outbound_dedupe_key,
                        'delivery-status:' || previous.order_id || ':' ||
                        previous.public_status || ':' || ?)
                     AND outbound.chat_id=?

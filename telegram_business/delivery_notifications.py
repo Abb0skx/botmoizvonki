@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass
 from typing import Any, Iterable
@@ -52,6 +53,29 @@ def _optional_text(value: Any, maximum: int) -> str:
     return str(value).strip()[:maximum]
 
 
+def _optional_positive_int(value: Any, field: str) -> int | None:
+    if value is None or value == "":
+        return None
+    parsed = _non_negative_int(value, field)
+    if parsed == 0:
+        raise DeliveryFeedError(f"delivery feed has invalid {field}")
+    return parsed
+
+
+def _optional_single_line(value: Any, field: str, maximum: int) -> str:
+    result = _optional_text(value, maximum)
+    if any(character in result for character in "\r\n\x00"):
+        raise DeliveryFeedError(f"delivery feed has invalid {field}")
+    return result
+
+
+def _optional_phone(value: Any) -> str:
+    result = _optional_single_line(value, "courier_phone", 32)
+    if result and not re.fullmatch(r"\+?[0-9][0-9 ()-]{6,24}", result):
+        raise DeliveryFeedError("delivery feed has invalid courier_phone")
+    return result
+
+
 def _validated_instance_id(value: Any) -> str:
     if not isinstance(value, str):
         raise DeliveryFeedError("delivery feed has invalid feed_instance_id")
@@ -87,6 +111,11 @@ def _validated_event(raw: Any, after_event_id: int, page_end: int) -> dict[str, 
         "product": _optional_text(raw.get("product"), 500),
         "client_phone": _optional_text(raw.get("client_phone"), 80),
         "client_phone_2": _optional_text(raw.get("client_phone_2"), 80),
+        "courier_id": _optional_positive_int(raw.get("courier_id"), "courier_id"),
+        "courier_name": _optional_single_line(
+            raw.get("courier_name"), "courier_name", 80
+        ),
+        "courier_phone": _optional_phone(raw.get("courier_phone")),
         "created_at": _optional_text(raw.get("created_at"), 80),
     }
 

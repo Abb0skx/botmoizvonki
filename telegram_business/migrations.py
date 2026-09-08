@@ -91,12 +91,13 @@ CREATE TABLE IF NOT EXISTS delivery_status_notifications (
  source_event_id INTEGER PRIMARY KEY, order_id INTEGER NOT NULL,
  order_number TEXT NOT NULL, public_status TEXT NOT NULL,
  product TEXT, phones_json TEXT NOT NULL DEFAULT '[]', source_created_at TEXT,
+ courier_id INTEGER, courier_name TEXT, courier_phone TEXT,
+ outbound_dedupe_key TEXT,
  state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
  next_attempt_at TEXT NOT NULL, lease_token TEXT, lease_expires_at TEXT,
  match_outcome TEXT, business_connection_id TEXT, chat_id TEXT, session_id TEXT,
  template_code TEXT, telegram_message_id INTEGER, last_error TEXT,
- created_at TEXT NOT NULL, updated_at TEXT NOT NULL, processed_at TEXT,
- UNIQUE(order_id, public_status));
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL, processed_at TEXT);
 CREATE INDEX IF NOT EXISTS idx_delivery_status_notifications_due
  ON delivery_status_notifications(state, next_attempt_at, source_event_id);
 CREATE INDEX IF NOT EXISTS idx_delivery_status_notifications_order
@@ -197,6 +198,7 @@ def connect(path: Path | str) -> sqlite3.Connection:
 def migrate(path: Path | str) -> None:
     with connect(path) as db:
         db.executescript(SCHEMA)
+        _migrate_delivery_notifications_to_event_identity(db)
         # CREATE TABLE IF NOT EXISTS cannot evolve databases created by an older
         # release.  Additive migrations keep existing calls/messages untouched.
         _ensure_columns(
@@ -208,6 +210,16 @@ def migrate(path: Path | str) -> None:
             db,
             "business_outbound_deliveries",
             {"business_connection_id": "TEXT"},
+        )
+        _ensure_columns(
+            db,
+            "delivery_status_notifications",
+            {
+                "courier_id": "INTEGER",
+                "courier_name": "TEXT",
+                "courier_phone": "TEXT",
+                "outbound_dedupe_key": "TEXT",
+            },
         )
         _ensure_columns(
             db,
@@ -325,3 +337,169 @@ def _ensure_columns(
     for name, definition in definitions.items():
         if name not in existing:
             db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+
+def _migrate_delivery_notifications_to_event_identity(
+    db: sqlite3.Connection,
+) -> None:
+    """Remove the legacy order/status uniqueness without losing its outbox.
+
+    A delivery can legitimately reach the same public status again after a
+    rollback or courier reassignment.  ``source_event_id`` is the immutable
+    idempotency boundary; the old ``UNIQUE(order_id, public_status)`` suppressed
+    the replacement notification and could leave a stale courier contact in the
+    customer chat.
+
+    SQLite cannot drop a table constraint in place, so rebuild the table inside
+    the caller's transaction.  Every existing row and delivery audit identifier
+    is copied verbatim.  The detection by unique-index columns makes the
+    migration idempotent on both fresh and already-upgraded databases.
+    """
+
+    existing_columns = {
+        str(row["name"])
+        for row in db.execute("PRAGMA table_info(delivery_status_notifications)")
+    }
+    has_legacy_constraint = False
+    for index in db.execute("PRAGMA index_list(delivery_status_notifications)"):
+        if not int(index["unique"]):
+            continue
+        columns = [
+            str(row["name"])
+            for row in db.execute(f"PRAGMA index_info({index['name']})")
+        ]
+        if columns == ["order_id", "public_status"]:
+            has_legacy_constraint = True
+            break
+    if not has_legacy_constraint:
+        return
+
+    if not db.in_transaction:
+        db.execute("BEGIN IMMEDIATE")
+    before = int(
+        db.execute("SELECT count(*) FROM delivery_status_notifications").fetchone()[0]
+    )
+    db.execute("DROP TABLE IF EXISTS delivery_status_notifications_event_migration")
+    db.execute(
+        """CREATE TABLE delivery_status_notifications_event_migration (
+           source_event_id INTEGER PRIMARY KEY, order_id INTEGER NOT NULL,
+           order_number TEXT NOT NULL, public_status TEXT NOT NULL,
+           product TEXT, phones_json TEXT NOT NULL DEFAULT '[]',
+           source_created_at TEXT, courier_id INTEGER, courier_name TEXT,
+           courier_phone TEXT, outbound_dedupe_key TEXT,
+           state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+           next_attempt_at TEXT NOT NULL, lease_token TEXT, lease_expires_at TEXT,
+           match_outcome TEXT, business_connection_id TEXT, chat_id TEXT,
+           session_id TEXT, template_code TEXT, telegram_message_id INTEGER,
+           last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+           processed_at TEXT)"""
+    )
+    courier_id_source = "courier_id" if "courier_id" in existing_columns else "NULL"
+    courier_name_source = (
+        "courier_name" if "courier_name" in existing_columns else "NULL"
+    )
+    courier_phone_source = (
+        "courier_phone" if "courier_phone" in existing_columns else "NULL"
+    )
+    legacy_key_source = (
+        "CASE WHEN chat_id IS NOT NULL AND trim(chat_id)<>'' THEN "
+        "'delivery-status:' || order_id || ':' || public_status || ':' || chat_id "
+        "ELSE NULL END"
+    )
+    outbound_key_source = (
+        f"COALESCE(outbound_dedupe_key,{legacy_key_source})"
+        if "outbound_dedupe_key" in existing_columns
+        else legacy_key_source
+    )
+    db.execute(
+        f"""INSERT INTO delivery_status_notifications_event_migration(
+           source_event_id,order_id,order_number,public_status,product,phones_json,
+           source_created_at,courier_id,courier_name,courier_phone,state,attempts,
+           next_attempt_at,lease_token,lease_expires_at,match_outcome,
+           business_connection_id,chat_id,session_id,template_code,
+           telegram_message_id,last_error,created_at,updated_at,processed_at,
+           outbound_dedupe_key)
+           SELECT source_event_id,order_id,order_number,public_status,product,
+                  phones_json,source_created_at,{courier_id_source},
+                  {courier_name_source},{courier_phone_source},state,attempts,
+                  next_attempt_at,lease_token,lease_expires_at,match_outcome,
+                  business_connection_id,chat_id,session_id,template_code,
+                  telegram_message_id,last_error,created_at,updated_at,processed_at,
+                  {outbound_key_source}
+             FROM delivery_status_notifications"""
+    )
+    after = int(
+        db.execute(
+            "SELECT count(*) FROM delivery_status_notifications_event_migration"
+        ).fetchone()[0]
+    )
+    if after != before:
+        raise sqlite3.IntegrityError(
+            "delivery notification migration did not preserve every row"
+        )
+    db.execute("DROP TABLE delivery_status_notifications")
+    db.execute(
+        "ALTER TABLE delivery_status_notifications_event_migration "
+        "RENAME TO delivery_status_notifications"
+    )
+    db.execute(
+        "CREATE INDEX idx_delivery_status_notifications_due "
+        "ON delivery_status_notifications(state,next_attempt_at,source_event_id)"
+    )
+    db.execute(
+        "CREATE INDEX idx_delivery_status_notifications_order "
+        "ON delivery_status_notifications(order_id,source_event_id)"
+    )
+
+    # Rows queued by the previous release do not contain courier identity.
+    # Rewind only far enough to let the authenticated feed enrich those rows;
+    # the immutable source_event_id still prevents a duplicate notification.
+    replay = db.execute(
+        """SELECT MIN(source_event_id) AS source_event_id
+             FROM delivery_status_notifications
+            WHERE public_status IN ('picked_up','on_way')
+              AND state IN ('pending','retry','deferred','running')
+              AND (
+                courier_id IS NULL OR trim(COALESCE(courier_name,''))=''
+                OR (
+                  public_status='on_way'
+                  AND trim(COALESCE(courier_phone,''))=''
+                )
+              )"""
+    ).fetchone()
+    replay_event_id = int(replay["source_event_id"] or 0)
+    if replay_event_id > 0:
+        db.execute(
+            """UPDATE delivery_status_notifications
+                  SET state=CASE WHEN state='running' THEN 'retry' ELSE state END,
+                      lease_token=NULL,lease_expires_at=NULL
+                WHERE public_status IN ('picked_up','on_way')
+                  AND state IN ('pending','retry','deferred','running')
+                  AND (
+                    courier_id IS NULL OR trim(COALESCE(courier_name,''))=''
+                    OR (
+                      public_status='on_way'
+                      AND trim(COALESCE(courier_phone,''))=''
+                    )
+                  )"""
+        )
+        cursor = db.execute(
+            """SELECT value FROM business_integration_state
+               WHERE key='delivery_status_event_cursor'"""
+        ).fetchone()
+        if cursor is not None:
+            try:
+                current_cursor = int(cursor["value"])
+            except (TypeError, ValueError):
+                current_cursor = -1
+            replay_cursor = replay_event_id - 1
+            if current_cursor > replay_cursor:
+                db.execute(
+                    """UPDATE business_integration_state
+                          SET value=?,
+                              updated_at=strftime(
+                                '%Y-%m-%dT%H:%M:%f+00:00','now'
+                              )
+                        WHERE key='delivery_status_event_cursor'""",
+                    (str(replay_cursor),),
+                )
