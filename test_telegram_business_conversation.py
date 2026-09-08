@@ -779,6 +779,8 @@ def test_language_context_and_bilingual_fallback():
         "чтобы не было видно какой товар",
         saved="uz",
     )[0] == "ru"
+    assert detect_language("заказ курьер", saved="uz")[0] == "uz"
+    assert detect_language("товар пакет")[0] == "bi"
 
 
 def test_query_normalization_memory_color_plus_and_cyrillic_generation():
