@@ -971,6 +971,29 @@ class BusinessService:
                 ),
             )
             return None
+        latest_language = str(
+            _value(send_gate.get("client"), "language", "bi") or "bi"
+        )
+        if latest_language != language:
+            language = latest_language
+            text = self._render_message(
+                template_code,
+                language,
+                send_now,
+                courier_id=courier_id,
+                courier_name=courier_name,
+                courier_phone=courier_phone,
+            )
+            if not text:
+                store.finish(
+                    **common,
+                    **match_fields,
+                    session_id=session_id,
+                    template_code=template_code,
+                    outcome="failed",
+                    error="delivery template is unavailable",
+                )
+                return None
         try:
             outcome, message_id = self._send_delivery_message(
                 connection_id,
@@ -1657,6 +1680,48 @@ class BusinessService:
             edited_at=edited_at,
         )
 
+    def _remember_explicit_client_language(
+        self,
+        connection_id: str,
+        chat_id: str,
+        message_id: int,
+        text: str,
+        now: datetime,
+    ) -> str | None:
+        """Persist strong current-message evidence before automation gates.
+
+        The manager lock must stop replies, not observation. Calling the
+        detector without saved/history/Telegram fallbacks means a model name,
+        phone, location or other neutral message cannot change the client's
+        language. A later explicit switch still takes effect immediately.
+        """
+
+        language, confidence = detect_language(text)
+        if language not in {"ru", "uz"}:
+            return None
+        self.repo.update_language(chat_id, language, confidence, now)
+        annotate = getattr(self.repo, "annotate_message", None)
+        if annotate:
+            try:
+                annotate(
+                    connection_id,
+                    chat_id,
+                    int(message_id),
+                    now,
+                    language=language,
+                )
+            except TypeError:
+                # Language selection remains authoritative even for a narrow
+                # legacy repository adapter without message annotations.
+                pass
+        LOG.info(
+            "business_client_language_observed chat_id=%s language=%s confidence=%.2f",
+            chat_id,
+            language,
+            confidence,
+        )
+        return language
+
     def _touch_client(self, chat_id: str, session_id: str, now: datetime, event_at: datetime, message_id: int) -> None:
         policy = self._runtime_policy(now)
         try:
@@ -1820,6 +1885,13 @@ class BusinessService:
                     except (TypeError, ValueError):
                         original_at = event_at
                     effective_text = saved["text"] or saved["caption"] or ""
+                    self._remember_explicit_client_language(
+                        connection_id,
+                        chat_id,
+                        int(message_id),
+                        effective_text,
+                        now,
+                    )
                     self._index_client_phones(
                         connection_id,
                         chat_id,
@@ -1943,6 +2015,13 @@ class BusinessService:
                     (persisted_message["text"] or persisted_message["caption"] or "")
                     if persisted_message else
                     (message.get("text") or message.get("caption") or "")
+                )
+                self._remember_explicit_client_language(
+                    connection_id,
+                    chat_id,
+                    int(message["message_id"]),
+                    effective_text,
+                    now,
                 )
                 self._index_client_phones(
                     connection_id,

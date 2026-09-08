@@ -1264,6 +1264,7 @@ def test_client_edit_after_manager_answer_does_not_restart_automation(tmp_path):
     harness = Harness(tmp_path, datetime(2026, 8, 22, 21, 0, tzinfo=TZ))
     original_at = harness.clock()
     harness.incoming(original_at, "UnknownPhone ZX999")
+    harness.service.repo.update_language("200", "uz", 0.69, harness.clock())
 
     manager_at = original_at + timedelta(seconds=1)
     harness.clock.value = manager_at
@@ -1290,7 +1291,7 @@ def test_client_edit_after_manager_answer_does_not_restart_automation(tmp_path):
             "date": int(original_at.timestamp()),
             "edit_date": int(edit_at.timestamp()),
             "chat": {"id": 200, "type": "private"},
-            "from": {"id": 200}, "text": "iPhone 16 Pro Max",
+            "from": {"id": 200}, "text": "Какая цена?",
         },
     }
     assert harness.service.repo.save_update(edited, harness.clock())
@@ -1303,8 +1304,79 @@ def test_client_edit_after_manager_answer_does_not_restart_automation(tmp_path):
         text = db.execute(
             "SELECT text FROM business_messages WHERE message_id=1"
         ).fetchone()[0]
-    assert text == "iPhone 16 Pro Max"  # revision remains audited
+    assert text == "Какая цена?"  # revision remains audited
     assert active == 0
+    assert harness.service.repo.client("200")["language"] == "ru"
+
+
+def test_client_language_refreshes_during_manager_lock_without_reply(tmp_path):
+    harness = Harness(tmp_path, datetime(2026, 8, 22, 21, 0, tzinfo=TZ))
+    harness.incoming(harness.clock(), "Assalomu alaykum", language_code="uz")
+    harness.run_debounce()
+    assert harness.service.repo.client("200")["language"] == "uz"
+
+    manager_at = harness.clock() + timedelta(seconds=1)
+    harness.clock.value = manager_at
+    harness.update_id += 1
+    manager = {
+        "update_id": harness.update_id,
+        "business_message": {
+            "business_connection_id": "connection",
+            "message_id": harness.update_id,
+            "date": int(manager_at.timestamp()),
+            "chat": {"id": 200, "type": "private"},
+            "from": {"id": 100},
+            "text": "Ответ менеджера",
+        },
+    }
+    assert harness.service.repo.save_update(manager, harness.clock())
+    harness.service.process_update(manager)
+    sent_before = len(harness.api.sent)
+
+    neutral_ids = []
+    neutral_session = None
+    neutral_messages = (
+        {"text": "iPhone 16 Pro Max"},
+        {"text": "+998901112233"},
+        {"location": {"latitude": 41.3111, "longitude": 69.2797}},
+    )
+    neutral_at = manager_at
+    for neutral_message in neutral_messages:
+        neutral_at += timedelta(seconds=1)
+        harness.clock.value = neutral_at
+        neutral_session = harness.incoming(
+            neutral_at,
+            language_code="ru",
+            **neutral_message,
+        )
+        neutral_ids.append(harness.update_id)
+        assert harness.service.repo.client("200")["language"] == "uz"
+
+    russian_at = neutral_at + timedelta(seconds=1)
+    harness.clock.value = russian_at
+    harness.incoming(
+        russian_at,
+        "Какая цена и сколько стоит?",
+        language_code="uz",
+    )
+
+    client = harness.service.repo.client("200")
+    assert client["language"] == "ru"
+    assert client["language_confidence"] > 0.6
+    assert len(harness.api.sent) == sent_before
+    assert harness.service.repo.due_actions(harness.clock()) == []
+    with connect(harness.service.repo.path) as db:
+        rows = db.execute(
+            """SELECT message_id,language FROM business_messages
+               WHERE session_id=? AND sender_type='client'
+               AND message_id>=?
+               ORDER BY message_id""",
+            (neutral_session["session_id"], neutral_ids[0]),
+        ).fetchall()
+    assert [(row["message_id"], row["language"]) for row in rows] == [
+        *((message_id, None) for message_id in neutral_ids),
+        (harness.update_id, "ru"),
+    ]
 
 
 @pytest.mark.parametrize(

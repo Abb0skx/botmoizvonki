@@ -769,3 +769,96 @@ def test_delivery_status_uses_saved_client_language(tmp_path, language, expected
 
     assert len(api.sent) == 1
     assert expected in api.sent[0][2]
+
+
+def test_delivery_rechecks_language_immediately_before_send(tmp_path):
+    now = datetime(2026, 9, 7, 12, 0, tzinfo=TZ)
+    api = RecordingTelegramAPI()
+    service = BusinessService(
+        settings(tmp_path / "language_race.db"),
+        clock=lambda: now,
+        api=api,
+    )
+    establish_chat(service, now)
+    service.repo.update_language("200", "uz", 0.69, now)
+    seed_notifications(service, now, [delivery_event(1, 1, now)])
+    original_render = service._render_message
+    switched = False
+
+    def render_while_language_changes(*args, **kwargs):
+        nonlocal switched
+        text = original_render(*args, **kwargs)
+        if not switched:
+            switched = True
+            service.repo.update_language("200", "ru", 0.80, now)
+        return text
+
+    service._render_message = render_while_language_changes
+    service.delivery_notifications_cycle()
+
+    assert switched is True
+    assert len(api.sent) == 1
+    assert "Ожидаем курьера" in api.sent[0][2]
+    assert "Kuryerni kutyapmiz" not in api.sent[0][2]
+
+
+def test_delivery_uses_explicit_language_seen_during_manager_lock(tmp_path):
+    current = [datetime(2026, 9, 7, 12, 0, tzinfo=TZ)]
+    api = RecordingTelegramAPI()
+    service = BusinessService(
+        settings(tmp_path / "language_refresh.db"),
+        clock=lambda: current[0],
+        api=api,
+    )
+    establish_chat(service, current[0])
+    service.repo.update_language("200", "uz", 0.69, current[0])
+
+    manager_update = {
+        "update_id": 700,
+        "business_message": {
+            "business_connection_id": "connection",
+            "message_id": 701,
+            "date": int(current[0].timestamp()),
+            "chat": {"id": 200, "type": "private"},
+            "from": {"id": 100},
+            "text": "Ответ менеджера",
+        },
+    }
+    assert service.repo.save_update(
+        manager_update,
+        current[0],
+        allowed_connection_id="connection",
+    )
+    service.process_update(manager_update)
+
+    current[0] += timedelta(seconds=1)
+    client_update = {
+        "update_id": 702,
+        "business_message": {
+            "business_connection_id": "connection",
+            "message_id": 703,
+            "date": int(current[0].timestamp()),
+            "chat": {"id": 200, "type": "private"},
+            "from": {"id": 200, "language_code": "uz"},
+            "text": "Какая цена и сколько стоит?",
+        },
+    }
+    assert service.repo.save_update(
+        client_update,
+        current[0],
+        allowed_connection_id="connection",
+    )
+    service.process_update(client_update)
+    assert service.repo.client("200")["language"] == "ru"
+    assert service.repo.due_actions(current[0]) == []
+
+    seed_notifications(
+        service,
+        current[0],
+        [delivery_event(1, 1, current[0])],
+    )
+    service.delivery_notifications_cycle()
+
+    assert len(api.sent) == 1
+    assert "Ожидаем курьера" in api.sent[0][2]
+    assert "Kuryerni kutyapmiz" not in api.sent[0][2]

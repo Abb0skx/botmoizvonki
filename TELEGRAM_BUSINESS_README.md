@@ -64,6 +64,12 @@ remains unread (one check), a bot answer carries `sender_business_bot`, a manual
 profile answer activates manager lock, and the bot can reply only inside Telegram's
 24-hour Business reply window.
 
+Явный русский или узбекский язык сохраняется из каждого входящего сообщения
+клиента даже при активном manager lock: блокировка запрещает автоответ, но не
+обновление контекста. Нейтральные сообщения — модель, номер, Contact или
+локация — сохранённый язык не меняют. Поэтому служебный статус доставки
+использует последний язык, на котором клиент действительно писал.
+
 The Telegram adapter exposes safe `getMe` and `getBusinessConnection` checks.
 Its exceptions carry `status`, `retryable`, and `retry_after` metadata for
 the durable scheduler, but never include the bot-token URL. No code path calls
