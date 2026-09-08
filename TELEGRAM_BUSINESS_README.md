@@ -44,9 +44,10 @@ the image.
 1. Create a new bot in BotFather; do not reuse the calls or delivery bot.
 2. Enable **Secretary Mode** (called Business Mode in older BotFather/docs) for
    this bot. In the TEXNIKACH account's Business chatbot settings, connect this
-   bot only to the intended private-chat recipients and grant only `can_reply`.
-   Leave `can_read_messages`, deletion, profile, stories, gifts, and Stars rights
-   disabled.
+   bot only to the intended private-chat recipients and grant `can_reply` and
+   `can_delete_sent_messages`. The deletion right is used only for the bot's own
+   previous delivery-status messages. Leave `can_delete_all_messages`, profile,
+   `can_read_messages`, stories, gifts, and Stars rights disabled.
 3. Set the webhook to
    `https://bot.texnikach.uz/webhooks/telegram-business`, include a strong
    `secret_token`, and subscribe to `business_connection`, `business_message`,
@@ -114,6 +115,7 @@ BUSINESS_DELIVERY_NOTIFICATIONS_URL=http://texnikach-delivery-stats:8080
 BUSINESS_DELIVERY_NOTIFICATIONS_TOKEN=тот-же-секрет-что-MONITORING_DELIVERY_SERVICE_TOKEN
 BUSINESS_DELIVERY_NOTIFICATIONS_POLL_SECONDS=30
 BUSINESS_DELIVERY_NOTIFICATIONS_MAX_EVENT_AGE_HOURS=24
+BUSINESS_DELIVERY_COURIER_PHONE=+998948765070
 ```
 
 Пустые `BUSINESS_DELIVERY_NOTIFICATIONS_URL` и
@@ -156,14 +158,32 @@ Telegram разрешает Business-боту ответить только в �
 `business_connection_id`; Telegram не позволяет найти или открыть чат по одному
 номеру телефона.
 
-Клиенту отправляются только короткие статусы:
+Клиенту отправляются только короткие статусы без внутреннего номера заказа:
 
-- `pending` — заказ передан в службу доставки;
-- `picked_up` — курьер получил товар;
-- `on_way` — курьер выехал;
-- `completed` — заказ доставлен; в том же коротком сообщении клиенту предлагается
+- `pending` — ожидаем курьера;
+- `picked_up` — курьер забрал товар;
+- `on_way` — курьер выехал; клиенту предлагается быть по указанному адресу и
+  подготовиться к получению, также отправляется номер курьера из
+  `BUSINESS_DELIVERY_COURIER_PHONE`;
+- `completed` — товар доставлен; в том же коротком сообщении клиенту предлагается
   оценить работу по ссылке `https://bot.texnikach.uz/review`;
 - `cancelled` — активная доставка подтверждённо отменена.
+
+Сначала бот успешно отправляет новый статус, фиксирует его `message_id` в SQLite
+и только затем ставит предыдущие статусы этой же доставки в устойчивую очередь
+удаления. Удаляются исключительно сообщения, которые этот Business-бот сам
+отправил с шаблоном `delivery_status_*`; сообщения клиента и ручные ответы
+менеджера никогда не выбираются. Очередь переживает перезапуск и повторяет
+временные ошибки с backoff. Поэтому в обычной цепочке «ожидаем курьера → курьер
+забрал товар → курьер выехал → товар доставлен» после завершения остаётся только
+сообщение о доставке и ссылка на отзыв.
+
+Для удаления Telegram требует `can_delete_sent_messages`; `can_reply` одного
+недостаточно. Bot API обычно не удаляет сообщения старше 48 часов. Если право
+отозвано или доставка между статусами длится дольше этого срока, новый статус всё
+равно отправляется, но Telegram может не позволить убрать старый. Даже если у
+подключения уже есть более широкое право `can_delete_all_messages`, код никогда не
+выбирает произвольные сообщения и не вызывает `readBusinessMessage`.
 
 Служебные `draft`, `awaiting_photo`, `awaiting_amount`, переназначение курьера,
 изменение полей без смены статуса и обратные/восстанавливающие переходы клиенту
@@ -188,7 +208,8 @@ The database creates: `business_connections`, `business_updates`,
 `business_clients`, `business_sessions`, `business_messages`,
 `business_chat_phones`, `response_cycles`, `scheduled_actions`, `sheets_outbox`,
 `business_errors`, `business_integration_state`,
-`delivery_status_notifications`, and `business_model_choices`, plus the
+`delivery_status_notifications`, `delivery_status_message_deletions`, and
+`business_model_choices`, plus the
 lightweight `business_manager_fences` used to
 stop an already queued automatic action as soon as a manual webhook is persisted,
 and `business_outbound_deliveries` for stable automatic-reply delivery fencing.

@@ -6,7 +6,9 @@ from pathlib import Path
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS business_connections (
  connection_id TEXT PRIMARY KEY, business_user_id TEXT, is_enabled INTEGER NOT NULL DEFAULT 1,
- can_reply INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+ can_reply INTEGER NOT NULL DEFAULT 0,
+ can_delete_sent_messages INTEGER NOT NULL DEFAULT 0,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS business_updates (
  update_id INTEGER PRIMARY KEY, event_type TEXT NOT NULL, business_connection_id TEXT, chat_id TEXT,
  message_id INTEGER, raw_payload TEXT NOT NULL, received_at TEXT NOT NULL, processed_at TEXT,
@@ -57,6 +59,7 @@ CREATE TABLE IF NOT EXISTS business_manager_fences (
  PRIMARY KEY(business_connection_id, chat_id, message_id));
 CREATE TABLE IF NOT EXISTS business_outbound_deliveries (
  dedupe_key TEXT PRIMARY KEY, chat_id TEXT NOT NULL, session_id TEXT,
+ business_connection_id TEXT,
  template_code TEXT NOT NULL, content_hash TEXT NOT NULL,
  state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 1,
  telegram_message_id INTEGER, last_error TEXT,
@@ -98,6 +101,22 @@ CREATE INDEX IF NOT EXISTS idx_delivery_status_notifications_due
  ON delivery_status_notifications(state, next_attempt_at, source_event_id);
 CREATE INDEX IF NOT EXISTS idx_delivery_status_notifications_order
  ON delivery_status_notifications(order_id, source_event_id);
+CREATE TABLE IF NOT EXISTS delivery_status_message_deletions (
+ deletion_id INTEGER PRIMARY KEY AUTOINCREMENT,
+ order_id INTEGER NOT NULL,
+ business_connection_id TEXT NOT NULL, chat_id TEXT NOT NULL,
+ telegram_message_id INTEGER NOT NULL,
+ target_source_event_id INTEGER NOT NULL,
+ replacement_source_event_id INTEGER NOT NULL,
+ state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+ next_attempt_at TEXT NOT NULL, lease_token TEXT, lease_expires_at TEXT,
+ last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ processed_at TEXT,
+ UNIQUE(business_connection_id, chat_id, telegram_message_id));
+CREATE INDEX IF NOT EXISTS idx_delivery_status_message_deletions_due
+ ON delivery_status_message_deletions(state, next_attempt_at, deletion_id);
+CREATE INDEX IF NOT EXISTS idx_delivery_status_message_deletions_order
+ ON delivery_status_message_deletions(order_id, chat_id, deletion_id);
 CREATE TABLE IF NOT EXISTS business_requests (
  request_id TEXT PRIMARY KEY, business_connection_id TEXT, chat_id TEXT NOT NULL,
  session_id TEXT, cycle_id TEXT, business_date TEXT, origin_update_id INTEGER,
@@ -180,6 +199,16 @@ def migrate(path: Path | str) -> None:
         db.executescript(SCHEMA)
         # CREATE TABLE IF NOT EXISTS cannot evolve databases created by an older
         # release.  Additive migrations keep existing calls/messages untouched.
+        _ensure_columns(
+            db,
+            "business_connections",
+            {"can_delete_sent_messages": "INTEGER NOT NULL DEFAULT 0"},
+        )
+        _ensure_columns(
+            db,
+            "business_outbound_deliveries",
+            {"business_connection_id": "TEXT"},
+        )
         _ensure_columns(
             db,
             "business_updates",

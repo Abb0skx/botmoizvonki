@@ -1106,6 +1106,44 @@ class TelegramAPISecurityTests(unittest.TestCase):
         self.assertTrue(http.calls[-1][0].endswith("/getBusinessConnection"))
         self.assertEqual(http.calls[-1][1]["json"]["business_connection_id"], "connection")
 
+    def test_delete_business_messages_uses_official_payload_and_validates_ids(self):
+        http = self.HTTP(
+            [self.Response(200, {"ok": True, "result": True})]
+        )
+        api = TelegramBusinessAPI("123456:secret", http=http)
+
+        result = api.delete_business_messages("connection", [10, 11])
+
+        self.assertTrue(result["result"])
+        self.assertTrue(http.calls[-1][0].endswith("/deleteBusinessMessages"))
+        self.assertEqual(
+            http.calls[-1][1]["json"],
+            {
+                "business_connection_id": "connection",
+                "message_ids": [10, 11],
+            },
+        )
+
+        invalid_batches = ([], [1] * 101, [0], [True], ["10"])
+        for message_ids in invalid_batches:
+            with self.subTest(message_ids=message_ids):
+                with self.assertRaises(ValueError):
+                    api.delete_business_messages("connection", message_ids)
+        with self.assertRaises(ValueError):
+            api.delete_business_messages("", [10])
+        self.assertEqual(len(http.calls), 1)
+
+    def test_delete_business_messages_rejects_invalid_success(self):
+        http = self.HTTP(
+            [self.Response(200, {"ok": True, "result": False})]
+        )
+        with self.assertRaises(TelegramAPIError) as raised:
+            TelegramBusinessAPI(
+                "123456:secret", http=http
+            ).delete_business_messages("connection", [10])
+        self.assertTrue(raised.exception.retryable)
+        self.assertFalse(raised.exception.ambiguous)
+
     def test_empty_successful_send_is_an_ambiguous_transport_outcome(self):
         http = self.HTTP([self.Response(200, {"ok": True, "result": {}})])
         with self.assertRaises(TelegramAPIError) as raised:

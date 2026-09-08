@@ -80,6 +80,7 @@ class BusinessSettings:
     delivery_notifications_token: str = ""
     delivery_notifications_poll_seconds: int = 30
     delivery_notifications_max_event_age_hours: int = 24
+    delivery_courier_phone: str = "+998948765070"
 
     @classmethod
     def load(cls) -> "BusinessSettings":
@@ -171,6 +172,12 @@ class BusinessSettings:
                 ),
                 24,
             ),
+            delivery_courier_phone=(
+                os.getenv(
+                    "BUSINESS_DELIVERY_COURIER_PHONE", "+998948765070"
+                ).strip()
+                or "+998948765070"
+            ),
         )
 
     def validate_enabled(self) -> None:
@@ -205,6 +212,10 @@ class BusinessSettings:
         if not self.sheet_id:
             raise RuntimeError("Telegram Business Google workbook ID is missing")
         if self.delivery_notifications_enabled:
+            if not re.fullmatch(r"\+?[0-9][0-9 ()-]{6,24}", self.delivery_courier_phone):
+                raise RuntimeError(
+                    "BUSINESS_DELIVERY_COURIER_PHONE must be a display-safe phone number"
+                )
             if not (
                 self.delivery_notifications_url
                 and self.delivery_notifications_token

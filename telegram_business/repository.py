@@ -250,29 +250,36 @@ class BusinessRepository:
                     rights = event.get("rights") or {}
                     is_enabled = int(bool(event.get("is_enabled", True)))
                     can_reply = int(bool(rights.get("can_reply", False)))
+                    can_delete_sent_messages = int(bool(
+                        rights.get("can_delete_sent_messages", False)
+                        or rights.get("can_delete_all_messages", False)
+                    ))
+                    business_user_id = str((event.get("user") or {}).get("id", ""))
+                    db.execute(
+                        """INSERT INTO business_connections(
+                           connection_id,business_user_id,is_enabled,can_reply,
+                           can_delete_sent_messages,created_at,updated_at)
+                           VALUES(?,?,?,?,?,?,?)
+                           ON CONFLICT(connection_id) DO UPDATE SET
+                           business_user_id=CASE
+                             WHEN excluded.business_user_id!=''
+                             THEN excluded.business_user_id
+                             ELSE business_connections.business_user_id END,
+                           is_enabled=excluded.is_enabled,
+                           can_reply=excluded.can_reply,
+                           can_delete_sent_messages=excluded.can_delete_sent_messages,
+                           updated_at=excluded.updated_at""",
+                        (
+                            str(connection_id),
+                            business_user_id,
+                            is_enabled,
+                            can_reply,
+                            can_delete_sent_messages,
+                            iso(now),
+                            iso(now),
+                        ),
+                    )
                     if not is_enabled or not can_reply:
-                        business_user_id = str((event.get("user") or {}).get("id", ""))
-                        db.execute(
-                            """INSERT INTO business_connections(
-                               connection_id,business_user_id,is_enabled,can_reply,
-                               created_at,updated_at) VALUES(?,?,?,?,?,?)
-                               ON CONFLICT(connection_id) DO UPDATE SET
-                               business_user_id=CASE
-                                 WHEN excluded.business_user_id!=''
-                                 THEN excluded.business_user_id
-                                 ELSE business_connections.business_user_id END,
-                               is_enabled=excluded.is_enabled,
-                               can_reply=excluded.can_reply,
-                               updated_at=excluded.updated_at""",
-                            (
-                                str(connection_id),
-                                business_user_id,
-                                is_enabled,
-                                can_reply,
-                                iso(now),
-                                iso(now),
-                            ),
-                        )
                         db.execute(
                             """UPDATE scheduled_actions SET status='cancelled',
                                generation=generation+1,lease_token=NULL,
@@ -549,16 +556,28 @@ class BusinessRepository:
 
     def upsert_connection(self, event: dict, now: datetime) -> None:
         rights = event.get("rights") or {}
-        is_enabled = int(event.get("is_enabled", True))
-        can_reply = int(rights.get("can_reply", False))
+        is_enabled = int(bool(event.get("is_enabled", True)))
+        can_reply = int(bool(rights.get("can_reply", False)))
+        # ``can_delete_all_messages`` also authorizes deletion of messages sent
+        # by this bot.  Store only the least-privileged capability the service
+        # needs; no broader deletion right is requested or exercised.
+        can_delete_sent_messages = int(bool(
+            rights.get("can_delete_sent_messages", False)
+            or rights.get("can_delete_all_messages", False)
+        ))
         with connect(self.path) as db:
             db.execute("BEGIN IMMEDIATE")
             db.execute(
-                """INSERT INTO business_connections VALUES(?,?,?,?,?,?)
+                """INSERT INTO business_connections(
+                   connection_id,business_user_id,is_enabled,can_reply,
+                   can_delete_sent_messages,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?)
                    ON CONFLICT(connection_id) DO UPDATE SET business_user_id=excluded.business_user_id,
-                   is_enabled=excluded.is_enabled,can_reply=excluded.can_reply,updated_at=excluded.updated_at""",
+                   is_enabled=excluded.is_enabled,can_reply=excluded.can_reply,
+                   can_delete_sent_messages=excluded.can_delete_sent_messages,
+                   updated_at=excluded.updated_at""",
                 (event["id"], str((event.get("user") or {}).get("id", "")), is_enabled,
-                 can_reply, iso(now), iso(now)),
+                 can_reply, can_delete_sent_messages, iso(now), iso(now)),
             )
             if not is_enabled or not can_reply:
                 # This repository is scoped to one allowed Business connection.
@@ -580,6 +599,12 @@ class BusinessRepository:
     def connection_can_reply(self, connection_id: str) -> bool:
         row = self.connection(connection_id)
         return bool(row and row["is_enabled"] and row["can_reply"])
+
+    def connection_can_delete_sent_messages(self, connection_id: str) -> bool:
+        row = self.connection(connection_id)
+        return bool(
+            row and row["is_enabled"] and row["can_delete_sent_messages"]
+        )
 
     def client(self, chat_id: str):
         with connect(self.path) as db:
@@ -1343,6 +1368,46 @@ class BusinessRepository:
                 affected += 1
                 self._refresh_message_outbox(db, row_id, event_at, "deleted")
         return affected
+
+    def mark_delivery_status_message_deleted(
+        self,
+        connection_id: str,
+        chat_id: str,
+        message_id: int,
+        order_id: int,
+        event_at: datetime,
+    ) -> bool:
+        """Tombstone exactly one status message proven to be sent by this bot.
+
+        Delivery cleanup must never create an ``unknown`` audit row or touch a
+        customer/manager message.  The order discriminator and status template
+        provide an additional local fence around the Telegram message ID.
+        """
+
+        with connect(self.path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                """SELECT id FROM business_messages
+                   WHERE business_connection_id=? AND chat_id=? AND message_id=?
+                     AND sender_type='business_bot'
+                     AND template_code LIKE 'delivery_status_%'
+                     AND model_query=?""",
+                (
+                    str(connection_id),
+                    str(chat_id),
+                    int(message_id),
+                    f"delivery_order:{int(order_id)}",
+                ),
+            ).fetchone()
+            if row is None:
+                return False
+            db.execute(
+                """UPDATE business_messages SET deleted_at=COALESCE(deleted_at,?)
+                   WHERE id=?""",
+                (iso(event_at), int(row["id"])),
+            )
+            self._refresh_message_outbox(db, int(row["id"]), event_at, "deleted")
+            return True
 
     def session_messages(self, session_id: str) -> list[dict[str, Any]]:
         with connect(self.path) as db:
@@ -2438,6 +2503,8 @@ class BusinessRepository:
         template_code: str,
         content_hash: str,
         now: datetime,
+        *,
+        business_connection_id: str | None = None,
     ) -> str:
         """Return ``send``, ``assumed`` or ``blocked`` for a critical reply.
 
@@ -2454,12 +2521,14 @@ class BusinessRepository:
             if row is None:
                 db.execute(
                     """INSERT INTO business_outbound_deliveries(
-                       dedupe_key,chat_id,session_id,template_code,content_hash,
-                       state,created_at,updated_at) VALUES(?,?,?,?,?,'sending',?,?)""",
+                       dedupe_key,chat_id,session_id,business_connection_id,
+                       template_code,content_hash,state,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,'sending',?,?)""",
                     (
                         dedupe_key,
                         chat_id,
                         session_id,
+                        business_connection_id,
                         template_code,
                         content_hash,
                         iso(now),
@@ -2467,6 +2536,12 @@ class BusinessRepository:
                     ),
                 )
                 return "send"
+            if business_connection_id is not None and str(
+                row["business_connection_id"] or ""
+            ) != str(business_connection_id):
+                # Never reuse an old/legacy delivery receipt for another
+                # Business connection. A missing legacy value is fail-closed.
+                return "blocked"
             if row["state"] == "retry":
                 db.execute(
                     """UPDATE business_outbound_deliveries SET state='sending',

@@ -25,6 +25,7 @@ class RecordingTelegramAPI:
         self.errors = list(errors or ())
         self.calls: list[tuple[str, str, str]] = []
         self.sent: list[tuple[str, str, str]] = []
+        self.deleted: list[tuple[str, tuple[int, ...]]] = []
 
     def send_message(self, connection_id, chat_id, text, **_options):
         call = (str(connection_id), str(chat_id), str(text))
@@ -36,6 +37,21 @@ class RecordingTelegramAPI:
             "ok": True,
             "result": {"message_id": 8000 + len(self.sent)},
         }
+
+    def get_business_connection(self, connection_id):
+        return {
+            "id": connection_id,
+            "user": {"id": 100},
+            "is_enabled": True,
+            "rights": {
+                "can_reply": True,
+                "can_delete_sent_messages": True,
+            },
+        }
+
+    def delete_business_messages(self, connection_id, message_ids):
+        self.deleted.append((str(connection_id), tuple(message_ids)))
+        return {"ok": True, "result": True}
 
 
 class CaughtUpFeed:
@@ -181,7 +197,10 @@ def establish_chat(
             "id": "connection",
             "user": {"id": 100},
             "is_enabled": True,
-            "rights": {"can_reply": True},
+            "rights": {
+                "can_reply": True,
+                "can_delete_sent_messages": True,
+            },
         },
         now,
     )
@@ -605,20 +624,19 @@ def test_crash_after_telegram_accepts_message_never_resends_on_restart(tmp_path)
     first = BusinessService(settings(path), clock=lambda: current[0], api=first_api)
     establish_chat(first, current[0])
     seed_notifications(first, current[0], [delivery_event(1, 1, current[0])])
-    real_finish = first.delivery_store.finish
+    real_finish = first.delivery_store.finish_sent_and_queue_cleanup
     crashed = False
 
     def crash_before_notification_finish(*args, **kwargs):
         nonlocal crashed
-        outcome = kwargs.get("outcome")
-        if outcome is None and len(args) >= 4:
-            outcome = args[3]
-        if outcome == "sent" and not crashed:
+        if not crashed:
             crashed = True
             raise RuntimeError("simulated crash after Telegram acceptance")
         return real_finish(*args, **kwargs)
 
-    first.delivery_store.finish = crash_before_notification_finish
+    first.delivery_store.finish_sent_and_queue_cleanup = (
+        crash_before_notification_finish
+    )
     with pytest.raises(RuntimeError, match="simulated crash"):
         first.delivery_notifications_cycle()
     assert crashed is True
@@ -664,6 +682,7 @@ def test_persisted_sending_ledger_never_retries_after_lease_expiry(
         "delivery_status_pending",
         "simulated-content-hash",
         current[0],
+        business_connection_id="connection",
     ) == "send"
 
     if remap_phone:
@@ -692,16 +711,20 @@ def test_persisted_sending_ledger_never_retries_after_lease_expiry(
     assert second.delivery_store.notification(1)["state"] == expected_state
     with connect(path) as db:
         ledgers = db.execute(
-            "SELECT state,chat_id FROM business_outbound_deliveries"
+            """SELECT state,chat_id,business_connection_id
+               FROM business_outbound_deliveries"""
         ).fetchall()
-    assert [(row["state"], row["chat_id"]) for row in ledgers] == [
-        ("sending", "200")
+    assert [
+        (row["state"], row["chat_id"], row["business_connection_id"])
+        for row in ledgers
+    ] == [
+        ("sending", "200", "connection")
     ]
 
 
 @pytest.mark.parametrize(
     "language, expected",
-    (("ru", "Заказ №1001"), ("uz", "№1001 buyurtma"), ("bi", "———")),
+    (("ru", "Ожидаем курьера"), ("uz", "Kuryerni kutyapmiz"), ("bi", "———")),
 )
 def test_delivery_status_uses_saved_client_language(tmp_path, language, expected):
     now = datetime(2026, 9, 7, 12, 0, tzinfo=TZ)

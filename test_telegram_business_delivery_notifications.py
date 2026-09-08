@@ -31,10 +31,32 @@ FEED_ID = "11111111-1111-4111-8111-111111111111"
 class FakeTelegramAPI:
     def __init__(self):
         self.sent: list[tuple[str, str, str]] = []
+        self.deleted: list[tuple[str, tuple[int, ...]]] = []
+        self.actions: list[tuple[str, int]] = []
+        self.connection_rights = {
+            "can_reply": True,
+            "can_delete_sent_messages": True,
+        }
 
     def send_message(self, connection_id, chat_id, text, **_options):
         self.sent.append((connection_id, chat_id, text))
-        return {"ok": True, "result": {"message_id": 7000 + len(self.sent)}}
+        message_id = 7000 + len(self.sent)
+        self.actions.append(("send", message_id))
+        return {"ok": True, "result": {"message_id": message_id}}
+
+    def get_business_connection(self, connection_id):
+        return {
+            "id": connection_id,
+            "user": {"id": 100},
+            "is_enabled": True,
+            "rights": dict(self.connection_rights),
+        }
+
+    def delete_business_messages(self, connection_id, message_ids):
+        ids = tuple(message_ids)
+        self.deleted.append((connection_id, ids))
+        self.actions.extend(("delete", message_id) for message_id in ids)
+        return {"ok": True, "result": True}
 
 
 class RetryTelegramAPI(FakeTelegramAPI):
@@ -142,7 +164,10 @@ def establish_chat(service: BusinessService, now: datetime, chat_id="200", phone
         {
             "id": "connection",
             "user": {"id": 100},
-            "rights": {"can_reply": True},
+            "rights": {
+                "can_reply": True,
+                "can_delete_sent_messages": True,
+            },
         },
         now,
     )
@@ -337,7 +362,8 @@ def test_first_poll_baselines_then_routes_and_deduplicates():
         service.delivery_notifications_cycle()
         assert len(api.sent) == 1
         assert api.sent[0][0:2] == ("connection", "200")
-        assert "№1002" in api.sent[0][2]
+        assert "Ожидаем курьера" in api.sent[0][2]
+        assert "1002" not in api.sent[0][2]
         notification = service.delivery_store.notification(101)
         assert notification["state"] == "sent"
 
@@ -405,6 +431,321 @@ def test_completed_delivery_sends_one_localized_review_link(
 
         service.delivery_notifications_cycle()
         assert len(api.sent) == 1
+
+
+def test_delivery_status_sequence_replaces_only_its_previous_bot_message():
+    with tempfile.TemporaryDirectory() as tmp:
+        now = datetime(2026, 9, 7, 20, 0, tzinfo=TZ)
+        api = FakeTelegramAPI()
+        service = BusinessService(
+            business_settings(Path(tmp) / "business.db"),
+            clock=lambda: now,
+            api=api,
+        )
+        feed = FakeFeed(latest=0)
+        service.delivery_client = feed
+        establish_chat(service, now)
+        service.delivery_notifications_cycle()
+
+        statuses = ("pending", "picked_up", "on_way", "completed")
+        for event_id, status in enumerate(statuses, start=1):
+            feed.events.append(delivery_event(event_id, 1, status))
+            feed.latest = event_id
+            service.delivery_notifications_cycle()
+
+        assert api.actions == [
+            ("send", 7001),
+            ("send", 7002),
+            ("delete", 7001),
+            ("send", 7003),
+            ("delete", 7002),
+            ("send", 7004),
+            ("delete", 7003),
+        ]
+        assert api.deleted == [
+            ("connection", (7001,)),
+            ("connection", (7002,)),
+            ("connection", (7003,)),
+        ]
+        texts = [item[2] for item in api.sent]
+        assert texts[0] == "⏳ Ожидаем курьера."
+        assert texts[1] == "📦 Курьер забрал товар."
+        assert "+998948765070" in texts[2]
+        assert "будьте по указанному адресу" in texts[2]
+        assert texts[3].count(REVIEW_URL) == 1
+        assert all("1001" not in text for text in texts)
+
+        with connect(service.repo.path) as db:
+            audit = db.execute(
+                """SELECT message_id,deleted_at FROM business_messages
+                   WHERE sender_type='business_bot'
+                     AND template_code LIKE 'delivery_status_%'
+                   ORDER BY message_id"""
+            ).fetchall()
+            cleanup = db.execute(
+                """SELECT telegram_message_id,state
+                   FROM delivery_status_message_deletions
+                   ORDER BY telegram_message_id"""
+            ).fetchall()
+        assert [row["message_id"] for row in audit] == [7001, 7002, 7003, 7004]
+        assert [row["deleted_at"] is not None for row in audit] == [
+            True,
+            True,
+            True,
+            False,
+        ]
+        assert [tuple(row) for row in cleanup] == [
+            (7001, "deleted"),
+            (7002, "deleted"),
+            (7003, "deleted"),
+        ]
+
+
+def test_bilingual_on_way_message_shows_courier_phone_once():
+    with tempfile.TemporaryDirectory() as tmp:
+        now = datetime(2026, 9, 7, 20, 0, tzinfo=TZ)
+        service = BusinessService(
+            business_settings(Path(tmp) / "business.db"),
+            clock=lambda: now,
+            api=FakeTelegramAPI(),
+        )
+
+        text = service._render_message(
+            "delivery_status_on_way",
+            "bi",
+            now,
+            courier_phone="+998948765070",
+        )
+
+        assert text is not None
+        assert text.count("+998948765070") == 1
+        assert "Курьер выехал" in text
+        assert "Kuryer yo‘lga chiqdi" in text
+        assert "———" in text
+
+
+@pytest.mark.parametrize("language", ("ru", "uz", "bi"))
+@pytest.mark.parametrize(
+    "template_code, required_value",
+    (
+        ("delivery_status_on_way", "+998948765070"),
+        ("delivery_status_completed", REVIEW_URL),
+    ),
+)
+def test_sheet_override_cannot_omit_mandatory_delivery_detail(
+    language, template_code, required_value
+):
+    class ShortSheetOverride:
+        @staticmethod
+        def render_cached(_code, selected, _values):
+            return "Статус обновлён." if selected == "ru" else "Holat yangilandi."
+
+    with tempfile.TemporaryDirectory() as tmp:
+        now = datetime(2026, 9, 7, 20, 0, tzinfo=TZ)
+        service = BusinessService(
+            business_settings(Path(tmp) / "business.db"),
+            clock=lambda: now,
+            api=FakeTelegramAPI(),
+        )
+        service.sheets = ShortSheetOverride()
+
+        text = service._render_message(
+            template_code,
+            language,
+            now,
+            courier_phone="+998948765070",
+        )
+
+        assert text is not None
+        assert text.count(required_value) == 1
+
+
+def test_bilingual_sheet_override_keeps_text_when_phone_was_inline():
+    class InlinePhoneSheetOverride:
+        @staticmethod
+        def render_cached(_code, selected, values):
+            phone = values["courier_phone"]
+            if selected == "uz":
+                return f"Kuryer {phone} bilan yo‘lga chiqdi."
+            return f"Курьер с номером {phone} уже выехал."
+
+    with tempfile.TemporaryDirectory() as tmp:
+        now = datetime(2026, 9, 7, 20, 0, tzinfo=TZ)
+        service = BusinessService(
+            business_settings(Path(tmp) / "business.db"),
+            clock=lambda: now,
+            api=FakeTelegramAPI(),
+        )
+        service.sheets = InlinePhoneSheetOverride()
+
+        text = service._render_message(
+            "delivery_status_on_way",
+            "bi",
+            now,
+            courier_phone="+998948765070",
+        )
+
+        assert text is not None
+        assert "Курьер с номером уже выехал." in text
+        assert "Kuryer bilan yo‘lga chiqdi." in text
+        assert text.count("+998948765070") == 1
+
+
+def test_cleanup_waits_for_delete_right_then_resumes_without_resending():
+    with tempfile.TemporaryDirectory() as tmp:
+        current = [datetime(2026, 9, 7, 20, 0, tzinfo=TZ)]
+        api = FakeTelegramAPI()
+        service = BusinessService(
+            business_settings(Path(tmp) / "business.db"),
+            clock=lambda: current[0],
+            api=api,
+        )
+        feed = FakeFeed(latest=0)
+        service.delivery_client = feed
+        establish_chat(service, current[0])
+        service.delivery_notifications_cycle()
+
+        feed.events.append(delivery_event(1, 1, "pending"))
+        feed.latest = 1
+        service.delivery_notifications_cycle()
+
+        api.connection_rights = {"can_reply": True}
+        service.repo.upsert_connection(
+            {
+                "id": "connection",
+                "user": {"id": 100},
+                "is_enabled": True,
+                "rights": {"can_reply": True},
+            },
+            current[0],
+        )
+        feed.events.append(delivery_event(2, 1, "picked_up"))
+        feed.latest = 2
+        service.delivery_notifications_cycle()
+
+        assert len(api.sent) == 2
+        assert api.deleted == []
+        with connect(service.repo.path) as db:
+            assert db.execute(
+                "SELECT state FROM delivery_status_message_deletions"
+            ).fetchone()[0] == "deferred"
+
+        current[0] += timedelta(seconds=301)
+        api.connection_rights["can_delete_sent_messages"] = True
+        service.repo.upsert_connection(
+            {
+                "id": "connection",
+                "user": {"id": 100},
+                "is_enabled": True,
+                "rights": dict(api.connection_rights),
+            },
+            current[0],
+        )
+        service.delivery_notifications_cycle()
+
+        assert len(api.sent) == 2
+        assert api.deleted == [("connection", (7001,))]
+
+
+def test_cleanup_retry_survives_restart_without_resending_status():
+    class TimeoutOnceAPI(FakeTelegramAPI):
+        def __init__(self):
+            super().__init__()
+            self.failed_once = False
+
+        def delete_business_messages(self, connection_id, message_ids):
+            if not self.failed_once:
+                self.failed_once = True
+                raise TelegramAPIError(
+                    "Telegram network request failed",
+                    retryable=True,
+                    ambiguous=True,
+                )
+            return super().delete_business_messages(connection_id, message_ids)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "business.db"
+        current = [datetime(2026, 9, 7, 20, 0, tzinfo=TZ)]
+        first_api = TimeoutOnceAPI()
+        first = BusinessService(
+            business_settings(path), clock=lambda: current[0], api=first_api
+        )
+        feed = FakeFeed(latest=0)
+        first.delivery_client = feed
+        establish_chat(first, current[0])
+        first.delivery_notifications_cycle()
+        for event_id, status in ((1, "pending"), (2, "picked_up")):
+            feed.events.append(delivery_event(event_id, 1, status))
+            feed.latest = event_id
+            first.delivery_notifications_cycle()
+
+        assert len(first_api.sent) == 2
+        assert first_api.deleted == []
+        with connect(path) as db:
+            assert db.execute(
+                "SELECT state FROM delivery_status_message_deletions"
+            ).fetchone()[0] == "retry"
+
+        current[0] += timedelta(seconds=6)
+        second_api = FakeTelegramAPI()
+        second = BusinessService(
+            business_settings(path), clock=lambda: current[0], api=second_api
+        )
+        second.delivery_client = feed
+        second.delivery_notifications_cycle()
+
+        assert second_api.sent == []
+        assert second_api.deleted == [("connection", (7001,))]
+        with connect(path) as db:
+            assert db.execute(
+                "SELECT state FROM delivery_status_message_deletions"
+            ).fetchone()[0] == "deleted"
+
+
+def test_cleanup_auth_failure_is_deferred_until_token_is_fixed():
+    class UnauthorizedOnceAPI(FakeTelegramAPI):
+        def __init__(self):
+            super().__init__()
+            self.failed_once = False
+
+        def delete_business_messages(self, connection_id, message_ids):
+            if not self.failed_once:
+                self.failed_once = True
+                raise TelegramAPIError(
+                    "Telegram authorization failed",
+                    status=401,
+                    retryable=False,
+                )
+            return super().delete_business_messages(connection_id, message_ids)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "business.db"
+        current = [datetime(2026, 9, 7, 20, 0, tzinfo=TZ)]
+        api = UnauthorizedOnceAPI()
+        service = BusinessService(
+            business_settings(path), clock=lambda: current[0], api=api
+        )
+        feed = FakeFeed(latest=0)
+        service.delivery_client = feed
+        establish_chat(service, current[0])
+        service.delivery_notifications_cycle()
+        for event_id, status in ((1, "pending"), (2, "picked_up")):
+            feed.events.append(delivery_event(event_id, 1, status))
+            feed.latest = event_id
+            service.delivery_notifications_cycle()
+
+        assert len(api.sent) == 2
+        assert api.deleted == []
+        with connect(path) as db:
+            assert db.execute(
+                "SELECT state FROM delivery_status_message_deletions"
+            ).fetchone()[0] == "deferred"
+
+        current[0] += timedelta(seconds=301)
+        service.delivery_notifications_cycle()
+
+        assert len(api.sent) == 2
+        assert api.deleted == [("connection", (7001,))]
 
 
 def test_multiple_orders_same_chat_and_ambiguous_phone_are_safe():

@@ -173,17 +173,19 @@ def test_delivery_flag_is_effectively_off_when_business_integration_is_off():
 
 @pytest.mark.parametrize("code", DELIVERY_TEMPLATE_CODES)
 @pytest.mark.parametrize("language", ("ru", "uz"))
-def test_delivery_status_templates_are_short_and_render_order_number(code, language):
+def test_delivery_status_templates_are_short_and_hide_order_number(code, language):
     text = render(
         code,
         language,
         order_number="1542",
         product="iPhone 16 Pro Max",
+        courier_phone="+998948765070",
     )
 
-    assert "1542" in text
+    assert "1542" not in text
+    assert "{order_number}" not in text
     assert "{" not in text
-    assert len(text) <= 180
+    assert len(text) <= 240
 
 
 def test_delivery_status_templates_are_seeded_for_sheets_idempotently():
@@ -191,14 +193,15 @@ def test_delivery_status_templates_are_seeded_for_sheets_idempotently():
     rows_by_code = {str(row[0]): row for row in rows}
 
     assert len(rows_by_code) == len(rows)
-    assert {"order_number", "product"} <= ALLOWED_PLACEHOLDERS
+    assert "order_number" not in ALLOWED_PLACEHOLDERS
+    assert {"product", "courier_phone"} <= ALLOWED_PLACEHOLDERS
     for code in DELIVERY_TEMPLATE_CODES:
         row = rows_by_code[code]
         assert row[1] is True
         assert row[2] == "all"
         assert row[6] == 0
-        assert "{order_number}" in row[4]
-        assert "{order_number}" in row[5]
+        assert "{order_number}" not in row[4]
+        assert "{order_number}" not in row[5]
 
 
 @pytest.mark.parametrize(
@@ -211,6 +214,7 @@ def test_completed_delivery_asks_for_review_once(language, call_to_action):
         language,
         order_number="1542",
         product="iPhone 16 Pro Max",
+        courier_phone="+998948765070",
     )
 
     assert text.casefold().count(call_to_action) == 1
@@ -223,7 +227,13 @@ def test_completed_delivery_asks_for_review_once(language, call_to_action):
 )
 @pytest.mark.parametrize("language", ("ru", "uz"))
 def test_review_link_is_not_sent_for_incomplete_delivery_statuses(code, language):
-    text = render(code, language, order_number="1542", product="iPhone 16 Pro Max")
+    text = render(
+        code,
+        language,
+        order_number="1542",
+        product="iPhone 16 Pro Max",
+        courier_phone="+998948765070",
+    )
 
     assert REVIEW_URL not in text
 
@@ -239,3 +249,77 @@ def test_review_link_is_seeded_only_for_completed_delivery():
         expected_count = 1 if code == "delivery_status_completed" else 0
         assert str(row[4]).count(REVIEW_URL) == expected_count
         assert str(row[5]).count(REVIEW_URL) == expected_count
+
+
+@pytest.mark.parametrize(
+    "code, language, expected",
+    (
+        ("delivery_status_pending", "ru", "⏳ Ожидаем курьера."),
+        ("delivery_status_pending", "uz", "⏳ Kuryerni kutyapmiz."),
+        ("delivery_status_picked_up", "ru", "📦 Курьер забрал товар."),
+        ("delivery_status_picked_up", "uz", "📦 Kuryer mahsulotni olib ketdi."),
+        (
+            "delivery_status_on_way",
+            "ru",
+            "🚗 Курьер выехал. Пожалуйста, будьте по указанному адресу и готовы "
+            "получить товар.\n\nТелефон курьера: +998948765070",
+        ),
+        (
+            "delivery_status_on_way",
+            "uz",
+            "🚗 Kuryer yo‘lga chiqdi. Iltimos, ko‘rsatilgan manzilda bo‘ling va "
+            "mahsulotni qabul qilishga tayyor turing.\n\n"
+            "Kuryer raqami: +998948765070",
+        ),
+        (
+            "delivery_status_completed",
+            "ru",
+            "✅ Товар доставлен.\n\nПожалуйста, оцените нашу работу: " + REVIEW_URL,
+        ),
+        (
+            "delivery_status_completed",
+            "uz",
+            "✅ Mahsulot yetkazildi.\n\nIltimos, xizmatimizni baholang: "
+            + REVIEW_URL,
+        ),
+        (
+            "delivery_status_cancelled",
+            "ru",
+            "❌ Доставка отменена. Подробности уточнит менеджер.",
+        ),
+        (
+            "delivery_status_cancelled",
+            "uz",
+            "❌ Yetkazib berish bekor qilindi. Tafsilotlarni menejer "
+            "aniqlashtiradi.",
+        ),
+    ),
+)
+def test_delivery_status_copy_is_exact(code, language, expected):
+    assert render(code, language, courier_phone="+998948765070") == expected
+
+
+def test_delivery_courier_phone_is_configurable_and_validated():
+    env = enabled_business_env(
+        BUSINESS_DELIVERY_NOTIFICATIONS_ENABLED="true",
+        BUSINESS_DELIVERY_NOTIFICATIONS_URL="http://delivery:8080",
+        BUSINESS_DELIVERY_NOTIFICATIONS_TOKEN="secret",
+        BUSINESS_DELIVERY_COURIER_PHONE="+998 94 876 50 70",
+    )
+    with patch.dict(os.environ, env, clear=True):
+        settings = BusinessSettings.load()
+    assert settings.delivery_courier_phone == "+998 94 876 50 70"
+    settings.validate_enabled()
+
+
+def test_delivery_courier_phone_rejects_template_injection():
+    env = enabled_business_env(
+        BUSINESS_DELIVERY_NOTIFICATIONS_ENABLED="true",
+        BUSINESS_DELIVERY_NOTIFICATIONS_URL="http://delivery:8080",
+        BUSINESS_DELIVERY_NOTIFICATIONS_TOKEN="secret",
+        BUSINESS_DELIVERY_COURIER_PHONE="+998\nBAD",
+    )
+    with patch.dict(os.environ, env, clear=True):
+        settings = BusinessSettings.load()
+    with pytest.raises(RuntimeError, match="display-safe phone"):
+        settings.validate_enabled()

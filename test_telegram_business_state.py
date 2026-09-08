@@ -126,6 +126,93 @@ class TelegramBusinessStateTests(unittest.TestCase):
         self.assertIn("origin_update_id", request_columns)
         self.assertIn("result", receipt_columns)
 
+    def test_additive_connection_delete_right_migration_preserves_legacy_row(self):
+        legacy = Path(self.tmp.name) / "legacy-connection.db"
+        db = sqlite3.connect(legacy)
+        db.execute(
+            """CREATE TABLE business_connections(
+               connection_id TEXT PRIMARY KEY, business_user_id TEXT,
+               is_enabled INTEGER NOT NULL DEFAULT 1,
+               can_reply INTEGER NOT NULL DEFAULT 0,
+               created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"""
+        )
+        db.execute(
+            """INSERT INTO business_connections(
+               connection_id,business_user_id,is_enabled,can_reply,
+               created_at,updated_at) VALUES('legacy','100',1,1,?,?)""",
+            (self.now.isoformat(), self.now.isoformat()),
+        )
+        db.commit()
+        db.close()
+
+        migrated_repo = BusinessRepository(legacy)
+
+        with connect(legacy) as migrated:
+            columns = {
+                row["name"]
+                for row in migrated.execute(
+                    "PRAGMA table_info(business_connections)"
+                )
+            }
+            row = migrated.execute(
+                "SELECT * FROM business_connections WHERE connection_id='legacy'"
+            ).fetchone()
+        self.assertIn("can_delete_sent_messages", columns)
+        self.assertEqual(row["business_user_id"], "100")
+        self.assertEqual(row["can_delete_sent_messages"], 0)
+        self.assertFalse(
+            migrated_repo.connection_can_delete_sent_messages("legacy")
+        )
+
+    def test_connection_delete_right_is_updated_at_ingest_and_upsert(self):
+        granted = {
+            "id": "c", "user": {"id": 100}, "is_enabled": True,
+            "rights": {"can_reply": True, "can_delete_sent_messages": True},
+        }
+        self.assertTrue(self.repo.save_update(
+            {"update_id": 7, "business_connection": granted},
+            self.now,
+            allowed_connection_id="c",
+        ))
+        self.assertTrue(
+            self.repo.connection_can_delete_sent_messages("c")
+        )
+
+        # Missing optional rights are fail-closed.
+        self.repo.upsert_connection(
+            {
+                "id": "c", "user": {"id": 100}, "is_enabled": True,
+                "rights": {"can_reply": True},
+            },
+            self.now + timedelta(seconds=1),
+        )
+        self.assertFalse(
+            self.repo.connection_can_delete_sent_messages("c")
+        )
+
+        # Telegram's broader right implies the narrower internal capability;
+        # the service still only deletes its own ledgered messages.
+        self.repo.upsert_connection(
+            {
+                "id": "c", "user": {"id": 100}, "is_enabled": True,
+                "rights": {"can_reply": True, "can_delete_all_messages": True},
+            },
+            self.now + timedelta(seconds=2),
+        )
+        self.assertTrue(
+            self.repo.connection_can_delete_sent_messages("c")
+        )
+        self.repo.upsert_connection(
+            {
+                "id": "c", "user": {"id": 100}, "is_enabled": False,
+                "rights": {"can_reply": True, "can_delete_sent_messages": True},
+            },
+            self.now + timedelta(seconds=3),
+        )
+        self.assertFalse(
+            self.repo.connection_can_delete_sent_messages("c")
+        )
+
     def test_update_claim_is_atomic_and_stale_lease_recovers(self):
         update = {"update_id": 10, "business_connection": {"id": "c"}}
         self.assertTrue(self.repo.save_update(update, self.now))

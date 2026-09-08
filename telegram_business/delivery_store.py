@@ -505,6 +505,279 @@ class DeliveryNotificationStore:
                 ),
             ).rowcount == 1
 
+    def finish_sent_and_queue_cleanup(
+        self,
+        source_event_id: int,
+        lease_token: str,
+        now: datetime,
+        *,
+        connection_id: str,
+        chat_id: str,
+        session_id: str,
+        template_code: str,
+        telegram_message_id: int,
+    ) -> bool:
+        """Finish a confirmed send and durably queue deletion of older statuses.
+
+        The status transition and cleanup enqueue share one transaction.  This
+        closes the restart window where Telegram accepted the replacement but
+        the process died before recording which older messages may be removed.
+        Cleanup targets are admitted only when both the delivery notification
+        row and the outbound send ledger prove that the target was a status
+        message sent by this bot.
+        """
+
+        event_id = int(source_event_id)
+        message_id = int(telegram_message_id)
+        connection = str(connection_id or "").strip()
+        chat = str(chat_id or "").strip()
+        template = str(template_code or "").strip()
+        if event_id < 0 or message_id <= 0:
+            raise ValueError("delivery event and message ids must be positive")
+        if not lease_token or not connection or not chat:
+            raise ValueError("delivery send identity is required")
+        if not template.startswith("delivery_status_"):
+            raise ValueError("delivery cleanup requires a status template")
+
+        with connect(self.path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            current = db.execute(
+                """SELECT order_id,public_status FROM delivery_status_notifications
+                   WHERE source_event_id=? AND state='running' AND lease_token=?""",
+                (event_id, lease_token),
+            ).fetchone()
+            if current is None:
+                return False
+
+            order_id = int(current["order_id"])
+            delivery_key = (
+                f"delivery-status:{order_id}:{current['public_status']}:{chat}"
+            )
+            confirmed = db.execute(
+                """SELECT 1 FROM business_outbound_deliveries
+                   WHERE dedupe_key=? AND chat_id=? AND template_code=?
+                     AND business_connection_id=?
+                     AND state='sent' AND telegram_message_id=?""",
+                (delivery_key, chat, template, connection, message_id),
+            ).fetchone()
+            if confirmed is None:
+                return False
+
+            changed = db.execute(
+                """UPDATE delivery_status_notifications SET
+                   state='sent',match_outcome='sent',
+                   business_connection_id=?,chat_id=?,session_id=?,
+                   template_code=?,telegram_message_id=?,next_attempt_at=?,
+                   last_error=NULL,processed_at=?,updated_at=?,
+                   lease_token=NULL,lease_expires_at=NULL
+                   WHERE source_event_id=? AND state='running' AND lease_token=?""",
+                (
+                    connection,
+                    chat,
+                    session_id,
+                    template,
+                    message_id,
+                    _iso(now),
+                    _iso(now),
+                    _iso(now),
+                    event_id,
+                    lease_token,
+                ),
+            ).rowcount
+            if changed != 1:
+                return False
+
+            targets = db.execute(
+                """SELECT previous.source_event_id,
+                          outbound.telegram_message_id
+                   FROM delivery_status_notifications AS previous
+                   JOIN business_outbound_deliveries AS outbound
+                     ON outbound.dedupe_key=(
+                       'delivery-status:' || previous.order_id || ':' ||
+                       previous.public_status || ':' || ?)
+                    AND outbound.chat_id=?
+                    AND outbound.template_code=(
+                      'delivery_status_' || previous.public_status)
+                    AND outbound.state='sent'
+                     AND outbound.telegram_message_id IS NOT NULL
+                     AND outbound.telegram_message_id>0
+                   WHERE previous.order_id=?
+                     AND previous.source_event_id<?
+                     AND outbound.telegram_message_id<>?
+                     AND (
+                       outbound.business_connection_id=?
+                       OR (
+                         outbound.business_connection_id IS NULL
+                         AND previous.state='sent'
+                         AND previous.business_connection_id=?
+                         AND previous.chat_id=?
+                         AND previous.telegram_message_id=
+                             outbound.telegram_message_id
+                       )
+                     )
+                   ORDER BY previous.source_event_id""",
+                (
+                    chat,
+                    chat,
+                    order_id,
+                    event_id,
+                    message_id,
+                    connection,
+                    connection,
+                    chat,
+                ),
+            ).fetchall()
+            for target in targets:
+                db.execute(
+                    """INSERT INTO delivery_status_message_deletions(
+                       order_id,business_connection_id,chat_id,
+                       telegram_message_id,target_source_event_id,
+                       replacement_source_event_id,state,next_attempt_at,
+                       created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,'pending',?,?,?)
+                       ON CONFLICT(business_connection_id,chat_id,
+                                   telegram_message_id) DO UPDATE SET
+                       replacement_source_event_id=MAX(
+                         delivery_status_message_deletions.replacement_source_event_id,
+                         excluded.replacement_source_event_id),
+                       updated_at=excluded.updated_at""",
+                    (
+                        order_id,
+                        connection,
+                        chat,
+                        int(target["telegram_message_id"]),
+                        int(target["source_event_id"]),
+                        event_id,
+                        _iso(now),
+                        _iso(now),
+                        _iso(now),
+                    ),
+                )
+            return True
+
+    @staticmethod
+    def _recover_stale_deletions_in_db(
+        db: sqlite3.Connection, now: datetime
+    ) -> int:
+        return db.execute(
+            """UPDATE delivery_status_message_deletions
+               SET state='retry',next_attempt_at=?,updated_at=?,
+                   lease_token=NULL,lease_expires_at=NULL,
+                   last_error=COALESCE(
+                     last_error,'delivery message deletion lease expired')
+               WHERE state='running' AND (
+                   lease_expires_at IS NULL
+                   OR julianday(lease_expires_at) IS NULL
+                   OR julianday(lease_expires_at)<=julianday(?))""",
+            (_iso(now), _iso(now), _iso(now)),
+        ).rowcount
+
+    def recover_stale_deletions(self, now: datetime) -> int:
+        with connect(self.path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            return self._recover_stale_deletions_in_db(db, now)
+
+    def claim_due_deletions(
+        self, now: datetime, *, limit: int = 20, lease_seconds: int = 60
+    ) -> list[sqlite3.Row]:
+        """Lease due Telegram deletion jobs for confirmed bot-sent messages."""
+
+        claimed: list[sqlite3.Row] = []
+        with connect(self.path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._recover_stale_deletions_in_db(db, now)
+            rows = db.execute(
+                """SELECT deletion_id FROM delivery_status_message_deletions
+                   WHERE state IN ('pending','retry','deferred')
+                     AND julianday(next_attempt_at)<=julianday(?)
+                   ORDER BY deletion_id LIMIT ?""",
+                (_iso(now), min(100, max(1, int(limit)))),
+            ).fetchall()
+            for row in rows:
+                deletion_id = int(row["deletion_id"])
+                token = uuid.uuid4().hex
+                changed = db.execute(
+                    """UPDATE delivery_status_message_deletions
+                       SET state='running',attempts=attempts+1,
+                           lease_token=?,lease_expires_at=?,updated_at=?
+                       WHERE deletion_id=?
+                         AND state IN ('pending','retry','deferred')""",
+                    (
+                        token,
+                        _iso(now + timedelta(seconds=max(30, int(lease_seconds)))),
+                        _iso(now),
+                        deletion_id,
+                    ),
+                ).rowcount
+                if changed:
+                    claimed.append(
+                        db.execute(
+                            """SELECT * FROM delivery_status_message_deletions
+                               WHERE deletion_id=?""",
+                            (deletion_id,),
+                        ).fetchone()
+                    )
+        return claimed
+
+    def finish_deletion(
+        self,
+        deletion_id: int,
+        lease_token: str,
+        now: datetime,
+        outcome: str,
+        *,
+        error: Exception | str | None = None,
+        retry_after: float | None = None,
+    ) -> bool:
+        """Finish a leased deletion after the caller classifies the API result."""
+
+        if outcome not in {"deleted", "failed", "retry", "deferred"}:
+            raise ValueError("invalid delivery message deletion outcome")
+        safe_error = (redact_sensitive_data(str(error)) or "")[:500] or None
+        state = outcome
+        next_attempt_at = _iso(now)
+        processed_at: str | None = _iso(now)
+        if outcome in {"retry", "deferred"}:
+            processed_at = None
+            delay = max(
+                float(retry_after or 0),
+                float(_backoff(self._deletion_attempts(deletion_id))),
+            )
+            next_attempt_at = _iso(now + timedelta(seconds=delay))
+        with connect(self.path) as db:
+            return db.execute(
+                """UPDATE delivery_status_message_deletions SET
+                   state=?,next_attempt_at=?,last_error=?,processed_at=?,
+                   updated_at=?,lease_token=NULL,lease_expires_at=NULL
+                   WHERE deletion_id=? AND state='running' AND lease_token=?""",
+                (
+                    state,
+                    next_attempt_at,
+                    safe_error,
+                    processed_at,
+                    _iso(now),
+                    int(deletion_id),
+                    lease_token,
+                ),
+            ).rowcount == 1
+
+    def _deletion_attempts(self, deletion_id: int) -> int:
+        with connect(self.path) as db:
+            row = db.execute(
+                """SELECT attempts FROM delivery_status_message_deletions
+                   WHERE deletion_id=?""",
+                (int(deletion_id),),
+            ).fetchone()
+        return int(row["attempts"] if row else 1)
+
+    def deletion(self, deletion_id: int):
+        with connect(self.path) as db:
+            return db.execute(
+                """SELECT * FROM delivery_status_message_deletions
+                   WHERE deletion_id=?""",
+                (int(deletion_id),),
+            ).fetchone()
+
     def _attempts(self, source_event_id: int) -> int:
         with connect(self.path) as db:
             row = db.execute(

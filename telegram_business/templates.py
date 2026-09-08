@@ -32,8 +32,8 @@ ALLOWED_PLACEHOLDERS = frozenset(
         "fulfillment",
         "preferred_time",
         "missing_fields",
-        "order_number",
         "product",
+        "courier_phone",
     }
 )
 
@@ -111,30 +111,37 @@ TEMPLATES: dict[str, dict[str, str]] = {
         "uz": "Mavjudligini menejer {manager_time_phrase_uz} tasdiqlaydi. Modelning aniq nomini yozing, men joriy bazadagi narxlarni ko‘rsataman.",
     },
     "delivery_status_pending": {
-        "ru": "🚚 Заказ №{order_number} передан в службу доставки.",
-        "uz": "🚚 №{order_number} buyurtma yetkazib berish xizmatiga topshirildi.",
+        "ru": "⏳ Ожидаем курьера.",
+        "uz": "⏳ Kuryerni kutyapmiz.",
     },
     "delivery_status_picked_up": {
-        "ru": "📦 Курьер получил товар по заказу №{order_number}.",
-        "uz": "📦 Kuryer №{order_number} buyurtmadagi mahsulotni oldi.",
+        "ru": "📦 Курьер забрал товар.",
+        "uz": "📦 Kuryer mahsulotni olib ketdi.",
     },
     "delivery_status_on_way": {
-        "ru": "🚗 Курьер выехал с заказом №{order_number}.",
-        "uz": "🚗 Kuryer №{order_number} buyurtma bilan yo‘lga chiqdi.",
+        "ru": (
+            "🚗 Курьер выехал. Пожалуйста, будьте по указанному адресу "
+            "и готовы получить товар.\n\nТелефон курьера: {courier_phone}"
+        ),
+        "uz": (
+            "🚗 Kuryer yo‘lga chiqdi. Iltimos, ko‘rsatilgan manzilda bo‘ling "
+            "va mahsulotni qabul qilishga tayyor turing.\n\n"
+            "Kuryer raqami: {courier_phone}"
+        ),
     },
     "delivery_status_completed": {
         "ru": (
-            "✅ Заказ №{order_number} доставлен.\n\n"
+            "✅ Товар доставлен.\n\n"
             f"Пожалуйста, оцените нашу работу: {REVIEW_URL}"
         ),
         "uz": (
-            "✅ №{order_number} buyurtma yetkazildi.\n\n"
+            "✅ Mahsulot yetkazildi.\n\n"
             f"Iltimos, xizmatimizni baholang: {REVIEW_URL}"
         ),
     },
     "delivery_status_cancelled": {
-        "ru": "❌ Доставка заказа №{order_number} отменена. Подробности уточнит менеджер.",
-        "uz": "❌ №{order_number} buyurtmani yetkazib berish bekor qilindi. Tafsilotlarni menejer aniqlashtiradi.",
+        "ru": "❌ Доставка отменена. Подробности уточнит менеджер.",
+        "uz": "❌ Yetkazib berish bekor qilindi. Tafsilotlarni menejer aniqlashtiradi.",
     },
     "request_choose_attribute": {
         "ru": "Вы выбрали {model}.\n\nВыберите {attribute_label}:\n\n{variants}\n\nУказанные суммы — цены из текущей базы. Точную цену и наличие подтвердит менеджер.",

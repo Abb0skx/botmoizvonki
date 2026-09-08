@@ -490,6 +490,7 @@ class BusinessService:
             template_code,
             content_hash,
             now,
+            business_connection_id=connection_id,
         )
         if decision == "assumed":
             delivered = self.repo.outbound_delivery(delivery_key)
@@ -688,6 +689,147 @@ class BusinessService:
             return "deferred"
         return outcome
 
+    def _delivery_delete_right(self, connection_id: str, now: datetime) -> bool:
+        """Refresh and verify the narrow right used for status cleanup."""
+
+        checker = getattr(
+            self.repo, "connection_can_delete_sent_messages", None
+        )
+        if checker and checker(connection_id):
+            return True
+        remote = self.api.get_business_connection(connection_id)
+        if not isinstance(remote, dict) or remote.get("id") != connection_id:
+            raise RuntimeError(
+                "Telegram returned an unexpected Business connection"
+            )
+        self.repo.upsert_connection(remote, now)
+        return bool(checker and checker(connection_id))
+
+    def _process_delivery_deletion(self, row: Any, now: datetime) -> float | None:
+        """Delete one previously sent status without touching chat messages."""
+
+        store, _ = self._delivery_components()
+        deletion_id = int(row["deletion_id"])
+        lease_token = str(row["lease_token"] or "")
+        connection_id = str(row["business_connection_id"] or "")
+        chat_id = str(row["chat_id"] or "")
+        message_id = int(row["telegram_message_id"] or 0)
+        order_id = int(row["order_id"])
+        common = {
+            "deletion_id": deletion_id,
+            "lease_token": lease_token,
+            "now": now,
+        }
+        if (
+            connection_id != self.settings.allowed_connection_id
+            or not chat_id
+            or message_id <= 0
+        ):
+            store.finish_deletion(
+                **common,
+                outcome="failed",
+                error="invalid delivery cleanup target",
+            )
+            return None
+
+        try:
+            if not self._delivery_delete_right(connection_id, now):
+                store.finish_deletion(
+                    **common,
+                    outcome="deferred",
+                    error="Telegram Business deletion right is unavailable",
+                    retry_after=300,
+                )
+                return None
+            self.api.delete_business_messages(connection_id, [message_id])
+        except Exception as exc:
+            status = getattr(exc, "status", None)
+            retry_after = getattr(exc, "retry_after", None)
+            if status in {401, 403}:
+                outcome = "deferred"
+                retry_after = retry_after or 300
+            elif status == 400 or getattr(exc, "retryable", True) is False:
+                outcome = "failed"
+            else:
+                # A deletion can safely be retried after a timeout: it never
+                # creates another customer-visible message.
+                outcome = "retry"
+            store.finish_deletion(
+                **common,
+                outcome=outcome,
+                error=exc,
+                retry_after=retry_after,
+            )
+            self._record_error(
+                "delivery_status_delete", now, chat_id, None, exc
+            )
+            if status == 429:
+                try:
+                    return max(1.0, float(retry_after or 60.0))
+                except (TypeError, ValueError):
+                    return 60.0
+            return None
+
+        try:
+            marked = self.repo.mark_delivery_status_message_deleted(
+                connection_id,
+                chat_id,
+                message_id,
+                order_id,
+                now,
+            )
+            if not marked:
+                LOG.warning(
+                    "delivery_status_delete_audit_missing order_id=%s chat_id=%s message_id=%s",
+                    order_id,
+                    chat_id,
+                    message_id,
+                )
+        except Exception as exc:
+            # Telegram already confirmed deletion. Keep the cleanup terminal so
+            # an audit-only failure cannot generate repeated API mutations.
+            self._record_error(
+                "delivery_status_delete_audit", now, chat_id, None, exc
+            )
+        store.finish_deletion(**common, outcome="deleted")
+        LOG.info(
+            "delivery_status_message_deleted order_id=%s chat_id=%s message_id=%s",
+            order_id,
+            chat_id,
+            message_id,
+        )
+        return None
+
+    def _drain_delivery_deletions(
+        self,
+        store: DeliveryNotificationStore,
+        cycle_token: str,
+        *,
+        limit: int = 50,
+    ) -> float | None:
+        """Flush durable deletion work while holding the delivery-cycle lease."""
+
+        for _ in range(max(1, int(limit))):
+            now = self.clock()
+            telegram_not_before = store.telegram_not_before()
+            if telegram_not_before is not None and telegram_not_before > now:
+                return None
+            if not store.renew_cycle_lease(cycle_token, now, 120):
+                raise RuntimeError("delivery notification cycle lease was lost")
+            rows = store.claim_due_deletions(now, limit=1, lease_seconds=60)
+            if not rows:
+                return None
+            retry_after = self._process_delivery_deletion(rows[0], now)
+            if retry_after is not None:
+                return retry_after
+            current = store.deletion(int(rows[0]["deletion_id"]))
+            if current is not None and current["state"] in {"retry", "deferred"}:
+                # One permission or transport failure applies to the same
+                # connection for the rest of this cycle. Avoid hammering the
+                # Bot API for every queued message.
+                return None
+        return None
+
     def _process_delivery_notification(self, row: Any, now: datetime) -> float | None:
         store, _ = self._delivery_components()
         event_id = int(row["source_event_id"])
@@ -759,8 +901,13 @@ class BusinessService:
             template_code,
             language,
             now,
-            order_number=str(row["order_number"] or row["order_id"]),
-            product=str(row["product"] or ""),
+            courier_phone=str(
+                getattr(
+                    self.settings,
+                    "delivery_courier_phone",
+                    "+998948765070",
+                )
+            ),
         )
         if not text:
             store.finish(
@@ -838,15 +985,27 @@ class BusinessService:
                     return 60.0
             return None
 
-        store.finish(
-            **common,
-            **match_fields,
-            session_id=session_id,
-            template_code=template_code,
-            telegram_message_id=message_id,
-            outcome=outcome,
-        )
-        if outcome == "sent":
+        if outcome == "sent" and message_id is not None and int(message_id) > 0:
+            finished = store.finish_sent_and_queue_cleanup(
+                event_id,
+                lease_token,
+                now,
+                connection_id=connection_id,
+                chat_id=chat_id,
+                session_id=session_id,
+                template_code=template_code,
+                telegram_message_id=int(message_id),
+            )
+        else:
+            finished = store.finish(
+                **common,
+                **match_fields,
+                session_id=session_id,
+                template_code=template_code,
+                telegram_message_id=message_id,
+                outcome=outcome,
+            )
+        if outcome == "sent" and finished:
             LOG.info(
                 "delivery_status_notification_sent event_id=%s order_id=%s status=%s chat_id=%s",
                 event_id,
@@ -869,6 +1028,13 @@ class BusinessService:
         if not token:
             return
         try:
+            retry_after = self._drain_delivery_deletions(store, token)
+            if retry_after is not None:
+                limited_at = self.clock()
+                store.set_telegram_not_before(
+                    limited_at + timedelta(seconds=retry_after), limited_at
+                )
+                return
             # Continue the bounded startup backfill without delaying webhook
             # processing. Existing text messages become matchable over a few
             # polling cycles; native Contacts remain intentionally live-only.
@@ -951,6 +1117,12 @@ class BusinessService:
                         limited_at + timedelta(seconds=retry_after), limited_at
                     )
                     break
+            retry_after = self._drain_delivery_deletions(store, token)
+            if retry_after is not None:
+                limited_at = self.clock()
+                store.set_telegram_not_before(
+                    limited_at + timedelta(seconds=retry_after), limited_at
+                )
         finally:
             store.release_cycle_lease(token)
 
@@ -1037,15 +1209,38 @@ class BusinessService:
             try:
                 cached = getattr(self.sheets, "render_cached", None)
                 if cached:
-                    return cached(code, selected, values)
-                return self.sheets.render(code, selected, values, now=now)
+                    result = cached(code, selected, values)
+                else:
+                    result = self.sheets.render(code, selected, values, now=now)
             except Exception:
                 # Cached sheet content must never make Telegram processing fail.
                 # Invalid rows fall back to the approved built-in text.
                 try:
-                    return render(code, selected, **values)
+                    result = render(code, selected, **values)
                 except (KeyError, RuntimeError, ValueError):
                     return None
+
+            if not result:
+                return result
+
+            # Operators may customize the surrounding copy in Google Sheets,
+            # but these two transactional details are mandatory.  Append them
+            # when an older or shortened override omitted the placeholder/link.
+            if code == "delivery_status_on_way":
+                courier_phone = str(values.get("courier_phone") or "").strip()
+                if courier_phone and courier_phone not in result:
+                    label = (
+                        "Kuryer raqami" if selected == "uz" else "Телефон курьера"
+                    )
+                    result = f"{result.rstrip()}\n\n{label}: {courier_phone}"
+            elif code == "delivery_status_completed" and REVIEW_URL not in result:
+                review_prompt = (
+                    "Iltimos, xizmatimizni baholang:"
+                    if selected == "uz"
+                    else "Пожалуйста, оцените нашу работу:"
+                )
+                result = f"{result.rstrip()}\n\n{review_prompt} {REVIEW_URL}"
+            return result
 
         if language == "bi":
             parts = [part for selected in ("ru", "uz") if (part := one(selected))]
@@ -1057,6 +1252,23 @@ class BusinessService:
                     "\n\n———\n\n".join(review_parts)
                     + f"\n\n{REVIEW_URL}"
                 )
+            if code == "delivery_status_on_way" and len(parts) > 1:
+                courier_phone = str(values.get("courier_phone") or "").strip()
+                if courier_phone:
+                    standalone_label = re.compile(
+                        r"(?m)^(?:Телефон курьера|Kuryer raqami):[ \t]*$\n?"
+                    )
+                    clean_parts = []
+                    for part in parts:
+                        cleaned = part.replace(courier_phone, "")
+                        cleaned = standalone_label.sub("", cleaned)
+                        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+                        if cleaned:
+                            clean_parts.append(cleaned)
+                    return (
+                        "\n\n———\n\n".join(filter(None, clean_parts))
+                        + f"\n\n📞 {courier_phone}"
+                    )
             return "\n\n———\n\n".join(parts) if parts else None
         return one(language if language in {"ru", "uz"} else "ru")
 

@@ -218,6 +218,50 @@ class TelegramBusinessAPI:
             {"business_connection_id": connection_id},
         ).get("result") or {}
 
+    def delete_business_messages(
+        self,
+        connection_id: str,
+        message_ids: list[int] | tuple[int, ...],
+    ) -> dict:
+        """Delete 1-100 messages through a Telegram Business connection.
+
+        Telegram requires every ID in one call to belong to the same chat, but
+        the Bot API payload intentionally has no ``chat_id`` field.  The caller
+        must therefore enforce that invariant from its trusted outbound ledger.
+        """
+        if not isinstance(connection_id, str) or not connection_id.strip():
+            raise ValueError("business_connection_id is required")
+        if (
+            not isinstance(message_ids, (list, tuple))
+            or not 1 <= len(message_ids) <= 100
+        ):
+            raise ValueError("message_ids must contain 1-100 identifiers")
+        normalized: list[int] = []
+        for message_id in message_ids:
+            if (
+                isinstance(message_id, bool)
+                or not isinstance(message_id, int)
+                or message_id <= 0
+            ):
+                raise ValueError("message_ids must contain positive integers")
+            normalized.append(message_id)
+        response = self._call(
+            "deleteBusinessMessages",
+            {
+                "business_connection_id": connection_id,
+                "message_ids": normalized,
+            },
+        )
+        if response.get("result") is not True:
+            # Retrying cannot create customer-visible content; the durable
+            # worker still treats only an explicit True result as confirmed.
+            raise TelegramAPIError(
+                "Telegram returned an invalid deleteBusinessMessages result",
+                status=200,
+                retryable=True,
+            )
+        return response
+
     @staticmethod
     def _message_result(response: dict, method: str) -> dict:
         result = response.get("result") if isinstance(response, dict) else None
