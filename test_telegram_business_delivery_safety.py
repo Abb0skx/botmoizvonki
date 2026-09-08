@@ -840,7 +840,10 @@ def test_delivery_uses_explicit_language_seen_during_manager_lock(tmp_path):
             "date": int(current[0].timestamp()),
             "chat": {"id": 200, "type": "private"},
             "from": {"id": 200, "language_code": "uz"},
-            "text": "Какая цена и сколько стоит?",
+            "text": (
+                "Рахмат. Не видел про 2-3 часа. В какой-то пакет положите "
+                "илтимос, чтобы не было видно какой товар"
+            ),
         },
     }
     assert service.repo.save_update(

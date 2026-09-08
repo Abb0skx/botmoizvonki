@@ -16,9 +16,20 @@ RU = {
     "доставка", "кредит", "рассрочка", "пожалуйста", "адрес", "менеджер", "когда",
     "оплата", "наличие",
 }
+# Common Russian context words carry less weight than the explicit intent
+# vocabulary above.  Requiring at least two points keeps a lone generic word
+# from choosing a language, while a mostly Russian sentence still wins when it
+# contains an Uzbek courtesy word such as ``рахмат`` or ``илтимос``.
+RU_CONTEXT = {
+    "не", "нет", "да", "это", "что", "чтобы", "как", "какой", "какая",
+    "какие", "можно", "про", "если", "будет", "было", "была", "были",
+    "видел", "видела", "видно", "товар", "заказ", "курьер", "пакет",
+    "положите", "час", "часа", "часов", "минут", "хорошо", "понял",
+    "поняла",
+}
 UZ_CYRILLIC_WORDS = {
     "ассалому", "салом", "нарх", "нархи", "қанча", "керак", "борми",
-    "оламан", "юборинг", "ранг", "хотира", "раҳмат", "манзил", "учун", "илтимос",
+    "оламан", "юборинг", "ранг", "хотира", "раҳмат", "рахмат", "манзил", "учун", "илтимос",
     "менежер", "кредит", "насия", "етказиб", "тўлов",
 }
 UZ_CYRILLIC = re.compile(r"[ўқғҳ]")
@@ -29,7 +40,7 @@ def _scores(text: str) -> tuple[int, int]:
     lowered = str(text or "").casefold().replace("’", "'").replace("‘", "'").replace("ʻ", "'")
     words = set(re.findall(r"[\w']+", lowered))
     uz = len(words & UZ_LATIN) * 2 + len(words & UZ_CYRILLIC_WORDS) * 2
-    ru = len(words & RU) * 2
+    ru = len(words & RU) * 2 + len(words & RU_CONTEXT)
     # Uzbek-specific Cyrillic characters are strong evidence. Generic Cyrillic
     # is only weak evidence because Uzbek Cyrillic may contain none of them.
     if UZ_CYRILLIC.search(lowered):

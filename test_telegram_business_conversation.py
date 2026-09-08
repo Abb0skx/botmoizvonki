@@ -774,6 +774,11 @@ def test_language_context_and_bilingual_fallback():
     assert detect_language("Narxi qancha?", saved="ru")[0] == "uz"
     assert detect_language("iPhone 16 Pro Max")[0] == "bi"
     assert detect_language("Қанча, нархини айтинг")[0] == "uz"
+    assert detect_language(
+        "Рахмат. Не видел про 2-3 часа. В какой-то пакет положите илтимос, "
+        "чтобы не было видно какой товар",
+        saved="uz",
+    )[0] == "ru"
 
 
 def test_query_normalization_memory_color_plus_and_cyrillic_generation():
