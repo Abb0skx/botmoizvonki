@@ -614,8 +614,13 @@ class BusinessService:
 
         This helper is deliberately called both while preparing a notification
         and immediately before ``sendMessage``. Webhook processing runs in
-        parallel with the delivery worker, so phone evidence, manager fences,
-        pauses and Business rights may change between those two points.
+        parallel with the delivery worker, so phone evidence, pauses and
+        Business rights may change between those two points.
+
+        Delivery statuses are transactional updates requested by the customer,
+        not conversational auto-replies. They intentionally bypass the
+        temporary manager lock/fence while permanent pauses and every Telegram
+        eligibility check remain enforced.
         """
 
         match = self.repo.match_delivery_phones(phones, now)
@@ -655,24 +660,6 @@ class BusinessService:
             return fields
 
         policy = self._runtime_policy(now)
-        lock_until = _value(client, "manager_lock_until")
-        if lock_until:
-            try:
-                locked_until = datetime.fromisoformat(str(lock_until))
-            except (TypeError, ValueError):
-                locked_until = now + timedelta(minutes=policy.manager_lock_minutes)
-            if locked_until > now:
-                fields.update(
-                    outcome="deferred",
-                    retry_after=max(1.0, (locked_until - now).total_seconds()),
-                )
-                return fields
-        if self._manager_fence_active(chat_id, now, policy):
-            fields.update(
-                outcome="deferred",
-                retry_after=policy.manager_lock_minutes * 60,
-            )
-            return fields
         if not self._connection_allows_reply(connection_id):
             fields.update(outcome="retry", retry_after=60)
             return fields

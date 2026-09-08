@@ -390,15 +390,11 @@ def test_backlog_beyond_ten_page_cap_sends_nothing_until_fully_caught_up(
     assert service.delivery_store.notification(2001)["state"] == "sent"
 
 
-@pytest.mark.parametrize("mutation", ("delete_phone", "manager_fence"))
-def test_send_time_recheck_stops_concurrent_eligibility_change(
-    tmp_path,
-    mutation,
-):
+def test_send_time_recheck_stops_concurrent_phone_deletion(tmp_path):
     now = datetime(2026, 9, 7, 12, 0, tzinfo=TZ)
     api = RecordingTelegramAPI()
     service = BusinessService(
-        settings(tmp_path / f"{mutation}.db"),
+        settings(tmp_path / "delete_phone.db"),
         clock=lambda: now,
         api=api,
     )
@@ -412,27 +408,9 @@ def test_send_time_recheck_stops_concurrent_eligibility_change(
         text = original_render(*args, **kwargs)
         if not mutated:
             mutated = True
-            if mutation == "delete_phone":
-                service.repo.mark_deleted_messages(
-                    "connection", "200", [10], now
-                )
-            else:
-                manager_update = {
-                    "update_id": 700,
-                    "business_message": {
-                        "business_connection_id": "connection",
-                        "message_id": 701,
-                        "date": int(now.timestamp()),
-                        "chat": {"id": 200, "type": "private"},
-                        "from": {"id": 100},
-                        "text": "Ответ менеджера",
-                    },
-                }
-                assert service.repo.save_update(
-                    manager_update,
-                    now,
-                    allowed_connection_id="connection",
-                )
+            service.repo.mark_deleted_messages(
+                "connection", "200", [10], now
+            )
         return text
 
     service._render_message = render_with_race
@@ -441,6 +419,50 @@ def test_send_time_recheck_stops_concurrent_eligibility_change(
     assert mutated is True
     assert api.calls == []
     assert service.delivery_store.notification(1)["state"] == "deferred"
+
+
+def test_concurrent_manager_fence_does_not_block_delivery_status(tmp_path):
+    now = datetime(2026, 9, 7, 12, 0, tzinfo=TZ)
+    api = RecordingTelegramAPI()
+    service = BusinessService(
+        settings(tmp_path / "manager_fence.db"),
+        clock=lambda: now,
+        api=api,
+    )
+    establish_chat(service, now)
+    seed_notifications(service, now, [delivery_event(1, 1, now)])
+    original_render = service._render_message
+    manager_update_saved = False
+
+    def render_with_manager_reply(*args, **kwargs):
+        nonlocal manager_update_saved
+        text = original_render(*args, **kwargs)
+        if not manager_update_saved:
+            manager_update_saved = True
+            manager_update = {
+                "update_id": 700,
+                "business_message": {
+                    "business_connection_id": "connection",
+                    "message_id": 701,
+                    "date": int(now.timestamp()),
+                    "chat": {"id": 200, "type": "private"},
+                    "from": {"id": 100},
+                    "text": "Ответ менеджера",
+                },
+            }
+            assert service.repo.save_update(
+                manager_update,
+                now,
+                allowed_connection_id="connection",
+            )
+        return text
+
+    service._render_message = render_with_manager_reply
+    service.delivery_notifications_cycle()
+
+    assert manager_update_saved is True
+    assert len(api.sent) == 1
+    assert service.delivery_store.notification(1)["state"] == "sent"
 
 
 def test_event_older_than_configured_max_age_is_not_sent(tmp_path):

@@ -939,10 +939,11 @@ class BusinessRepository:
     ) -> dict[str, str]:
         """Return the deliberately small contract used by delivery polling.
 
-        ``now`` is accepted so callers use a time-aware API, but reply-window,
-        pause and manager-lock checks intentionally remain send-time policy.
-        This method is concerned only with unambiguous identity evidence and a
-        prior real Business conversation.
+        ``now`` is accepted so callers use a time-aware API, but reply-window
+        and pause checks intentionally remain send-time policy. Temporary
+        manager locks do not apply to transactional delivery statuses. This
+        method is concerned only with unambiguous identity evidence and a prior
+        real Business conversation.
         """
 
         if not isinstance(now, datetime):

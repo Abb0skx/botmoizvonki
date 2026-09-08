@@ -1101,7 +1101,7 @@ def test_expired_window_and_permanent_pause_block_but_active_order_pause_allows(
         assert service.delivery_store.notification(23)["state"] == "expired"
 
 
-def test_manager_lock_defers_current_status_then_sends_once():
+def test_manager_lock_does_not_delay_transactional_delivery_status():
     with tempfile.TemporaryDirectory() as tmp:
         now_box = [datetime(2026, 9, 7, 20, 0, tzinfo=TZ)]
         api = FakeTelegramAPI()
@@ -1125,13 +1125,12 @@ def test_manager_lock_defers_current_status_then_sends_once():
         feed.latest = 41
 
         service.delivery_notifications_cycle()
-        assert api.sent == []
-        assert service.delivery_store.notification(41)["state"] == "deferred"
+        assert len(api.sent) == 1
+        assert service.delivery_store.notification(41)["state"] == "sent"
 
         now_box[0] = lock_until + timedelta(seconds=1)
         service.delivery_notifications_cycle()
         assert len(api.sent) == 1
-        assert service.delivery_store.notification(41)["state"] == "sent"
 
 
 def test_explicit_rate_limit_retries_but_ambiguous_send_never_duplicates():
