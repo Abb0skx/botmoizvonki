@@ -23,13 +23,18 @@ RU = {
 RU_CONTEXT = {
     "не", "нет", "да", "это", "что", "чтобы", "как", "какой", "какая",
     "какие", "можно", "про", "если", "будет", "было", "была", "были",
-    "видел", "видела", "видно", "положите", "хорошо", "понял", "поняла",
+    "буду", "всем", "вас", "советовать", "деньги", "перевел", "перевёл",
+    "видел", "видела", "видно", "положите", "иду", "получается", "сегодня",
+    "ждать", "или", "поеду", "работать", "хорошо", "понял", "поняла",
 }
 UZ_CYRILLIC_WORDS = {
     "ассалому", "салом", "нарх", "нархи", "қанча", "керак", "борми",
-    "оламан", "юборинг", "ранг", "хотира", "раҳмат", "рахмат", "манзил", "учун", "илтимос",
+    "оламан", "юборинг", "ранг", "хотира", "раҳмат", "манзил", "учун",
     "менежер", "кредит", "насия", "етказиб", "тўлов",
 }
+# These unaccented courtesy words are common inside otherwise Russian chats.
+# They are useful context, but one of them alone must not switch the customer.
+UZ_CYRILLIC_CONTEXT = {"рахмат", "илтимос"}
 UZ_CYRILLIC = re.compile(r"[ўқғҳ]")
 CYRILLIC = re.compile(r"[а-яё]")
 
@@ -37,7 +42,11 @@ CYRILLIC = re.compile(r"[а-яё]")
 def _scores(text: str) -> tuple[int, int]:
     lowered = str(text or "").casefold().replace("’", "'").replace("‘", "'").replace("ʻ", "'")
     words = set(re.findall(r"[\w']+", lowered))
-    uz = len(words & UZ_LATIN) * 2 + len(words & UZ_CYRILLIC_WORDS) * 2
+    uz = (
+        len(words & UZ_LATIN) * 2
+        + len(words & UZ_CYRILLIC_WORDS) * 2
+        + len(words & UZ_CYRILLIC_CONTEXT)
+    )
     ru = len(words & RU) * 2 + len(words & RU_CONTEXT)
     # Uzbek-specific Cyrillic characters are strong evidence. Generic Cyrillic
     # is only weak evidence because Uzbek Cyrillic may contain none of them.
