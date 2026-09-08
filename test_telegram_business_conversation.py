@@ -780,9 +780,15 @@ def test_language_context_and_bilingual_fallback():
         saved="uz",
     )[0] == "ru"
     assert detect_language("Деньги перевел. Рахмат", saved="uz")[0] == "ru"
+    assert detect_language("Деньги перевел. Rahmat", saved="uz")[0] == "ru"
+    assert detect_language("Деньги перевел. Раҳмат", saved="uz")[0] == "ru"
     assert detect_language("Буду всем вас советовать, ака", saved="uz")[0] == "ru"
     assert detect_language("Рахмат", saved="ru")[0] == "ru"
     assert detect_language("Илтимос", saved="uz")[0] == "uz"
+    assert detect_language("Rahmat", saved="ru")[0] == "ru"
+    assert detect_language("Iltimos", saved="uz")[0] == "uz"
+    assert detect_language("Rahmat, kerak", saved="ru")[0] == "uz"
+    assert detect_language("Раҳмат, юборинг", saved="ru")[0] == "uz"
     assert detect_language("заказ курьер", saved="uz")[0] == "uz"
     assert detect_language("товар пакет")[0] == "bi"
 

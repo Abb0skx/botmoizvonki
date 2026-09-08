@@ -6,8 +6,8 @@ import re
 # appear here: a model name alone must not select a language.
 UZ_LATIN = {
     "assalomu", "salom", "narx", "narxi", "narxlar", "qancha", "necha",
-    "kerak", "bormi", "olaman", "yuboring", "rang", "xotira", "rahmat",
-    "lokatsiya", "manzil", "kredit", "nasiya", "uchun", "iltimos", "qachon",
+    "kerak", "bormi", "olaman", "yuboring", "rang", "xotira",
+    "lokatsiya", "manzil", "kredit", "nasiya", "uchun", "qachon",
     "yetkazib", "bering", "menejer", "topilmadi", "tulov", "to'lov",
 }
 RU = {
@@ -29,12 +29,12 @@ RU_CONTEXT = {
 }
 UZ_CYRILLIC_WORDS = {
     "ассалому", "салом", "нарх", "нархи", "қанча", "керак", "борми",
-    "оламан", "юборинг", "ранг", "хотира", "раҳмат", "манзил", "учун",
+    "оламан", "юборинг", "ранг", "хотира", "манзил", "учун",
     "менежер", "кредит", "насия", "етказиб", "тўлов",
 }
-# These unaccented courtesy words are common inside otherwise Russian chats.
+# Courtesy words are common inside otherwise Russian chats in both scripts.
 # They are useful context, but one of them alone must not switch the customer.
-UZ_CYRILLIC_CONTEXT = {"рахмат", "илтимос"}
+UZ_COURTESY = {"rahmat", "iltimos", "рахмат", "раҳмат", "илтимос"}
 UZ_CYRILLIC = re.compile(r"[ўқғҳ]")
 CYRILLIC = re.compile(r"[а-яё]")
 
@@ -45,12 +45,12 @@ def _scores(text: str) -> tuple[int, int]:
     uz = (
         len(words & UZ_LATIN) * 2
         + len(words & UZ_CYRILLIC_WORDS) * 2
-        + len(words & UZ_CYRILLIC_CONTEXT)
+        + len(words & UZ_COURTESY)
     )
     ru = len(words & RU) * 2 + len(words & RU_CONTEXT)
     # Uzbek-specific Cyrillic characters are strong evidence. Generic Cyrillic
     # is only weak evidence because Uzbek Cyrillic may contain none of them.
-    if UZ_CYRILLIC.search(lowered):
+    if any(UZ_CYRILLIC.search(word) for word in words - UZ_COURTESY):
         uz += 4
     elif CYRILLIC.search(lowered) and ru == 0 and uz == 0:
         ru += 1
