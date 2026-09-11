@@ -359,33 +359,20 @@ MISSED_CALL_WORK_END = os.getenv(
 
 SMS_TEXT = """TEXNIKACH
 
-Все актуальные цены, модели и каталог:
+Каталог и актуальные цены / Katalog va aktual narxlar:
 https://t.me/texnikach
 
-Для заказа напишите менеджеру:
+Заказ / Buyurtma:
 https://t.me/texnikach_admin
 
-Полная информация о нас:
-https://texnikach.uz/go
-
-------------------------
-
-Barcha aktual narxlar, modellar va katalog:
-https://t.me/texnikach
-
-Buyurtma berish uchun menejerga yozing:
-https://t.me/texnikach_admin
-
-Biz haqimizda to‘liq ma’lumot:
+О нас / Biz haqimizda:
 https://texnikach.uz/go"""
 
-RATING_SMS_TEXT = """TEXNIKACH
-Оцените звонок от 1 до 5.
-Qo‘ng‘iroqni 1 dan 5 gacha baholang.
-Ответьте на SMS одной цифрой 1–5 или откройте ссылку.
-SMSga 1–5 oralig‘idagi bitta raqam bilan javob bering yoki havolani oching.
+RATING_SMS_TEXT = """Оцените звонок от 1 до 5 / Qo‘ng‘iroqni 1–5 gacha baholang:
 {rating_url}
-1 — плохо/yomon, 5 — отлично/a’lo"""
+
+1 — плохо / yomon
+5 — отлично / a’lo"""
 
 AFTER_HOURS_MISSED_SMS_TEXT = """TEXNIKACH
 Мы закрыты. {day_ru} работаем с {work_start}.
@@ -5425,6 +5412,7 @@ def mark_sms_sent(
     call_id: int,
     history_id: int,
     provider_result,
+    rating_id: int | None = None,
 ):
 
     now_ts = int(
@@ -5477,6 +5465,19 @@ def mark_sms_sent(
             ),
         )
 
+        if rating_id is not None:
+            conn.execute(
+                """
+                UPDATE call_ratings
+                SET sms_status = 'sent',
+                    sms_sent_at = ?,
+                    sms_error = NULL,
+                    provider_response = ?
+                WHERE id = ? AND call_id = ?
+                """,
+                (now_ts, provider_response, rating_id, call_id),
+            )
+
         conn.commit()
 
 
@@ -5484,6 +5485,7 @@ def mark_sms_error(
     call_id: int,
     history_id: int,
     error,
+    rating_id: int | None = None,
 ):
 
     error_text = str(
@@ -5521,6 +5523,16 @@ def mark_sms_error(
                 call_id,
             ),
         )
+
+        if rating_id is not None:
+            conn.execute(
+                """
+                UPDATE call_ratings
+                SET sms_status = 'error', sms_error = ?
+                WHERE id = ? AND call_id = ?
+                """,
+                (error_text, rating_id, call_id),
+            )
 
         conn.commit()
 
@@ -22759,7 +22771,7 @@ async def moizvonki_webhook(
     # TELEGRAM
     # -----------------------------------------------------
 
-    # Telegram must not wait for the two client SMS API calls.  Apart from
+    # Telegram must not wait for the customer SMS API call. Apart from
     # making call notifications noticeably faster, this also keeps a slow
     # SMS gateway from holding the FastAPI event loop.
     telegram_status = (
@@ -22882,13 +22894,27 @@ async def moizvonki_webhook(
         )
 
     # -----------------------------------------------------
-    # AUTO SMS
+    # ONE CUSTOMER SMS: CATALOG + OPTIONAL RATING LINK
     # -----------------------------------------------------
 
     sms_started = time.monotonic()
     sms_status = "not_sent"
     sms_kind = "promo"
     sms_text = SMS_TEXT
+    rating_id = None
+    rating_sms_seconds = 0.0
+    rating_sms_status = (
+        "not_applicable" if RATING_SMS_ENABLED else "disabled"
+    )
+    rating_eligible = bool(
+        RATING_SMS_ENABLED
+        and answered
+        and not is_internal_contact
+        and normalize_phone(client_number)
+    )
+
+    if rating_eligible:
+        sms_kind = "promo_rating" if AUTO_SMS_ENABLED else "rating"
 
     if (
         direction == 0
@@ -22906,7 +22932,7 @@ async def moizvonki_webhook(
             )
             sms_text = after_hours_text
 
-    if not AUTO_SMS_ENABLED:
+    if not AUTO_SMS_ENABLED and not rating_eligible:
         sms_status = "disabled"
 
     elif is_internal_contact:
@@ -22929,28 +22955,84 @@ async def moizvonki_webhook(
 
             try:
 
-                sms_result = await asyncio.to_thread(
-                    send_client_sms,
-                    client_number,
-                    sender_user_login,
-                    sms_text,
-                )
+                if rating_eligible:
+                    rating_started = time.monotonic()
+                    rating_reservation = reserve_call_rating(
+                        call_id,
+                        client_number,
+                        sender_user_login,
+                    )
 
-                mark_sms_sent(
-                    call_id,
-                    history_id,
-                    sms_result,
-                )
+                    if rating_reservation["reserved"]:
+                        rating_id = rating_reservation["rating_id"]
+                        rating_url = build_rating_url(
+                            rating_reservation["token"]
+                        )
+                        rating_text = RATING_SMS_TEXT.format(
+                            rating_url=rating_url
+                        )
+                        sms_text = (
+                            (SMS_TEXT if AUTO_SMS_ENABLED else "TEXNIKACH")
+                            + "\n\n"
+                            + rating_text
+                        )
+                        rating_sms_status = "reserved"
+                    else:
+                        rating_sms_status = (
+                            rating_reservation.get("sms_status")
+                            or rating_reservation["reason"]
+                        )
+                        # An earlier request in this 30-hour client window
+                        # must not produce another rating link or SMS.
+                        if not AUTO_SMS_ENABLED:
+                            with connect_db() as conn:
+                                conn.execute(
+                                    "UPDATE sms_history SET status = 'skipped' "
+                                    "WHERE id = ? AND status = 'reserved'",
+                                    (history_id,),
+                                )
+                            reservation["reserved"] = False
+                        else:
+                            sms_kind = "promo"
 
-                sms_status = "sent"
+                    rating_sms_seconds = time.monotonic() - rating_started
 
-                print(
-                    "AUTO SMS SENT:",
-                    call_id,
-                    sms_kind,
-                    client_number,
-                    sender_user_login,
-                )
+                if not reservation["reserved"]:
+                    sms_status = rating_reservation["reason"]
+                else:
+                    with connect_db() as conn:
+                        conn.execute(
+                            "UPDATE sms_history SET message_kind = ? WHERE id = ?",
+                            (sms_kind, history_id),
+                        )
+
+                    sms_result = await asyncio.to_thread(
+                        send_client_sms,
+                        client_number,
+                        sender_user_login,
+                        sms_text,
+                    )
+
+                    # One provider request; both delivery records commit
+                    # together so incoming SMS replies can match the rating.
+                    mark_sms_sent(
+                        call_id,
+                        history_id,
+                        sms_result,
+                        rating_id=rating_id,
+                    )
+
+                    sms_status = "sent"
+                    if rating_id is not None:
+                        rating_sms_status = "sent"
+
+                    print(
+                        "AUTO SMS SENT:",
+                        call_id,
+                        sms_kind,
+                        client_number,
+                        sender_user_login,
+                    )
 
             except Exception as exc:
 
@@ -22958,9 +23040,12 @@ async def moizvonki_webhook(
                     call_id,
                     history_id,
                     repr(exc),
+                    rating_id=rating_id,
                 )
 
                 sms_status = "error"
+                if rating_eligible:
+                    rating_sms_status = "error"
 
                 print(
                     "AUTO SMS ERROR:",
@@ -22974,118 +23059,12 @@ async def moizvonki_webhook(
             sms_status = reservation[
                 "reason"
             ]
+            if rating_eligible:
+                rating_sms_status = sms_status
 
     sms_seconds = (
         time.monotonic()
         - sms_started
-    )
-
-    # -----------------------------------------------------
-    # CUSTOMER RATING SMS
-    # -----------------------------------------------------
-
-    rating_sms_started = time.monotonic()
-    rating_sms_status = "not_applicable"
-
-    if not RATING_SMS_ENABLED:
-        rating_sms_status = "disabled"
-
-    elif (
-        answered
-
-        and
-
-        not is_internal_contact
-
-        and
-
-        normalize_phone(
-            client_number
-        )
-    ):
-
-        rating_reservation = (
-            reserve_call_rating(
-                call_id,
-                client_number,
-                sender_user_login,
-            )
-        )
-
-        if rating_reservation[
-            "reserved"
-        ]:
-
-            rating_id = rating_reservation[
-                "rating_id"
-            ]
-
-            try:
-
-                rating_url = build_rating_url(
-                    rating_reservation[
-                        "token"
-                    ]
-                )
-
-                rating_text = (
-                    RATING_SMS_TEXT.format(
-                        rating_url=rating_url
-                    )
-                )
-
-                rating_sms_result = (
-                    await asyncio.to_thread(
-                        send_client_sms,
-                        client_number,
-                        sender_user_login,
-                        rating_text,
-                    )
-                )
-
-                mark_rating_sms_sent(
-                    rating_id,
-                    rating_sms_result,
-                )
-
-                rating_sms_status = "sent"
-
-                print(
-                    "RATING SMS SENT:",
-                    call_id,
-                    client_number,
-                    sender_user_login,
-                )
-
-            except Exception as exc:
-
-                mark_rating_sms_error(
-                    rating_id,
-                    repr(exc),
-                )
-
-                rating_sms_status = "error"
-
-                print(
-                    "RATING SMS ERROR:",
-                    call_id,
-                    client_number,
-                    repr(exc),
-                )
-
-        else:
-            rating_sms_status = (
-                rating_reservation.get(
-                    "sms_status"
-                )
-                or rating_reservation[
-                    "reason"
-                ]
-            )
-
-    rating_sms_seconds = (
-        time.monotonic()
-        - rating_sms_started
     )
 
     duplicate = (

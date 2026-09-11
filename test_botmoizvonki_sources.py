@@ -1653,12 +1653,147 @@ class CallSourceTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(
             delivery_order,
-            ["telegram", "sms", "sms"],
+            ["telegram", "sms"],
         )
         self.assertEqual(
             notification_flags,
             [True],
         )
+
+    def run_sms_call(self, event, *, login="texnikach@gmail.com", **settings):
+        request = mock.Mock(headers={}, query_params={})
+        request.json = mock.AsyncMock(return_value={
+            "webhook": self.webhook(login), "event": event,
+        })
+        defaults = {
+            "AUTO_SMS_ENABLED": True,
+            "RATING_SMS_ENABLED": True,
+            "MOIZVONKI_WEBHOOK_SECRET": "",
+            "PUBLIC_BASE_URL": "https://example.test",
+            "MOIZVONKI_API_URL": "https://provider.test/api/v1",
+            "MOIZVONKI_API_KEY": "test-key",
+        }
+        defaults.update(settings)
+        with mock.patch.multiple(bot, **defaults), mock.patch.object(
+            bot, "send_text_message", return_value={
+                "result": {"message_id": 500, "chat": {"id": 456}},
+            },
+        ):
+            return asyncio.run(bot.moizvonki_webhook(request))
+
+    def test_combined_sms_has_one_provider_request_and_accepts_sms_rating(self):
+        event = self.event(600, "+998900000600", 0)
+        # Exercise the provider's real text acknowledgement, not just the sender stub.
+        response = mock.Mock(text="SMS posted")
+        response.json.side_effect = ValueError("plain text")
+        with mock.patch.object(bot.HTTP, "post", return_value=response) as post:
+            result = self.run_sms_call(event, login="texnikacholx@gmail.com")
+
+        post.assert_called_once()
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["action"], "calls.send_sms")
+        self.assertEqual(payload["user_name"], "texnikacholx@gmail.com")
+        self.assertEqual(payload["to"], "+998900000600")
+        token = payload["text"].split("https://example.test/rate/")[1].split()[0]
+        self.assertEqual(payload["text"], (
+            "TEXNIKACH\n\n"
+            "Каталог и актуальные цены / Katalog va aktual narxlar:\n"
+            "https://t.me/texnikach\n\n"
+            "Заказ / Buyurtma:\nhttps://t.me/texnikach_admin\n\n"
+            "О нас / Biz haqimizda:\nhttps://texnikach.uz/go\n\n"
+            "Оцените звонок от 1 до 5 / Qo‘ng‘iroqni 1–5 gacha baholang:\n"
+            f"https://example.test/rate/{token}\n\n"
+            "1 — плохо / yomon\n5 — отлично / a’lo"
+        ))
+        self.assertEqual(result["sms_kind"], "promo_rating")
+        self.assertEqual(result["sms"], "sent")
+        self.assertEqual(result["rating_sms"], "sent")
+        with bot.connect_db() as conn:
+            history = conn.execute("SELECT * FROM sms_history").fetchall()
+            ratings = conn.execute("SELECT * FROM call_ratings").fetchall()
+        self.assertEqual(len(history), 1)
+        self.assertEqual(len(ratings), 1)
+        self.assertEqual(history[0]["status"], "sent")
+        self.assertEqual(ratings[0]["sms_status"], "sent")
+        self.assertEqual(ratings[0]["token_hash"], bot.hash_rating_token(token))
+        self.assertEqual(ratings[0]["call_id"], result["call_id"])
+        self.assertEqual(history[0]["sent_at"], ratings[0]["sms_sent_at"])
+        self.assertEqual(history[0]["provider_response"], ratings[0]["provider_response"])
+
+        with mock.patch.object(bot, "MOIZVONKI_WEBHOOK_SECRET", ""):
+            reply = asyncio.run(bot.moizvonki_webhook(self.inbound_sms_request(
+                "+998900000600", "5", user_login="texnikacholx@gmail.com",
+                event_created=history[0]["sent_at"] + 10,
+                start_time=history[0]["sent_at"] + 5,
+                event_pbx_call_id="combined-sms-reply",
+            )))
+        self.assertTrue(reply["sms_rating"]["processed"])
+        self.assertEqual(reply["sms_rating"]["score"], 5)
+        self.assertEqual(reply["sms_rating"]["call_id"], result["call_id"])
+
+    def test_combined_sms_cooldown_survives_retries_new_calls_and_db_init(self):
+        event = self.event(601, "+998900000601", 0)
+        later = self.event(602, "998900000601", 0)
+        for key in ("start_time", "answer_time", "end_time"):
+            later[key] += 31 * 24 * 60 * 60
+        with mock.patch.object(bot, "send_client_sms", return_value={"success": True}) as send:
+            first = self.run_sms_call(event)
+            bot.init_db()
+            duplicate = self.run_sms_call(event)
+            blocked = self.run_sms_call(later, login="aashshdjdjdjsj@gmail.com")
+            self.assertEqual(send.call_count, 1)
+            self.assertEqual(duplicate["sms"], "cooldown")
+            self.assertEqual(blocked["rating_sms"], "cooldown")
+            with bot.connect_db() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM call_ratings").fetchone()[0], 1)
+                conn.execute(
+                    "UPDATE sms_history SET sent_at = sent_at - ? WHERE call_id = ?",
+                    (30 * 24 * 60 * 60 + 1, first["call_id"]),
+                )
+            allowed = self.run_sms_call(later, login="aashshdjdjdjsj@gmail.com")
+            self.assertEqual(send.call_count, 2)
+            self.assertEqual(allowed["sms_kind"], "promo_rating")
+            self.assertEqual(allowed["rating_sms"], "sent")
+            self.assertNotEqual(send.call_args_list[0].args[2], send.call_args_list[1].args[2])
+
+    def test_combined_sms_failure_does_not_send_separate_rating_or_retry(self):
+        event = self.event(603, "+998900000603", 0)
+        with mock.patch.object(bot, "send_client_sms", side_effect=TimeoutError("uncertain")) as send:
+            failed = self.run_sms_call(event)
+            retry = self.run_sms_call(event)
+        send.assert_called_once()
+        self.assertEqual(failed["sms"], "error")
+        self.assertEqual(failed["rating_sms"], "error")
+        self.assertEqual(retry["sms"], "cooldown")
+        with bot.connect_db() as conn:
+            self.assertEqual(conn.execute("SELECT status FROM sms_history").fetchone()[0], "error")
+            self.assertEqual(conn.execute("SELECT sms_status FROM call_ratings").fetchone()[0], "error")
+
+    def test_combined_sms_rejects_missing_url_before_provider_send(self):
+        with mock.patch.object(bot, "send_client_sms") as send:
+            result = self.run_sms_call(
+                self.event(604, "+998900000604", 0), PUBLIC_BASE_URL="",
+            )
+        send.assert_not_called()
+        self.assertEqual(result["sms"], "error")
+        self.assertEqual(result["rating_sms"], "error")
+
+    def test_combined_sms_respects_internal_contacts_and_disabled_settings(self):
+        cases = (
+            ({"RATING_SMS_ENABLED": False}, "+998900000605", 1, False, "promo"),
+            ({"AUTO_SMS_ENABLED": False}, "+998900000606", 1, True, "rating"),
+            ({"AUTO_SMS_ENABLED": False, "RATING_SMS_ENABLED": False}, "+998900000607", 0, False, None),
+            ({}, "+998901333999", 0, False, None),
+        )
+        for index, (settings, phone, count, has_rating, kind) in enumerate(cases):
+            with self.subTest(settings=settings, phone=phone), mock.patch.object(
+                bot, "send_client_sms", return_value={"success": True},
+            ) as send:
+                result = self.run_sms_call(self.event(605 + index, phone, 0), **settings)
+                self.assertEqual(send.call_count, count)
+                if count:
+                    self.assertEqual("/rate/" in send.call_args.args[2], has_rating)
+                    self.assertEqual(result["sms_kind"], kind)
 
     def test_after_hours_sms_uses_call_start_time_boundaries(self):
         def timestamp(hour, minute, second=0):
