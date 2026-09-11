@@ -1881,6 +1881,17 @@ def init_db():
 
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS device_sms_senders (
+                user_login TEXT PRIMARY KEY,
+                sender_user_login TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                changed_by TEXT
+            )
+            """
+        )
+
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS sms_history (
 
                 id INTEGER
@@ -4485,6 +4496,74 @@ def get_effective_device_manager(
     }
 
 
+def get_device_sms_sender(user_login: str | None, conn=None) -> str:
+    """Resolve one explicit device route, never a chain of routes.
+
+    Missing settings retain the original behaviour: the calling phone sends
+    its own SMS. Unknown calling devices are never redirected automatically.
+    """
+    source_login = normalize_user_login(user_login)
+    if source_login not in CALL_SOURCE_PROFILES:
+        return source_login
+    if conn is None:
+        with connect_db() as db:
+            return get_device_sms_sender(source_login, db)
+    row = conn.execute(
+        "SELECT sender_user_login FROM device_sms_senders WHERE user_login = ?",
+        (source_login,),
+    ).fetchone()
+    if row:
+        sender = normalize_user_login(row["sender_user_login"])
+        if sender not in CALL_SOURCE_PROFILES:
+            # Do not silently use another phone if a configured sender was removed.
+            raise ValueError("Телефон для SMS больше не настроен")
+        return sender
+    return source_login
+
+
+def get_device_sms_settings(user_login: str | None, conn=None) -> dict:
+    sender = get_device_sms_sender(user_login, conn)
+    profile = get_call_source_profile(sender)
+    return {
+        "sms_sender_user_login": sender,
+        "sms_sender_device_name": profile["device_name"] if profile else sender,
+    }
+
+
+def set_device_sms_sender(
+    user_login: str,
+    sender_user_login: str,
+    *,
+    changed_by: str | None = None,
+):
+    source_login = normalize_user_login(user_login)
+    sender_login = normalize_user_login(sender_user_login)
+    if source_login not in CALL_SOURCE_PROFILES:
+        raise ValueError("Неизвестный телефон звонка")
+    if sender_login not in CALL_SOURCE_PROFILES:
+        raise ValueError("Выберите телефон для отправки SMS")
+
+    with connect_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO device_sms_senders (
+                user_login, sender_user_login, updated_at, changed_by
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_login) DO UPDATE SET
+                sender_user_login = excluded.sender_user_login,
+                updated_at = excluded.updated_at,
+                changed_by = excluded.changed_by
+            """,
+            (
+                source_login, sender_login,
+                int(datetime.now(timezone.utc).timestamp()), changed_by,
+            ),
+        )
+        device = get_effective_device_manager(source_login, conn=conn)
+        device.update(get_device_sms_settings(source_login, conn))
+    return device
+
+
 def list_device_manager_assignments(
     now_ts: int | None = None,
 ):
@@ -4505,6 +4584,8 @@ def list_device_manager_assignments(
             )
             for user_login in CALL_SOURCE_PROFILES
         ]
+        for device in devices:
+            device.update(get_device_sms_settings(device["user_login"], conn))
 
     for device in devices:
         until = device[
@@ -18502,6 +18583,12 @@ async def update_admin_device_manager(
                     changed_by="dashboard",
                 )
             )
+        elif action == "sms_sender":
+            device = set_device_sms_sender(
+                user_login,
+                payload.get("sender_user_login"),
+                changed_by="dashboard",
+            )
         elif action == "reset_permanent":
             device = (
                 reset_permanent_device_manager(
@@ -18519,6 +18606,7 @@ async def update_admin_device_manager(
             detail=str(exc),
         ) from exc
 
+    device.update(get_device_sms_settings(user_login))
     until = device[
         "effective_until"
     ]
@@ -19023,6 +19111,24 @@ tbody tr:last-child td {
     min-width: 120px;
 }
 
+.device-sms-section {
+    margin-top: 16px;
+    padding-top: 14px;
+    border-top: 1px solid #303030;
+}
+
+.device-sms-label {
+    display: block;
+    margin-bottom: 8px;
+    font-size: 14px;
+}
+
+.device-sms-status {
+    margin-top: 8px;
+    color: #aaa;
+    font-size: 13px;
+}
+
 .admin-message {
     margin-top: 12px;
     min-height: 20px;
@@ -19338,6 +19444,8 @@ tbody tr:last-child td {
                 «На сегодня» действует до 00:00.
                 «Постоянно» меняет менеджера для всех новых звонков.
                 История звонков не изменяется.
+                Телефон для SMS выбирается отдельно и сохраняется постоянно.
+                Оценка клиента относится к менеджеру исходного звонка.
             </div>
         </div>
 
@@ -20506,8 +20614,44 @@ function renderDeviceManagers(
             resetPermanentButton.disabled =
                 !device.permanent_custom;
 
+            const smsSection = document.createElement("div");
+            smsSection.className = "device-sms-section";
+            const smsLabel = document.createElement("label");
+            smsLabel.className = "device-sms-label";
+            smsLabel.textContent = "С какого телефона отправлять SMS";
+            const smsSelect = document.createElement("select");
+            smsSelect.className = "device-manager-select";
+            smsSelect.id = "sms_sender_" + device.user_login;
+            smsLabel.htmlFor = smsSelect.id;
+            data.devices.forEach(sender => {
+                const option = document.createElement("option");
+                option.value = sender.user_login;
+                option.textContent = sender.device_name + (
+                    sender.user_login === device.user_login ? " (этот телефон)" : ""
+                );
+                option.selected = sender.user_login === device.sms_sender_user_login;
+                smsSelect.appendChild(option);
+            });
+            const smsButton = document.createElement("button");
+            smsButton.type = "button";
+            smsButton.className = "admin-action";
+            smsButton.textContent = "Сохранить SMS";
+            const smsActions = document.createElement("div");
+            smsActions.className = "device-manager-actions";
+            smsActions.append(smsSelect, smsButton);
+            const smsStatus = document.createElement("div");
+            smsStatus.className = "device-sms-status";
+            smsStatus.textContent = "Сейчас SMS отправляет: " + device.sms_sender_device_name;
+            smsSection.append(smsLabel, smsActions, smsStatus);
+            [select, smsSelect].forEach(input => input.addEventListener("change", () => {
+                card.dataset.dirty = "true";
+            }));
+
             const setBusy = busy => {
+                card.dataset.busy = String(busy);
                 select.disabled = busy;
+                smsSelect.disabled = busy;
+                smsButton.disabled = busy;
                 temporaryButton.disabled = busy;
                 permanentButton.disabled = busy;
                 resetTemporaryButton.disabled =
@@ -20536,6 +20680,9 @@ function renderDeviceManagers(
                 if (includeManager) {
                     payload.manager_code =
                         select.value;
+                }
+                if (action === "sms_sender") {
+                    payload.sender_user_login = smsSelect.value;
                 }
 
                 try {
@@ -20599,6 +20746,12 @@ function renderDeviceManagers(
                 )
             );
 
+            smsButton.addEventListener("click", () => updateAssignment(
+                "sms_sender",
+                "Сохраняю телефон для SMS…",
+                "телефон для SMS сохранён"
+            ));
+
             actions.appendChild(
                 select
             );
@@ -20618,6 +20771,7 @@ function renderDeviceManagers(
             card.appendChild(name);
             card.appendChild(status);
             card.appendChild(actions);
+            card.appendChild(smsSection);
             grid.appendChild(card);
         }
     );
@@ -22394,7 +22548,13 @@ setInterval(
 
 
 setInterval(
-    () => loadDeviceManagers(false),
+    () => {
+        const grid = document.getElementById("device_manager_grid");
+        if (!grid.querySelector('[data-dirty="true"], [data-busy="true"]')
+            && !grid.contains(document.activeElement)) {
+            loadDeviceManagers(false);
+        }
+    },
     60000
 );
 
@@ -22749,7 +22909,7 @@ async def moizvonki_webhook(
         or ""
     )
 
-    sender_user_login = (
+    sender_user_login = get_device_sms_sender(
         (
             saved_call["user_login"]
             if saved_call
