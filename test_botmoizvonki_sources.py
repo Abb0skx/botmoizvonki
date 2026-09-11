@@ -1849,6 +1849,66 @@ class CallSourceTests(unittest.TestCase):
             )
         )
 
+    def test_friday_break_sms_uses_tashkent_weekday_and_time_boundaries(self):
+        cases = (
+            (11, 12, 54, 59, False),
+            (11, 12, 55, 0, True),
+            (11, 13, 39, 59, True),
+            (11, 13, 40, 0, False),
+            (18, 13, 10, 0, True),  # The following Friday.
+            (10, 13, 10, 0, False),
+            (12, 13, 10, 0, False),
+        )
+        for day, hour, minute, second, is_break in cases:
+            with self.subTest(day=day, hour=hour, minute=minute, second=second):
+                timestamp = int(bot.datetime(
+                    2026, 9, day, hour, minute, second, tzinfo=bot.UZ_TZ,
+                ).timestamp())
+                message = bot.build_after_hours_missed_sms(timestamp)
+                if is_break:
+                    self.assertIn("Продолжим работу с 13:40", message)
+                    self.assertIn("Ishimizni 13:40 dan davom ettiramiz", message)
+                    self.assertIn("https://texnikach.uz/go", message)
+                    self.assertNotIn("Завтра", message)
+                else:
+                    self.assertIsNone(message)
+
+    def test_friday_break_sms_replaces_promo_only_for_missed_incoming_calls(self):
+        # The call begins in the break, but finishes after work resumes.
+        start_time = int(bot.datetime(
+            2026, 9, 11, 13, 39, 50, tzinfo=bot.UZ_TZ,
+        ).timestamp())
+        cases = ((0, 0, True), (0, 1, False), (1, 0, False))
+        for index, (direction, answered, expect_break) in enumerate(cases):
+            with self.subTest(direction=direction, answered=answered):
+                event = self.event(650 + index, f"+998900000{650 + index}", 0)
+                event.update({
+                    "direction": direction,
+                    "answered": answered,
+                    "answer_time": start_time + 1 if answered else 0,
+                    "start_time": start_time,
+                    "end_time": start_time + 20,
+                    "upload_time": start_time + 60,
+                    "event_created": start_time + 60,
+                })
+                with mock.patch.object(
+                    bot, "send_client_sms", return_value={"success": True},
+                ) as send:
+                    first = self.run_sms_call(event)
+                    duplicate = self.run_sms_call(event)
+                send.assert_called_once()
+                message = send.call_args.args[2]
+                self.assertEqual(first["sms"], "sent")
+                self.assertEqual(duplicate["sms"], "cooldown")
+                self.assertEqual("Сейчас перерыв" in message, expect_break)
+                if expect_break:
+                    self.assertNotIn("/rate/", message)
+                    self.assertNotIn("https://t.me/texnikach_admin", message)
+                    self.assertEqual(first["sms_kind"], "after_hours_missed")
+                    self.assertEqual(first["rating_sms"], "not_applicable")
+                elif answered:
+                    self.assertIn("/rate/", message)
+
     def test_missed_after_hours_sms_replaces_promo_and_is_deduplicated(self):
         start_time = int(
             bot.datetime(

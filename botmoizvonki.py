@@ -384,6 +384,19 @@ Shahar bo‘ylab yetkazib berish bepul. Shuningdek, do‘kondan olib ketish mumk
 Все цены в Telegram / Telegramdagi barcha narxlar:
 https://texnikach.uz/go"""
 
+FRIDAY_BREAK_START_MINUTES = 12 * 60 + 55
+FRIDAY_BREAK_END_MINUTES = 13 * 60 + 40
+
+FRIDAY_BREAK_MISSED_SMS_TEXT = """TEXNIKACH
+Сейчас перерыв. Продолжим работу с 13:40.
+Доставка по городу бесплатная. Также можно забрать в магазине.
+
+Hozir tanaffus. Ishimizni 13:40 dan davom ettiramiz.
+Shahar bo‘ylab yetkazib berish bepul. Shuningdek, do‘kondan olib ketish mumkin.
+
+Все цены в Telegram / Telegramdagi barcha narxlar:
+https://texnikach.uz/go"""
+
 
 def parse_work_clock(
     value: str,
@@ -5014,6 +5027,15 @@ def build_after_hours_missed_sms(
         call_time.hour * 60
         + call_time.minute
     )
+
+    # The same missed-call sender and cooldown also cover the Friday break.
+    if (
+        call_time.weekday() == 4
+        and FRIDAY_BREAK_START_MINUTES
+        <= minute_of_day
+        < FRIDAY_BREAK_END_MINUTES
+    ):
+        return FRIDAY_BREAK_MISSED_SMS_TEXT
 
     if (
         MISSED_CALL_WORK_START_MINUTES
