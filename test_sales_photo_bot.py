@@ -313,9 +313,9 @@ class CaptionFormattingTests(unittest.TestCase):
         )
         self.assertEqual(
             caption,
+            "<blockquote>S/N: R8YL50R510N</blockquote>\n"
             "<blockquote>IMEI: 490154203237518</blockquote>\n"
-            "<blockquote>IMEI2: 352099001761481</blockquote>\n"
-            "<blockquote>S/N: R8YL50R510N</blockquote>\n\n"
+            "<blockquote>IMEI2: 352099001761481</blockquote>\n\n"
             "🛒💵:\n"
             "rasxod:\n\n"
             "📞: +998 90 123 45 67\n\n"
@@ -332,6 +332,32 @@ class CaptionFormattingTests(unittest.TestCase):
         self.assertNotIn("IMEI", caption)
         self.assertNotIn("S/N", caption)
         self.assertTrue(caption.startswith("🛒💵:"))
+
+    def test_product_serials_and_all_imeis_have_stable_line_order(self):
+        caption = build_caption(
+            None,
+            ProductIdentifiers(
+                product_names=("Phone A", "Phone B"),
+                serial_numbers=("SERIAL-A", "SERIAL-B"),
+                imeis=(
+                    "490154203237518",
+                    "352099001761481",
+                    "356938035643809",
+                ),
+            ),
+        )
+
+        expected = (
+            "📦 О товаре: Phone A; Phone B\n"
+            "<blockquote>S/N: SERIAL-A</blockquote>\n"
+            "<blockquote>S/N 2: SERIAL-B</blockquote>\n"
+            "<blockquote>IMEI: 490154203237518</blockquote>\n"
+            "<blockquote>IMEI2: 352099001761481</blockquote>\n"
+            "<blockquote>IMEI3: 356938035643809</blockquote>\n\n"
+            "🛒💵:"
+        )
+        self.assertTrue(caption.startswith(expected))
+        self.assertEqual(caption.count("<blockquote>IMEI"), 3)
 
     def test_manually_typed_product_label_is_rendered_safely(self):
         caption = build_caption(
@@ -1062,10 +1088,14 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertLess(
             card["text"].index("📦 О товаре: Redmi Note 14"),
-            card["text"].index("<blockquote>IMEI:"),
+            card["text"].index("<blockquote>S/N:"),
         )
         self.assertLess(
             card["text"].index("<blockquote>S/N:"),
+            card["text"].index("<blockquote>IMEI:"),
+        )
+        self.assertLess(
+            card["text"].index("<blockquote>IMEI:"),
             card["text"].index("🛒💵:"),
         )
         self.assertIsNotNone(card["reply_markup"])
@@ -1184,6 +1214,9 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
         caption = bot.send_photo.await_args.kwargs["caption"]
         self.assertIn("… ещё", caption)
+        for imei in imeis:
+            self.assertIn(imei, caption)
+        self.assertEqual(caption.count("<blockquote>IMEI"), 16)
         self.assertLessEqual(
             _telegram_text_units(caption),
             MAX_CAPTION_TEXT_UNITS + len(BOT_CARD_MARKER),

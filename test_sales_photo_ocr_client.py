@@ -306,11 +306,10 @@ class ProductIdentifierTests(unittest.TestCase):
 
         caption = build_caption(None, identifiers)
 
-        self.assertLessEqual(
-            len(caption.encode("utf-16-le")) // 2,
-            1000,
-        )
         self.assertIn("… ещё", caption)
+        for imei in identifiers.imeis:
+            self.assertIn(imei, caption)
+        self.assertEqual(caption.count("<blockquote>IMEI"), 16)
         self.assertIn("🛒💵:", caption)
         self.assertIn("<b>Card/Terminal/Paynet</b>", caption)
         self.assertLessEqual(
@@ -385,9 +384,9 @@ class ProductIdentifierTests(unittest.TestCase):
 
         expected = (
             "📦 О товаре: Samsung &lt;A16&gt; — SM-A166B\n"
+            "<blockquote>S/N: ABC123</blockquote>\n"
             "<blockquote>IMEI: 490154203237518</blockquote>\n"
-            "<blockquote>IMEI2: 352099001761481</blockquote>\n"
-            "<blockquote>S/N: ABC123</blockquote>\n\n"
+            "<blockquote>IMEI2: 352099001761481</blockquote>\n\n"
             "🛒💵:"
         )
         self.assertTrue(caption.startswith(expected))

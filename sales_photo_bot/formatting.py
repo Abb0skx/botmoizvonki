@@ -152,6 +152,20 @@ def build_caption(
             if hidden_products:
                 values.append(f"… ещё {hidden_products} товар(а)")
             rendered.append("📦 О товаре: " + "; ".join(values))
+        for index, value in enumerate(visible_serials):
+            label = "S/N" if index == 0 else f"S/N {index + 1}"
+            rendered.append(
+                f"<blockquote>{label}: "
+                f"{_safe(value, MAX_SERIAL_NUMBER)}</blockquote>"
+            )
+        if hidden_serials:
+            rendered.append(
+                f"<blockquote>S/N: … ещё {hidden_serials}</blockquote>"
+            )
+        # Keep every recognized IMEI directly after the serial-number block.
+        # The legacy singular fields and the v2 collection use the same stable
+        # labels, so existing cards remain readable while multi-box photos can
+        # show every value on its own line.
         for index, value in enumerate(visible_imeis):
             if legacy_imei2_only and index == 0:
                 label = "IMEI2"
@@ -163,16 +177,6 @@ def build_caption(
         if hidden_imeis:
             rendered.append(
                 f"<blockquote>IMEI: … ещё {hidden_imeis}</blockquote>"
-            )
-        for index, value in enumerate(visible_serials):
-            label = "S/N" if index == 0 else f"S/N {index + 1}"
-            rendered.append(
-                f"<blockquote>{label}: "
-                f"{_safe(value, MAX_SERIAL_NUMBER)}</blockquote>"
-            )
-        if hidden_serials:
-            rendered.append(
-                f"<blockquote>S/N: … ещё {hidden_serials}</blockquote>"
             )
         if (
             visible_products
@@ -190,19 +194,21 @@ def build_caption(
     # Valid service responses normally fit in full (including four boxes with
     # dual IMEIs). Keep a deterministic fail-safe for a pathological card:
     # retain the sales template and visibly report how many tail values could
-    # not fit instead of letting Telegram reject the entire card.
+    # not fit instead of letting Telegram reject the entire card. Prefer all
+    # validated IMEIs over additional product/serial values: an IMEI must not
+    # disappear merely because one photo contains unusually verbose OCR text.
     while _telegram_text_units(caption) > max_text_units:
         if visible_products and product_value_limit > 80:
             product_value_limit = max(80, product_value_limit - 20)
+        elif len(visible_products) > 1:
+            visible_products.pop()
+            hidden_products += 1
         elif visible_serials:
             visible_serials.pop()
             hidden_serials += 1
         elif visible_imeis:
             visible_imeis.pop()
             hidden_imeis += 1
-        elif len(visible_products) > 1:
-            visible_products.pop()
-            hidden_products += 1
         else:
             break
         caption = render()
