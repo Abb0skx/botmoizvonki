@@ -52,6 +52,7 @@ from .formatting import (
     MAX_CAPTION_TEXT_UNITS,
     MAX_MESSAGE_TEXT_UNITS,
     build_caption,
+    identifiers_from_card,
     product_label_from_card,
 )
 from .keyboards import (
@@ -75,7 +76,7 @@ from .phones import (
     normalize_caption_phone_field,
     parse_caption_phone_field,
 )
-from .prices import normalize_card_prices
+from .prices import normalize_card_prices, parse_supplier_product_price
 from .repository import SalesPhotoRepository, utc_now
 from .reminders import (
     FILL_REMINDER_MARKER,
@@ -1263,10 +1264,21 @@ class SalesPhotoService:
         chat_id: int,
         replacement_message_id: int,
         body: str,
+        identifiers: ProductIdentifiers | None = None,
     ) -> None:
         try:
             fill = inspect_fill_fields(body, None)
             phone_field = parse_caption_phone_field(body)
+            card_identifiers = identifiers_from_card(body)
+            if identifiers is not None:
+                serial_numbers = identifier_serial_numbers(identifiers)
+                imeis = identifier_imeis(identifiers)
+                identifiers_known = True
+            else:
+                serial_numbers = card_identifiers.serial_numbers
+                imeis = card_identifiers.imeis
+                identifiers_known = card_identifiers.conclusive
+            supplier_price = parse_supplier_product_price(body)
             self.repository.sync_sale_details(
                 chat_id,
                 replacement_message_id,
@@ -1275,6 +1287,13 @@ class SalesPhotoService:
                 supplier_price_filled=fill.supplier_price,
                 phone_field_filled=fill.phone,
                 preserve_phones=not phone_field.conclusive,
+                serial_numbers=serial_numbers,
+                imeis=imeis,
+                identifiers_known=identifiers_known,
+                supplier_name=supplier_price.supplier_name,
+                product_price_amount=supplier_price.amount,
+                product_price_currency=supplier_price.currency,
+                supplier_details_known=supplier_price.conclusive,
             )
         except Exception as exc:
             logger.warning(
@@ -1912,6 +1931,7 @@ class SalesPhotoService:
             chat_id,
             replacement_message_id,
             caption,
+            identifiers=identifiers,
         )
 
         if outcome == "recorded":

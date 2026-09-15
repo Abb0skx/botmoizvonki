@@ -141,6 +141,15 @@ class CallSyncCandidate:
 
 
 @dataclass(frozen=True)
+class StoredSaleDetails:
+    serial_numbers: tuple[str, ...]
+    imeis: tuple[str, ...]
+    supplier_name: str | None
+    product_price_amount: int | None
+    product_price_currency: str | None
+
+
+@dataclass(frozen=True)
 class FillReminderRecord:
     chat_id: int
     source_message_id: int
@@ -417,6 +426,12 @@ class SalesPhotoRepository:
                     phone_field_filled INTEGER NOT NULL DEFAULT 0,
                     product_label TEXT,
                     supplier_price_filled INTEGER NOT NULL DEFAULT 0,
+                    supplier_name TEXT,
+                    product_price_amount INTEGER,
+                    product_price_currency TEXT CHECK(
+                        product_price_currency IN ('USD','UZS')
+                        OR product_price_currency IS NULL
+                    ),
                     ui_generation INTEGER NOT NULL DEFAULT 0,
                     sale_date TEXT,
                     daily_order_id INTEGER,
@@ -474,6 +489,28 @@ class SalesPhotoRepository:
                     PRIMARY KEY(chat_id,source_message_id,message_id),
                     UNIQUE(chat_id,message_id)
                 );
+
+                CREATE TABLE IF NOT EXISTS sales_photo_identifiers (
+                    chat_id INTEGER NOT NULL,
+                    source_message_id INTEGER NOT NULL,
+                    identifier_type TEXT NOT NULL CHECK(
+                        identifier_type IN ('serial','imei')
+                    ),
+                    ordinal INTEGER NOT NULL CHECK(ordinal >= 1),
+                    value TEXT NOT NULL,
+                    PRIMARY KEY(
+                        chat_id,source_message_id,identifier_type,ordinal
+                    ),
+                    UNIQUE(
+                        chat_id,source_message_id,identifier_type,value
+                    ),
+                    FOREIGN KEY(chat_id,source_message_id)
+                        REFERENCES sales_photo_jobs(chat_id,source_message_id)
+                        ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_sales_photo_identifier_value
+                ON sales_photo_identifiers(identifier_type,value);
 
                 CREATE TABLE IF NOT EXISTS sales_photo_delivery_links (
                     chat_id INTEGER NOT NULL,
@@ -607,6 +644,22 @@ class SalesPhotoRepository:
                 # and forwarding the whole channel during migration.
                 db.execute(
                     "UPDATE sales_photo_jobs SET supplier_price_filled=1"
+                )
+            if "supplier_name" not in columns:
+                db.execute(
+                    "ALTER TABLE sales_photo_jobs ADD COLUMN supplier_name TEXT"
+                )
+            if "product_price_amount" not in columns:
+                db.execute(
+                    "ALTER TABLE sales_photo_jobs ADD COLUMN "
+                    "product_price_amount INTEGER"
+                )
+            if "product_price_currency" not in columns:
+                db.execute(
+                    "ALTER TABLE sales_photo_jobs ADD COLUMN "
+                    "product_price_currency TEXT CHECK("
+                    "product_price_currency IN ('USD','UZS') "
+                    "OR product_price_currency IS NULL)"
                 )
             if "ui_generation" not in columns:
                 db.execute(
@@ -4402,6 +4455,13 @@ class SalesPhotoRepository:
         supplier_price_filled: bool | None = None,
         phone_field_filled: bool | None = None,
         preserve_phones: bool = False,
+        serial_numbers: tuple[str, ...] = (),
+        imeis: tuple[str, ...] = (),
+        identifiers_known: bool = False,
+        supplier_name: str | None = None,
+        product_price_amount: int | None = None,
+        product_price_currency: str | None = None,
+        supplier_details_known: bool = False,
         at: datetime | None = None,
     ) -> bool:
         """Persist customer identity for call and sales analytics.
@@ -4425,7 +4485,38 @@ class SalesPhotoRepository:
         product = (
             str(product_label or "").strip()[:MAX_PRODUCT_LABEL] or None
         )
+        serial_values = tuple(
+            dict.fromkeys(
+                str(value or "").strip()[:40]
+                for value in serial_numbers[:160]
+                if str(value or "").strip()
+            )
+        )
+        imei_values = tuple(
+            dict.fromkeys(
+                str(value or "").strip()[:15]
+                for value in imeis[:160]
+                if str(value or "").strip()
+            )
+        )
+        supplier = (
+            " ".join(str(supplier_name or "").split())[:256] or None
+        )
+        price_amount: int | None = None
+        price_currency: str | None = None
+        if supplier_details_known and product_price_amount is not None:
+            if (
+                type(product_price_amount) is not int
+                or not 0 <= product_price_amount <= 9_223_372_036_854_775_807
+            ):
+                raise ValueError("product price amount is out of range")
+            currency = str(product_price_currency or "").upper()
+            if currency not in {"USD", "UZS"}:
+                raise ValueError("product price currency is invalid")
+            price_amount = product_price_amount
+            price_currency = currency
         with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             cursor = db.execute(
                 """UPDATE sales_photo_jobs
                    SET client_phone=CASE WHEN ? THEN client_phone ELSE ? END,
@@ -4433,6 +4524,11 @@ class SalesPhotoRepository:
                        product_label=?,
                        supplier_price_filled=COALESCE(?,supplier_price_filled),
                        phone_field_filled=COALESCE(?,phone_field_filled),
+                       supplier_name=CASE WHEN ? THEN ? ELSE supplier_name END,
+                       product_price_amount=CASE
+                         WHEN ? THEN ? ELSE product_price_amount END,
+                       product_price_currency=CASE
+                         WHEN ? THEN ? ELSE product_price_currency END,
                        updated_at=?
                    WHERE chat_id=? AND replacement_message_id=?
                      AND status IN ('reposted','delete_pending','complete')""",
@@ -4452,13 +4548,109 @@ class SalesPhotoRepository:
                         if phone_field_filled is not None
                         else None
                     ),
+                    int(bool(supplier_details_known)),
+                    supplier,
+                    int(bool(supplier_details_known)),
+                    price_amount,
+                    int(bool(supplier_details_known)),
+                    price_currency,
                     _iso(at or utc_now()),
                     int(chat_id),
                     int(replacement_message_id),
                 ),
             )
+            if cursor.rowcount == 1 and identifiers_known:
+                db.execute(
+                    """DELETE FROM sales_photo_identifiers
+                       WHERE chat_id=? AND source_message_id=(
+                         SELECT source_message_id FROM sales_photo_jobs
+                         WHERE chat_id=? AND replacement_message_id=?
+                       )""",
+                    (
+                        int(chat_id),
+                        int(chat_id),
+                        int(replacement_message_id),
+                    ),
+                )
+                source_row = db.execute(
+                    """SELECT source_message_id FROM sales_photo_jobs
+                       WHERE chat_id=? AND replacement_message_id=?""",
+                    (int(chat_id), int(replacement_message_id)),
+                ).fetchone()
+                if source_row is not None:
+                    source_message_id = int(source_row["source_message_id"])
+                    db.executemany(
+                        """INSERT INTO sales_photo_identifiers(
+                               chat_id,source_message_id,identifier_type,
+                               ordinal,value
+                           ) VALUES (?,?,?,?,?)""",
+                        (
+                            (
+                                int(chat_id),
+                                source_message_id,
+                                identifier_type,
+                                ordinal,
+                                value,
+                            )
+                            for identifier_type, values in (
+                                ("serial", serial_values),
+                                ("imei", imei_values),
+                            )
+                            for ordinal, value in enumerate(values, start=1)
+                        ),
+                    )
             db.commit()
             return cursor.rowcount == 1
+
+    def sale_details_for_replacement(
+        self,
+        chat_id: int,
+        replacement_message_id: int,
+    ) -> StoredSaleDetails | None:
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT source_message_id,supplier_name,
+                          product_price_amount,product_price_currency
+                   FROM sales_photo_jobs
+                   WHERE chat_id=? AND replacement_message_id=?""",
+                (int(chat_id), int(replacement_message_id)),
+            ).fetchone()
+            if row is None:
+                return None
+            identifiers = db.execute(
+                """SELECT identifier_type,value
+                   FROM sales_photo_identifiers
+                   WHERE chat_id=? AND source_message_id=?
+                   ORDER BY identifier_type,ordinal""",
+                (int(chat_id), int(row["source_message_id"])),
+            ).fetchall()
+        return StoredSaleDetails(
+            serial_numbers=tuple(
+                str(item["value"])
+                for item in identifiers
+                if str(item["identifier_type"]) == "serial"
+            ),
+            imeis=tuple(
+                str(item["value"])
+                for item in identifiers
+                if str(item["identifier_type"]) == "imei"
+            ),
+            supplier_name=(
+                str(row["supplier_name"])
+                if row["supplier_name"] is not None
+                else None
+            ),
+            product_price_amount=(
+                int(row["product_price_amount"])
+                if row["product_price_amount"] is not None
+                else None
+            ),
+            product_price_currency=(
+                str(row["product_price_currency"])
+                if row["product_price_currency"] is not None
+                else None
+            ),
+        )
 
     def ui_generation_for_replacement(
         self,

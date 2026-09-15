@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import re
+from dataclasses import dataclass
 from datetime import date
 
 from .models import (
@@ -32,6 +33,91 @@ PRODUCT_LINE_RE = re.compile(
     r"(?P<product>[^\r\n]{1,8192})(?:\n|$)",
     re.IGNORECASE,
 )
+_CARD_HEADER_LINE_RE = re.compile(r"^[ \t\u2063\u2064\ufeff]*🛒💵[ \t]*:")
+_BLOCKQUOTE_TAG_RE = re.compile(r"</?blockquote>", re.IGNORECASE)
+_IDENTIFIER_LINE_RE = re.compile(
+    r"^(?P<label>S/N(?:[ \t]+\d+)?|IMEI(?:[ \t]*\d+)?)"
+    r"[ \t]*:[ \t]*(?P<value>.*)$",
+    re.IGNORECASE,
+)
+_IDENTIFIER_PREFIX_RE = re.compile(r"^(?:S/N|IMEI)", re.IGNORECASE)
+_SERIAL_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/\-]{2,39}$")
+
+
+@dataclass(frozen=True)
+class CardIdentifiers:
+    """Identifier fields parsed from the generated part of a sales card."""
+
+    state: str
+    serial_numbers: tuple[str, ...] = ()
+    imeis: tuple[str, ...] = ()
+
+    @property
+    def conclusive(self) -> bool:
+        return self.state in {"empty", "valid"}
+
+
+def _valid_card_imei(value: str) -> bool:
+    if re.fullmatch(r"[0-9]{15}", value) is None:
+        return False
+    total = 0
+    for index, character in enumerate(reversed(value)):
+        digit = int(character)
+        if index % 2:
+            digit *= 2
+            if digit > 9:
+                digit -= 9
+        total += digit
+    return total % 10 == 0
+
+
+def identifiers_from_card(body: object) -> CardIdentifiers:
+    """Read all S/N and IMEI rows before the unique sales-card header."""
+
+    raw_lines = str(body or "").splitlines()
+    header_indexes = [
+        index
+        for index, raw_line in enumerate(raw_lines)
+        if _CARD_HEADER_LINE_RE.match(raw_line) is not None
+    ]
+    if len(header_indexes) != 1:
+        return CardIdentifiers("malformed")
+
+    serial_numbers: list[str] = []
+    imeis: list[str] = []
+    for raw_line in raw_lines[: header_indexes[0]]:
+        line = html.unescape(_BLOCKQUOTE_TAG_RE.sub("", raw_line)).strip(
+            " \t\u2063\u2064\ufeff"
+        )
+        match = _IDENTIFIER_LINE_RE.fullmatch(line)
+        if match is None:
+            if _IDENTIFIER_PREFIX_RE.match(line) is not None:
+                return CardIdentifiers("malformed")
+            continue
+        value = " ".join(match.group("value").split())
+        if not value or "… ещё" in value.casefold():
+            return CardIdentifiers("malformed")
+        label = match.group("label").upper().replace(" ", "")
+        if label.startswith("S/N"):
+            if _SERIAL_VALUE_RE.fullmatch(value) is None:
+                return CardIdentifiers("malformed")
+            if value.casefold() not in {item.casefold() for item in serial_numbers}:
+                serial_numbers.append(value)
+        else:
+            if not _valid_card_imei(value):
+                return CardIdentifiers("malformed")
+            if value not in imeis:
+                imeis.append(value)
+        if len(serial_numbers) + len(imeis) > 160:
+            return CardIdentifiers("malformed")
+
+    if not serial_numbers and not imeis:
+        return CardIdentifiers("empty")
+    return CardIdentifiers(
+        "valid",
+        serial_numbers=tuple(serial_numbers),
+        imeis=tuple(imeis),
+    )
 
 
 def _compact(value: object, limit: int) -> str:

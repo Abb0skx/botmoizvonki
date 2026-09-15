@@ -27,6 +27,7 @@ from sales_photo_bot.formatting import (
     _telegram_text_units,
     add_manager_selection,
     build_caption,
+    identifiers_from_card,
     product_label_from_card,
     remove_manager_selection,
     selected_manager_from_caption,
@@ -439,6 +440,41 @@ class CaptionFormattingTests(unittest.TestCase):
         self.assertEqual(product_label_from_card(with_product), "A16 <8/256>")
         self.assertIsNone(product_label_from_card(without_product))
 
+    def test_all_serials_and_imeis_can_be_read_back_from_card(self):
+        card = build_caption(
+            None,
+            ProductIdentifiers(
+                serial_numbers=("SERIAL-A", "SERIAL-B"),
+                imeis=(
+                    "490154203237518",
+                    "352099001761481",
+                    "356938035643809",
+                ),
+            ),
+        )
+
+        parsed = identifiers_from_card(card)
+
+        self.assertTrue(parsed.conclusive)
+        self.assertEqual(parsed.serial_numbers, ("SERIAL-A", "SERIAL-B"))
+        self.assertEqual(
+            parsed.imeis,
+            (
+                "490154203237518",
+                "352099001761481",
+                "356938035643809",
+            ),
+        )
+
+    def test_incomplete_identifier_summary_does_not_erase_database_values(self):
+        card = (
+            "<blockquote>S/N: … ещё 2</blockquote>\n"
+            "<blockquote>IMEI: 490154203237518</blockquote>\n\n"
+            "🛒💵:\nrasxod:"
+        )
+
+        self.assertFalse(identifiers_from_card(card).conclusive)
+
 
 class RepositoryTests(unittest.TestCase):
     def test_touch_processing_prevents_live_ocr_from_becoming_stale(self):
@@ -507,6 +543,58 @@ class RepositoryTests(unittest.TestCase):
                     "Abbos",
                 ),
             )
+
+    def test_identifiers_supplier_and_product_price_are_durable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sales.db"
+            repo = SalesPhotoRepository(path)
+            repo.claim_photo(CHAT_ID, 10, "file", sale_date=date(2026, 9, 2))
+            repo.mark_reposted(CHAT_ID, 10, 200)
+
+            self.assertTrue(
+                repo.sync_sale_details(
+                    CHAT_ID,
+                    200,
+                    (),
+                    "Phone A",
+                    serial_numbers=("SERIAL-A", "SERIAL-B"),
+                    imeis=(
+                        "490154203237518",
+                        "352099001761481",
+                    ),
+                    identifiers_known=True,
+                    supplier_name="A3 Mirsaid",
+                    product_price_amount=87,
+                    product_price_currency="USD",
+                    supplier_details_known=True,
+                )
+            )
+
+            reopened = SalesPhotoRepository(path)
+            details = reopened.sale_details_for_replacement(CHAT_ID, 200)
+            self.assertIsNotNone(details)
+            assert details is not None
+            self.assertEqual(details.serial_numbers, ("SERIAL-A", "SERIAL-B"))
+            self.assertEqual(
+                details.imeis,
+                ("490154203237518", "352099001761481"),
+            )
+            self.assertEqual(details.supplier_name, "A3 Mirsaid")
+            self.assertEqual(details.product_price_amount, 87)
+            self.assertEqual(details.product_price_currency, "USD")
+
+            self.assertTrue(
+                reopened.sync_sale_details(
+                    CHAT_ID,
+                    200,
+                    (),
+                    "Phone A",
+                    identifiers_known=False,
+                    supplier_details_known=False,
+                )
+            )
+            preserved = reopened.sale_details_for_replacement(CHAT_ID, 200)
+            self.assertEqual(preserved, details)
 
     def test_multi_box_product_line_is_not_truncated_to_legacy_model_length(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1105,6 +1193,11 @@ class PhotoWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(repo.is_replacement(CHAT_ID, 300))
         self.assertEqual(repo.output_message_ids(CHAT_ID, 10), (200, 201, 300))
+        stored = repo.sale_details_for_replacement(CHAT_ID, 300)
+        self.assertIsNotNone(stored)
+        assert stored is not None
+        self.assertEqual(stored.serial_numbers, ("ABC123",))
+        self.assertEqual(stored.imeis, ("490154203237518",))
 
     async def test_album_combines_boxes_with_phone_only_warranty_card(self):
         class SequenceRecognizer:
@@ -2206,6 +2299,43 @@ class EditedCaptionTests(unittest.IsolatedAsyncioTestCase):
             [["Olmas", "Otabek"], ["Ali", "Abbos"]],
         )
         self.assertEqual(kwargs["caption_entities"][0].type, MessageEntity.BOLD)
+        details = self.repo.sale_details_for_replacement(CHAT_ID, 200)
+        self.assertIsNotNone(details)
+        assert details is not None
+        self.assertEqual(details.supplier_name, "ACME")
+        self.assertEqual(details.product_price_amount, 100)
+        self.assertEqual(details.product_price_currency, "USD")
+
+    async def test_manual_edit_persists_all_identifiers_and_uzs_product_price(self):
+        caption = (
+            BOT_CARD_MARKER
+            + "📦 О товаре: Phone A\n"
+            + "S/N: SERIAL-A\n"
+            + "S/N 2: SERIAL-B\n"
+            + "IMEI: 490154203237518\n"
+            + "IMEI2: 352099001761481\n\n"
+            + "🛒💵: Toshkent 5000\n"
+            + "rasxod:\n\n📞:\n\nНаличка"
+        )
+        bot = self.bot()
+
+        await self.service.handle_edited_photo(
+            self.message(caption),
+            bot,
+            update_id=101,
+        )
+
+        details = self.repo.sale_details_for_replacement(CHAT_ID, 200)
+        self.assertIsNotNone(details)
+        assert details is not None
+        self.assertEqual(details.serial_numbers, ("SERIAL-A", "SERIAL-B"))
+        self.assertEqual(
+            details.imeis,
+            ("490154203237518", "352099001761481"),
+        )
+        self.assertEqual(details.supplier_name, "Toshkent")
+        self.assertEqual(details.product_price_amount, 5000)
+        self.assertEqual(details.product_price_currency, "UZS")
 
     async def test_manual_edit_restores_the_persisted_order_id(self):
         self.repo.ensure_order_numbers(CHAT_ID, 10, date(2026, 8, 31))

@@ -12,7 +12,10 @@ from telegram import MessageEntity
 
 from sales_photo_bot.config import Settings
 from sales_photo_bot.dates import tashkent_today
-from sales_photo_bot.prices import normalize_card_prices
+from sales_photo_bot.prices import (
+    normalize_card_prices,
+    parse_supplier_product_price,
+)
 from sales_photo_bot.repository import SalesPhotoRepository
 from sales_photo_bot.service import BOT_CARD_MARKER
 from sales_photo_bot.service import SalesPhotoService
@@ -40,6 +43,49 @@ def utf16_offset(value: str, needle: str, start: int = 0) -> int:
 
 
 class PriceCardFormattingTests(unittest.TestCase):
+    def test_supplier_and_price_are_split_into_structured_values(self):
+        cases = (
+            (
+                "🛒💵:A3 Mirsaid 87$\nrasxod:\n\n📞:",
+                ("A3 Mirsaid", 87, "USD"),
+            ),
+            (
+                "🛒💵: Toshkent 1 000 000 So'm\nrasxod:\n\n📞:",
+                ("Toshkent", 1_000_000, "UZS"),
+            ),
+            (
+                "🛒💵: A30 Umiddan\nrasxod:\n\n📞:",
+                ("A30 Umiddan", None, None),
+            ),
+        )
+        for body, expected in cases:
+            with self.subTest(body=body):
+                parsed = parse_supplier_product_price(body)
+                self.assertTrue(parsed.conclusive)
+                self.assertEqual(
+                    (parsed.supplier_name, parsed.amount, parsed.currency),
+                    expected,
+                )
+
+    def test_malformed_supplier_card_is_inconclusive(self):
+        body = "🛒💵: ACME 87$\n🛒💵: OTHER 90$\nrasxod:"
+
+        self.assertFalse(parse_supplier_product_price(body).conclusive)
+
+    def test_supplier_after_many_identifiers_is_still_parsed_and_normalized(self):
+        body = (
+            "\n".join(f"IMEI{index}: 490154203237518" for index in range(16))
+            + "\n🛒💵: ACME 87\nrasxod:\n\n📞:"
+        )
+
+        normalized = normalize_card_prices(body, max_length=4096)
+        parsed = parse_supplier_product_price(normalized.body)
+
+        self.assertIn("🛒💵: ACME 87$", normalized.body)
+        self.assertEqual(parsed.supplier_name, "ACME")
+        self.assertEqual(parsed.amount, 87)
+        self.assertEqual(parsed.currency, "USD")
+
     def test_normalizes_complete_user_example(self):
         body = (
             BOT_CARD_MARKER

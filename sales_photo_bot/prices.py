@@ -16,6 +16,10 @@ _USD_LINE_RE = re.compile(
 _UZS_LINE_RE = re.compile(
     r"^(?P<label>[ \t]*🇺🇿[ \t]*:[ \t]*)(?P<value>.*)$"
 )
+_EXPENSE_LINE_RE = re.compile(
+    r"^[ \t\u2063]*rasxod[ \t]*(?::|$)",
+    re.IGNORECASE,
+)
 _HEADER_AMOUNT_RE = re.compile(
     r"(?<![\w/])(?:\$[ \t]*)?"
     r"(?P<amount>\d(?:[\d \t\u00a0]*\d)?)"
@@ -75,6 +79,78 @@ class PriceCardNormalization:
     changed: bool = False
 
 
+@dataclass(frozen=True)
+class SupplierProductPrice:
+    """Structured supplier row read only from a canonical sales card."""
+
+    state: str
+    supplier_name: str | None = None
+    amount: int | None = None
+    currency: str | None = None
+
+    @property
+    def conclusive(self) -> bool:
+        return self.state in {"empty", "valid"}
+
+
+def parse_supplier_product_price(body: object) -> SupplierProductPrice:
+    """Split ``🛒💵: supplier price`` without scanning unrelated rows.
+
+    The parser follows the same last-number and 5000 threshold rules as price
+    normalization. A malformed card is intentionally inconclusive so a manual
+    typo cannot erase previously stored sale analytics.
+    """
+
+    lines = _line_spans(str(body or ""))
+    headers = [
+        (index, match)
+        for index, (_, _, line) in enumerate(lines)
+        if (match := _CARD_HEADER_RE.match(line)) is not None
+    ]
+    expenses = [
+        index
+        for index, (_, _, line) in enumerate(lines)
+        if _EXPENSE_LINE_RE.match(line) is not None
+    ]
+    if (
+        len(headers) != 1
+        or len(expenses) != 1
+        or headers[0][0] >= expenses[0]
+    ):
+        return SupplierProductPrice("malformed")
+
+    _, header_match = headers[0]
+    value = " ".join(header_match.group("value").split())
+    if not value:
+        return SupplierProductPrice("empty")
+
+    amount_match = _HEADER_AMOUNT_RE.search(value)
+    if amount_match is None:
+        return SupplierProductPrice("valid", supplier_name=value[:256])
+
+    digits = _digits(amount_match.group("amount"))
+    if not digits:
+        return SupplierProductPrice("malformed")
+    amount = int(digits)
+    if amount > 9_223_372_036_854_775_807:
+        return SupplierProductPrice("malformed")
+
+    price_token = amount_match.group(0).casefold()
+    if "$" in price_token:
+        currency = "USD"
+    elif any(token in price_token for token in ("so'm", "so’m", "so`m", "сум", "uzs")):
+        currency = "UZS"
+    else:
+        currency = "USD" if amount < 5000 else "UZS"
+    supplier = value[: amount_match.start()].strip(" \t/|,;:-–—")[:256] or None
+    return SupplierProductPrice(
+        "valid",
+        supplier_name=supplier,
+        amount=amount,
+        currency=currency,
+    )
+
+
 def _has_exact_bold(
     entities: Sequence[MessageEntity],
     body: str,
@@ -106,16 +182,14 @@ def normalize_card_prices(
     original = str(body or "")
     original_entities = tuple(entities or ())
     lines = _line_spans(original)
-    header_index = next(
-        (
-            index
-            for index, (_, _, line) in enumerate(lines[:12])
-            if _CARD_HEADER_RE.match(line) is not None
-        ),
-        None,
-    )
-    if header_index is None:
+    header_indexes = [
+        index
+        for index, (_, _, line) in enumerate(lines)
+        if _CARD_HEADER_RE.match(line) is not None
+    ]
+    if len(header_indexes) != 1:
         return PriceCardNormalization(original, original_entities)
+    header_index = header_indexes[0]
 
     replacements: list[_Replacement] = []
     for index, (line_start, line_end, line) in enumerate(lines[header_index:]):
