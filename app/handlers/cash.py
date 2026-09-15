@@ -114,56 +114,6 @@ def cash_notification_text(
     )
 
 
-def _message_missing(error: Exception) -> bool:
-    if not isinstance(error, BadRequest):
-        return False
-    text = str(error).casefold()
-    return "message to delete not found" in text or "message not found" in text
-
-
-async def _delete_cash_source(context: ContextTypes.DEFAULT_TYPE, entry: CourierCashEntry) -> bool:
-    if entry.entry_type != "handover" or entry.source_deleted_at:
-        return True
-    repo: OrderRepository = context.application.bot_data["repo"]
-    try:
-        await context.bot.delete_message(entry.source_chat_id, entry.source_message_id)
-    except RetryAfter:
-        raise
-    except Forbidden as error:
-        repo.record_cash_source_delete_failure(entry.id, str(error), terminal=True)
-        logger.error(
-            "Cash handover source cannot be deleted %s/%s: %s",
-            entry.source_chat_id,
-            entry.source_message_id,
-            error,
-        )
-        return False
-    except BadRequest as error:
-        if _message_missing(error):
-            repo.mark_cash_source_deleted(entry.id)
-            return True
-        repo.record_cash_source_delete_failure(entry.id, str(error), terminal=True)
-        logger.error(
-            "Cash handover source permanently rejected deletion %s/%s: %s",
-            entry.source_chat_id,
-            entry.source_message_id,
-            error,
-        )
-        return False
-    except Exception as error:
-        failed = repo.record_cash_source_delete_failure(entry.id, str(error))
-        logger.warning(
-            "Could not delete cash handover source %s/%s (attempt %s): %s",
-            entry.source_chat_id,
-            entry.source_message_id,
-            failed.source_delete_attempts if failed else "?",
-            error,
-        )
-        return False
-    repo.mark_cash_source_deleted(entry.id)
-    return True
-
-
 async def publish_cash_notification(
     context: ContextTypes.DEFAULT_TYPE,
     entry: CourierCashEntry,
@@ -173,8 +123,6 @@ async def publish_cash_notification(
     if not current:
         raise ValueError("cash entry no longer exists")
     if current.notification_message_id:
-        if current.entry_type == "handover":
-            await _delete_cash_source(context, current)
         return current
 
     publishing: set[int] = context.application.bot_data.setdefault("cash_notifications_publishing", set())
@@ -203,8 +151,6 @@ async def publish_cash_notification(
             except Exception:
                 logger.exception("Could not remove duplicate cash notification %s", sent.message_id)
             attached = repo.get_cash_entry(current.id)
-        if attached and attached.entry_type == "handover":
-            await _delete_cash_source(context, attached)
         return attached or current
     finally:
         publishing.discard(current.id)
@@ -228,13 +174,6 @@ async def reconcile_cash_entries(application) -> None:
             raise
         except Exception:
             logger.exception("Could not synchronize cash notification %s", entry.id)
-    for entry in repo.list_cash_sources_needing_deletion(limit=50):
-        try:
-            await _delete_cash_source(context, entry)
-        except RetryAfter:
-            raise
-        except Exception:
-            logger.exception("Could not recover cash source deletion %s", entry.id)
 
 
 async def courier_cash_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -276,8 +215,6 @@ async def courier_cash_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             raise
         except Exception:
             logger.exception("Could not publish cash entry %s", entry.id)
-    elif entry.entry_type == "handover" and not entry.source_deleted_at:
-        await _delete_cash_source(context, entry)
 
 
 async def _is_cash_channel_admin(

@@ -2244,7 +2244,7 @@ async def validate_delivery_configuration(application: Application) -> None:
             False,
         ):
             raise RuntimeError(
-                "The delivery bot must be allowed to delete cash messages in group "
+                "The delivery bot must be allowed to delete obsolete bot messages in group "
                 f"{delivery_group_id}"
             )
 

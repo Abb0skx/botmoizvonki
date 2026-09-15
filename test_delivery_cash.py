@@ -6,8 +6,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from telegram.error import Forbidden
-
 from app.database import OrderRepository
 from app.handlers.cash import (
     cash_correction_input,
@@ -231,13 +229,13 @@ class CourierCashHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("+40 $", sent["text"])
         self.assertIn("−25 000 сум", sent["text"])
 
-    async def test_handover_is_published_then_original_is_deleted(self):
+    async def test_handover_is_published_and_original_message_stays(self):
         await courier_cash_input(self.update("40$ касса"), self.context())
         entry = self.repo.get_cash_entry(1)
         self.assertEqual(entry.status, "pending")
         self.assertEqual(entry.notification_message_id, 700)
-        self.assertIsNotNone(entry.source_deleted_at)
-        self.bot.delete_message.assert_awaited_once_with(-1004404461980, 50)
+        self.assertIsNone(entry.source_deleted_at)
+        self.bot.delete_message.assert_not_awaited()
         keyboard = self.bot.send_message.await_args.kwargs["reply_markup"]
         labels = [button.text for row in keyboard.inline_keyboard for button in row]
         self.assertEqual(labels, ["✅ Получил", "❌ Не получил", "✏️ Другая сумма"])
@@ -269,17 +267,18 @@ class CourierCashHandlerTests(unittest.IsolatedAsyncioTestCase):
 
         recovered = self.repo.get_cash_entry(1)
         self.assertEqual(recovered.notification_message_id, 701)
-        self.assertIsNotNone(recovered.source_deleted_at)
-        self.bot.delete_message.assert_awaited_once_with(-1004404461980, 50)
+        self.assertIsNone(recovered.source_deleted_at)
+        self.bot.delete_message.assert_not_awaited()
 
-    async def test_permanent_delete_denial_is_not_retried_forever(self):
-        self.bot.delete_message.side_effect = Forbidden("not enough rights")
+    async def test_reconciliation_never_deletes_retained_handover_source(self):
         await courier_cash_input(self.update("40$ касса"), self.context())
+        self.application.bot = self.bot
+        await reconcile_cash_entries(self.application)
 
         entry = self.repo.get_cash_entry(1)
-        self.assertEqual(entry.source_delete_attempts, 1)
-        self.assertEqual(entry.source_delete_terminal, 1)
-        self.assertEqual(self.repo.list_cash_sources_needing_deletion(), [])
+        self.assertIsNone(entry.source_deleted_at)
+        self.assertEqual(entry.source_delete_attempts, 0)
+        self.bot.delete_message.assert_not_awaited()
 
     async def test_confirmed_db_change_repairs_channel_after_edit_failure(self):
         await courier_cash_input(self.update("40$ касса"), self.context())
