@@ -402,7 +402,7 @@ class ActiveEditNotificationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class LocationPublicationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_native_pin_contains_compact_buttons_without_reply_text(self):
+    async def test_location_is_four_posts_with_text_links_and_plain_native_pin(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = OrderRepository(Path(directory) / "delivery.db")
             repo.initialize()
@@ -423,7 +423,7 @@ class LocationPublicationTests(unittest.IsolatedAsyncioTestCase):
             order = repo.update(
                 order.id,
                 status="pending",
-                delivery_chat_id=-5125237049,
+                delivery_chat_id=-1004404461980,
                 delivery_message_id=25,
             )
             bot = SimpleNamespace(
@@ -434,7 +434,9 @@ class LocationPublicationTests(unittest.IsolatedAsyncioTestCase):
                 send_message=AsyncMock(side_effect=[
                     SimpleNamespace(chat_id=-1004398605075, message_id=9),
                     SimpleNamespace(chat_id=-1004398605075, message_id=11),
+                    SimpleNamespace(chat_id=-1004398605075, message_id=12),
                 ]),
+                delete_message=AsyncMock(),
             )
             context = SimpleNamespace(
                 bot=bot,
@@ -446,21 +448,35 @@ class LocationPublicationTests(unittest.IsolatedAsyncioTestCase):
             fields = await _send_location_messages(context, order, 1)
 
             self.assertEqual(fields["location_message_id"], 10)
-            self.assertEqual(fields["location_details_message_id"], 9)
-            self.assertEqual(fields["location_footer_message_id"], 11)
-            self.assertEqual(bot.send_message.await_count, 2)
-            self.assertTrue(all(
-                call.kwargs["text"].count("📍") == 33
-                for call in bot.send_message.await_args_list
-            ))
-            buttons = bot.send_location.await_args.kwargs["reply_markup"].inline_keyboard
-            self.assertEqual(len(buttons), 3)
-            self.assertTrue(buttons[0][0].text.startswith("📍 Яшнабадский район"))
-            self.assertEqual(buttons[1][0].text, "📦 A56 · №1 · Ali")
-            self.assertEqual(buttons[2][0].text, "📱 +998 90 133 39 99")
+            self.assertEqual(fields["location_header_message_id"], 9)
+            self.assertEqual(fields["location_details_message_id"], 11)
+            self.assertEqual(fields["location_footer_message_id"], 12)
+            self.assertEqual(bot.send_message.await_count, 3)
             self.assertEqual(
-                {row[0].callback_data for row in buttons},
-                {f"location_label:{order.id}"},
+                bot.send_message.await_args_list[0].kwargs["text"].count("📍"),
+                33,
+            )
+            self.assertEqual(
+                bot.send_message.await_args_list[2].kwargs["text"].count("📍"),
+                33,
+            )
+            self.assertNotIn("reply_markup", bot.send_location.await_args.kwargs)
+            details = bot.send_message.await_args_list[1].kwargs["text"]
+            self.assertIn("📍 <b>Яшнабадский район</b>", details)
+            self.assertIn("📦 A56", details)
+            self.assertIn("🚚 Заказ №1", details)
+            self.assertIn("👤 Менеджер: Ali", details)
+            self.assertIn(
+                '<a href="tel:+998901333999">+998 90 133 39 99</a>',
+                details,
+            )
+            self.assertIn(
+                '<a href="tel:+998912223344">+998 91 222 33 44</a>',
+                details,
+            )
+            self.assertIn(
+                '<a href="https://t.me/c/4404461980/25">Открыть заказ №1</a>',
+                details,
             )
 
 

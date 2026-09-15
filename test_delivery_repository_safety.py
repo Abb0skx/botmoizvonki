@@ -1,4 +1,6 @@
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -329,6 +331,248 @@ class DeliveryRepositorySafetyTests(unittest.TestCase):
         self.assertEqual(version, SCHEMA_VERSION)
         self.assertIn("idx_cleanup_queue_due", indices)
 
+    def test_schema_v7_preserves_old_separator_ids_as_location_headers(self) -> None:
+        order = self.create_order()
+        self.repo.update(
+            order.id,
+            location_chat_id=-1002,
+            location_message_id=500,
+            location_details_message_id=499,
+            location_footer_message_id=501,
+            second_location_chat_id=-1002,
+            second_location_message_id=510,
+            second_location_details_message_id=509,
+            second_location_footer_message_id=511,
+        )
+        with sqlite3.connect(self.repo.path) as db:
+            db.execute("PRAGMA user_version=6")
+
+        self.repo.initialize()
+
+        migrated = self.repo.get(order.id)
+        self.assertEqual(migrated.location_header_message_id, 499)
+        self.assertIsNone(migrated.location_details_message_id)
+        self.assertEqual(migrated.location_footer_message_id, 501)
+        self.assertEqual(migrated.second_location_header_message_id, 509)
+        self.assertIsNone(migrated.second_location_details_message_id)
+        self.assertEqual(migrated.second_location_footer_message_id, 511)
+
+    def test_schema_v7_does_not_reshape_an_already_migrated_partial_block(self) -> None:
+        order = self.create_order()
+        self.repo.update(
+            order.id,
+            location_chat_id=-1002,
+            location_header_message_id=None,
+            location_message_id=500,
+            location_details_message_id=501,
+            location_footer_message_id=502,
+        )
+
+        self.repo.initialize()
+
+        unchanged = self.repo.get(order.id)
+        self.assertIsNone(unchanged.location_header_message_id)
+        self.assertEqual(unchanged.location_details_message_id, 501)
+        self.assertEqual(unchanged.location_footer_message_id, 502)
+
+    def test_publication_references_are_attach_once_without_changing_business_revision(self) -> None:
+        order = self.create_order()
+        version = order.updated_at
+
+        published = self.repo.update(
+            order.id,
+            expected_updated_at=version,
+            expected_publications={
+                "delivery_chat_id": None,
+                "delivery_message_id": None,
+            },
+            delivery_chat_id=-1001,
+            delivery_message_id=10,
+        )
+        losing_publish = self.repo.update(
+            order.id,
+            expected_updated_at=version,
+            expected_publications={
+                "delivery_chat_id": None,
+                "delivery_message_id": None,
+            },
+            delivery_chat_id=-1001,
+            delivery_message_id=11,
+        )
+
+        self.assertIsNotNone(published)
+        self.assertEqual(published.updated_at, version)
+        self.assertIsNone(losing_publish)
+        canonical = self.repo.get(order.id)
+        self.assertEqual(canonical.delivery_message_id, 10)
+        self.assertEqual(canonical.updated_at, version)
+
+    def test_stale_publication_clear_cannot_erase_a_replacement(self) -> None:
+        order = self.create_order()
+        order = self.repo.update(
+            order.id,
+            status="completed",
+            delivered_at="2026-09-15T10:00:00+05:00",
+            post_delivery_prompt_required=1,
+            post_delivery_prompt_chat_id=-1001,
+            post_delivery_prompt_message_id=11,
+        )
+        version = order.updated_at
+        cleared = self.repo.update(
+            order.id,
+            expected_updated_at=version,
+            expected_publications={
+                "post_delivery_prompt_chat_id": -1001,
+                "post_delivery_prompt_message_id": 11,
+            },
+            post_delivery_prompt_chat_id=None,
+            post_delivery_prompt_message_id=None,
+        )
+        replacement = self.repo.update(
+            order.id,
+            expected_updated_at=version,
+            expected_publications={
+                "post_delivery_prompt_chat_id": None,
+                "post_delivery_prompt_message_id": None,
+            },
+            post_delivery_prompt_chat_id=-1001,
+            post_delivery_prompt_message_id=12,
+        )
+        stale_clear = self.repo.update(
+            order.id,
+            expected_updated_at=version,
+            expected_publications={
+                "post_delivery_prompt_chat_id": -1001,
+                "post_delivery_prompt_message_id": 11,
+            },
+            post_delivery_prompt_chat_id=None,
+            post_delivery_prompt_message_id=None,
+        )
+
+        self.assertIsNotNone(cleared)
+        self.assertIsNotNone(replacement)
+        self.assertIsNone(stale_clear)
+        canonical = self.repo.get(order.id)
+        self.assertEqual(canonical.post_delivery_prompt_message_id, 12)
+        self.assertEqual(canonical.updated_at, version)
+
+    def test_transition_rejects_stale_publication_and_does_not_queue_wrong_cleanup(self) -> None:
+        order = self.create_order()
+        order = self.repo.update(
+            order.id,
+            status="completed",
+            courier_id=202,
+            courier_name="Courier",
+            delivered_at="2026-09-15T10:00:00+05:00",
+            post_delivery_prompt_required=1,
+            post_delivery_prompt_chat_id=-1001,
+            post_delivery_prompt_message_id=11,
+        )
+        version = order.updated_at
+        cleared = self.repo.update(
+            order.id,
+            expected_updated_at=version,
+            expected_publications={
+                "post_delivery_prompt_chat_id": -1001,
+                "post_delivery_prompt_message_id": 11,
+            },
+            post_delivery_prompt_chat_id=None,
+            post_delivery_prompt_message_id=None,
+        )
+        replacement = self.repo.update(
+            order.id,
+            expected_updated_at=version,
+            expected_publications={
+                "post_delivery_prompt_chat_id": None,
+                "post_delivery_prompt_message_id": None,
+            },
+            post_delivery_prompt_chat_id=-1001,
+            post_delivery_prompt_message_id=12,
+        )
+        self.assertIsNotNone(cleared)
+        self.assertIsNotNone(replacement)
+
+        stale_transition = self.repo.transition(
+            order.id,
+            {"completed"},
+            expected_updated_at=version,
+            expected_publications={
+                "post_delivery_prompt_chat_id": -1001,
+                "post_delivery_prompt_message_id": 11,
+            },
+            cleanup_messages=[(-1001, 11)],
+            status="on_way",
+            delivered_at=None,
+            post_delivery_prompt_required=0,
+            post_delivery_prompt_chat_id=None,
+            post_delivery_prompt_message_id=None,
+        )
+
+        self.assertIsNone(stale_transition)
+        canonical = self.repo.get(order.id)
+        self.assertEqual(canonical.status, "completed")
+        self.assertEqual(canonical.post_delivery_prompt_message_id, 12)
+        self.assertEqual(self.repo.list_cleanup_messages(order_id=order.id), [])
+
+        current_transition = self.repo.transition(
+            order.id,
+            {"completed"},
+            expected_updated_at=version,
+            expected_publications={
+                "post_delivery_prompt_chat_id": -1001,
+                "post_delivery_prompt_message_id": 12,
+            },
+            cleanup_messages=[(-1001, 12)],
+            status="on_way",
+            delivered_at=None,
+            post_delivery_prompt_required=0,
+            post_delivery_prompt_chat_id=None,
+            post_delivery_prompt_message_id=None,
+        )
+        self.assertIsNotNone(current_transition)
+        queued = self.repo.list_cleanup_messages(order_id=order.id)
+        self.assertEqual(
+            [(row["chat_id"], row["message_id"]) for row in queued],
+            [(-1001, 12)],
+        )
+
+    def test_mark_synced_rejects_a_newer_publication_generation(self) -> None:
+        order = self.create_order()
+        order = self.repo.update(
+            order.id,
+            status="pending",
+            delivery_chat_id=-1001,
+            delivery_message_id=10,
+        )
+        version = order.updated_at
+        cleared = self.repo.update(
+            order.id,
+            expected_updated_at=version,
+            expected_publications={
+                "delivery_chat_id": -1001,
+                "delivery_message_id": 10,
+            },
+            delivery_chat_id=None,
+            delivery_message_id=None,
+        )
+        self.assertIsNotNone(cleared)
+        self.assertEqual(cleared.updated_at, version)
+
+        marked = self.repo.mark_synced(
+            order.id,
+            expected_updated_at=version,
+            expected_publications={
+                "delivery_chat_id": -1001,
+                "delivery_message_id": 10,
+            },
+        )
+
+        self.assertFalse(marked)
+        canonical = self.repo.get(order.id)
+        self.assertEqual(canonical.sync_needed, 1)
+        self.assertIsNone(canonical.delivery_chat_id)
+        self.assertIsNone(canonical.delivery_message_id)
+
     def test_concurrent_initializers_do_not_race_on_legacy_columns(self) -> None:
         legacy_path = Path(self.tempdir.name) / "concurrent-legacy.db"
         legacy_schema = "\n".join(
@@ -358,6 +602,38 @@ class DeliveryRepositorySafetyTests(unittest.TestCase):
         self.assertIn("next_attempt_at", cleanup_columns)
         self.assertIn("terminal", cleanup_columns)
 
+    def test_concurrent_process_initializers_retry_sqlite_wal_lock(self) -> None:
+        shared_path = Path(self.tempdir.name) / "multiprocess-initialize.db"
+        start_signal = Path(self.tempdir.name) / "start-initialize"
+        script = (
+            "import sys,time; from pathlib import Path; "
+            "from app.database import OrderRepository; "
+            "db=Path(sys.argv[1]); signal=Path(sys.argv[2]); "
+            "\nwhile not signal.exists(): time.sleep(0.001)"
+            "\nOrderRepository(db).initialize()"
+        )
+        processes = [
+            subprocess.Popen(
+                [sys.executable, "-c", script, str(shared_path), str(start_signal)],
+                cwd=Path(__file__).parent,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for _ in range(6)
+        ]
+        start_signal.touch()
+        failures: list[str] = []
+        for process in processes:
+            stdout, stderr = process.communicate(timeout=20)
+            if process.returncode:
+                failures.append(f"exit={process.returncode}\n{stdout}\n{stderr}")
+        self.assertEqual(failures, [])
+
+        with sqlite3.connect(shared_path) as db:
+            self.assertEqual(db.execute("PRAGMA quick_check").fetchone()[0], "ok")
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
+
     def test_periodic_job_claim_table_is_initialized_at_current_schema(self) -> None:
         with self.repo.connect() as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
@@ -366,8 +642,8 @@ class DeliveryRepositorySafetyTests(unittest.TestCase):
                 ("periodic_job_claims",),
             ).fetchone()
 
-        self.assertEqual(SCHEMA_VERSION, 6)
-        self.assertEqual(version, 6)
+        self.assertEqual(SCHEMA_VERSION, 7)
+        self.assertEqual(version, 7)
         self.assertIsNotNone(table)
 
     def test_periodic_job_claim_is_idempotent_per_job_and_slot(self) -> None:

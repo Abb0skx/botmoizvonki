@@ -26,6 +26,7 @@ from app.handlers.orders import (
     _notify_log,
     _process_cleanup_messages,
     _queue_product_photo_sales_card,
+    _sync_retry_remaining,
     _sync_order,
     _waiting_pickup_reminder_messages,
     reconcile_orders_on_start,
@@ -169,6 +170,8 @@ async def reconcile_pending_orders(application: Application) -> None:
     repo: OrderRepository = application.bot_data["repo"]
     context = SimpleNamespace(application=application, bot=application.bot)
     for order in repo.list_needing_sync(limit=SYNC_RECONCILIATION_BATCH_SIZE):
+        if _sync_retry_remaining(application, order.id) > 0:
+            continue
         try:
             _, success = await _sync_order(context, order.id)
             if not success:

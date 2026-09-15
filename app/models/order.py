@@ -55,11 +55,16 @@ class Order:
     estimated_delivery_at: str | None = None
     delivery_chat_id: int | None = None
     delivery_message_id: int | None = None
+    post_delivery_prompt_required: int = 0
+    post_delivery_prompt_chat_id: int | None = None
+    post_delivery_prompt_message_id: int | None = None
     location_chat_id: int | None = None
+    location_header_message_id: int | None = None
     location_message_id: int | None = None
     location_details_message_id: int | None = None
     location_footer_message_id: int | None = None
     second_location_chat_id: int | None = None
+    second_location_header_message_id: int | None = None
     second_location_message_id: int | None = None
     second_location_details_message_id: int | None = None
     second_location_footer_message_id: int | None = None

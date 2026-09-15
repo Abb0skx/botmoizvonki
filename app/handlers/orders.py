@@ -10,9 +10,9 @@ from types import SimpleNamespace
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from telegram import ReplyKeyboardRemove, Update
+from telegram import ReplyKeyboardRemove, ReplyParameters, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, Forbidden, RetryAfter
+from telegram.error import BadRequest, ChatMigrated, Forbidden, RetryAfter
 from telegram.ext import (
     Application, ApplicationHandlerStop, CallbackQueryHandler, CommandHandler, ContextTypes,
     ConversationHandler, MessageHandler, TypeHandler, filters,
@@ -23,7 +23,7 @@ from app.bot.keyboards import (
     courier_keyboard, courier_reassignment_confirmation_keyboard,
     courier_selection_keyboard,
     delivery_pending_keyboard, delivery_time_keyboard, edit_input_keyboard,
-    location_channel_keyboard, log_location_keyboard, log_order_keyboard,
+    log_location_keyboard, log_order_keyboard,
     main_keyboard,
     manager_cancelled_keyboard, manager_sent_keyboard, on_way_keyboard,
     orders_channel_keyboard, orders_page_keyboard, payment_keyboard, review_keyboard, seller_keyboard,
@@ -43,7 +43,8 @@ from app.utils import (
 )
 from app.utils.formatters import (
     STATUS_LABELS, all_locations_card, amount_text,
-    money, orders_channel_card, short_address,
+    delivery_order_message_url, location_channel_text, money,
+    orders_channel_card, short_address,
 )
 from app.utils.couriers import (
     courier_group_id, courier_option,
@@ -97,6 +98,13 @@ def _message_is_missing(error: Exception) -> bool:
     )
 
 
+def _retry_after_seconds(error: RetryAfter) -> float:
+    value = error.retry_after
+    if hasattr(value, "total_seconds"):
+        return max(1.0, float(value.total_seconds()))
+    return max(1.0, float(value))
+
+
 def _cleanup_error_is_permanent(error: Exception) -> bool:
     if isinstance(error, Forbidden):
         return True
@@ -118,12 +126,111 @@ def _order_sync_lock(application: Application, order_id: int) -> asyncio.Lock:
     return locks.setdefault(order_id, asyncio.Lock())
 
 
+def _location_publication_lock(application: Application) -> asyncio.Lock:
+    """Keep each four-message location block contiguous in the channel."""
+    lock = application.bot_data.get("location_publication_lock")
+    if lock is None:
+        lock = asyncio.Lock()
+        application.bot_data["location_publication_lock"] = lock
+    return lock
+
+
+def _publication_expectations(order) -> dict[str, int | None]:
+    """Snapshot every Telegram reference before clearing ``sync_needed``."""
+    return {
+        field: getattr(order, field)
+        for field in OrderRepository.publication_reference_fields
+    }
+
+
+def _record_publication_expectations(
+    expectations: dict[str, int | None] | None,
+    order,
+    fields,
+) -> None:
+    """Adopt only publication references changed by the current sync pass."""
+    if expectations is None or order is None:
+        return
+    for field in fields:
+        expectations[field] = getattr(order, field)
+
+
+def _mark_order_synced(repo: OrderRepository, order) -> bool:
+    """Mark only the exact business/publication generation as synchronized."""
+    return repo.mark_synced(
+        order.id,
+        expected_updated_at=order.updated_at,
+        expected_publications=_publication_expectations(order),
+    )
+
+
 async def _delete_message_quietly(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int) -> None:
     try:
         await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except ChatMigrated:
+        # The old basic-group message ID cannot safely be reused against the
+        # new supergroup sequence. Treat it as retired without guessing.
+        return
     except Exception as error:
         if not _message_is_missing(error):
             logger.warning("Could not remove superseded Telegram message %s/%s: %s", chat_id, message_id, error)
+
+
+async def _discard_unattached_messages(
+    context: ContextTypes.DEFAULT_TYPE,
+    order_id: int,
+    messages: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+) -> None:
+    """Durably delete Telegram sends that never became canonical DB refs.
+
+    Persistence can fail after Telegram has accepted a message.  Prefer the
+    SQLite cleanup outbox; if SQLite itself is unavailable, make a best-effort
+    direct deletion so the failure does not silently leave duplicate posts.
+    """
+    clean = [
+        (int(chat_id), int(message_id))
+        for chat_id, message_id in messages
+        if chat_id and message_id
+    ]
+    if not clean:
+        return
+    repo: OrderRepository | None = context.application.bot_data.get("repo")
+    persisted = False
+    if repo is not None:
+        try:
+            repo.enqueue_cleanup_messages(order_id, clean)
+            persisted = True
+        except Exception:
+            logger.exception(
+                "Could not persist cleanup for unattached Telegram messages of order %s",
+                order_id,
+            )
+    if persisted:
+        try:
+            await _process_cleanup_messages(context, order_id=order_id)
+        except RetryAfter as error:
+            # The durable outbox remains pending and the reconciliation worker
+            # will honor Telegram's retry window.
+            delay = _retry_after_seconds(error)
+            _schedule_sync_retry(
+                context,
+                order_id,
+                initial_delay=delay,
+            )
+            logger.warning(
+                "Telegram rate-limited unattached-message cleanup for order %s for %.1f seconds",
+                order_id,
+                delay,
+            )
+            raise
+        except Exception:
+            logger.exception(
+                "Could not process durable cleanup for order %s immediately",
+                order_id,
+            )
+        return
+    for chat_id, message_id in clean:
+        await _delete_message_quietly(context, chat_id, message_id)
 
 
 def _name(user) -> str:
@@ -528,24 +635,117 @@ def _waiting_pickup_reminder_messages(repo: OrderRepository) -> list[str]:
 async def _send_post_delivery_prompt(
     context: ContextTypes.DEFAULT_TYPE,
     order,
-) -> None:
-    """Ask for optional evidence without reopening or blocking the order."""
-    if not order.delivery_chat_id:
-        return
+):
+    """Create or refresh the optional evidence prompt exactly once.
+
+    ``post_delivery_prompt_required`` distinguishes newly completed orders
+    from historical rows, so a deploy never republishes old deliveries.
+    """
+    if (
+        order.status != "completed"
+        or not order.post_delivery_prompt_required
+        or not order.delivery_chat_id
+        or not order.delivery_message_id
+    ):
+        return order
+
+    repo: OrderRepository = context.application.bot_data["repo"]
+    courier = " ".join(
+        (order.courier_name or order.assigned_courier_name or "Курьер").split()
+    )[:100]
+    product = " ".join((order.product or "Без модели").split())[:200]
+    order_url = delivery_order_message_url(order)
+    backlink = (
+        f' (<a href="{escape(order_url, quote=True)}">'
+        f"Заказ{order.order_number}</a>)"
+        if order_url
+        else f" (Заказ{order.order_number})"
+    )
+    text = (
+        f"🚚 Заказ №{order.order_number} · {escape(product)}\n"
+        f"{escape(courier)}, отправьте фото и цену товара 📸💰"
+        f"{backlink}"
+    )
+
+    if order.post_delivery_prompt_chat_id and order.post_delivery_prompt_message_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=order.post_delivery_prompt_chat_id,
+                message_id=order.post_delivery_prompt_message_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            return order
+        except RetryAfter:
+            raise
+        except Exception as error:
+            if _message_is_not_modified(error):
+                return order
+            if not _message_is_missing(error):
+                raise
+            cleared = repo.update(
+                order.id,
+                expected_updated_at=order.updated_at,
+                expected_publications={
+                    "post_delivery_prompt_chat_id": order.post_delivery_prompt_chat_id,
+                    "post_delivery_prompt_message_id": order.post_delivery_prompt_message_id,
+                },
+                post_delivery_prompt_chat_id=None,
+                post_delivery_prompt_message_id=None,
+            )
+            if not cleared:
+                raise RuntimeError("Order changed while its delivery prompt was repaired")
+            order = cleared
+
+    sent = await context.bot.send_message(
+        chat_id=order.delivery_chat_id,
+        text=text,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+        reply_parameters=ReplyParameters(
+            message_id=order.delivery_message_id,
+            allow_sending_without_reply=False,
+        ),
+    )
+    if not isinstance(getattr(sent, "chat_id", None), int) or not isinstance(
+        getattr(sent, "message_id", None), int
+    ):
+        raise RuntimeError("Telegram returned an invalid delivery prompt reference")
+    candidate_message = [(sent.chat_id, sent.message_id)]
     try:
-        courier = " ".join(
-            (order.courier_name or order.assigned_courier_name or "Курьер").split()
-        )[:100]
-        product = " ".join((order.product or "Без модели").split())[:200]
-        await context.bot.send_message(
-            chat_id=order.delivery_chat_id,
-            text=(
-                f"🚚 Заказ №{order.order_number} · {product}\n"
-                f"{courier}, отправьте фото и цену товара 📸💰"
-            ),
+        updated = repo.update(
+            order.id,
+            expected_updated_at=order.updated_at,
+            expected_publications={
+                "delivery_chat_id": order.delivery_chat_id,
+                "delivery_message_id": order.delivery_message_id,
+                "post_delivery_prompt_chat_id": None,
+                "post_delivery_prompt_message_id": None,
+            },
+            post_delivery_prompt_chat_id=sent.chat_id,
+            post_delivery_prompt_message_id=sent.message_id,
         )
     except Exception:
-        logger.exception("Could not send optional delivery prompt for order %s", order.id)
+        await _discard_unattached_messages(context, order.id, candidate_message)
+        raise
+    if updated:
+        return updated
+    await _discard_unattached_messages(context, order.id, candidate_message)
+    # Another synchronizer may have won the optimistic race while this
+    # Telegram request was in flight.  Its prompt is canonical; return that
+    # fresh row after removing our duplicate so the delivery card can link to
+    # it immediately instead of waiting for a later retry.
+    current = repo.get(order.id)
+    if (
+        current
+        and current.status == "completed"
+        and current.post_delivery_prompt_required
+        and current.post_delivery_prompt_chat_id
+        and current.post_delivery_prompt_message_id
+    ):
+        return current
+    raise RuntimeError("Order changed while its delivery prompt was published")
 
 
 async def daily_delivery_log_action(
@@ -651,7 +851,12 @@ def _delivery_message(order):
     return courier_card(order), courier_keyboard(order)
 
 
-async def _refresh_delivery_message(context: ContextTypes.DEFAULT_TYPE, order) -> bool:
+async def _refresh_delivery_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    order,
+    *,
+    publication_expectations: dict[str, int | None] | None = None,
+) -> bool:
     if not order.delivery_chat_id or not order.delivery_message_id:
         return True
     text, keyboard = _delivery_message(order)
@@ -672,18 +877,62 @@ async def _refresh_delivery_message(context: ContextTypes.DEFAULT_TYPE, order) -
             return True
         if _message_is_missing(error):
             repo: OrderRepository = context.application.bot_data["repo"]
+            cleanup_messages = []
+            clear_fields = {
+                "delivery_chat_id": None,
+                "delivery_message_id": None,
+            }
+            if order.status in {"completed", "cancelled"}:
+                if (
+                    order.post_delivery_prompt_chat_id
+                    and order.post_delivery_prompt_message_id
+                ):
+                    cleanup_messages.append((
+                        order.post_delivery_prompt_chat_id,
+                        order.post_delivery_prompt_message_id,
+                    ))
+                clear_fields.update(
+                    post_delivery_prompt_required=0,
+                    post_delivery_prompt_chat_id=None,
+                    post_delivery_prompt_message_id=None,
+                )
+            expected_publications = {
+                field: getattr(order, field)
+                for field in clear_fields
+                if field.endswith(("_chat_id", "_message_id"))
+            }
             cleared = repo.update(
                 order.id,
                 expected_updated_at=order.updated_at,
-                delivery_chat_id=None,
-                delivery_message_id=None,
+                expected_publications=expected_publications,
+                cleanup_messages=cleanup_messages,
+                **clear_fields,
             )
+            if cleared:
+                _record_publication_expectations(
+                    publication_expectations,
+                    cleared,
+                    expected_publications,
+                )
             if order.status in {"completed", "cancelled"}:
                 logger.info(
                     "Closed delivery message disappeared for order %s; it will not be recreated",
                     order.id,
                 )
-                return cleared is not None
+                if not cleared:
+                    return False
+                cleanup_ok = await _process_cleanup_messages(
+                    context,
+                    order_id=order.id,
+                )
+                # Remove the now-dead backlink from any surviving location
+                # detail cards without recreating the closed order itself.
+                locations_ok = await _set_location_marker(
+                    context,
+                    cleared,
+                    publication_expectations=publication_expectations,
+                )
+                return cleanup_ok and locations_ok
             logger.warning("Delivery message disappeared for order %s; it will be recreated", order.id)
             return False
         logger.exception("Could not refresh delivery message for order %s", order.id)
@@ -700,7 +949,12 @@ def _manager_order_keyboard(order):
     return None
 
 
-async def _refresh_manager_message(context: ContextTypes.DEFAULT_TYPE, order) -> bool:
+async def _refresh_manager_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    order,
+    *,
+    publication_expectations: dict[str, int | None] | None = None,
+) -> bool:
     repo: OrderRepository = context.application.bot_data["repo"]
     if not order.manager_chat_id or not order.manager_message_id:
         # Closed orders already trigger a separate manager notification. Do
@@ -726,16 +980,33 @@ async def _refresh_manager_message(context: ContextTypes.DEFAULT_TYPE, order) ->
         ):
             logger.error("Telegram returned an invalid manager message reference for order %s", order.id)
             return False
-        updated = repo.update(
-            order.id,
-            expected_updated_at=order.updated_at,
-            manager_chat_id=sent.chat_id,
-            manager_message_id=sent.message_id,
-        )
+        candidate_message = [(sent.chat_id, sent.message_id)]
+        try:
+            updated = repo.update(
+                order.id,
+                expected_updated_at=order.updated_at,
+                expected_publications={
+                    "manager_chat_id": None,
+                    "manager_message_id": None,
+                },
+                manager_chat_id=sent.chat_id,
+                manager_message_id=sent.message_id,
+            )
+        except Exception:
+            await _discard_unattached_messages(
+                context,
+                order.id,
+                candidate_message,
+            )
+            raise
         if updated:
+            _record_publication_expectations(
+                publication_expectations,
+                updated,
+                ("manager_chat_id", "manager_message_id"),
+            )
             return True
-        repo.enqueue_cleanup_messages(order.id, [(sent.chat_id, sent.message_id)])
-        await _process_cleanup_messages(context, order_id=order.id)
+        await _discard_unattached_messages(context, order.id, candidate_message)
         return False
     try:
         await context.bot.edit_message_text(
@@ -756,17 +1027,35 @@ async def _refresh_manager_message(context: ContextTypes.DEFAULT_TYPE, order) ->
             cleared = repo.update(
                 order.id,
                 expected_updated_at=order.updated_at,
+                expected_publications={
+                    "manager_chat_id": order.manager_chat_id,
+                    "manager_message_id": order.manager_message_id,
+                },
                 manager_chat_id=None,
                 manager_message_id=None,
             )
             if cleared:
-                return await _refresh_manager_message(context, cleared)
+                _record_publication_expectations(
+                    publication_expectations,
+                    cleared,
+                    ("manager_chat_id", "manager_message_id"),
+                )
+                return await _refresh_manager_message(
+                    context,
+                    cleared,
+                    publication_expectations=publication_expectations,
+                )
             return False
         logger.exception("Could not refresh manager message for order %s", order.id)
         return False
 
 
-async def _refresh_orders_channel_message(context: ContextTypes.DEFAULT_TYPE, order) -> bool:
+async def _refresh_orders_channel_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    order,
+    *,
+    publication_expectations: dict[str, int | None] | None = None,
+) -> bool:
     """Create or update the single shared manager-journal card for an order."""
     settings: Settings = context.application.bot_data["settings"]
     channel_id = getattr(settings, "orders_channel_id", None)
@@ -794,16 +1083,33 @@ async def _refresh_orders_channel_message(context: ContextTypes.DEFAULT_TYPE, or
         ):
             logger.error("Telegram returned an invalid orders-channel reference for order %s", order.id)
             return False
-        updated = repo.update(
-            order.id,
-            expected_updated_at=order.updated_at,
-            orders_channel_chat_id=sent.chat_id,
-            orders_channel_message_id=sent.message_id,
-        )
+        candidate_message = [(sent.chat_id, sent.message_id)]
+        try:
+            updated = repo.update(
+                order.id,
+                expected_updated_at=order.updated_at,
+                expected_publications={
+                    "orders_channel_chat_id": None,
+                    "orders_channel_message_id": None,
+                },
+                orders_channel_chat_id=sent.chat_id,
+                orders_channel_message_id=sent.message_id,
+            )
+        except Exception:
+            await _discard_unattached_messages(
+                context,
+                order.id,
+                candidate_message,
+            )
+            raise
         if updated:
+            _record_publication_expectations(
+                publication_expectations,
+                updated,
+                ("orders_channel_chat_id", "orders_channel_message_id"),
+            )
             return True
-        repo.enqueue_cleanup_messages(order.id, [(sent.chat_id, sent.message_id)])
-        await _process_cleanup_messages(context, order_id=order.id)
+        await _discard_unattached_messages(context, order.id, candidate_message)
         return False
     try:
         await context.bot.edit_message_text(
@@ -824,22 +1130,162 @@ async def _refresh_orders_channel_message(context: ContextTypes.DEFAULT_TYPE, or
             cleared = repo.update(
                 order.id,
                 expected_updated_at=order.updated_at,
+                expected_publications={
+                    "orders_channel_chat_id": order.orders_channel_chat_id,
+                    "orders_channel_message_id": order.orders_channel_message_id,
+                },
                 orders_channel_chat_id=None,
                 orders_channel_message_id=None,
             )
             if cleared:
-                return await _refresh_orders_channel_message(context, cleared)
+                _record_publication_expectations(
+                    publication_expectations,
+                    cleared,
+                    ("orders_channel_chat_id", "orders_channel_message_id"),
+                )
+                return await _refresh_orders_channel_message(
+                    context,
+                    cleared,
+                    publication_expectations=publication_expectations,
+                )
             return False
         logger.exception("Could not refresh orders-channel card for order %s", order.id)
         return False
+
+
+def _location_publication_ids(order, location_number: int) -> tuple[int | None, ...]:
+    prefix = "second_" if location_number == 2 else ""
+    return (
+        getattr(order, f"{prefix}location_chat_id"),
+        getattr(order, f"{prefix}location_header_message_id"),
+        getattr(order, f"{prefix}location_message_id"),
+        getattr(order, f"{prefix}location_details_message_id"),
+        getattr(order, f"{prefix}location_footer_message_id"),
+    )
+
+
+def _location_publication_expectations(order, location_number: int) -> dict[str, int | None]:
+    """Return the exact canonical references for one four-message block."""
+    prefix = "second_" if location_number == 2 else ""
+    return {
+        f"{prefix}location_chat_id": getattr(order, f"{prefix}location_chat_id"),
+        f"{prefix}location_header_message_id": getattr(
+            order,
+            f"{prefix}location_header_message_id",
+        ),
+        f"{prefix}location_message_id": getattr(order, f"{prefix}location_message_id"),
+        f"{prefix}location_details_message_id": getattr(
+            order,
+            f"{prefix}location_details_message_id",
+        ),
+        f"{prefix}location_footer_message_id": getattr(
+            order,
+            f"{prefix}location_footer_message_id",
+        ),
+    }
+
+
+async def _retire_location_publication(
+    context: ContextTypes.DEFAULT_TYPE,
+    repo: OrderRepository,
+    order,
+    location_number: int,
+    *,
+    publication_expectations: dict[str, int | None] | None = None,
+) -> bool:
+    """Clear a broken block and durably remove every surviving message."""
+    chat_id, *message_ids = _location_publication_ids(order, location_number)
+    prefix = "second_" if location_number == 2 else ""
+    cleanup_messages = [
+        (chat_id, message_id)
+        for message_id in message_ids
+        if chat_id and message_id
+    ]
+    cleared = repo.update(
+        order.id,
+        expected_updated_at=order.updated_at,
+        expected_publications=_location_publication_expectations(
+            order,
+            location_number,
+        ),
+        cleanup_messages=cleanup_messages,
+        **{
+            f"{prefix}location_chat_id": None,
+            f"{prefix}location_header_message_id": None,
+            f"{prefix}location_message_id": None,
+            f"{prefix}location_details_message_id": None,
+            f"{prefix}location_footer_message_id": None,
+        },
+    )
+    if not cleared:
+        return False
+    _record_publication_expectations(
+        publication_expectations,
+        cleared,
+        _location_publication_expectations(cleared, location_number),
+    )
+    return await _process_cleanup_messages(context, order_id=order.id)
+
+
+async def _replace_location_publication(
+    context: ContextTypes.DEFAULT_TYPE,
+    repo: OrderRepository,
+    order,
+    location_number: int,
+):
+    """Publish a complete block before atomically retiring the old block."""
+    old_chat_id, *old_message_ids = _location_publication_ids(order, location_number)
+    old_messages = [
+        (old_chat_id, message_id)
+        for message_id in old_message_ids
+        if old_chat_id and message_id
+    ]
+    fields = await _send_location_messages(context, order, location_number)
+    prefix = "second_" if location_number == 2 else ""
+    new_chat_id = fields[f"{prefix}location_chat_id"]
+    new_message_ids = (
+        fields[f"{prefix}location_header_message_id"],
+        fields[f"{prefix}location_message_id"],
+        fields[f"{prefix}location_details_message_id"],
+        fields[f"{prefix}location_footer_message_id"],
+    )
+    candidate_messages = [
+        (new_chat_id, message_id)
+        for message_id in new_message_ids
+    ]
+    try:
+        updated = repo.update(
+            order.id,
+            expected_updated_at=order.updated_at,
+            expected_publications=_location_publication_expectations(
+                order,
+                location_number,
+            ),
+            cleanup_messages=old_messages,
+            **fields,
+        )
+    except Exception:
+        await _discard_unattached_messages(
+            context,
+            order.id,
+            candidate_messages,
+        )
+        raise
+    if not updated:
+        await _discard_unattached_messages(context, order.id, candidate_messages)
+        return None
+    await _process_cleanup_messages(context, order_id=order.id)
+    return updated
 
 
 async def _set_location_marker(
     context: ContextTypes.DEFAULT_TYPE,
     order,
     location_number: int | None = None,
+    *,
+    publication_expectations: dict[str, int | None] | None = None,
 ) -> bool:
-    """Refresh the functional pin buttons and migrate legacy location replies."""
+    """Refresh location text/backlinks and retire the old button layout."""
     numbers = (location_number,) if location_number else (1, 2)
     success = True
     repo: OrderRepository = context.application.bot_data["repo"]
@@ -847,93 +1293,125 @@ async def _set_location_marker(
         order = repo.get(order.id)
         if not order:
             return False
-        if number == 2:
-            chat_id = order.second_location_chat_id
-            message_id = order.second_location_message_id
-            details_message_id = order.second_location_details_message_id
-            footer_message_id = order.second_location_footer_message_id
-            details_field = "second_location_details_message_id"
-        else:
-            chat_id = order.location_chat_id
-            message_id = order.location_message_id
-            details_message_id = order.location_details_message_id
-            footer_message_id = order.location_footer_message_id
-            details_field = "location_details_message_id"
-        if not chat_id or not message_id:
+        chat_id, header_id, pin_id, details_id, footer_id = (
+            _location_publication_ids(order, number)
+        )
+        publication_ids = (chat_id, header_id, pin_id, details_id, footer_id)
+        if not any(publication_ids):
             continue
 
+        complete_block = all(publication_ids)
+        if not complete_block:
+            # Existing three-message blocks are upgraded only while the order
+            # is active. Historical completed deliveries are never reposted
+            # during a deployment.
+            if order.status in DELIVERY_ACTIVE_STATUSES:
+                try:
+                    replaced = await _replace_location_publication(
+                        context,
+                        repo,
+                        order,
+                        number,
+                    )
+                except RetryAfter:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "Could not upgrade location %s block for order %s",
+                        number,
+                        order.id,
+                    )
+                    replaced = None
+                if not replaced:
+                    success = False
+                else:
+                    _record_publication_expectations(
+                        publication_expectations,
+                        replaced,
+                        _location_publication_expectations(replaced, number),
+                    )
+            # A closed incomplete block can be the valid historical
+            # header/pin/footer layout migrated from schema v6.  Preserve it:
+            # closed orders must not be republished or have their old pins
+            # deleted merely because they predate the new text card.
+            continue
+
+        missing = False
         try:
             await context.bot.edit_message_reply_markup(
                 chat_id=chat_id,
-                message_id=message_id,
-                reply_markup=location_channel_keyboard(
-                    order,
-                    location_number=number,
-                ),
+                message_id=pin_id,
+                reply_markup=None,
             )
         except RetryAfter:
             raise
         except Exception as error:
-            if not _message_is_not_modified(error):
+            if _message_is_missing(error):
+                missing = True
+            elif not _message_is_not_modified(error):
+                logger.exception(
+                    "Could not remove location %s buttons for order %s",
+                    number,
+                    order.id,
+                )
+                success = False
+
+        if not missing:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=details_id,
+                    text=location_channel_text(order, number),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            except RetryAfter:
+                raise
+            except Exception as error:
                 if _message_is_missing(error):
-                    prefix = "second_" if number == 2 else ""
-                    cleanup_messages = [
-                        (chat_id, cleanup_id)
-                        for cleanup_id in (details_message_id, message_id, footer_message_id)
-                        if cleanup_id
-                    ]
-                    cleared = repo.transition(
-                        order.id,
-                        {order.status},
-                        expected_updated_at=order.updated_at,
-                        cleanup_messages=cleanup_messages,
-                        **{
-                            f"{prefix}location_chat_id": None,
-                            f"{prefix}location_message_id": None,
-                            f"{prefix}location_details_message_id": None,
-                            f"{prefix}location_footer_message_id": None,
-                        },
-                    )
-                    if cleared:
-                        await _process_cleanup_messages(context, order_id=order.id)
-                    logger.warning(
-                        "Location pin %s disappeared for order %s; it will be recreated",
-                        number,
-                        order.id,
-                    )
-                else:
+                    missing = True
+                elif not _message_is_not_modified(error):
                     logger.exception(
-                        "Could not validate location %s pin for order %s",
+                        "Could not refresh location %s text for order %s",
                         number,
                         order.id,
                     )
-                success = False
-                continue
+                    success = False
 
-        # Rows created before the separator feature used the details field for
-        # an explanatory reply below the pin. Without a footer it is legacy
-        # text, so remove it instead of turning it into a misplaced separator.
-        if details_message_id and not footer_message_id:
-            cleaned = repo.transition(
-                order.id,
-                {order.status},
-                expected_updated_at=order.updated_at,
-                cleanup_messages=[(chat_id, details_message_id)],
-                **{details_field: None},
-            )
-            if not cleaned:
+        if missing and order.status in DELIVERY_ACTIVE_STATUSES:
+            try:
+                replaced = await _replace_location_publication(
+                    context,
+                    repo,
+                    order,
+                    number,
+                )
+            except RetryAfter:
+                raise
+            except Exception:
+                logger.exception(
+                    "Could not repair location %s block for order %s",
+                    number,
+                    order.id,
+                )
+                replaced = None
+            if not replaced:
                 success = False
-                continue
-            if not await _process_cleanup_messages(context, order_id=order.id):
+            else:
+                _record_publication_expectations(
+                    publication_expectations,
+                    replaced,
+                    _location_publication_expectations(replaced, number),
+                )
+        elif missing:
+            if not await _retire_location_publication(
+                context,
+                repo,
+                order,
+                number,
+                publication_expectations=publication_expectations,
+            ):
                 success = False
-            details_message_id = None
-
-        # The header and footer are static decoration. Re-editing them during
-        # every status/courier change adds two Telegram API requests per pin
-        # and a timeout used to make the whole order look unsynchronized even
-        # though every functional card and button had already been updated.
-        # They are created together with the pin and removed when the location
-        # is replaced, so there is nothing to refresh here.
     return success
 
 
@@ -942,12 +1420,14 @@ def _location_publication_fields(
     *,
     chat_id: int,
     message_id: int,
+    header_message_id: int | None = None,
     details_message_id: int | None = None,
     footer_message_id: int | None = None,
 ) -> dict:
     prefix = "second_" if location_number == 2 else ""
     return {
         f"{prefix}location_chat_id": chat_id,
+        f"{prefix}location_header_message_id": header_message_id,
         f"{prefix}location_message_id": message_id,
         f"{prefix}location_details_message_id": details_message_id,
         f"{prefix}location_footer_message_id": footer_message_id,
@@ -967,38 +1447,70 @@ async def _send_location_messages(
         raise ValueError("Order has no coordinates")
     settings: Settings = context.application.bot_data["settings"]
     published: list[tuple[int, int]] = []
-    try:
-        header = await context.bot.send_message(
-            chat_id=settings.location_channel_id,
-            text=LOCATION_SEPARATOR,
-        )
-        published.append((header.chat_id, header.message_id))
-        pin = await context.bot.send_location(
-            chat_id=settings.location_channel_id,
-            latitude=latitude,
-            longitude=longitude,
-            reply_markup=location_channel_keyboard(order, location_number=location_number),
-        )
-        published.append((pin.chat_id, pin.message_id))
-        footer = await context.bot.send_message(
-            chat_id=settings.location_channel_id,
-            text=LOCATION_SEPARATOR,
-        )
-        published.append((footer.chat_id, footer.message_id))
-    except Exception:
-        repo: OrderRepository | None = context.application.bot_data.get("repo")
-        if repo and published:
-            repo.enqueue_cleanup_messages(order.id, published)
-            await _process_cleanup_messages(context, order_id=order.id)
-        else:
-            for chat_id, message_id in published:
-                await _delete_message_quietly(context, chat_id, message_id)
-        raise
+    async with _location_publication_lock(context.application):
+        try:
+            header = await context.bot.send_message(
+                chat_id=settings.location_channel_id,
+                text=LOCATION_SEPARATOR,
+            )
+            published.append((header.chat_id, header.message_id))
+            pin = await context.bot.send_location(
+                chat_id=settings.location_channel_id,
+                latitude=latitude,
+                longitude=longitude,
+            )
+            published.append((pin.chat_id, pin.message_id))
+            details = await context.bot.send_message(
+                chat_id=settings.location_channel_id,
+                text=location_channel_text(order, location_number),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            published.append((details.chat_id, details.message_id))
+            footer = await context.bot.send_message(
+                chat_id=settings.location_channel_id,
+                text=LOCATION_SEPARATOR,
+            )
+            published.append((footer.chat_id, footer.message_id))
+        except asyncio.CancelledError:
+            # Cancellation must not strand the already-sent beginning of a
+            # four-message block.  Persist cleanup synchronously before the
+            # cancellation is re-raised; the background outbox worker will
+            # remove it safely after restart/shutdown.
+            repo: OrderRepository | None = context.application.bot_data.get("repo")
+            if repo and published:
+                try:
+                    repo.enqueue_cleanup_messages(order.id, published)
+                except Exception:
+                    logger.exception(
+                        "Could not persist cancelled location cleanup for order %s",
+                        order.id,
+                    )
+                    for chat_id, message_id in published:
+                        try:
+                            await asyncio.shield(
+                                _delete_message_quietly(context, chat_id, message_id)
+                            )
+                        except asyncio.CancelledError:
+                            break
+            else:
+                for chat_id, message_id in published:
+                    try:
+                        await asyncio.shield(
+                            _delete_message_quietly(context, chat_id, message_id)
+                        )
+                    except asyncio.CancelledError:
+                        break
+            raise
+        except Exception:
+            await _discard_unattached_messages(context, order.id, published)
+            raise
     return _location_publication_fields(
         location_number,
         chat_id=pin.chat_id,
+        header_message_id=header.message_id,
         message_id=pin.message_id,
-        details_message_id=header.message_id,
+        details_message_id=details.message_id,
         footer_message_id=footer.message_id,
     )
 
@@ -1010,26 +1522,47 @@ async def _publish_location(
     location_number: int = 1,
 ):
     update_fields = await _send_location_messages(context, order, location_number)
-    updated = repo.update(
-        order.id,
-        expected_updated_at=order.updated_at,
-        **update_fields,
-    )
+    prefix = "second_" if location_number == 2 else ""
+    candidate_messages = [
+        (update_fields[f"{prefix}location_chat_id"], message_id)
+        for message_id in (
+            update_fields[f"{prefix}location_header_message_id"],
+            update_fields[f"{prefix}location_message_id"],
+            update_fields[f"{prefix}location_details_message_id"],
+            update_fields[f"{prefix}location_footer_message_id"],
+        )
+    ]
+    try:
+        updated = repo.update(
+            order.id,
+            expected_updated_at=order.updated_at,
+            expected_publications={
+                f"{prefix}location_chat_id": None,
+                f"{prefix}location_header_message_id": None,
+                f"{prefix}location_message_id": None,
+                f"{prefix}location_details_message_id": None,
+                f"{prefix}location_footer_message_id": None,
+            },
+            **update_fields,
+        )
+    except Exception:
+        await _discard_unattached_messages(context, order.id, candidate_messages)
+        raise
     if updated:
         return updated
-    repo.enqueue_cleanup_messages(
-        order.id,
-        [
-            (update_fields[f"{'second_' if location_number == 2 else ''}location_chat_id"], message_id)
-            for message_id in (
-                update_fields[f"{'second_' if location_number == 2 else ''}location_details_message_id"],
-                update_fields[f"{'second_' if location_number == 2 else ''}location_message_id"],
-                update_fields[f"{'second_' if location_number == 2 else ''}location_footer_message_id"],
-            )
-        ],
-    )
-    await _process_cleanup_messages(context, order_id=order.id)
+    await _discard_unattached_messages(context, order.id, candidate_messages)
     raise RuntimeError("Order changed while its location was being published")
+
+
+def _cleanup_retry_remaining(application: Application) -> float:
+    deadline = application.bot_data.get("cleanup_retry_not_before")
+    if deadline is None:
+        return 0.0
+    remaining = float(deadline) - asyncio.get_running_loop().time()
+    if remaining <= 0:
+        application.bot_data.pop("cleanup_retry_not_before", None)
+        return 0.0
+    return remaining
 
 
 async def _process_cleanup_messages(
@@ -1039,6 +1572,8 @@ async def _process_cleanup_messages(
     limit: int = 100,
 ) -> bool:
     """Delete superseded Telegram publications from the durable outbox."""
+    if _cleanup_retry_remaining(context.application) > 0:
+        return False
     repo: OrderRepository = context.application.bot_data["repo"]
     success = True
     for item in repo.list_cleanup_messages(limit=limit, order_id=order_id):
@@ -1047,8 +1582,23 @@ async def _process_cleanup_messages(
                 chat_id=item["chat_id"],
                 message_id=item["message_id"],
             )
-        except RetryAfter:
+        except RetryAfter as error:
+            delay = _retry_after_seconds(error)
+            deadline = asyncio.get_running_loop().time() + delay
+            previous = context.application.bot_data.get(
+                "cleanup_retry_not_before",
+                0.0,
+            )
+            context.application.bot_data["cleanup_retry_not_before"] = max(
+                float(previous),
+                deadline,
+            )
             raise
+        except ChatMigrated:
+            # A migrated basic group has a different message-ID sequence.
+            # Retire the stale cleanup item instead of probing the new group
+            # with an unrelated ID eight times.
+            repo.mark_cleanup_done(item["id"])
         except Exception as error:
             if _message_is_missing(error):
                 repo.mark_cleanup_done(item["id"])
@@ -1108,7 +1658,31 @@ def _known_delivery_groups(settings: Settings) -> frozenset[int]:
 
 async def _sync_order(context: ContextTypes.DEFAULT_TYPE, order_id: int) -> tuple[object | None, bool]:
     async with _order_sync_lock(context.application, order_id):
+        # Recheck after acquiring the per-order lock. Another request may have
+        # received a newer Telegram RetryAfter while this worker was queued;
+        # entering Telegram before that deadline would immediately extend the
+        # flood wait again.
+        if _sync_retry_remaining(context.application, order_id) > 0:
+            repo = context.application.bot_data.get("repo")
+            return (repo.get(order_id) if repo is not None else None), False
         return await _sync_order_locked(context, order_id)
+
+
+async def _sync_order_foreground(
+    context: ContextTypes.DEFAULT_TYPE,
+    order_id: int,
+) -> tuple[object | None, bool]:
+    """Synchronize from a user update without surfacing Telegram flood waits."""
+    try:
+        return await _sync_order(context, order_id)
+    except RetryAfter as error:
+        _schedule_sync_retry(
+            context,
+            order_id,
+            initial_delay=_retry_after_seconds(error),
+        )
+        repo = context.application.bot_data.get("repo")
+        return (repo.get(order_id) if repo is not None else None), False
 
 
 def _reset_mismatched_publications(
@@ -1117,13 +1691,27 @@ def _reset_mismatched_publications(
     order,
 ):
     """Clear references that belong to chats replaced in environment config."""
-    fields: dict[str, None] = {}
+    fields: dict[str, int | None] = {}
     cleanup: list[tuple[int, int]] = []
     expected_delivery_chat_id = _target_delivery_group(settings, order)
     if order.delivery_chat_id and order.delivery_chat_id != expected_delivery_chat_id:
         if order.delivery_message_id:
             cleanup.append((order.delivery_chat_id, order.delivery_message_id))
-        fields.update(delivery_chat_id=None, delivery_message_id=None)
+        if (
+            order.post_delivery_prompt_chat_id
+            and order.post_delivery_prompt_message_id
+        ):
+            cleanup.append((
+                order.post_delivery_prompt_chat_id,
+                order.post_delivery_prompt_message_id,
+            ))
+        fields.update(
+            delivery_chat_id=None,
+            delivery_message_id=None,
+            post_delivery_prompt_required=0,
+            post_delivery_prompt_chat_id=None,
+            post_delivery_prompt_message_id=None,
+        )
     orders_channel_id = getattr(settings, "orders_channel_id", None)
     if (
         orders_channel_id
@@ -1137,8 +1725,9 @@ def _reset_mismatched_publications(
         chat_id = getattr(order, f"{prefix}location_chat_id")
         if chat_id and chat_id != settings.location_channel_id:
             for suffix in (
-                "location_details_message_id",
+                "location_header_message_id",
                 "location_message_id",
+                "location_details_message_id",
                 "location_footer_message_id",
             ):
                 message_id = getattr(order, f"{prefix}{suffix}")
@@ -1146,6 +1735,7 @@ def _reset_mismatched_publications(
                     cleanup.append((chat_id, message_id))
             fields.update({
                 f"{prefix}location_chat_id": None,
+                f"{prefix}location_header_message_id": None,
                 f"{prefix}location_message_id": None,
                 f"{prefix}location_details_message_id": None,
                 f"{prefix}location_footer_message_id": None,
@@ -1155,10 +1745,14 @@ def _reset_mismatched_publications(
     # Clear references and enqueue their cleanup in the same SQLite
     # transaction. If the optimistic guard loses a race, the still-canonical
     # old messages must not be scheduled for deletion.
-    return repo.transition(
+    return repo.update(
         order.id,
-        {order.status},
         expected_updated_at=order.updated_at,
+        expected_publications={
+            field: getattr(order, field)
+            for field in fields
+            if field.endswith(("_chat_id", "_message_id"))
+        },
         cleanup_messages=cleanup,
         **fields,
     )
@@ -1183,6 +1777,23 @@ async def _sync_order_locked(context: ContextTypes.DEFAULT_TYPE, order_id: int) 
             return None, False
     else:
         return order, False
+    pass_updated_at = order.updated_at
+    expected_publications = _publication_expectations(order)
+
+    def reload_generation():
+        latest = repo.get(order_id)
+        return latest, bool(
+            latest
+            and latest.updated_at == pass_updated_at
+            and _publication_expectations(latest) == expected_publications
+        )
+
+    def adopt_publications(latest, fields) -> None:
+        if latest is None:
+            return
+        for field in fields:
+            expected_publications[field] = getattr(latest, field)
+
     success = True
     should_publish = _order_should_be_in_delivery_group(order)
     may_create_publications = order.status in DELIVERY_ACTIVE_STATUSES
@@ -1197,15 +1808,35 @@ async def _sync_order_locked(context: ContextTypes.DEFAULT_TYPE, order_id: int) 
                 disable_web_page_preview=True,
                 reply_markup=keyboard,
             )
-            order = repo.update(
-                order.id,
-                expected_updated_at=order.updated_at,
-                delivery_chat_id=sent.chat_id,
-                delivery_message_id=sent.message_id,
-            )
+            candidate_message = [(sent.chat_id, sent.message_id)]
+            try:
+                order = repo.update(
+                    order.id,
+                    expected_updated_at=order.updated_at,
+                    expected_publications={
+                        "delivery_chat_id": order.delivery_chat_id,
+                        "delivery_message_id": order.delivery_message_id,
+                    },
+                    delivery_chat_id=sent.chat_id,
+                    delivery_message_id=sent.message_id,
+                )
+                adopt_publications(
+                    order,
+                    ("delivery_chat_id", "delivery_message_id"),
+                )
+            except Exception:
+                await _discard_unattached_messages(
+                    context,
+                    order_id,
+                    candidate_message,
+                )
+                raise
             if not order:
-                repo.enqueue_cleanup_messages(order_id, [(sent.chat_id, sent.message_id)])
-                await _process_cleanup_messages(context, order_id=order_id)
+                await _discard_unattached_messages(
+                    context,
+                    order_id,
+                    candidate_message,
+                )
                 success = False
         except RetryAfter:
             raise
@@ -1213,66 +1844,244 @@ async def _sync_order_locked(context: ContextTypes.DEFAULT_TYPE, order_id: int) 
             success = False
             logger.exception("Could not publish delivery message for order %s", order_id)
 
+    order, same_generation = reload_generation()
+    if not same_generation:
+        return order, False
+
     if should_publish:
         for location_number in (1, 2):
-            order = repo.get(order_id)
-            if location_number == 2:
-                has_coordinates = order.second_latitude is not None and order.second_longitude is not None
-                has_pin = bool(order.second_location_chat_id and order.second_location_message_id)
-            else:
-                has_coordinates = order.latitude is not None and order.longitude is not None
-                has_pin = bool(order.location_chat_id and order.location_message_id)
+            order, same_generation = reload_generation()
+            if not same_generation:
+                return order, False
+            prefix = "second_" if location_number == 2 else ""
+            has_coordinates = (
+                getattr(order, f"{prefix}latitude") is not None
+                and getattr(order, f"{prefix}longitude") is not None
+            )
             if not has_coordinates:
                 continue
-            if not has_pin:
-                if not may_create_publications:
-                    continue
-                try:
+            publication_ids = _location_publication_ids(order, location_number)
+            if all(publication_ids) or not may_create_publications:
+                continue
+            try:
+                if any(publication_ids):
+                    order = await _replace_location_publication(
+                        context,
+                        repo,
+                        order,
+                        location_number,
+                    )
+                    if not order:
+                        success = False
+                else:
                     order = await _publish_location(context, repo, order, location_number)
-                except RetryAfter:
-                    raise
-                except Exception:
-                    success = False
-                    logger.exception("Could not publish location %s for order %s", location_number, order_id)
+                if order:
+                    adopt_publications(
+                        order,
+                        _location_publication_expectations(
+                            order,
+                            location_number,
+                        ),
+                    )
+            except RetryAfter:
+                raise
+            except Exception:
+                success = False
+                logger.exception("Could not publish location %s for order %s", location_number, order_id)
 
-        order = repo.get(order_id)
-        if order and not await _set_location_marker(context, order):
+            order, same_generation = reload_generation()
+            if not same_generation:
+                return order, False
+
+    # Existing location blocks also need refreshing after a closed main card
+    # disappears.  Keep this outside ``should_publish`` so a retry can remove
+    # a dead backlink without ever recreating a historical order or pin.
+    order, same_generation = reload_generation()
+    if not same_generation:
+        return order, False
+    locations_ok = await _set_location_marker(
+        context,
+        order,
+        publication_expectations=expected_publications,
+    )
+    if not locations_ok:
+        success = False
+    order, same_generation = reload_generation()
+    if not same_generation:
+        return order, False
+
+    # Validate the canonical order post before creating a linked completion
+    # prompt.  Otherwise Telegram's reply fallback could briefly publish a
+    # prompt whose target was already deleted.
+    if order.delivery_message_id:
+        if not await _refresh_delivery_message(
+            context,
+            order,
+            publication_expectations=expected_publications,
+        ):
             success = False
-        order = repo.get(order_id)
-        if order and order.delivery_message_id and not await _refresh_delivery_message(context, order):
+    order, same_generation = reload_generation()
+    if not same_generation:
+        return order, False
+    if (
+        order
+        and order.status == "completed"
+        and order.post_delivery_prompt_required
+        and order.delivery_chat_id
+        and order.delivery_message_id
+    ):
+        previous_prompt = (
+            order.post_delivery_prompt_chat_id,
+            order.post_delivery_prompt_message_id,
+        )
+        try:
+            order = await _send_post_delivery_prompt(context, order)
+            adopt_publications(
+                order,
+                (
+                    "post_delivery_prompt_chat_id",
+                    "post_delivery_prompt_message_id",
+                ),
+            )
+        except RetryAfter:
+            raise
+        except Exception:
+            success = False
+            logger.exception(
+                "Could not synchronize delivery prompt for order %s",
+                order_id,
+            )
+            order, same_generation = reload_generation()
+            if not same_generation:
+                return order, False
+        current_prompt = (
+            getattr(order, "post_delivery_prompt_chat_id", None),
+            getattr(order, "post_delivery_prompt_message_id", None),
+        )
+        if (
+            order
+            and current_prompt != previous_prompt
+            and order.delivery_message_id
+            and not await _refresh_delivery_message(
+                context,
+                order,
+                publication_expectations=expected_publications,
+            )
+        ):
             success = False
 
-    order = repo.get(order_id)
-    if not order or not await _refresh_manager_message(context, order):
+        order, same_generation = reload_generation()
+        if not same_generation:
+            return order, False
+
+    order, same_generation = reload_generation()
+    if not same_generation:
+        return order, False
+    if not await _refresh_manager_message(
+        context,
+        order,
+        publication_expectations=expected_publications,
+    ):
         success = False
-    order = repo.get(order_id)
-    if not order or not await _refresh_orders_channel_message(context, order):
+    order, same_generation = reload_generation()
+    if not same_generation:
+        return order, False
+    if not await _refresh_orders_channel_message(
+        context,
+        order,
+        publication_expectations=expected_publications,
+    ):
         success = False
-    order = repo.get(order_id)
+    order, same_generation = reload_generation()
+    if not same_generation:
+        return order, False
     if success and order.sync_needed:
-        repo.mark_synced(order.id, expected_updated_at=order.updated_at)
+        if not _mark_order_synced(repo, order):
+            success = False
         order = repo.get(order_id)
     return order, success
 
 
-async def _retry_order_sync(application: Application, order_id: int) -> None:
+def _sync_retry_remaining(application: Application, order_id: int) -> float:
+    deadlines: dict[int, float] = application.bot_data.setdefault(
+        "sync_retry_not_before",
+        {},
+    )
+    deadline = deadlines.get(order_id)
+    if deadline is None:
+        return 0.0
+    remaining = deadline - asyncio.get_running_loop().time()
+    if remaining <= 0:
+        deadlines.pop(order_id, None)
+        return 0.0
+    return remaining
+
+
+async def _retry_order_sync(
+    application: Application,
+    order_id: int,
+    *,
+    initial_delay: float | None = None,
+) -> None:
     pending: set[int] = application.bot_data.setdefault("sync_retry_orders", set())
     try:
         context = SimpleNamespace(application=application, bot=application.bot)
-        for delay in (2, 10, 30):
+        delays = iter((initial_delay if initial_delay is not None else 2, 10, 30))
+        delay = next(delays)
+        while True:
             await asyncio.sleep(delay)
+            # A later Telegram RetryAfter can extend an already-running
+            # generic retry task.  Recheck the shared monotonic deadline after
+            # every sleep so no request is made before the flood wait expires.
+            while (remaining := _sync_retry_remaining(application, order_id)) > 0:
+                await asyncio.sleep(remaining)
             order = application.bot_data["repo"].get(order_id)
             if not order or not order.sync_needed:
                 return
-            _, success = await _sync_order(context, order_id)
+            try:
+                _, success = await _sync_order(context, order_id)
+            except RetryAfter as error:
+                delay = _retry_after_seconds(error)
+                deadlines: dict[int, float] = application.bot_data.setdefault(
+                    "sync_retry_not_before",
+                    {},
+                )
+                deadline = asyncio.get_running_loop().time() + delay
+                deadlines[order_id] = max(deadlines.get(order_id, 0.0), deadline)
+                logger.warning(
+                    "Telegram rate-limited order %s synchronization for %.1f seconds",
+                    order_id,
+                    delay,
+                )
+                continue
             if success:
+                return
+            try:
+                delay = next(delays)
+            except StopIteration:
                 return
     finally:
         pending.discard(order_id)
+        deadlines = application.bot_data.get("sync_retry_not_before", {})
+        deadline = deadlines.get(order_id)
+        if deadline is not None and deadline <= asyncio.get_running_loop().time():
+            deadlines.pop(order_id, None)
 
 
-def _schedule_sync_retry(context: ContextTypes.DEFAULT_TYPE, order_id: int) -> None:
+def _schedule_sync_retry(
+    context: ContextTypes.DEFAULT_TYPE,
+    order_id: int,
+    *,
+    initial_delay: float | None = None,
+) -> None:
     pending: set[int] = context.application.bot_data.setdefault("sync_retry_orders", set())
+    if initial_delay is not None:
+        deadlines: dict[int, float] = context.application.bot_data.setdefault(
+            "sync_retry_not_before",
+            {},
+        )
+        deadline = asyncio.get_running_loop().time() + max(1.0, initial_delay)
+        deadlines[order_id] = max(deadlines.get(order_id, 0.0), deadline)
     if order_id in pending:
         return
     create_task = getattr(context.application, "create_task", None)
@@ -1281,7 +2090,11 @@ def _schedule_sync_retry(context: ContextTypes.DEFAULT_TYPE, order_id: int) -> N
         return
     pending.add(order_id)
     create_task(
-        _retry_order_sync(context.application, order_id),
+        _retry_order_sync(
+            context.application,
+            order_id,
+            initial_delay=initial_delay,
+        ),
         name=f"delivery-sync-{order_id}",
     )
 
@@ -1304,6 +2117,16 @@ async def _finish_status_change_locked(
     text: str,
     keyboard,
 ) -> bool:
+    pass_updated_at = order.updated_at
+    expected_publications = _publication_expectations(order)
+
+    def generation_is_current(latest) -> bool:
+        return bool(
+            latest
+            and latest.updated_at == pass_updated_at
+            and _publication_expectations(latest) == expected_publications
+        )
+
     success = True
     try:
         await query.edit_message_text(
@@ -1312,27 +2135,87 @@ async def _finish_status_change_locked(
             disable_web_page_preview=True,
             reply_markup=keyboard,
         )
-    except RetryAfter:
-        raise
+    except RetryAfter as error:
+        _schedule_sync_retry(
+            context,
+            order.id,
+            initial_delay=_retry_after_seconds(error),
+        )
+        return False
     except Exception as error:
         if not _message_is_not_modified(error):
             success = False
             logger.exception("Could not update delivery callback message for order %s", order.id)
-    if not await _set_location_marker(context, order):
-        success = False
-    latest = context.application.bot_data["repo"].get(order.id)
-    if not await _refresh_manager_message(context, latest):
-        success = False
-    latest = context.application.bot_data["repo"].get(order.id)
-    if not await _refresh_orders_channel_message(context, latest):
-        success = False
-    latest = context.application.bot_data["repo"].get(order.id)
-    if success and latest.sync_needed:
-        context.application.bot_data["repo"].mark_synced(
-            latest.id,
-            expected_updated_at=latest.updated_at,
+    try:
+        locations_ok = await _set_location_marker(
+            context,
+            order,
+            publication_expectations=expected_publications,
         )
-    elif not success:
+    except RetryAfter as error:
+        _schedule_sync_retry(
+            context,
+            order.id,
+            initial_delay=_retry_after_seconds(error),
+        )
+        return False
+    if not locations_ok:
+        success = False
+    latest = context.application.bot_data["repo"].get(order.id)
+    if not generation_is_current(latest):
+        _schedule_sync_retry(context, order.id)
+        return False
+    try:
+        manager_ok = await _refresh_manager_message(
+            context,
+            latest,
+            publication_expectations=expected_publications,
+        )
+    except RetryAfter as error:
+        _schedule_sync_retry(
+            context,
+            order.id,
+            initial_delay=_retry_after_seconds(error),
+        )
+        return False
+    if not manager_ok:
+        success = False
+    latest = context.application.bot_data["repo"].get(order.id)
+    if not generation_is_current(latest):
+        _schedule_sync_retry(context, order.id)
+        return False
+    try:
+        orders_channel_ok = await _refresh_orders_channel_message(
+            context,
+            latest,
+            publication_expectations=expected_publications,
+        )
+    except RetryAfter as error:
+        _schedule_sync_retry(
+            context,
+            order.id,
+            initial_delay=_retry_after_seconds(error),
+        )
+        return False
+    if not orders_channel_ok:
+        success = False
+    latest = context.application.bot_data["repo"].get(order.id)
+    if not generation_is_current(latest):
+        _schedule_sync_retry(context, order.id)
+        return False
+    prompt_still_pending = bool(
+        latest
+        and latest.status == "completed"
+        and latest.post_delivery_prompt_required
+        and not (
+            latest.post_delivery_prompt_chat_id
+            and latest.post_delivery_prompt_message_id
+        )
+    )
+    if success and latest.sync_needed and not prompt_still_pending:
+        if not _mark_order_synced(context.application.bot_data["repo"], latest):
+            success = False
+    if not success:
         _schedule_sync_retry(context, order.id)
     return success
 
@@ -1487,6 +2370,8 @@ async def reconcile_orders_on_start(application: Application) -> None:
             candidates[order.id] = order
     context = SimpleNamespace(application=application, bot=application.bot)
     for order_id in sorted(candidates):
+        if _sync_retry_remaining(application, order_id) > 0:
+            continue
         try:
             await _sync_order(context, order_id)
         except RetryAfter:
@@ -1513,7 +2398,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
     prefix = ""
     if committed and committed.status == "draft":
-        _, recovered = await _sync_order(context, committed.id)
+        _, recovered = await _sync_order_foreground(context, committed.id)
         if not recovered:
             _schedule_sync_retry(context, committed.id)
         prefix = f"Заказ №{committed.order_number} уже сохранён. Его карточка будет восстановлена автоматически.\n\n"
@@ -1542,7 +2427,7 @@ async def _end_creation_with_order_list(
     committed = repo.get_by_creation_token(draft.get("creation_token"))
     context.user_data.pop("draft", None)
     if committed and committed.status == "draft":
-        _, recovered = await _sync_order(context, committed.id)
+        _, recovered = await _sync_order_foreground(context, committed.id)
         if not recovered:
             _schedule_sync_retry(context, committed.id)
     text = (update.message.text or "").strip()
@@ -1565,7 +2450,7 @@ async def _end_creation_with_map(
     committed = repo.get_by_creation_token(draft.get("creation_token"))
     context.user_data.pop("draft", None)
     if committed and committed.status == "draft":
-        _, recovered = await _sync_order(context, committed.id)
+        _, recovered = await _sync_order_foreground(context, committed.id)
         if not recovered:
             _schedule_sync_retry(context, committed.id)
     await show_all_locations(update, context)
@@ -1583,7 +2468,7 @@ async def _end_creation_with_statistics(
     committed = repo.get_by_creation_token(draft.get("creation_token"))
     context.user_data.pop("draft", None)
     if committed and committed.status == "draft":
-        _, recovered = await _sync_order(context, committed.id)
+        _, recovered = await _sync_order_foreground(context, committed.id)
         if not recovered:
             _schedule_sync_retry(context, committed.id)
     await show_statistics(update, context)
@@ -1783,18 +2668,30 @@ async def open_order_from_list(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.error("Telegram returned an invalid list-order card reference for order %s", order.id)
         return
     old_reference = (order.manager_chat_id, order.manager_message_id)
-    updated = repo.update(
-        order.id,
-        expected_updated_at=order.updated_at,
-        actor_id=query.from_user.id,
-        actor_name=_name(query.from_user),
-        actor_role="manager",
-        manager_chat_id=sent_chat_id,
-        manager_message_id=sent_message_id,
-    )
+    candidate_message = [(sent_chat_id, sent_message_id)]
+    try:
+        updated = repo.update(
+            order.id,
+            expected_updated_at=order.updated_at,
+            expected_publications={
+                "manager_chat_id": old_reference[0],
+                "manager_message_id": old_reference[1],
+            },
+            actor_id=query.from_user.id,
+            actor_name=_name(query.from_user),
+            actor_role="manager",
+            manager_chat_id=sent_chat_id,
+            manager_message_id=sent_message_id,
+        )
+    except Exception:
+        await _discard_unattached_messages(
+            context,
+            order.id,
+            candidate_message,
+        )
+        raise
     if not updated:
-        repo.enqueue_cleanup_messages(order.id, [(sent_chat_id, sent_message_id)])
-        await _process_cleanup_messages(context, order_id=order.id)
+        await _discard_unattached_messages(context, order.id, candidate_message)
         await _notify_manager(
             context,
             query.from_user.id,
@@ -1814,7 +2711,7 @@ async def open_order_from_list(update: Update, context: ContextTypes.DEFAULT_TYP
             )
         except Exception:
             logger.info("Could not deactivate previous manager card for order %s", order.id)
-    _, success = await _sync_order(context, updated.id)
+    _, success = await _sync_order_foreground(context, updated.id)
     if not success:
         _schedule_sync_retry(context, updated.id)
         await _notify_manager(
@@ -1838,7 +2735,7 @@ async def new_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         # ``➕ Новый заказ``. Never replace the creation token silently:
         # first surface the already-saved order, then let the manager start a
         # genuinely new one with a second explicit press.
-        _, recovered = await _sync_order(context, committed.id)
+        _, recovered = await _sync_order_foreground(context, committed.id)
         if not recovered:
             _schedule_sync_retry(context, committed.id)
         context.user_data.pop("draft", None)
@@ -2230,16 +3127,41 @@ async def comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                     )
                 raise
             if getattr(card_message, "message_id", None):
-                order = repo.update(
-                    order.id,
-                    expected_updated_at=order.updated_at,
-                    manager_chat_id=card_message.chat_id,
-                    manager_message_id=card_message.message_id,
-                )
-                if order and not _orders_channel_id(context):
-                    repo.mark_synced(order.id, expected_updated_at=order.updated_at)
+                order_id = order.id
+                candidate_message = [
+                    (card_message.chat_id, card_message.message_id)
+                ]
+                try:
+                    updated = repo.update(
+                        order_id,
+                        expected_updated_at=order.updated_at,
+                        expected_publications={
+                            "manager_chat_id": None,
+                            "manager_message_id": None,
+                        },
+                        manager_chat_id=card_message.chat_id,
+                        manager_message_id=card_message.message_id,
+                    )
+                except Exception:
+                    await _discard_unattached_messages(
+                        context,
+                        order_id,
+                        candidate_message,
+                    )
+                    raise
+                if not updated:
+                    await _discard_unattached_messages(
+                        context,
+                        order_id,
+                        candidate_message,
+                    )
+                    order = repo.get(order_id)
+                else:
+                    order = updated
+                if updated and not _orders_channel_id(context):
+                    _mark_order_synced(repo, order)
     if order and _orders_channel_id(context):
-        order, synchronized = await _sync_order(context, order.id)
+        order, synchronized = await _sync_order_foreground(context, order.id)
         if not synchronized:
             _schedule_sync_retry(context, order.id)
     sales_queued = False
@@ -2258,7 +3180,7 @@ async def comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             )
         else:
             if sales_queued:
-                _, synchronized = await _sync_order(context, order.id)
+                _, synchronized = await _sync_order_foreground(context, order.id)
                 if not synchronized:
                     _schedule_sync_retry(context, order.id)
     confirmation = "Проверьте данные заказа."
@@ -2283,6 +3205,10 @@ async def begin_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         adopted = repo.update(
             order.id,
             expected_updated_at=order.updated_at,
+            expected_publications={
+                "manager_chat_id": None,
+                "manager_message_id": None,
+            },
             manager_chat_id=query.message.chat_id,
             manager_message_id=clicked_message_id,
         )
@@ -2500,7 +3426,7 @@ async def sales_card_action(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await query.answer("Заказ уже изменён. Попробуйте ещё раз.", show_alert=True)
         return
     await query.answer("Карточка поставлена в очередь")
-    _, synchronized = await _sync_order(context, order.id)
+    _, synchronized = await _sync_order_foreground(context, order.id)
     if not synchronized:
         _schedule_sync_retry(context, order.id)
     try:
@@ -2632,14 +3558,25 @@ async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     sent = previous.status != "draft"
     location_number = 2 if field == "second_location" else 1
     publication_fields: dict = {}
+    publication_expectations: dict[str, int | None] = {}
+    new_publication_messages: list[tuple[int, int]] = []
     actor = getattr(update, "effective_user", None)
     cleanup_messages: list[tuple[int, int]] = []
     if field in {"location", "second_location"}:
+        publication_expectations = _location_publication_expectations(
+            previous,
+            location_number,
+        )
         prefix = "second_" if location_number == 2 else ""
         old_chat_id = (
             previous.second_location_chat_id
             if location_number == 2
             else previous.location_chat_id
+        )
+        old_header_id = (
+            previous.second_location_header_message_id
+            if location_number == 2
+            else previous.location_header_message_id
         )
         old_details_id = (
             previous.second_location_details_message_id
@@ -2659,7 +3596,12 @@ async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         if old_chat_id:
             cleanup_messages = [
                 (old_chat_id, message_id)
-                for message_id in (old_details_id, old_pin_id, old_footer_id)
+                for message_id in (
+                    old_header_id,
+                    old_pin_id,
+                    old_details_id,
+                    old_footer_id,
+                )
                 if message_id
             ]
         has_coordinates = (
@@ -2683,55 +3625,50 @@ async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 )
                 return EDIT_VALUE
             values.update(publication_fields)
+            prefix = "second_" if location_number == 2 else ""
+            new_chat_id = publication_fields[f"{prefix}location_chat_id"]
+            new_publication_messages = [
+                (new_chat_id, publication_fields[f"{prefix}{suffix}"])
+                for suffix in (
+                    "location_header_message_id",
+                    "location_message_id",
+                    "location_details_message_id",
+                    "location_footer_message_id",
+                )
+            ]
         else:
             values.update({
                 f"{prefix}location_chat_id": None,
+                f"{prefix}location_header_message_id": None,
                 f"{prefix}location_message_id": None,
                 f"{prefix}location_details_message_id": None,
                 f"{prefix}location_footer_message_id": None,
             })
-    order = repo.transition(
-        edit["order_id"],
-        MANAGER_EDITABLE_STATUSES,
-        expected_updated_at=edit.get("updated_at"),
-        actor_id=actor.id if actor else None,
-        actor_name=_name(actor) if actor else None,
-        actor_role="manager" if actor else None,
-        cleanup_messages=cleanup_messages,
-        **values,
-    )
+    try:
+        order = repo.transition(
+            edit["order_id"],
+            MANAGER_EDITABLE_STATUSES,
+            expected_updated_at=edit.get("updated_at"),
+            expected_publications=publication_expectations,
+            actor_id=actor.id if actor else None,
+            actor_name=_name(actor) if actor else None,
+            actor_role="manager" if actor else None,
+            cleanup_messages=cleanup_messages,
+            **values,
+        )
+    except Exception:
+        await _discard_unattached_messages(
+            context,
+            previous.id,
+            new_publication_messages,
+        )
+        raise
     if not order:
-        if publication_fields:
-            new_publication = replace(previous, **values)
-            new_chat_id = (
-                new_publication.second_location_chat_id
-                if location_number == 2
-                else new_publication.location_chat_id
-            )
-            new_details_id = (
-                new_publication.second_location_details_message_id
-                if location_number == 2
-                else new_publication.location_details_message_id
-            )
-            new_footer_id = (
-                new_publication.second_location_footer_message_id
-                if location_number == 2
-                else new_publication.location_footer_message_id
-            )
-            new_pin_id = (
-                new_publication.second_location_message_id
-                if location_number == 2
-                else new_publication.location_message_id
-            )
-            repo.enqueue_cleanup_messages(
-                previous.id,
-                [
-                    (new_chat_id, message_id)
-                    for message_id in (new_details_id, new_pin_id, new_footer_id)
-                    if new_chat_id and message_id
-                ],
-            )
-            await _process_cleanup_messages(context, order_id=previous.id)
+        await _discard_unattached_messages(
+            context,
+            previous.id,
+            new_publication_messages,
+        )
         context.user_data.pop("edit", None)
         await update.message.reply_text(
             "Заказ уже изменил другой менеджер или его статус изменился. Откройте свежую карточку.",
@@ -2739,7 +3676,26 @@ async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return ConversationHandler.END
     if cleanup_messages:
-        await _process_cleanup_messages(context, order_id=order.id)
+        try:
+            await _process_cleanup_messages(context, order_id=order.id)
+        except RetryAfter as error:
+            _schedule_sync_retry(
+                context,
+                order.id,
+                initial_delay=_retry_after_seconds(error),
+            )
+            # The edit and durable cleanup outbox are already committed. End
+            # the conversation without issuing another Bot API call during
+            # Telegram's flood-wait window.
+            context.user_data.pop("edit", None)
+            return ConversationHandler.END
+        except Exception:
+            # The replacement and durable cleanup outbox are already saved;
+            # do not keep the manager trapped in the edit conversation.
+            logger.exception(
+                "Could not process replaced-location cleanup for order %s",
+                order.id,
+            )
 
     sales_queued = False
     sales_queue_failed = False
@@ -2774,7 +3730,7 @@ async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             manager_refreshed = False
             logger.exception("Could not refresh manager message for order %s", order.id)
     if sent or _orders_channel_id(context):
-        order, refreshed = await _sync_order(context, order.id)
+        order, refreshed = await _sync_order_foreground(context, order.id)
         order = order or repo.get(edit["order_id"])
         if not refreshed:
             _schedule_sync_retry(context, order.id)
@@ -2782,7 +3738,7 @@ async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         refreshed = manager_refreshed
         refreshed_order = repo.get(order.id)
         if manager_refreshed and refreshed_order.sync_needed:
-            repo.mark_synced(refreshed_order.id, expected_updated_at=refreshed_order.updated_at)
+            _mark_order_synced(repo, refreshed_order)
         elif not manager_refreshed:
             _schedule_sync_retry(context, order.id)
     if (
@@ -2861,12 +3817,12 @@ async def manager_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         await query.answer("Заказ возвращён")
         if getattr(settings, "orders_channel_id", None):
-            latest, success = await _sync_order(context, restored.id)
+            latest, success = await _sync_order_foreground(context, restored.id)
             if not success:
                 _schedule_sync_retry(context, restored.id)
         else:
             latest = repo.get(restored.id)
-            repo.mark_synced(latest.id, expected_updated_at=latest.updated_at)
+            _mark_order_synced(repo, latest)
         return
     if order.status != "draft":
         await query.answer("Заказ уже обработан или недоступен", show_alert=True); return
@@ -2887,11 +3843,11 @@ async def manager_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         await query.answer()
         if getattr(settings, "orders_channel_id", None):
-            latest, success = await _sync_order(context, cancelled.id)
+            latest, success = await _sync_order_foreground(context, cancelled.id)
             if not success:
                 _schedule_sync_retry(context, cancelled.id)
         else:
-            repo.mark_synced(cancelled.id, expected_updated_at=cancelled.updated_at)
+            _mark_order_synced(repo, cancelled)
         return
     await query.edit_message_reply_markup(
         reply_markup=courier_selection_keyboard(
@@ -3070,32 +4026,53 @@ async def courier_assignment_action(update: Update, context: ContextTypes.DEFAUL
         cleanup_messages = []
         if order.delivery_chat_id and order.delivery_message_id:
             cleanup_messages.append((order.delivery_chat_id, order.delivery_message_id))
-        updated = repo.transition(
-            order.id,
-            {"draft", "pending", "picked_up", "on_way"},
-            expected_updated_at=order.updated_at,
-            actor_id=query.from_user.id,
-            actor_name=_name(query.from_user),
-            actor_role="manager",
-            cleanup_messages=cleanup_messages,
-            status="pending",
-            assigned_courier_id=selected.user_id,
-            assigned_courier_name=selected.name,
-            courier_id=None,
-            courier_name=None,
-            courier_read_at=None,
-            picked_up_at=None,
-            time_started=None,
-            estimated_delivery_at=None,
-            delivery_photo=None,
-            received_usd=None,
-            received_uzs=None,
-            delivered_at=None,
-            delivery_chat_id=sent.chat_id,
-            delivery_message_id=sent.message_id,
-        )
+        try:
+            updated = repo.transition(
+                order.id,
+                {"draft", "pending", "picked_up", "on_way"},
+                expected_updated_at=order.updated_at,
+                expected_publications={
+                    "delivery_chat_id": order.delivery_chat_id,
+                    "delivery_message_id": order.delivery_message_id,
+                },
+                actor_id=query.from_user.id,
+                actor_name=_name(query.from_user),
+                actor_role="manager",
+                cleanup_messages=cleanup_messages,
+                status="pending",
+                assigned_courier_id=selected.user_id,
+                assigned_courier_name=selected.name,
+                courier_id=None,
+                courier_name=None,
+                courier_read_at=None,
+                picked_up_at=None,
+                time_started=None,
+                estimated_delivery_at=None,
+                delivery_photo=None,
+                received_usd=None,
+                received_uzs=None,
+                delivered_at=None,
+                delivery_chat_id=sent.chat_id,
+                delivery_message_id=sent.message_id,
+            )
+        except Exception:
+            logger.exception(
+                "Could not persist courier reassignment for order %s",
+                order.id,
+            )
+            await _discard_unattached_messages(
+                context,
+                order.id,
+                [(sent.chat_id, sent.message_id)],
+            )
+            await _notify_manager(
+                context,
+                query.from_user.id,
+                f"⚠️ Не удалось сохранить нового курьера заказа №{order.order_number}. "
+                "Новая карточка удалена, старый курьер не изменён.",
+            )
+            return
         if not updated:
-            repo.enqueue_cleanup_messages(order.id, [(sent.chat_id, sent.message_id)])
             await _notify_manager(
                 context,
                 query.from_user.id,
@@ -3105,7 +4082,11 @@ async def courier_assignment_action(update: Update, context: ContextTypes.DEFAUL
             # Cleanup runs after releasing the order lock, because Telegram
             # deletion may be rate-limited and needs no business-state lock.
     if not updated:
-        await _process_cleanup_messages(context, order_id=order.id)
+        await _discard_unattached_messages(
+            context,
+            order.id,
+            [(sent.chat_id, sent.message_id)],
+        )
         return
 
     if order.delivery_chat_id and order.delivery_chat_id != sent.chat_id:
@@ -3129,8 +4110,19 @@ async def courier_assignment_action(update: Update, context: ContextTypes.DEFAUL
                 f"⚠️ Заказ №{order.order_number} переназначен на {escape(selected.name)}, "
                 "но старую группу предупредить не удалось. Свяжитесь со старым курьером вручную.",
             )
-    await _process_cleanup_messages(context, order_id=updated.id)
-    synced_order, synchronized = await _sync_order(context, updated.id)
+    try:
+        await _process_cleanup_messages(context, order_id=updated.id)
+    except RetryAfter as error:
+        # Reassignment is already committed and the obsolete card remains in
+        # the durable cleanup outbox.  Stop issuing Telegram calls during the
+        # flood wait and let the background worker finish both jobs later.
+        _schedule_sync_retry(
+            context,
+            updated.id,
+            initial_delay=_retry_after_seconds(error),
+        )
+        return
+    synced_order, synchronized = await _sync_order_foreground(context, updated.id)
     updated = synced_order or repo.get(updated.id) or updated
     await _notify_log(
         context,
@@ -3159,7 +4151,7 @@ async def manager_sync_action(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.answer("Заказ не найден", show_alert=True)
         return
     await query.answer("Синхронизация запущена…")
-    order, success = await _sync_order(context, int(raw_id))
+    order, success = await _sync_order_foreground(context, int(raw_id))
     if not success:
         _schedule_sync_retry(context, current.id)
         await _notify_manager(
@@ -3289,6 +4281,8 @@ async def manager_pickup_action(update: Update, context: ContextTypes.DEFAULT_TY
             keyboard,
         )
 
+    if not success and _sync_retry_remaining(context.application, updated.id) > 0:
+        return
     actor_name = escape(_name(user))
     courier_name = escape(updated.assigned_courier_name or updated.courier_name or "—")
     if action == "pickup":
@@ -3423,13 +4417,18 @@ async def group_cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE
                 )
                 return
             await query.answer("Заказ отменён")
-            await _finish_status_change_locked(
+            refreshed = await _finish_status_change_locked(
                 context,
                 query,
                 updated,
                 courier_card(updated, "❌ <b>Заказ отменён</b>"),
                 courier_cancelled_keyboard(updated),
             )
+            if (
+                not refreshed
+                and _sync_retry_remaining(context.application, updated.id) > 0
+            ):
+                return
             await _notify_log(
                 context,
                 f"❌ <b>Заказ №{updated.order_number}</b> отменён\n"
@@ -3495,7 +4494,18 @@ async def group_cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
         await query.answer("Заказ возвращён")
         text, keyboard = _delivery_message(updated)
-        await _finish_status_change_locked(context, query, updated, text, keyboard)
+        refreshed = await _finish_status_change_locked(
+            context,
+            query,
+            updated,
+            text,
+            keyboard,
+        )
+        if (
+            not refreshed
+            and _sync_retry_remaining(context.application, updated.id) > 0
+        ):
+            return
         await _notify_log(
             context,
             f"↩️ <b>Заказ №{updated.order_number}</b> · отмена снята\n"
@@ -3523,6 +4533,10 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         adopted = repo.update(
             order.id,
             expected_updated_at=order.updated_at,
+            expected_publications={
+                "delivery_chat_id": None,
+                "delivery_message_id": None,
+            },
             delivery_chat_id=query.message.chat_id,
             delivery_message_id=clicked_message_id,
         )
@@ -3545,44 +4559,102 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if action == "undo_complete":
         if order.status not in {"awaiting_photo", "awaiting_amount", "completed"} or order.courier_id != query.from_user.id:
             await query.answer("Подтверждение уже нельзя отменить", show_alert=True); return
-        target_status = (
-            "on_way"
-            if order.time_started
-            else ("picked_up" if order.picked_up_at else "pending")
-        )
-        reset = {
-            "status": target_status,
-            "delivery_photo": None,
-            "received_usd": None,
-            "received_uzs": None,
-            "delivered_at": None,
-        }
-        if target_status == "pending":
-            reset.update(
-                courier_id=None,
-                courier_name=None,
-                time_started=None,
-                estimated_delivery_at=None,
+        # Prompt repair is publication-only and deliberately does not bump the
+        # business revision.  Compare its exact references and retry against
+        # the latest tuple so undo always queues the canonical prompt, never a
+        # superseded one that leaves an orphan behind.
+        business_revision = order.updated_at
+        transitioned = None
+        prompt_cleanup: list[tuple[int, int]] = []
+        target_status = "pending"
+        for _ in range(3):
+            if (
+                order.status not in {"awaiting_photo", "awaiting_amount", "completed"}
+                or order.courier_id != query.from_user.id
+                or order.updated_at != business_revision
+            ):
+                break
+            target_status = (
+                "on_way"
+                if order.time_started
+                else ("picked_up" if order.picked_up_at else "pending")
             )
-        order = repo.transition(
-            order.id,
-            {"awaiting_photo", "awaiting_amount", "completed"},
-            guard_courier_id=query.from_user.id,
-            require_unassigned_or_same=True,
-            **reset,
-        )
+            reset = {
+                "status": target_status,
+                "delivery_photo": None,
+                "received_usd": None,
+                "received_uzs": None,
+                "delivered_at": None,
+                "post_delivery_prompt_required": 0,
+                "post_delivery_prompt_chat_id": None,
+                "post_delivery_prompt_message_id": None,
+            }
+            if target_status == "pending":
+                reset.update(
+                    courier_id=None,
+                    courier_name=None,
+                    time_started=None,
+                    estimated_delivery_at=None,
+                )
+            prompt_cleanup = [
+                (
+                    order.post_delivery_prompt_chat_id,
+                    order.post_delivery_prompt_message_id,
+                )
+            ] if (
+                order.post_delivery_prompt_chat_id
+                and order.post_delivery_prompt_message_id
+            ) else []
+            transitioned = repo.transition(
+                order.id,
+                {"awaiting_photo", "awaiting_amount", "completed"},
+                guard_courier_id=query.from_user.id,
+                require_unassigned_or_same=True,
+                expected_updated_at=order.updated_at,
+                expected_publications={
+                    "post_delivery_prompt_chat_id": order.post_delivery_prompt_chat_id,
+                    "post_delivery_prompt_message_id": order.post_delivery_prompt_message_id,
+                },
+                cleanup_messages=prompt_cleanup,
+                **reset,
+            )
+            if transitioned:
+                break
+            latest = repo.get(order.id)
+            if not latest or latest.updated_at != business_revision:
+                break
+            order = latest
+        order = transitioned
         if not order:
             await query.answer("Подтверждение уже нельзя отменить", show_alert=True); return
         state = "↩️ <b>Подтверждение доставки отменено</b>"
         keyboard = on_way_keyboard(order) if target_status == "on_way" else courier_keyboard(order)
         await query.answer("Возвращено назад")
-        await _finish_status_change(
+        refreshed = await _finish_status_change(
             context,
             query,
             order,
             courier_card(order, state),
             keyboard,
         )
+        if (
+            not refreshed
+            and _sync_retry_remaining(context.application, order.id) > 0
+        ):
+            return
+        if prompt_cleanup:
+            try:
+                await _process_cleanup_messages(context, order_id=order.id)
+            except RetryAfter as error:
+                # The main card already shows the restored state.  Cleanup is
+                # durable and the background worker will retry after Telegram's
+                # flood wait instead of leaving a stale completed card visible.
+                logger.warning(
+                    "Telegram rate-limited prompt cleanup for order %s for %.1f seconds",
+                    order.id,
+                    _retry_after_seconds(error),
+                )
+                return
         await _notify_log(
             context,
             f"↩️ <b>Заказ №{order.order_number}</b> · подтверждение доставки отменено",
@@ -3617,13 +4689,18 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not order:
             await query.answer("Выезд уже нельзя отменить", show_alert=True); return
         await query.answer("Заказ возвращён в очередь")
-        await _finish_status_change(
+        refreshed = await _finish_status_change(
             context,
             query,
             order,
             courier_card(order, "↩️ <b>Выезд отменён</b>"),
             courier_keyboard(order),
         )
+        if (
+            not refreshed
+            and _sync_retry_remaining(context.application, order.id) > 0
+        ):
+            return
         await _notify_log(
             context,
             f"↩️ Курьер {escape(order.assigned_courier_name or order.courier_name or '—')} "
@@ -3663,13 +4740,18 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
         order = await _store_estimated_delivery_time(context, order)
         await query.answer("Статус обновлён")
-        await _finish_status_change(
+        refreshed = await _finish_status_change(
             context,
             query,
             order,
             courier_card(order, "🚗 <b>Курьер едет</b>"),
             on_way_keyboard(order),
         )
+        if (
+            not refreshed
+            and _sync_retry_remaining(context.application, order.id) > 0
+        ):
+            return
         await _notify_on_way_log(context, order)
     elif action == "complete":
         timestamp = datetime.now().astimezone()
@@ -3678,22 +4760,59 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             {"on_way"},
             status="completed",
             delivered_at=timestamp.isoformat(timespec="seconds"),
+            post_delivery_prompt_required=1,
+            post_delivery_prompt_chat_id=None,
+            post_delivery_prompt_message_id=None,
             guard_courier_id=query.from_user.id, require_unassigned_or_same=True, **courier,
         )
         if not order:
             await query.answer("Сначала нажмите «🚗 Еду к заказу»", show_alert=True); return
+        await query.answer("Заказ доставлен")
+        prompt_ready = True
+        prompt_retry_delay: float | None = None
+        try:
+            order = await _send_post_delivery_prompt(context, order)
+        except RetryAfter as error:
+            prompt_ready = False
+            prompt_retry_delay = _retry_after_seconds(error)
+            logger.warning(
+                "Telegram rate-limited delivery prompt for order %s for %.1f seconds",
+                order.id,
+                prompt_retry_delay,
+            )
+        except Exception:
+            prompt_ready = False
+            logger.exception("Could not send optional delivery prompt for order %s", order.id)
+        if not prompt_ready:
+            # Reserve the correct first retry delay before any other refresh
+            # can schedule the generic two-second retry for this order.
+            _schedule_sync_retry(
+                context,
+                order.id,
+                initial_delay=prompt_retry_delay,
+            )
+        if prompt_retry_delay is not None:
+            # Telegram requested a global quiet window. The durable completed
+            # state is already in SQLite; the scheduled sync will update the
+            # card, prompt, locations and manager views after that window.
+            # Do not issue more Bot API calls here and prolong the flood wait.
+            return
         result_text = completed_card(
             order,
             timestamp.astimezone(ZoneInfo("Asia/Tashkent")).strftime("%H:%M"),
         )
-        await query.answer("Заказ доставлен")
-        await _finish_status_change(
+        refreshed = await _finish_status_change(
             context,
             query,
             order,
             result_text,
             completed_keyboard(order),
         )
+        if (
+            not refreshed
+            and _sync_retry_remaining(context.application, order.id) > 0
+        ):
+            return
         await _notify_log(
             context,
             f"✅ Курьер <b>{escape(order.courier_name or _name(query.from_user))}</b> доставил "
@@ -3702,7 +4821,18 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"📦 {escape(order.product)} · 👤 {escape(order.seller_name or '—')}",
             reply_markup=log_order_keyboard(order),
         )
-        await _send_post_delivery_prompt(context, order)
+        if not prompt_ready:
+            latest = repo.get(order.id)
+            if latest:
+                repo.update(
+                    latest.id,
+                    expected_updated_at=latest.updated_at,
+                    sync_needed=1,
+                )
+                _schedule_sync_retry(
+                    context,
+                    latest.id,
+                )
     else:
         await query.answer("Неизвестное действие", show_alert=True)
 
@@ -3855,11 +4985,11 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
             context.user_data.pop("draft", None)
             result = f"Заказ №{cancelled.order_number} отменён."
             if cancelled.manager_message_id:
-                _, success = await _sync_order(context, cancelled.id)
+                _, success = await _sync_order_foreground(context, cancelled.id)
                 if not success:
                     _schedule_sync_retry(context, cancelled.id)
             else:
-                repo.mark_synced(cancelled.id, expected_updated_at=cancelled.updated_at)
+                _mark_order_synced(repo, cancelled)
         else:
             # The state changed concurrently, so this creation payload is no
             # longer an active draft that /cancel is allowed to modify.

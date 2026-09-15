@@ -5,6 +5,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
 from app.models import Order
 from app.utils.formatters import (
     delivery_order_message_url,
+    post_delivery_prompt_url,
     short_address,
     telegram_message_url,
     telegram_location_url,
@@ -445,9 +446,17 @@ def delivery_pending_keyboard(order: Order) -> InlineKeyboardMarkup:
 
 
 def completed_keyboard(order: Order) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(_location_rows(order) + [[
+    rows = _location_rows(order)
+    prompt_url = post_delivery_prompt_url(order)
+    if prompt_url:
+        rows.append([InlineKeyboardButton(
+            f"📸 Фото и цена · Заказ №{order.order_number}",
+            url=prompt_url,
+        )])
+    rows.append([
         InlineKeyboardButton("↩️ Назад", callback_data=f"undo_complete:{order.id}"),
-    ]])
+    ])
+    return InlineKeyboardMarkup(rows)
 
 
 def readonly_order_keyboard(order: Order) -> InlineKeyboardMarkup | None:

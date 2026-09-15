@@ -1,6 +1,7 @@
 import json
 import math
 import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
@@ -8,7 +9,7 @@ from typing import Any
 
 from app.models import CourierCashEntry, Order, OrderEvent
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 SQLITE_INT_MAX = 2**63 - 1
 KNOWN_STATUSES = frozenset({
     "draft",
@@ -30,11 +31,16 @@ COORDINATE_PAIRS = (
 PUBLICATION_FIELDS = frozenset({
     "delivery_chat_id",
     "delivery_message_id",
+    "post_delivery_prompt_required",
+    "post_delivery_prompt_chat_id",
+    "post_delivery_prompt_message_id",
     "location_chat_id",
+    "location_header_message_id",
     "location_message_id",
     "location_details_message_id",
     "location_footer_message_id",
     "second_location_chat_id",
+    "second_location_header_message_id",
     "second_location_message_id",
     "second_location_details_message_id",
     "second_location_footer_message_id",
@@ -44,9 +50,14 @@ PUBLICATION_FIELDS = frozenset({
     "orders_channel_message_id",
     "sync_needed",
 })
+PUBLICATION_REFERENCE_FIELDS = PUBLICATION_FIELDS - {
+    "post_delivery_prompt_required",
+    "sync_needed",
+}
 CLEANUP_MAX_ATTEMPTS = 8
 CLEANUP_RETRY_BASE_SECONDS = 30
 CLEANUP_RETRY_MAX_SECONDS = 60 * 60
+INITIALIZE_LOCK_RETRY_SECONDS = 10.0
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS orders (
@@ -100,11 +111,16 @@ CREATE TABLE IF NOT EXISTS orders (
     estimated_delivery_at TEXT,
     delivery_chat_id INTEGER,
     delivery_message_id INTEGER,
+    post_delivery_prompt_required INTEGER NOT NULL DEFAULT 0,
+    post_delivery_prompt_chat_id INTEGER,
+    post_delivery_prompt_message_id INTEGER,
     location_chat_id INTEGER,
+    location_header_message_id INTEGER,
     location_message_id INTEGER,
     location_details_message_id INTEGER,
     location_footer_message_id INTEGER,
     second_location_chat_id INTEGER,
+    second_location_header_message_id INTEGER,
     second_location_message_id INTEGER,
     second_location_details_message_id INTEGER,
     second_location_footer_message_id INTEGER,
@@ -230,6 +246,7 @@ MIGRATION_COLUMNS = {
     "district": "TEXT",
     "mahalla": "TEXT",
     "location_chat_id": "INTEGER",
+    "location_header_message_id": "INTEGER",
     "location_message_id": "INTEGER",
     "location_details_message_id": "INTEGER",
     "location_footer_message_id": "INTEGER",
@@ -240,6 +257,7 @@ MIGRATION_COLUMNS = {
     "second_district": "TEXT",
     "second_mahalla": "TEXT",
     "second_location_chat_id": "INTEGER",
+    "second_location_header_message_id": "INTEGER",
     "second_location_message_id": "INTEGER",
     "second_location_details_message_id": "INTEGER",
     "second_location_footer_message_id": "INTEGER",
@@ -268,6 +286,9 @@ MIGRATION_COLUMNS = {
     "cancelled_by_username": "TEXT",
     "cancelled_at": "TEXT",
     "cancelled_from_status": "TEXT",
+    "post_delivery_prompt_required": "INTEGER NOT NULL DEFAULT 0",
+    "post_delivery_prompt_chat_id": "INTEGER",
+    "post_delivery_prompt_message_id": "INTEGER",
 }
 
 ORDER_EVENT_MIGRATION_COLUMNS = {
@@ -301,6 +322,9 @@ def _retry_at(attempts: int) -> str:
 
 
 class OrderRepository:
+    _initialize_lock = Lock()
+    publication_reference_fields = PUBLICATION_REFERENCE_FIELDS
+
     editable_fields = {
         "seller_name", "payment_status", "product", "client_phone", "client_phone_2", "amount_usd", "amount_uzs", "location_url",
         "product_photo_file_id", "product_photo_unique_id", "product_photo_path",
@@ -314,9 +338,12 @@ class OrderRepository:
         "courier_id", "courier_name", "delivery_photo", "received_usd",
         "received_uzs", "delivered_at", "courier_read_at", "picked_up_at", "time_started",
         "estimated_delivery_at", "delivery_chat_id",
-        "delivery_message_id", "location_chat_id", "location_message_id",
+        "delivery_message_id", "post_delivery_prompt_required",
+        "post_delivery_prompt_chat_id", "post_delivery_prompt_message_id",
+        "location_chat_id", "location_header_message_id", "location_message_id",
         "location_details_message_id", "second_location_chat_id",
-        "location_footer_message_id", "second_location_message_id",
+        "location_footer_message_id", "second_location_header_message_id",
+        "second_location_message_id",
         "second_location_details_message_id", "second_location_footer_message_id",
         "manager_chat_id", "manager_message_id", "orders_channel_chat_id",
         "orders_channel_message_id", "sync_needed",
@@ -363,13 +390,58 @@ class OrderRepository:
                 raise
 
     def initialize(self) -> None:
+        # Multiple local app components/tests may instantiate repositories for
+        # the same SQLite file simultaneously.  ``PRAGMA journal_mode=WAL``
+        # does not reliably honor busy_timeout while another connection is
+        # changing the journal, so serialize initialization within a process.
+        with self._initialize_lock:
+            deadline = time.monotonic() + INITIALIZE_LOCK_RETRY_SECONDS
+            while True:
+                try:
+                    self._initialize_unlocked()
+                    return
+                except sqlite3.OperationalError as error:
+                    locked = "locked" in str(error).casefold()
+                    if not locked or time.monotonic() >= deadline:
+                        raise
+                    # A second container/process may be migrating the same
+                    # volume.  Reopen a fresh connection after a short bounded
+                    # delay; partially completed SQLite transactions have
+                    # already been rolled back by the context manager.
+                    time.sleep(0.05)
+
+    def _initialize_unlocked(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as db:
             db.executescript(SCHEMA)
+            db.execute("PRAGMA journal_mode=WAL")
+            previous_version = int(db.execute("PRAGMA user_version").fetchone()[0])
             existing = {row[1] for row in db.execute("PRAGMA table_info(orders)")}
             for column, definition in MIGRATION_COLUMNS.items():
                 if column not in existing:
                     self._add_column_if_missing(db, "orders", column, definition)
+            # Before schema v7, ``location_details_message_id`` stored the
+            # upper separator for the three-message location block. Preserve
+            # that reference as the new header and free ``details`` for the
+            # actual text card. Rows without a footer belong to an older
+            # legacy layout and are intentionally left untouched.
+            if previous_version < 7:
+                db.execute(
+                    """UPDATE orders
+                       SET location_header_message_id=location_details_message_id,
+                           location_details_message_id=NULL
+                       WHERE location_header_message_id IS NULL
+                         AND location_details_message_id IS NOT NULL
+                         AND location_footer_message_id IS NOT NULL"""
+                )
+                db.execute(
+                    """UPDATE orders
+                       SET second_location_header_message_id=second_location_details_message_id,
+                           second_location_details_message_id=NULL
+                       WHERE second_location_header_message_id IS NULL
+                         AND second_location_details_message_id IS NOT NULL
+                         AND second_location_footer_message_id IS NOT NULL"""
+                )
             event_existing = {
                 row[1] for row in db.execute("PRAGMA table_info(order_events)")
             }
@@ -420,14 +492,12 @@ class OrderRepository:
                 "CREATE INDEX IF NOT EXISTS idx_cleanup_queue_due "
                 "ON telegram_cleanup_queue(terminal, next_attempt_at, attempts, id)"
             )
-            db.execute("PRAGMA journal_mode=WAL")
             db.execute(
                 """UPDATE counters
                    SET value=MAX(value, (SELECT COALESCE(MAX(order_number), 0) FROM orders))
                    WHERE name='order_number'"""
             )
-            current_version = int(db.execute("PRAGMA user_version").fetchone()[0])
-            if current_version < SCHEMA_VERSION:
+            if previous_version < SCHEMA_VERSION:
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     def claim_periodic_job(self, job_name: str, slot: int) -> bool:
@@ -1185,17 +1255,30 @@ class OrderRepository:
         order_id: int,
         *,
         expected_updated_at: str | None = None,
+        expected_publications: dict[str, Any] | None = None,
         actor_id: int | None = None,
         actor_name: str | None = None,
         actor_username: str | None = None,
         actor_role: str | None = None,
         event_courier_id: int | None = None,
         event_courier_name: str | None = None,
+        cleanup_messages: list[tuple[int, int]] | tuple[tuple[int, int], ...] = (),
         **fields: Any,
     ) -> Order | None:
         invalid = set(fields) - self.editable_fields
         if invalid:
             raise ValueError(f"Unsupported fields: {invalid}")
+        expected_publications = expected_publications or {}
+        invalid_expected = set(expected_publications) - PUBLICATION_REFERENCE_FIELDS
+        if invalid_expected:
+            raise ValueError(
+                f"Unsupported expected publication fields: {invalid_expected}"
+            )
+        cleanups = [
+            (int(chat_id), int(message_id))
+            for chat_id, message_id in cleanup_messages
+            if chat_id and message_id
+        ]
         changed_fields = set(fields)
         publication_only = bool(changed_fields) and changed_fields <= PUBLICATION_FIELDS
         if "sync_needed" not in fields:
@@ -1215,12 +1298,22 @@ class OrderRepository:
                 return None
             if expected_updated_at is not None and previous["updated_at"] != expected_updated_at:
                 return None
+            # Publication metadata has its own compare-and-set guard because
+            # it intentionally does not change the manager-visible business
+            # ``updated_at`` revision.  This supports both attach-if-empty and
+            # compare-and-clear/replace without orphaning Telegram messages.
+            for field, expected in expected_publications.items():
+                if previous[field] != expected:
+                    return None
             self._validate_domain_fields(fields, current=previous)
             where = "id=?"
             params: list[Any] = [*fields.values(), order_id]
             if expected_updated_at is not None:
                 where += " AND updated_at=?"
                 params.append(expected_updated_at)
+            for field, expected in sorted(expected_publications.items()):
+                where += f" AND {field} IS ?"
+                params.append(expected)
             cursor = db.execute(f"UPDATE orders SET {assignments} WHERE {where}", params)
             if cursor.rowcount != 1:
                 return None
@@ -1255,6 +1348,13 @@ class OrderRepository:
                     to_status=row["status"],
                     changed_fields=changed_fields,
                 )
+            for chat_id, message_id in cleanups:
+                db.execute(
+                    """INSERT OR IGNORE INTO telegram_cleanup_queue
+                       (order_id, chat_id, message_id, created_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (order_id, chat_id, message_id, now()),
+                )
         return Order.from_row(row)
 
     def transition(
@@ -1267,6 +1367,7 @@ class OrderRepository:
         require_assigned_to_courier: bool = False,
         require_no_other_on_way_for_courier: bool = False,
         expected_updated_at: str | None = None,
+        expected_publications: dict[str, Any] | None = None,
         actor_id: int | None = None,
         actor_name: str | None = None,
         actor_username: str | None = None,
@@ -1281,6 +1382,12 @@ class OrderRepository:
         invalid = set(fields) - self.editable_fields
         if invalid:
             raise ValueError(f"Unsupported fields: {invalid}")
+        expected_publications = expected_publications or {}
+        invalid_expected = set(expected_publications) - PUBLICATION_REFERENCE_FIELDS
+        if invalid_expected:
+            raise ValueError(
+                f"Unsupported expected publication fields: {invalid_expected}"
+            )
         if not from_statuses:
             raise ValueError("from_statuses cannot be empty")
         if require_unassigned_or_same and require_assigned_to_courier:
@@ -1344,6 +1451,9 @@ class OrderRepository:
         if expected_updated_at is not None:
             where += " AND updated_at=?"
             params.append(expected_updated_at)
+        for field, expected in sorted(expected_publications.items()):
+            where += f" AND {field} IS ?"
+            params.append(expected)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             previous = db.execute(
@@ -1354,6 +1464,9 @@ class OrderRepository:
                 return None
             if expected_updated_at is not None and previous["updated_at"] != expected_updated_at:
                 return None
+            for field, expected in expected_publications.items():
+                if previous[field] != expected:
+                    return None
             self._validate_domain_fields(fields, current=previous)
             if require_unassigned_or_same or require_assigned_to_courier:
                 for courier_field in ("assigned_courier_id", "courier_id"):
@@ -1444,13 +1557,23 @@ class OrderRepository:
         order_id: int,
         *,
         expected_updated_at: str | None = None,
+        expected_publications: dict[str, Any] | None = None,
     ) -> bool:
         """Clear the sync marker without changing the order version or audit log."""
+        expected_publications = expected_publications or {}
+        invalid_expected = set(expected_publications) - PUBLICATION_REFERENCE_FIELDS
+        if invalid_expected:
+            raise ValueError(
+                f"Unsupported expected publication fields: {invalid_expected}"
+            )
         where = "id=? AND sync_needed=1"
         params: list[Any] = [order_id]
         if expected_updated_at is not None:
             where += " AND updated_at=?"
             params.append(expected_updated_at)
+        for field, expected in sorted(expected_publications.items()):
+            where += f" AND {field} IS ?"
+            params.append(expected)
         with self.connect() as db:
             cursor = db.execute(
                 f"UPDATE orders SET sync_needed=0, sync_attempted_at=NULL WHERE {where}",

@@ -37,12 +37,21 @@ def yandex_route_url(order: Order) -> str | None:
 
 def telegram_message_url(chat_id: int | None, message_id: int | None) -> str | None:
     """Build a private supergroup/channel message link from Telegram numeric IDs."""
-    if chat_id is None or message_id is None or message_id <= 0:
+    if (
+        not isinstance(chat_id, int)
+        or isinstance(chat_id, bool)
+        or not isinstance(message_id, int)
+        or isinstance(message_id, bool)
+        or message_id <= 0
+    ):
         return None
-    raw_chat_id = str(chat_id)
-    if not raw_chat_id.startswith("-100"):
+    # Bot API supergroup/channel IDs encode the internal peer ID as
+    # ``-(10**12 + peer_id)``.  A mere textual ``-100`` prefix is ambiguous
+    # with small basic-group IDs such as -1001234567 and creates dead links.
+    internal_id = -chat_id - 1_000_000_000_000
+    if internal_id <= 0:
         return None
-    return f"https://t.me/c/{raw_chat_id[4:]}/{message_id}"
+    return f"https://t.me/c/{internal_id}/{message_id}"
 
 
 def delivery_order_message_url(order: Order) -> str | None:
@@ -58,6 +67,14 @@ def delivery_order_message_url(order: Order) -> str | None:
         order.delivery_message_id,
     )
     return public_link
+
+
+def post_delivery_prompt_url(order: Order) -> str | None:
+    """Return the direct link to the optional photo/price prompt."""
+    return telegram_message_url(
+        order.post_delivery_prompt_chat_id,
+        order.post_delivery_prompt_message_id,
+    )
 
 
 def telegram_location_url(order: Order, location_number: int = 1) -> str | None:
@@ -105,6 +122,33 @@ def short_address(order: Order, location_number: int = 1) -> str:
             order.second_mahalla,
         )
     return _short_address_parts(order.address_text, order.district, order.mahalla)
+
+
+def location_channel_text(order: Order, location_number: int = 1) -> str:
+    """Compact, linkable details shown next to one native Telegram pin."""
+    owner = order.seller_name or order.manager_name or "—"
+    lines = [
+        f"📍 <b>{escape(short_address(order, location_number))}</b>",
+        f"📦 {escape(order.product)}",
+        f"🚚 Заказ №{order.order_number}",
+        f"👤 Менеджер: {escape(owner)}",
+    ]
+    for phone in (order.client_phone, order.client_phone_2):
+        if not phone:
+            continue
+        normalized = "+" + "".join(character for character in phone if character.isdigit())
+        lines.append(
+            f'📞 <a href="tel:{escape(normalized, quote=True)}">'
+            f"{escape(display_phone(phone))}</a>"
+        )
+    target_url = delivery_order_message_url(order)
+    if target_url:
+        lines.extend([
+            "",
+            f'↩️ <a href="{escape(target_url, quote=True)}">'
+            f"Открыть заказ №{order.order_number}</a>",
+        ])
+    return "\n".join(lines)
 
 
 def _tashkent_datetime(value: str | None) -> datetime | None:

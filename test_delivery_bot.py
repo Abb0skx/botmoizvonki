@@ -1,9 +1,10 @@
+import asyncio
 import tempfile
 import unittest
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 
@@ -17,12 +18,14 @@ from app.database.repository import MIGRATION_COLUMNS, SCHEMA
 from app.handlers.orders import (
     DETAILS, PAYMENT, PRODUCT_PHOTO, SECOND_LOCATION, _courier_waiting_pickup_text,
     _location_values, _message_location_urls, _publish_location,
-    _waiting_pickup_reminder_messages, courier_action, delivery_input, details,
+    _send_post_delivery_prompt, _waiting_pickup_reminder_messages,
+    courier_action, delivery_input, details,
     location_label_action, product, product_photo, save_edit, second_location,
 )
+from app.models import Order
 from app.utils.formatters import (
     all_locations_card, completed_card, courier_card, manager_card, short_address,
-    telegram_location_url, telegram_message_url, yandex_map_url,
+    post_delivery_prompt_url, telegram_location_url, telegram_message_url, yandex_map_url,
     yandex_route_url,
 )
 from app.utils.geocoding import (
@@ -303,6 +306,7 @@ class ParserTests(unittest.TestCase):
             "https://t.me/c/4398605075/125",
         )
         self.assertIsNone(telegram_message_url(-5125237049, 125))
+        self.assertIsNone(telegram_message_url(-1001234567, 125))
         self.assertIsNone(telegram_message_url(-1004398605075, None))
 
 
@@ -997,19 +1001,25 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
                 courier_name="Courier",
                 picked_up_at="2026-08-24T10:00:00+05:00",
                 time_started="2026-08-24T10:05:00+05:00",
-                delivery_chat_id=-100,
+                delivery_chat_id=-1004404461980,
                 delivery_message_id=50,
             )
             query = SimpleNamespace(
                 data=f"complete:{order.id}",
                 from_user=SimpleNamespace(id=2, full_name="Courier", username=None),
-                message=SimpleNamespace(chat_id=-100, message_id=50),
+                message=SimpleNamespace(chat_id=-1004404461980, message_id=50),
                 answer=AsyncMock(),
                 edit_message_text=AsyncMock(),
             )
             update = SimpleNamespace(callback_query=query)
-            bot = SimpleNamespace(send_message=AsyncMock())
-            settings = SimpleNamespace(delivery_group_id=-100, courier_ids=frozenset({2}))
+            bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(
+                chat_id=-1004404461980,
+                message_id=51,
+            )))
+            settings = SimpleNamespace(
+                delivery_group_id=-1004404461980,
+                courier_ids=frozenset({2}),
+            )
             context = SimpleNamespace(
                 application=SimpleNamespace(bot_data={"settings": settings, "repo": repo}),
                 bot=bot,
@@ -1028,11 +1038,212 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(bot.send_message.await_count, 1)
             prompt = bot.send_message.await_args
-            self.assertEqual(
-                prompt.kwargs["text"],
+            self.assertIn(
                 f"🚚 Заказ №{order.order_number} · A56\n"
                 "Courier, отправьте фото и цену товара 📸💰",
+                prompt.kwargs["text"],
             )
+            self.assertIn(
+                f'<a href="https://t.me/c/4404461980/50">Заказ{order.order_number}</a>',
+                prompt.kwargs["text"],
+            )
+            self.assertEqual(prompt.kwargs["parse_mode"], "HTML")
+            linked_buttons = [
+                button
+                for row in query.edit_message_text.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+            ]
+            self.assertTrue(any(
+                button.url == "https://t.me/c/4404461980/51"
+                for button in linked_buttons
+            ))
+
+    async def test_delivery_prompt_is_idempotent_and_refreshable(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = OrderRepository(Path(tempdir) / "delivery.db")
+            repo.initialize()
+            order = repo.create(
+                manager_id=1,
+                manager_name="Manager",
+                data={
+                    "seller_name": "Ali",
+                    "client_phone": "+998901333999",
+                    "product": "Pad <2>",
+                    "amount_usd": 100,
+                },
+            )
+            order = repo.update(
+                order.id,
+                status="completed",
+                courier_id=1799690992,
+                courier_name="Muzrob Oka",
+                delivered_at="2026-09-15T11:00:00+05:00",
+                delivery_chat_id=-1004404461980,
+                delivery_message_id=235,
+                post_delivery_prompt_required=1,
+            )
+            bot = SimpleNamespace(
+                send_message=AsyncMock(return_value=SimpleNamespace(
+                    chat_id=-1004404461980,
+                    message_id=236,
+                )),
+                edit_message_text=AsyncMock(),
+            )
+            context = SimpleNamespace(
+                bot=bot,
+                application=SimpleNamespace(bot_data={"repo": repo}),
+            )
+
+            published = await _send_post_delivery_prompt(context, order)
+            refreshed = await _send_post_delivery_prompt(context, published)
+
+            self.assertEqual(bot.send_message.await_count, 1)
+            bot.edit_message_text.assert_awaited_once()
+            self.assertEqual(
+                post_delivery_prompt_url(refreshed),
+                "https://t.me/c/4404461980/236",
+            )
+            self.assertIn("Pad &lt;2&gt;", bot.send_message.await_args.kwargs["text"])
+            self.assertEqual(
+                bot.send_message.await_args.kwargs["reply_parameters"].message_id,
+                235,
+            )
+
+    async def test_delivery_prompt_is_deleted_when_database_attach_raises(self):
+        order = Order(
+            id=1,
+            order_number=235,
+            manager_id=1,
+            manager_name="Manager",
+            seller_name="Ali",
+            client_phone="+998901333999",
+            product="Pad 2",
+            status="completed",
+            courier_id=1799690992,
+            courier_name="Muzrob Oka",
+            delivered_at="2026-09-15T11:00:00+05:00",
+            delivery_chat_id=-1004404461980,
+            delivery_message_id=235,
+            post_delivery_prompt_required=1,
+            updated_at="version-1",
+        )
+        repo = SimpleNamespace(
+            update=Mock(side_effect=RuntimeError("database unavailable")),
+            enqueue_cleanup_messages=Mock(side_effect=RuntimeError("database unavailable")),
+        )
+        bot = SimpleNamespace(
+            send_message=AsyncMock(return_value=SimpleNamespace(
+                chat_id=-1004404461980,
+                message_id=236,
+            )),
+            delete_message=AsyncMock(),
+        )
+        context = SimpleNamespace(
+            bot=bot,
+            application=SimpleNamespace(bot_data={"repo": repo}),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "database unavailable"):
+            await _send_post_delivery_prompt(context, order)
+
+        bot.delete_message.assert_awaited_once_with(
+            chat_id=-1004404461980,
+            message_id=236,
+        )
+
+    async def test_concurrent_delivery_prompt_publish_keeps_one_canonical_message(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = OrderRepository(Path(tempdir) / "delivery.db")
+            repo.initialize()
+            order = repo.create(
+                manager_id=1,
+                manager_name="Manager",
+                data={
+                    "client_phone": "+998901333999",
+                    "product": "Pad 2",
+                    "amount_usd": 100,
+                },
+            )
+            order = repo.update(
+                order.id,
+                status="completed",
+                courier_id=1799690992,
+                courier_name="Muzrob Oka",
+                delivered_at="2026-09-15T11:00:00+05:00",
+                delivery_chat_id=-1004404461980,
+                delivery_message_id=235,
+                post_delivery_prompt_required=1,
+            )
+            both_sending = asyncio.Event()
+            send_count = 0
+
+            async def send_message(**_kwargs):
+                nonlocal send_count
+                send_count += 1
+                message_id = 235 + send_count
+                if send_count == 2:
+                    both_sending.set()
+                await both_sending.wait()
+                return SimpleNamespace(
+                    chat_id=-1004404461980,
+                    message_id=message_id,
+                )
+
+            bot = SimpleNamespace(
+                send_message=AsyncMock(side_effect=send_message),
+                delete_message=AsyncMock(),
+            )
+            context = SimpleNamespace(
+                bot=bot,
+                application=SimpleNamespace(bot_data={"repo": repo}),
+            )
+
+            first, second = await asyncio.gather(
+                _send_post_delivery_prompt(context, order),
+                _send_post_delivery_prompt(context, order),
+            )
+
+            canonical = repo.get(order.id)
+            self.assertEqual(send_count, 2)
+            self.assertEqual(first.post_delivery_prompt_message_id, canonical.post_delivery_prompt_message_id)
+            self.assertEqual(second.post_delivery_prompt_message_id, canonical.post_delivery_prompt_message_id)
+            self.assertIn(canonical.post_delivery_prompt_message_id, {236, 237})
+            bot.delete_message.assert_awaited_once()
+            deleted_id = bot.delete_message.await_args.kwargs["message_id"]
+            self.assertIn(deleted_id, {236, 237})
+            self.assertNotEqual(deleted_id, canonical.post_delivery_prompt_message_id)
+
+    async def test_historical_completed_order_does_not_create_delivery_prompt(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = OrderRepository(Path(tempdir) / "delivery.db")
+            repo.initialize()
+            order = repo.create(
+                manager_id=1,
+                manager_name="Manager",
+                data={
+                    "client_phone": "+998901333999",
+                    "product": "A56",
+                    "amount_usd": 100,
+                },
+            )
+            order = repo.update(
+                order.id,
+                status="completed",
+                delivery_chat_id=-1004404461980,
+                delivery_message_id=235,
+            )
+            bot = SimpleNamespace(send_message=AsyncMock())
+            context = SimpleNamespace(
+                bot=bot,
+                application=SimpleNamespace(bot_data={"repo": repo}),
+            )
+
+            unchanged = await _send_post_delivery_prompt(context, order)
+
+            self.assertEqual(unchanged.id, order.id)
+            bot.send_message.assert_not_awaited()
 
     async def test_publish_location_saves_channel_message(self):
         with tempfile.TemporaryDirectory() as tempdir:
@@ -1061,6 +1272,8 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
                     SimpleNamespace(chat_id=-1004398605075, message_id=89),
                     SimpleNamespace(chat_id=-1004398605075, message_id=90),
                     SimpleNamespace(chat_id=-1004398605075, message_id=92),
+                    SimpleNamespace(chat_id=-1004398605075, message_id=93),
+                    SimpleNamespace(chat_id=-1004398605075, message_id=94),
                 ]),
                 send_location=AsyncMock(
                     return_value=SimpleNamespace(chat_id=-1004398605075, message_id=88)
@@ -1078,14 +1291,13 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
             bot.send_location.assert_awaited_once()
             self.assertEqual(published.location_chat_id, -1004398605075)
             self.assertEqual(published.location_message_id, 88)
-            self.assertEqual(published.location_details_message_id, 87)
-            self.assertEqual(published.location_footer_message_id, 89)
-            location_buttons = bot.send_location.await_args.kwargs["reply_markup"].inline_keyboard
-            self.assertEqual(len(location_buttons), 3)
-            self.assertEqual(
-                {row[0].callback_data for row in location_buttons},
-                {f"location_label:{order.id}"},
-            )
+            self.assertEqual(published.location_header_message_id, 87)
+            self.assertEqual(published.location_details_message_id, 89)
+            self.assertEqual(published.location_footer_message_id, 90)
+            self.assertNotIn("reply_markup", bot.send_location.await_args.kwargs)
+            details = bot.send_message.await_args_list[1].kwargs
+            self.assertIn("📦 A7 Pro", details["text"])
+            self.assertIn("📞", details["text"])
             self.assertEqual(
                 telegram_location_url(published),
                 "https://t.me/c/4398605075/88",
@@ -1098,16 +1310,143 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
             )
             bot.send_location.return_value = SimpleNamespace(
                 chat_id=-1004398605075,
-                message_id=89,
+                message_id=91,
             )
             published = await _publish_location(context, repo, published, 2)
             self.assertEqual(
                 telegram_location_url(published, 2),
-                "https://t.me/c/4398605075/89",
+                "https://t.me/c/4398605075/91",
             )
-            self.assertEqual(published.second_location_details_message_id, 90)
-            self.assertEqual(published.second_location_footer_message_id, 92)
-            self.assertEqual(bot.send_message.await_count, 4)
+            self.assertEqual(published.second_location_header_message_id, 92)
+            self.assertEqual(published.second_location_details_message_id, 93)
+            self.assertEqual(published.second_location_footer_message_id, 94)
+            self.assertEqual(bot.send_message.await_count, 6)
+
+    async def test_partial_four_post_location_is_cleaned_after_every_failure_stage(self):
+        cases = {
+            "header": ([RuntimeError("header failed")], None, []),
+            "pin": (
+                [SimpleNamespace(chat_id=-1004398605075, message_id=81)],
+                RuntimeError("pin failed"),
+                [81],
+            ),
+            "details": (
+                [
+                    SimpleNamespace(chat_id=-1004398605075, message_id=81),
+                    RuntimeError("details failed"),
+                ],
+                None,
+                [81, 82],
+            ),
+            "footer": (
+                [
+                    SimpleNamespace(chat_id=-1004398605075, message_id=81),
+                    SimpleNamespace(chat_id=-1004398605075, message_id=83),
+                    RuntimeError("footer failed"),
+                ],
+                None,
+                [81, 82, 83],
+            ),
+        }
+        for stage, (message_effects, pin_error, expected_deleted) in cases.items():
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as tempdir:
+                repo = OrderRepository(Path(tempdir) / "delivery.db")
+                repo.initialize()
+                order = repo.create(
+                    manager_id=1,
+                    manager_name="Manager",
+                    data={
+                        "client_phone": "+998901333999",
+                        "product": "A7 Pro",
+                        "amount_usd": 100,
+                        "latitude": 41.311081,
+                        "longitude": 69.240562,
+                    },
+                )
+                order = repo.update(order.id, status="pending")
+                send_location = AsyncMock(
+                    side_effect=pin_error,
+                    return_value=SimpleNamespace(
+                        chat_id=-1004398605075,
+                        message_id=82,
+                    ),
+                )
+                bot = SimpleNamespace(
+                    send_message=AsyncMock(side_effect=message_effects),
+                    send_location=send_location,
+                    delete_message=AsyncMock(),
+                )
+                context = SimpleNamespace(
+                    application=SimpleNamespace(bot_data={
+                        "settings": SimpleNamespace(
+                            location_channel_id=-1004398605075,
+                        ),
+                        "repo": repo,
+                    }),
+                    bot=bot,
+                )
+
+                with self.assertRaises(RuntimeError):
+                    await _publish_location(context, repo, order)
+
+                unchanged = repo.get(order.id)
+                self.assertIsNone(unchanged.location_chat_id)
+                self.assertIsNone(unchanged.location_header_message_id)
+                self.assertIsNone(unchanged.location_message_id)
+                self.assertIsNone(unchanged.location_details_message_id)
+                self.assertIsNone(unchanged.location_footer_message_id)
+                self.assertEqual(
+                    [call.kwargs["message_id"] for call in bot.delete_message.await_args_list],
+                    expected_deleted,
+                )
+                self.assertEqual(repo.list_cleanup_messages(order_id=order.id), [])
+
+    async def test_cancelled_location_publish_durably_queues_partial_block(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = OrderRepository(Path(tempdir) / "delivery.db")
+            repo.initialize()
+            order = repo.create(
+                manager_id=1,
+                manager_name="Manager",
+                data={
+                    "client_phone": "+998901333999",
+                    "product": "A7 Pro",
+                    "amount_usd": 100,
+                    "latitude": 41.311081,
+                    "longitude": 69.240562,
+                },
+            )
+            order = repo.update(order.id, status="pending")
+            bot = SimpleNamespace(
+                send_message=AsyncMock(side_effect=[
+                    SimpleNamespace(chat_id=-1004398605075, message_id=81),
+                    asyncio.CancelledError(),
+                ]),
+                send_location=AsyncMock(return_value=SimpleNamespace(
+                    chat_id=-1004398605075,
+                    message_id=82,
+                )),
+                delete_message=AsyncMock(),
+            )
+            context = SimpleNamespace(
+                application=SimpleNamespace(bot_data={
+                    "settings": SimpleNamespace(
+                        location_channel_id=-1004398605075,
+                    ),
+                    "repo": repo,
+                }),
+                bot=bot,
+            )
+
+            with self.assertRaises(asyncio.CancelledError):
+                await _publish_location(context, repo, order)
+
+            queued = repo.list_cleanup_messages(order_id=order.id)
+            self.assertEqual(
+                {(item["chat_id"], item["message_id"]) for item in queued},
+                {(-1004398605075, 81), (-1004398605075, 82)},
+            )
+            bot.delete_message.assert_not_awaited()
 
 
 class RepositoryTests(unittest.TestCase):

@@ -1,8 +1,11 @@
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
+
+from telegram.error import RetryAfter
 
 from app.database import OrderRepository
 from app.handlers.orders import (
@@ -33,7 +36,7 @@ class CourierConfigurationTests(unittest.TestCase):
 
         self.assertIsNotNone(courier)
         self.assertEqual(courier.name, "Muzrob Oka")
-        self.assertEqual(courier_group_id(1799690992), -5125237049)
+        self.assertEqual(courier_group_id(1799690992), -1004404461980)
 
 
 class OrderListUxTests(unittest.IsolatedAsyncioTestCase):
@@ -312,6 +315,65 @@ class CallbackAcknowledgementTests(unittest.IsolatedAsyncioTestCase):
             for call in bot.send_message.await_args_list
         ))
 
+    async def test_assignment_cleanup_flood_wait_keeps_committed_courier(self):
+        order = self.repo.create(
+            manager_id=11,
+            manager_name="Manager",
+            data=_order_data(),
+        )
+        query = SimpleNamespace(
+            data=f"courier_assign:{order.id}:202134293",
+            from_user=SimpleNamespace(
+                id=11,
+                full_name="Manager",
+                username=None,
+            ),
+            message=SimpleNamespace(chat_id=11, message_id=90),
+            answer=AsyncMock(),
+        )
+        bot = SimpleNamespace(
+            send_message=AsyncMock(
+                return_value=SimpleNamespace(
+                    chat_id=-5216093690,
+                    message_id=60,
+                )
+            ),
+        )
+        context = SimpleNamespace(
+            bot=bot,
+            application=SimpleNamespace(
+                bot_data={
+                    "settings": SimpleNamespace(
+                        manager_ids=frozenset({11}),
+                        courier_ids=frozenset({202134293}),
+                        delivery_group_id=-100,
+                        location_channel_id=-1002,
+                    ),
+                    "repo": self.repo,
+                }
+            ),
+        )
+
+        with (
+            patch(
+                "app.handlers.orders._process_cleanup_messages",
+                new=AsyncMock(side_effect=RetryAfter(7)),
+            ),
+            patch("app.handlers.orders._schedule_sync_retry") as schedule,
+            patch("app.handlers.orders._sync_order", new=AsyncMock()) as sync,
+        ):
+            await courier_assignment_action(
+                SimpleNamespace(callback_query=query),
+                context,
+            )
+
+        assigned = self.repo.get(order.id)
+        self.assertEqual(assigned.status, "pending")
+        self.assertEqual(assigned.assigned_courier_id, 202134293)
+        self.assertEqual(assigned.delivery_chat_id, -5216093690)
+        schedule.assert_called_once_with(context, order.id, initial_delay=7.0)
+        sync.assert_not_awaited()
+
     async def test_published_pending_reassignment_requires_confirmation_without_read_receipt(self):
         order = self.repo.create(manager_id=11, manager_name="Manager", data=_order_data())
         order = self.repo.update(
@@ -488,6 +550,221 @@ class CallbackAcknowledgementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events, ["answer", "refresh"])
         query.answer.assert_awaited_once_with("Заказ доставлен")
 
+    async def test_completed_prompt_flood_wait_is_used_for_first_retry(self):
+        order = self.repo.create(manager_id=11, manager_name="Manager", data=_order_data())
+        order = self.repo.update(
+            order.id,
+            status="on_way",
+            assigned_courier_id=22,
+            assigned_courier_name="Courier",
+            courier_id=22,
+            courier_name="Courier",
+            time_started="2026-09-15T10:00:00+05:00",
+        )
+        query = SimpleNamespace(
+            data=f"complete:{order.id}",
+            from_user=SimpleNamespace(id=22, full_name="Courier", username=None),
+            message=SimpleNamespace(chat_id=-100, message_id=100),
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        )
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={
+                "settings": SimpleNamespace(
+                    delivery_group_id=-100,
+                    courier_ids=frozenset({22}),
+                ),
+                "repo": self.repo,
+            }),
+            bot=SimpleNamespace(),
+        )
+        schedule = Mock()
+        notify_log = AsyncMock()
+
+        with (
+            patch(
+                "app.handlers.orders._send_post_delivery_prompt",
+                new=AsyncMock(side_effect=RetryAfter(60)),
+            ),
+            patch("app.handlers.orders._schedule_sync_retry", schedule),
+            patch("app.handlers.orders._notify_log", new=notify_log),
+        ):
+            await courier_action(SimpleNamespace(callback_query=query), context)
+
+        self.assertGreaterEqual(schedule.call_count, 1)
+        self.assertEqual(schedule.call_args_list[0].kwargs.get("initial_delay"), 60.0)
+        self.assertEqual(self.repo.get(order.id).sync_needed, 1)
+        query.edit_message_text.assert_not_awaited()
+        notify_log.assert_not_awaited()
+
+    async def test_completed_refresh_flood_wait_stops_before_log_send(self):
+        order = self.repo.create(
+            manager_id=11,
+            manager_name="Manager",
+            data=_order_data(),
+        )
+        order = self.repo.update(
+            order.id,
+            status="on_way",
+            assigned_courier_id=22,
+            assigned_courier_name="Courier",
+            courier_id=22,
+            courier_name="Courier",
+            time_started="2026-09-15T10:00:00+05:00",
+        )
+        query = SimpleNamespace(
+            data=f"complete:{order.id}",
+            from_user=SimpleNamespace(
+                id=22,
+                full_name="Courier",
+                username=None,
+            ),
+            message=SimpleNamespace(chat_id=-100, message_id=100),
+            answer=AsyncMock(),
+        )
+        application = SimpleNamespace(
+            bot_data={
+                "settings": SimpleNamespace(
+                    delivery_group_id=-100,
+                    courier_ids=frozenset({22}),
+                ),
+                "repo": self.repo,
+            }
+        )
+        context = SimpleNamespace(application=application, bot=SimpleNamespace())
+        notify_log = AsyncMock()
+
+        async def rate_limited_finish(*_args, **_kwargs):
+            application.bot_data["sync_retry_not_before"] = {
+                order.id: asyncio.get_running_loop().time() + 60,
+            }
+            return False
+
+        with (
+            patch(
+                "app.handlers.orders._send_post_delivery_prompt",
+                new=AsyncMock(side_effect=lambda _context, value: value),
+            ),
+            patch(
+                "app.handlers.orders._finish_status_change",
+                new=AsyncMock(side_effect=rate_limited_finish),
+            ),
+            patch("app.handlers.orders._notify_log", new=notify_log),
+        ):
+            await courier_action(SimpleNamespace(callback_query=query), context)
+
+        self.assertEqual(self.repo.get(order.id).status, "completed")
+        notify_log.assert_not_awaited()
+
+    async def test_undo_completed_removes_linked_photo_prompt(self):
+        order = self.repo.create(manager_id=11, manager_name="Manager", data=_order_data())
+        order = self.repo.update(
+            order.id,
+            status="completed",
+            assigned_courier_id=22,
+            assigned_courier_name="Courier",
+            courier_id=22,
+            courier_name="Courier",
+            time_started="2026-09-15T10:00:00+05:00",
+            delivered_at="2026-09-15T10:30:00+05:00",
+            delivery_chat_id=-1004404461980,
+            delivery_message_id=100,
+            post_delivery_prompt_required=1,
+            post_delivery_prompt_chat_id=-1004404461980,
+            post_delivery_prompt_message_id=101,
+        )
+        query = SimpleNamespace(
+            data=f"undo_complete:{order.id}",
+            from_user=SimpleNamespace(id=22, full_name="Courier", username=None),
+            message=SimpleNamespace(chat_id=-1004404461980, message_id=100),
+            answer=AsyncMock(),
+        )
+        bot = SimpleNamespace(delete_message=AsyncMock())
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={
+                "settings": SimpleNamespace(
+                    delivery_group_id=-1004404461980,
+                    courier_ids=frozenset({22}),
+                ),
+                "repo": self.repo,
+            }),
+            bot=bot,
+        )
+
+        with (
+            patch("app.handlers.orders._finish_status_change", new=AsyncMock(return_value=True)),
+            patch("app.handlers.orders._notify_log", new=AsyncMock()),
+        ):
+            await courier_action(SimpleNamespace(callback_query=query), context)
+
+        restored = self.repo.get(order.id)
+        self.assertEqual(restored.status, "on_way")
+        self.assertEqual(restored.post_delivery_prompt_required, 0)
+        self.assertIsNone(restored.post_delivery_prompt_chat_id)
+        self.assertIsNone(restored.post_delivery_prompt_message_id)
+        bot.delete_message.assert_awaited_once_with(
+            chat_id=-1004404461980,
+            message_id=101,
+        )
+
+    async def test_undo_refreshes_main_card_before_rate_limited_prompt_cleanup(self):
+        order = self.repo.create(manager_id=11, manager_name="Manager", data=_order_data())
+        order = self.repo.update(
+            order.id,
+            status="completed",
+            assigned_courier_id=22,
+            assigned_courier_name="Courier",
+            courier_id=22,
+            courier_name="Courier",
+            time_started="2026-09-15T10:00:00+05:00",
+            delivered_at="2026-09-15T10:30:00+05:00",
+            delivery_chat_id=-1004404461980,
+            delivery_message_id=100,
+            post_delivery_prompt_required=1,
+            post_delivery_prompt_chat_id=-1004404461980,
+            post_delivery_prompt_message_id=101,
+        )
+        events: list[str] = []
+
+        async def finish(*_args, **_kwargs):
+            events.append("refresh")
+            return True
+
+        async def delete_message(**_kwargs):
+            events.append("cleanup")
+            raise RetryAfter(7)
+
+        query = SimpleNamespace(
+            data=f"undo_complete:{order.id}",
+            from_user=SimpleNamespace(id=22, full_name="Courier", username=None),
+            message=SimpleNamespace(chat_id=-1004404461980, message_id=100),
+            answer=AsyncMock(),
+        )
+        bot = SimpleNamespace(delete_message=AsyncMock(side_effect=delete_message))
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={
+                "settings": SimpleNamespace(
+                    delivery_group_id=-1004404461980,
+                    courier_ids=frozenset({22}),
+                ),
+                "repo": self.repo,
+            }),
+            bot=bot,
+        )
+
+        with (
+            patch("app.handlers.orders._finish_status_change", side_effect=finish),
+            patch("app.handlers.orders._notify_log", new=AsyncMock()) as notify_log,
+        ):
+            await courier_action(SimpleNamespace(callback_query=query), context)
+
+        self.assertEqual(events, ["refresh", "cleanup"])
+        self.assertEqual(self.repo.get(order.id).status, "on_way")
+        queued = self.repo.list_cleanup_messages(order_id=order.id)
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0]["attempts"], 0)
+        notify_log.assert_not_awaited()
+
     async def test_stale_courier_card_cannot_change_canonical_order(self):
         order = self.repo.create(manager_id=11, manager_name="Manager", data=_order_data())
         order = self.repo.update(
@@ -629,6 +906,83 @@ class CallbackAcknowledgementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(updated.sync_needed, 1)
         schedule.assert_called_once_with(context, order.id)
         self.assertIn("карточку менеджера обновить не удалось", message.reply_text.await_args.args[0])
+
+    async def test_location_edit_cleanup_flood_wait_stops_further_bot_calls(self):
+        order = self.repo.create(
+            manager_id=11,
+            manager_name="Manager",
+            data=_order_data(),
+        )
+        order = self.repo.update(
+            order.id,
+            status="pending",
+            second_location_url="https://maps.google.com/?q=41.3,69.2",
+            second_latitude=41.3,
+            second_longitude=69.2,
+            second_location_chat_id=-1002,
+            second_location_header_message_id=201,
+            second_location_message_id=202,
+            second_location_details_message_id=203,
+            second_location_footer_message_id=204,
+            manager_chat_id=11,
+            manager_message_id=100,
+        )
+        message = SimpleNamespace(
+            text="🗑 Удалить доп. локацию",
+            location=None,
+            venue=None,
+            photo=None,
+            entities=None,
+            caption=None,
+            caption_entities=None,
+            reply_text=AsyncMock(),
+        )
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=11, type="private"),
+            effective_user=SimpleNamespace(
+                id=11,
+                full_name="Manager",
+                username=None,
+            ),
+            message=message,
+        )
+        bot = SimpleNamespace(edit_message_text=AsyncMock())
+        context = SimpleNamespace(
+            user_data={
+                "edit": {
+                    "order_id": order.id,
+                    "field": "second_location",
+                    "message_id": 100,
+                    "chat_id": 11,
+                    "updated_at": order.updated_at,
+                }
+            },
+            application=SimpleNamespace(
+                bot_data={
+                    "repo": self.repo,
+                    "settings": SimpleNamespace(
+                        manager_ids=frozenset({11}),
+                    ),
+                }
+            ),
+            bot=bot,
+        )
+
+        with (
+            patch(
+                "app.handlers.orders._process_cleanup_messages",
+                new=AsyncMock(side_effect=RetryAfter(7)),
+            ),
+            patch("app.handlers.orders._schedule_sync_retry") as schedule,
+        ):
+            result = await save_edit(update, context)
+
+        self.assertEqual(result, -1)
+        self.assertNotIn("edit", context.user_data)
+        self.assertIsNone(self.repo.get(order.id).second_latitude)
+        schedule.assert_called_once_with(context, order.id, initial_delay=7.0)
+        bot.edit_message_text.assert_not_awaited()
+        message.reply_text.assert_not_awaited()
 
     async def test_courier_cancelled_order_cannot_be_restored_by_manager(self):
         order = self.repo.create(manager_id=11, manager_name="Manager", data=_order_data())

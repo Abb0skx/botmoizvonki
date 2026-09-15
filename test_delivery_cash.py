@@ -75,7 +75,7 @@ class CourierCashRepositoryTests(unittest.TestCase):
             usd=usd,
             uzs=uzs,
             raw_text="40 -25000" if kind == "receipt" else "40$ касса",
-            source_chat_id=-5125237049,
+            source_chat_id=-1004404461980,
             source_message_id=message_id,
         )
 
@@ -204,7 +204,7 @@ class CourierCashHandlerTests(unittest.IsolatedAsyncioTestCase):
         )
 
     @staticmethod
-    def update(text, *, message_id=50, chat_id=-5125237049, user_id=1799690992):
+    def update(text, *, message_id=50, chat_id=-1004404461980, user_id=1799690992):
         message = SimpleNamespace(
             text=text,
             caption=None,
@@ -237,7 +237,7 @@ class CourierCashHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(entry.status, "pending")
         self.assertEqual(entry.notification_message_id, 700)
         self.assertIsNotNone(entry.source_deleted_at)
-        self.bot.delete_message.assert_awaited_once_with(-5125237049, 50)
+        self.bot.delete_message.assert_awaited_once_with(-1004404461980, 50)
         keyboard = self.bot.send_message.await_args.kwargs["reply_markup"]
         labels = [button.text for row in keyboard.inline_keyboard for button in row]
         self.assertEqual(labels, ["✅ Получил", "❌ Не получил", "✏️ Другая сумма"])
@@ -270,7 +270,7 @@ class CourierCashHandlerTests(unittest.IsolatedAsyncioTestCase):
         recovered = self.repo.get_cash_entry(1)
         self.assertEqual(recovered.notification_message_id, 701)
         self.assertIsNotNone(recovered.source_deleted_at)
-        self.bot.delete_message.assert_awaited_once_with(-5125237049, 50)
+        self.bot.delete_message.assert_awaited_once_with(-1004404461980, 50)
 
     async def test_permanent_delete_denial_is_not_retried_forever(self):
         self.bot.delete_message.side_effect = Forbidden("not enough rights")
