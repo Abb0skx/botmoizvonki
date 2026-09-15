@@ -646,6 +646,38 @@ class DeliveryRepositorySafetyTests(unittest.TestCase):
         self.assertEqual(version, 7)
         self.assertIsNotNone(table)
 
+    def test_delivery_feed_identity_is_initialized_once(self) -> None:
+        with self.repo.connect() as db:
+            first = db.execute(
+                "SELECT feed_instance_id FROM delivery_feed_identity WHERE singleton=1"
+            ).fetchone()[0]
+
+        self.repo.initialize()
+
+        with self.repo.connect() as db:
+            second = db.execute(
+                "SELECT feed_instance_id FROM delivery_feed_identity WHERE singleton=1"
+            ).fetchone()[0]
+        self.assertTrue(first)
+        self.assertEqual(second, first)
+
+    def test_delivery_status_feed_returns_latest_visible_transition(self) -> None:
+        order = self.create_order()
+        pending = self.repo.transition(order.id, {"draft"}, status="pending")
+        self.assertIsNotNone(pending)
+        on_way = self.repo.transition(order.id, {"pending"}, status="on_way")
+        self.assertIsNotNone(on_way)
+
+        feed = self.repo.delivery_status_event_feed(after_event_id=0, limit=100)
+
+        self.assertTrue(feed["feed_instance_id"])
+        self.assertEqual(len(feed["events"]), 1)
+        self.assertEqual(feed["events"][0]["order_number"], order.order_number)
+        self.assertEqual(feed["events"][0]["to_status"], "on_way")
+        self.assertEqual(feed["invalidations"], [])
+        self.assertEqual(feed["next_after_event_id"], feed["latest_event_id"])
+        self.assertFalse(feed["has_more"])
+
     def test_periodic_job_claim_is_idempotent_per_job_and_slot(self) -> None:
         self.assertTrue(self.repo.claim_periodic_job("pickup_reminder", 100))
         self.assertFalse(self.repo.claim_periodic_job("pickup_reminder", 100))
