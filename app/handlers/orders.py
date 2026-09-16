@@ -5028,7 +5028,7 @@ async def location_label_action(update: Update, context: ContextTypes.DEFAULT_TY
 
 def register_handlers(application: Application) -> None:
     application.add_handler(
-        MessageHandler(filters.TEXT & filters.ChatType.PRIVATE, cash_correction_input),
+        MessageHandler(filters.TEXT, cash_correction_input),
         group=-2,
     )
     application.add_handler(

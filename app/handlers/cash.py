@@ -17,6 +17,7 @@ from app.utils.parsers import contains_cash_keyword, parse_courier_cash
 
 logger = logging.getLogger(__name__)
 TASHKENT = ZoneInfo("Asia/Tashkent")
+CASH_REVIEWER_ID = 5619452809
 
 
 def _name(user) -> str:
@@ -133,8 +134,13 @@ async def publish_cash_notification(
         balance = repo.cash_balance(current.courier_id)
         keyboard = cash_review_keyboard(current) if current.status == "pending" else None
         settings: Settings = context.application.bot_data["settings"]
+        notification_chat_id = (
+            current.source_chat_id
+            if current.entry_type == "handover"
+            else settings.cash_notification_channel_id
+        )
         sent = await context.bot.send_message(
-            chat_id=settings.cash_notification_channel_id,
+            chat_id=notification_chat_id,
             text=cash_notification_text(current, balance),
             parse_mode=ParseMode.HTML,
             reply_markup=keyboard,
@@ -217,19 +223,6 @@ async def courier_cash_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             logger.exception("Could not publish cash entry %s", entry.id)
 
 
-async def _is_cash_channel_admin(
-    context: ContextTypes.DEFAULT_TYPE,
-    user_id: int,
-) -> bool:
-    settings: Settings = context.application.bot_data["settings"]
-    try:
-        member = await context.bot.get_chat_member(settings.cash_notification_channel_id, user_id)
-    except Exception:
-        logger.exception("Could not verify cash-channel administrator %s", user_id)
-        return False
-    return member.status in {"administrator", "creator", "owner"}
-
-
 async def _refresh_cash_notification(
     context: ContextTypes.DEFAULT_TYPE,
     entry: CourierCashEntry,
@@ -271,12 +264,8 @@ async def _refresh_cash_notification(
 async def cash_review_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     user = query.from_user
-    settings: Settings = context.application.bot_data["settings"]
-    if query.message.chat_id != settings.cash_notification_channel_id:
-        await query.answer("Эта кнопка не из канала кассы", show_alert=True)
-        return
-    if not await _is_cash_channel_admin(context, user.id):
-        await query.answer("Подтверждать кассу может только администратор канала", show_alert=True)
+    if user.id != CASH_REVIEWER_ID:
+        await query.answer("Эти кнопки доступны только ответственному за кассу", show_alert=True)
         return
     action, raw_id, raw_revision = query.data.split(":")
     repo: OrderRepository = context.application.bot_data["repo"]
@@ -306,21 +295,21 @@ async def cash_review_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data["cash_correction"] = {
             "entry_id": entry.id,
             "revision": entry.revision,
+            "chat_id": entry.notification_chat_id,
         }
         try:
             await context.bot.send_message(
-                user.id,
-                f"✏️ Введите правильную сумму для кассы №K-{entry.id}.\n"
-                "Например: 35$ 200000 сум\n\n/cancel — отменить изменение",
+                chat_id=entry.notification_chat_id,
+                text="Отправьте точную сумму",
             )
         except Exception:
             context.user_data.pop("cash_correction", None)
             await query.answer(
-                "Сначала откройте личный чат с ботом и нажмите /start",
+                "Не удалось отправить запрос. Попробуйте ещё раз.",
                 show_alert=True,
             )
             return
-        await query.answer("Запрос отправлен вам в личный чат", show_alert=True)
+        await query.answer("Отправьте точную сумму в эту группу", show_alert=True)
         return
 
     decision = "confirmed" if action == "cash_ok" else "rejected"
@@ -348,12 +337,13 @@ async def cash_correction_input(update: Update, context: ContextTypes.DEFAULT_TY
     user = update.effective_user
     chat = update.effective_chat
     message = update.effective_message
-    if not user or not chat or chat.type != "private" or not message:
+    if not user or not chat or not message:
         return
-    if not await _is_cash_channel_admin(context, user.id):
+    if user.id != CASH_REVIEWER_ID:
         context.user_data.pop("cash_correction", None)
-        await message.reply_text("Права администратора канала кассы больше не доступны.")
         raise ApplicationHandlerStop
+    if chat.id != int(pending.get("chat_id") or 0):
+        return
     raw = (message.text or "").strip()
     if raw.casefold() in {
         "/start", "/map", "➕ новый заказ", "📋 активные заказы",

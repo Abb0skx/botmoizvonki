@@ -181,11 +181,13 @@ class CourierCashHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.settings = SimpleNamespace(cash_notification_channel_id=-1003927727489)
         self.bot = SimpleNamespace(
             send_message=AsyncMock(
-                return_value=SimpleNamespace(chat_id=-1003927727489, message_id=700)
+                side_effect=lambda **kwargs: SimpleNamespace(
+                    chat_id=kwargs["chat_id"],
+                    message_id=700,
+                )
             ),
             delete_message=AsyncMock(),
             edit_message_text=AsyncMock(),
-            get_chat_member=AsyncMock(return_value=SimpleNamespace(status="administrator")),
         )
         self.application = SimpleNamespace(
             bot_data={"repo": self.repo, "settings": self.settings},
@@ -225,6 +227,7 @@ class CourierCashHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.repo.cash_balance(1799690992), (40, -25_000))
         self.bot.delete_message.assert_not_awaited()
         sent = self.bot.send_message.await_args.kwargs
+        self.assertEqual(sent["chat_id"], -1003927727489)
         self.assertIn("Сумма учтена", sent["text"])
         self.assertIn("+40 $", sent["text"])
         self.assertIn("−25 000 сум", sent["text"])
@@ -236,6 +239,9 @@ class CourierCashHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(entry.notification_message_id, 700)
         self.assertIsNone(entry.source_deleted_at)
         self.bot.delete_message.assert_not_awaited()
+        sent = self.bot.send_message.await_args.kwargs
+        self.assertEqual(sent["chat_id"], -1004404461980)
+        self.assertIn("40 $", sent["text"])
         keyboard = self.bot.send_message.await_args.kwargs["reply_markup"]
         labels = [button.text for row in keyboard.inline_keyboard for button in row]
         self.assertEqual(labels, ["✅ Получил", "❌ Не получил", "✏️ Другая сумма"])
@@ -258,8 +264,8 @@ class CourierCashHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.bot.delete_message.assert_not_awaited()
 
         self.bot.send_message.side_effect = None
-        self.bot.send_message.return_value = SimpleNamespace(
-            chat_id=-1003927727489,
+        self.bot.send_message.side_effect = lambda **kwargs: SimpleNamespace(
+            chat_id=kwargs["chat_id"],
             message_id=701,
         )
         self.application.bot = self.bot
@@ -284,8 +290,8 @@ class CourierCashHandlerTests(unittest.IsolatedAsyncioTestCase):
         await courier_cash_input(self.update("40$ касса"), self.context())
         query = SimpleNamespace(
             data="cash_ok:1:1",
-            from_user=SimpleNamespace(id=202134293, full_name="Abbos", username="abbos"),
-            message=SimpleNamespace(chat_id=-1003927727489, message_id=700),
+            from_user=SimpleNamespace(id=5619452809, full_name="Admin", username="admin"),
+            message=SimpleNamespace(chat_id=-1004404461980, message_id=700),
             answer=AsyncMock(),
         )
         self.bot.edit_message_text.side_effect = RuntimeError("temporary")
@@ -311,12 +317,12 @@ class CourierCashHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.repo.cash_balance(1799690992), (0, 0))
         self.bot.send_message.assert_not_awaited()
 
-    async def test_channel_admin_confirmation_updates_balance_once(self):
+    async def test_responsible_user_confirmation_updates_balance_once(self):
         await courier_cash_input(self.update("40$ касса"), self.context())
         query = SimpleNamespace(
             data="cash_ok:1:1",
-            from_user=SimpleNamespace(id=202134293, full_name="Abbos", username="abbos"),
-            message=SimpleNamespace(chat_id=-1003927727489, message_id=700),
+            from_user=SimpleNamespace(id=5619452809, full_name="Admin", username="admin"),
+            message=SimpleNamespace(chat_id=-1004404461980, message_id=700),
             answer=AsyncMock(),
         )
         update = SimpleNamespace(callback_query=query)
@@ -326,16 +332,15 @@ class CourierCashHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.repo.cash_balance(1799690992), (-40, 0))
         current = self.repo.get_cash_entry(1)
         self.assertEqual(current.status, "confirmed")
-        self.assertEqual(current.reviewed_by_name, "Abbos")
+        self.assertEqual(current.reviewed_by_name, "Admin")
         self.assertIn("Касса получена", self.bot.edit_message_text.await_args.kwargs["text"])
 
-    async def test_non_admin_cannot_confirm(self):
+    async def test_other_user_cannot_confirm(self):
         await courier_cash_input(self.update("40$ касса"), self.context())
-        self.bot.get_chat_member.return_value = SimpleNamespace(status="member")
         query = SimpleNamespace(
             data="cash_ok:1:1",
             from_user=SimpleNamespace(id=99, full_name="User", username=None),
-            message=SimpleNamespace(chat_id=-1003927727489, message_id=700),
+            message=SimpleNamespace(chat_id=-1004404461980, message_id=700),
             answer=AsyncMock(),
         )
         await cash_review_action(SimpleNamespace(callback_query=query), self.context())
@@ -347,22 +352,28 @@ class CourierCashHandlerTests(unittest.IsolatedAsyncioTestCase):
         user_data = {}
         query = SimpleNamespace(
             data="cash_other:1:1",
-            from_user=SimpleNamespace(id=202134293, full_name="Abbos", username="abbos"),
-            message=SimpleNamespace(chat_id=-1003927727489, message_id=700),
+            from_user=SimpleNamespace(id=5619452809, full_name="Admin", username="admin"),
+            message=SimpleNamespace(chat_id=-1004404461980, message_id=700),
             answer=AsyncMock(),
         )
         context = self.context(user_data=user_data)
         await cash_review_action(SimpleNamespace(callback_query=query), context)
-        self.assertEqual(user_data["cash_correction"], {"entry_id": 1, "revision": 1})
+        self.assertEqual(
+            user_data["cash_correction"],
+            {"entry_id": 1, "revision": 1, "chat_id": -1004404461980},
+        )
+        prompt = self.bot.send_message.await_args.kwargs
+        self.assertEqual(prompt["chat_id"], -1004404461980)
+        self.assertEqual(prompt["text"], "Отправьте точную сумму")
 
-        private_message = SimpleNamespace(text="35$ 200000 сум", reply_text=AsyncMock())
-        private_update = SimpleNamespace(
+        group_message = SimpleNamespace(text="35$ 200000 сум", reply_text=AsyncMock())
+        group_update = SimpleNamespace(
             effective_user=query.from_user,
-            effective_chat=SimpleNamespace(id=202134293, type="private"),
-            effective_message=private_message,
+            effective_chat=SimpleNamespace(id=-1004404461980, type="supergroup"),
+            effective_message=group_message,
         )
         with self.assertRaises(Exception) as stopped:
-            await cash_correction_input(private_update, context)
+            await cash_correction_input(group_update, context)
         self.assertEqual(stopped.exception.__class__.__name__, "ApplicationHandlerStop")
         corrected = self.repo.get_cash_entry(1)
         self.assertEqual(corrected.status, "pending")
