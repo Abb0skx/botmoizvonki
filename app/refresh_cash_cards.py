@@ -81,7 +81,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true", help="изменить прежние карточки в Telegram")
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    # HTTP client debug/info logs include the bot token in Telegram request URLs.
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
     _, failed = asyncio.run(refresh(apply=args.apply))
     if failed:
         raise SystemExit(1)
