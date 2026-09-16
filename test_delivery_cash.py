@@ -231,6 +231,7 @@ class CourierCashHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Сумма учтена", sent["text"])
         self.assertIn("+40 $", sent["text"])
         self.assertIn("−25 000 сум", sent["text"])
+        self.assertNotIn("Сейчас у курьера", sent["text"])
 
     async def test_handover_is_published_and_original_message_stays(self):
         await courier_cash_input(self.update("40$ касса"), self.context())
@@ -242,6 +243,7 @@ class CourierCashHandlerTests(unittest.IsolatedAsyncioTestCase):
         sent = self.bot.send_message.await_args.kwargs
         self.assertEqual(sent["chat_id"], -1004404461980)
         self.assertIn("40 $", sent["text"])
+        self.assertNotIn("Сейчас у курьера", sent["text"])
         keyboard = self.bot.send_message.await_args.kwargs["reply_markup"]
         labels = [button.text for row in keyboard.inline_keyboard for button in row]
         self.assertEqual(labels, ["✅ Получил", "❌ Не получил", "✏️ Другая сумма"])
@@ -308,6 +310,7 @@ class CourierCashHandlerTests(unittest.IsolatedAsyncioTestCase):
         repaired = self.repo.get_cash_entry(1)
         self.assertEqual(repaired.notification_sync_needed, 0)
         self.assertIn("Касса получена", self.bot.edit_message_text.await_args.kwargs["text"])
+        self.assertNotIn("Сейчас у курьера", self.bot.edit_message_text.await_args.kwargs["text"])
 
     async def test_message_from_wrong_group_is_ignored(self):
         await courier_cash_input(

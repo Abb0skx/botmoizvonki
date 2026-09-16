@@ -43,16 +43,6 @@ def _amount_lines(usd: int, uzs: int, *, signed: bool) -> list[str]:
     return lines or ["—"]
 
 
-def _balance_lines(balance: tuple[int, int]) -> str:
-    usd, uzs = balance
-    usd_sign = "−" if usd < 0 else ""
-    uzs_sign = "−" if uzs < 0 else ""
-    return (
-        f"💵 {usd_sign}{_number(usd)} $\n"
-        f"🇺🇿 {uzs_sign}{_number(uzs)} сум"
-    )
-
-
 def _local_time(value: str | None) -> str | None:
     if not value:
         return None
@@ -78,9 +68,7 @@ def cash_review_keyboard(entry: CourierCashEntry) -> InlineKeyboardMarkup:
 
 def cash_notification_text(
     entry: CourierCashEntry,
-    balance: tuple[int, int],
 ) -> str:
-    balance_lines = _balance_lines(balance)
     courier = escape(entry.courier_name)
     if entry.entry_type == "receipt":
         delta_lines = "\n".join(_amount_lines(entry.delta_usd, entry.delta_uzs, signed=True))
@@ -89,8 +77,7 @@ def cash_notification_text(
         return (
             "🧾 <b>Сумма учтена</b>\n"
             f"🚚 Курьер: <b>{courier}</b>\n\n"
-            f"Изменение кассы:\n{delta_lines}\n\n"
-            f"💼 <b>Сейчас у курьера</b>\n{balance_lines}{time_line}"
+            f"Изменение кассы:\n{delta_lines}{time_line}"
         )
 
     amount_lines = "\n".join(_amount_lines(entry.amount_usd, entry.amount_uzs, signed=False))
@@ -110,7 +97,6 @@ def cash_notification_text(
         f"{heading}\n"
         f"🚚 Курьер: <b>{courier}</b>\n\n"
         f"Передаёт:\n{amount_lines}{corrected}\n\n"
-        f"💼 <b>Сейчас у курьера</b>\n{balance_lines}\n\n"
         f"{footer}"
     )
 
@@ -131,7 +117,6 @@ async def publish_cash_notification(
         return current
     publishing.add(current.id)
     try:
-        balance = repo.cash_balance(current.courier_id)
         keyboard = cash_review_keyboard(current) if current.status == "pending" else None
         settings: Settings = context.application.bot_data["settings"]
         notification_chat_id = (
@@ -141,7 +126,7 @@ async def publish_cash_notification(
         )
         sent = await context.bot.send_message(
             chat_id=notification_chat_id,
-            text=cash_notification_text(current, balance),
+            text=cash_notification_text(current),
             parse_mode=ParseMode.HTML,
             reply_markup=keyboard,
         )
@@ -230,13 +215,12 @@ async def _refresh_cash_notification(
     if not entry.notification_chat_id or not entry.notification_message_id:
         return
     repo: OrderRepository = context.application.bot_data["repo"]
-    balance = repo.cash_balance(entry.courier_id)
     keyboard = cash_review_keyboard(entry) if entry.status == "pending" else None
     try:
         await context.bot.edit_message_text(
             chat_id=entry.notification_chat_id,
             message_id=entry.notification_message_id,
-            text=cash_notification_text(entry, balance),
+            text=cash_notification_text(entry),
             parse_mode=ParseMode.HTML,
             reply_markup=keyboard,
         )
