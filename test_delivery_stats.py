@@ -884,6 +884,9 @@ class DeliveryStatsWebTests(unittest.TestCase):
         self.assertIn("loadMapPhoto", page.text)
         self.assertEqual(page.headers["cache-control"], "no-store")
         self.assertEqual(page.headers["x-frame-options"], "DENY")
+        self.assertEqual(
+            page.headers["referrer-policy"], "strict-origin-when-cross-origin"
+        )
 
         health = self.client.get("/healthz")
         self.assertEqual(health.status_code, 200)

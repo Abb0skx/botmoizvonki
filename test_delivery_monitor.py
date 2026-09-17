@@ -613,9 +613,13 @@ class DeliveryMonitorWebTests(unittest.TestCase):
         self.assertIn("touch-action:pan-y", page.text)
         self.assertIn("AbortController", page.text)
         self.assertEqual(page.headers["cache-control"], "no-store")
+        self.assertEqual(
+            page.headers["referrer-policy"], "strict-origin-when-cross-origin"
+        )
 
         state = self.client.get("/delivery/monitor/api/state", headers=self.auth())
         self.assertEqual(state.status_code, 200)
+        self.assertEqual(state.headers["referrer-policy"], "no-referrer")
         self.assertIn("couriers", state.json())
         self.assertIn("manager_counts", state.json())
 

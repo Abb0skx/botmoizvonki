@@ -137,7 +137,16 @@ async def security_headers(request: Request, call_next):
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
-        response.headers["Referrer-Policy"] = "no-referrer"
+        # OpenStreetMap requires a Referer for browser tile requests. Expose
+        # only this site's origin, never the protected page path or query.
+        response.headers["Referrer-Policy"] = (
+            "strict-origin-when-cross-origin"
+            if request.url.path in {
+                "/delivery/monitor", "/delivery/monitor/",
+                "/delivery/stats", "/delivery/stats/",
+            }
+            else "no-referrer"
+        )
         response.headers["X-Robots-Tag"] = "noindex, nofollow"
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; "
