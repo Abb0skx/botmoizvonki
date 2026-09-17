@@ -99,6 +99,9 @@ def _delivery_html(template_name: str) -> HTMLResponse:
     )
     content = content.replace("<script>", f'<script nonce="{nonce}">')
     response = monitoring_security_headers(HTMLResponse(content))
+    # OSM's public tile server needs the site's origin as the Referer. Keep
+    # every other monitoring page/API at the stricter no-referrer default.
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; "
         f"script-src 'self' 'nonce-{nonce}' https://unpkg.com; "

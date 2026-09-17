@@ -295,6 +295,7 @@ class MonitoringRouteTests(unittest.TestCase):
             self.assertIn(f'href="{legacy_url}"', response.text)
         self.assertEqual(response.headers["cache-control"], "no-store, private")
         self.assertEqual(response.headers["x-frame-options"], "DENY")
+        self.assertEqual(response.headers["referrer-policy"], "no-referrer")
 
     def test_reduced_portal_sections_return_to_complete_legacy_pages(self):
         anonymous = self.client.get(
@@ -484,6 +485,9 @@ class MonitoringRouteTests(unittest.TestCase):
             "https://unpkg.com",
             stats.headers["content-security-policy"],
         )
+        self.assertEqual(
+            stats.headers["referrer-policy"], "strict-origin-when-cross-origin"
+        )
 
         self.assertEqual(live.status_code, 200)
         self.assertIn("Карта движения", live.text)
@@ -493,6 +497,9 @@ class MonitoringRouteTests(unittest.TestCase):
         self.assertIn("movementPreviewTime", live.text)
         self.assertIn('movement.kind==="warehouse"', live.text)
         self.assertIn("/monitoring/delivery/live/api/state", live.text)
+        self.assertEqual(
+            live.headers["referrer-policy"], "strict-origin-when-cross-origin"
+        )
 
         direct_stats = self.client.get(
             "/delivery/stats?period=today", follow_redirects=False
