@@ -10,7 +10,7 @@ from app.handlers.orders import group_cancel_action
 
 
 ABBOS_ID = 202134293
-ABBOS_GROUP_ID = -5216093690
+ABBOS_GROUP_ID = -1003918562868
 
 
 class GroupCancellationTests(unittest.IsolatedAsyncioTestCase):
@@ -201,7 +201,7 @@ class GroupCancellationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_button_from_another_group_cannot_cancel(self):
         query = self.query("cancel")
-        query.message.chat_id = -5111626405
+        query.message.chat_id = -1004417796153
 
         finish, _ = await self.run_action(query)
 

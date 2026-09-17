@@ -31,6 +31,10 @@ def _order_data(index: int = 1) -> dict:
 
 
 class CourierConfigurationTests(unittest.TestCase):
+    def test_migrated_courier_groups_are_supergroups(self):
+        self.assertEqual(courier_group_id(7636344727), -1004417796153)
+        self.assertEqual(courier_group_id(202134293), -1003918562868)
+
     def test_muzrob_is_authorized_and_routed_to_his_group(self):
         courier = courier_option(1799690992)
 
@@ -193,7 +197,7 @@ class CallbackAcknowledgementTests(unittest.IsolatedAsyncioTestCase):
         )
         bot = SimpleNamespace(
             send_message=AsyncMock(return_value=SimpleNamespace(
-                chat_id=-5111626405,
+                chat_id=-1004417796153,
                 message_id=50,
             )),
             delete_message=AsyncMock(),
@@ -225,8 +229,8 @@ class CallbackAcknowledgementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(assigned.assigned_courier_id, 7636344727)
         self.assertEqual(assigned.assigned_courier_name, "Olmas")
         self.assertIsNone(assigned.courier_id)
-        self.assertEqual(assigned.delivery_chat_id, -5111626405)
-        self.assertEqual(bot.send_message.await_args.args[0], -5111626405)
+        self.assertEqual(assigned.delivery_chat_id, -1004417796153)
+        self.assertEqual(bot.send_message.await_args.args[0], -1004417796153)
         self.assertIn("🚚 Курьер: Olmas", bot.send_message.await_args.args[1])
         notify_log.assert_awaited_once_with(
             context,

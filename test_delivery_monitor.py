@@ -53,7 +53,7 @@ class PickupWorkflowTests(unittest.IsolatedAsyncioTestCase):
             assigned_courier_name="Abbos",
             manager_chat_id=11,
             manager_message_id=90 + order.id,
-            delivery_chat_id=-5216093690,
+            delivery_chat_id=-1003918562868,
             delivery_message_id=190 + order.id,
         )
 

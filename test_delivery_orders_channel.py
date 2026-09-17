@@ -219,7 +219,7 @@ class OrdersChannelTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_preflight_rejects_courier_who_left_own_group(self):
         courier_id = 202134293
-        courier_group_id = -5216093690
+        courier_group_id = -1003918562868
         settings = SimpleNamespace(
             manager_ids=frozenset({11}),
             courier_ids=frozenset({courier_id}),
@@ -248,7 +248,7 @@ class OrdersChannelTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.assertRaisesRegex(
                 RuntimeError,
-                r"Courier Abbos must be a member of group -5216093690",
+                r"Courier Abbos must be a member of group -1003918562868",
             ):
                 await validate_delivery_configuration(application)
 

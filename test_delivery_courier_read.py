@@ -21,7 +21,7 @@ from app.utils.formatters import courier_card, daily_delivery_report, orders_cha
 
 
 ABBOS_ID = 202134293
-ABBOS_GROUP_ID = -5216093690
+ABBOS_GROUP_ID = -1003918562868
 
 
 def order_data(product: str, latitude: float = 41.311) -> dict:
