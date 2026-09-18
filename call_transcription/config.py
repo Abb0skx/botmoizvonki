@@ -27,6 +27,7 @@ class TranscriptionConfig:
     max_bytes: int = 100 * 1024 * 1024
     chunk_seconds: float = 20
     cpu_threads: int = 2
+    diarization_batch_size: int = 32
     role_confidence_threshold: float = 0.8
     ffmpeg: str = "ffmpeg"
     ffprobe: str = "ffprobe"
@@ -48,6 +49,8 @@ class TranscriptionConfig:
             raise ConfigurationError("chunk_seconds: 1–30; max_duration_seconds > 0")
         if self.cpu_threads < 1 or self.max_bytes < 1 or not 0 <= self.role_confidence_threshold <= 1:
             raise ConfigurationError("Некорректные лимиты локального распознавания")
+        if not 1 <= self.diarization_batch_size <= 64:
+            raise ConfigurationError("diarization_batch_size: 1–64")
 
     @classmethod
     def from_env(cls):
@@ -64,6 +67,7 @@ class TranscriptionConfig:
                 num_speakers=int(os.getenv("LOCAL_TRANSCRIPTION_NUM_SPEAKERS", "2")),
                 merge_gap_seconds=float(os.getenv("LOCAL_TRANSCRIPTION_MERGE_GAP", "0.8")),
                 cpu_threads=int(os.getenv("LOCAL_TRANSCRIPTION_CPU_THREADS", "2")),
+                diarization_batch_size=int(os.getenv("LOCAL_DIARIZATION_BATCH_SIZE", "32")),
                 max_duration_seconds=float(os.getenv("TRANSCRIPTION_MAX_DURATION_SECONDS", "1800")),
                 max_bytes=int(os.getenv("TRANSCRIPTION_MAX_BYTES", str(100 * 1024 * 1024))),
                 identify_roles=flag("LOCAL_TRANSCRIPTION_IDENTIFY_ROLES", True),

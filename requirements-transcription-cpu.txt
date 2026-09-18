@@ -1,0 +1,7 @@
+# CPU-only Linux staging versions verified on Python 3.11.
+# Avoid accidentally installing multi-gigabyte CUDA wheels on the VPS.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.8.0+cpu
+torchaudio==2.8.0+cpu
+torchcodec==0.7.0
+-r requirements-transcription-linux.txt

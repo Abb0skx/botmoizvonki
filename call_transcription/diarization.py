@@ -26,6 +26,10 @@ class PyannoteDiarizer:
                 if self._pipeline is None:
                     torch.set_num_threads(self.config.cpu_threads)
                     pipeline = Pipeline.from_pretrained(str(Path(self.config.diarization_model_path).resolve()))
+                    # Smaller batches reduce intermediate tensor memory on a VPS,
+                    # without replacing the models or changing speaker thresholds.
+                    pipeline.segmentation_batch_size = self.config.diarization_batch_size
+                    pipeline.embedding_batch_size = self.config.diarization_batch_size
                     device = self.config.device
                     if device == "auto":
                         device = "cuda" if torch.cuda.is_available() else "cpu"

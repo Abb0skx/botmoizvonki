@@ -45,6 +45,30 @@ def example_result():
 
 
 class LocalTranscriptionUnitTests(unittest.TestCase):
+    def test_diarization_batch_env_and_validation(self):
+        from call_transcription.errors import ConfigurationError
+        with patch.dict(os.environ, {"LOCAL_DIARIZATION_BATCH_SIZE": "1"}):
+            self.assertEqual(TranscriptionConfig.from_env().diarization_batch_size, 1)
+        for value in (0, 65):
+            with self.assertRaises(ConfigurationError):
+                TranscriptionConfig(diarization_batch_size=value)
+
+    def test_diarizer_batch_size_and_model_reuse(self):
+        from call_transcription.diarization import PyannoteDiarizer
+        pipeline = Mock()
+        pipeline.return_value.speaker_diarization.itertracks.return_value = []
+        factory = Mock(return_value=pipeline)
+        torch = Mock()
+        with patch.dict("sys.modules", {"torch": torch, "pyannote.audio": SimpleNamespace(
+                Pipeline=SimpleNamespace(from_pretrained=factory))}), \
+             patch("call_transcription.diarization.read_samples", return_value=[]):
+            diarizer = PyannoteDiarizer(TranscriptionConfig(device="cpu", diarization_batch_size=1))
+            diarizer.diarize("test.wav")
+            diarizer.diarize("test.wav")
+        factory.assert_called_once()
+        self.assertEqual(pipeline.segmentation_batch_size, 1)
+        self.assertEqual(pipeline.embedding_batch_size, 1)
+
     def test_merge_same_speaker(self):
         items = [segment("Да.", start=10, end=11.5), segment("Конечно.", start=11.6, end=13), segment("Сейчас посмотрю.", start=13.1, end=15)]
         result = merge_same_speaker(items)

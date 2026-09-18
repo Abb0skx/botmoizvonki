@@ -15,6 +15,13 @@ Unit/integration-тесты используют fakes. Они **не подтв
 swap уже используется. Включать на нём одновременно large-v3/turbo и pyannote
 без выделенных ресурсов небезопасно. Код не включает ASR автоматически.
 
+После оптимизации OCR 18.09.2026 доступно около 2 ГБ RAM. Код, CPU-зависимости
+и обе модели установлены отдельно в `/opt/texnikach-transcription-20260918`.
+Полный тест реального звонка превысил безопасный лимит контейнера 1536 МиБ RAM
++ 256 МиБ swap при загрузке Whisper после diarization. Автообработка и
+публикация расшифровок **не включены**. Подробности —
+`docs/TRANSCRIPTION_SERVER_TRIAL_20260918.md`.
+
 ## Как встроено в существующую архитектуру
 
 Основной процесс — FastAPI в `botmoizvonki.py`, хранение звонков — SQLite
@@ -64,6 +71,13 @@ python3.11 -m venv .venv-transcription
 драйверов/CUDA/cuDNN; на CPU используется int8, на CUDA по умолчанию float16.
 На Mac pyannote работает на CPU, Whisper — на Metal. Скорость надо измерять,
 а не предполагать по рекламным benchmark.
+
+Для CPU-only VPS есть `requirements-transcription-cpu.txt`: фиксирует CPU
+PyTorch 2.8/torchaudio и совместимый TorchCodec 0.7. На небольшом сервере задайте
+`LOCAL_DIARIZATION_BATCH_SIZE=1` (по умолчанию 32): это уменьшает промежуточные
+тензоры, не заменяет модели. `LOCAL_TRANSCRIPTION_CPU_THREADS=1` ограничивает
+потоки. Эти параметры не гарантируют, что весь стек поместится в 4 ГБ вместе
+с другими проектами; проверяйте ресурсно ограниченным реальным тестом.
 
 Первоначальное скачивание требует интернета. Примите условия модели
 [pyannote community-1](https://huggingface.co/pyannote/speaker-diarization-community-1)
