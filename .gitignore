@@ -18,3 +18,9 @@ data/delivery.db-shm
 data/delivery.db-wal
 data/delivery-state.pickle*
 data/delivery-heartbeat
+
+# Local call-ASR weights, dedicated environment and private exports.
+/models/
+/.venv-transcription/
+/transcription-output/
+/transcription-audio/

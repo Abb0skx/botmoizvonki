@@ -18,3 +18,8 @@ data/delivery-state.pickle*
 **/google-credentials*.json
 venv/
 .venv/
+# Local ASR data must be mounted explicitly, never baked into the web image.
+models/
+.venv-transcription/
+transcription-output/
+transcription-audio/

@@ -1,0 +1,4 @@
+# Apple Silicon only; install in a separate venv.
+mlx-whisper==0.4.3
+# Local diarization runs on CPU; ASR uses MLX/Metal.
+pyannote.audio==4.0.7

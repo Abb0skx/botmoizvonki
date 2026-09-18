@@ -1,0 +1,5 @@
+# Install ONLY in the dedicated local transcription environment, not the web image.
+# CTranslate2 Whisper inference + bundled Silero VAD (CPU/CUDA).
+faster-whisper==1.2.1
+# Local speaker diarization. Brings PyTorch/numpy; gated model download is separate.
+pyannote.audio==4.0.7

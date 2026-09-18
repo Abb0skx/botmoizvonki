@@ -1,0 +1,29 @@
+"""Explicit ONLINE provisioning only. Never accepts or processes client audio."""
+import argparse
+import os
+from pathlib import Path
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Download local models after accepting pyannote HF conditions")
+    parser.add_argument("--backend", required=True, choices=["mlx", "faster-whisper"])
+    parser.add_argument("--directory", default="models")
+    parser.add_argument("--model", choices=["large-v3", "large-v3-turbo"], default="large-v3-turbo")
+    args = parser.parse_args()
+    from huggingface_hub import snapshot_download
+    root = Path(args.directory).resolve()
+    repo = (
+        f"mlx-community/whisper-{args.model}"
+        if args.backend == "mlx" else
+        "Systran/faster-whisper-large-v3" if args.model == "large-v3" else
+        "mobiuslabsgmbh/faster-whisper-large-v3-turbo"
+    )
+    # Token stays in the environment/HF credential store, never command line or logs.
+    token = os.getenv("HF_TOKEN") or None
+    snapshot_download(repo, local_dir=root / "whisper", token=token)
+    snapshot_download("pyannote/speaker-diarization-community-1", local_dir=root / "diarization", token=token)
+    print("Models downloaded. Disconnect the network and run the benchmark before activation.")
+
+
+if __name__ == "__main__":
+    main()

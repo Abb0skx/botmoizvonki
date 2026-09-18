@@ -15,6 +15,7 @@ import time
 import uuid
 
 from datetime import date, datetime, timedelta, timezone
+from functools import lru_cache
 from html import escape
 from pathlib import Path
 from urllib.parse import quote, urlparse
@@ -38,7 +39,7 @@ from fastapi import (
     Request,
 )
 
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, PlainTextResponse
 
 from instagram_bot import router as instagram_router
 from price_server.router import (
@@ -199,7 +200,7 @@ async def start_telegram_business():
         _telegram_business_scheduler = DurableScheduler(service)
         await _telegram_business_scheduler.start()
 
-    if TRANSCRIPTION_ENABLED:
+    if TRANSCRIPTION_ENABLED and TRANSCRIPTION_WORKER_MODE == "embedded":
         transcription_config_error = (
             get_transcription_config_error()
         )
@@ -566,25 +567,11 @@ TRANSCRIPTION_ENABLED = (
     }
 )
 
-TRANSCRIPTION_API_URL = os.getenv(
-    "TRANSCRIPTION_API_URL",
-    "https://api.openai.com/v1/audio/transcriptions",
-).strip()
-
-TRANSCRIPTION_API_KEY = (
-    os.getenv(
-        "TRANSCRIPTION_API_KEY",
-        "",
-    ).strip()
-    or os.getenv(
-        "OPENAI_API_KEY",
-        "",
-    ).strip()
-)
-
+# Existing queue and API stay intact; all call ASR is now local-only.
+TRANSCRIPTION_WORKER_MODE = os.getenv("TRANSCRIPTION_WORKER_MODE", "embedded").strip()
 TRANSCRIPTION_MODEL = os.getenv(
-    "TRANSCRIPTION_MODEL",
-    "gpt-4o-mini-transcribe",
+    "LOCAL_WHISPER_MODEL",
+    "large-v3-turbo",
 ).strip()
 
 TRANSCRIPTION_TIMEOUT_SECONDS = env_int(
@@ -640,25 +627,14 @@ TRANSCRIPTION_ALLOWED_HOSTS = tuple(
 
 
 def get_transcription_config_error() -> str | None:
-
-    if not TRANSCRIPTION_API_KEY:
-        return "TRANSCRIPTION_API_KEY не указан"
-
-    if not TRANSCRIPTION_MODEL:
-        return "TRANSCRIPTION_MODEL не указан"
-
-    parsed = urlparse(
-        TRANSCRIPTION_API_URL
-    )
-
-    if (
-        parsed.scheme.casefold() != "https"
-        or not parsed.hostname
-        or parsed.username
-        or parsed.password
-    ):
-        return "TRANSCRIPTION_API_URL должен быть безопасным HTTPS URL"
-
+    from call_transcription.config import TranscriptionConfig
+    from call_transcription.errors import ConfigurationError
+    if TRANSCRIPTION_WORKER_MODE not in {"embedded", "external"}:
+        return "TRANSCRIPTION_WORKER_MODE: embedded или external"
+    try:
+        TranscriptionConfig.from_env().check_model_paths()
+    except ConfigurationError as exc:
+        return str(exc)
     if not TRANSCRIPTION_ALLOWED_HOSTS:
         return "TRANSCRIPTION_ALLOWED_HOSTS пуст"
 
@@ -1629,6 +1605,9 @@ def init_db():
                 ADD COLUMN telegram_message_id INTEGER
                 """,
 
+            "telegram_message_kind":
+                "ALTER TABLE calls ADD COLUMN telegram_message_kind TEXT",
+
             "sms_sent":
                 """
                 ALTER TABLE calls
@@ -2576,6 +2555,16 @@ def init_db():
             )
             """
         )
+
+        transcription_columns = {row["name"] for row in conn.execute("PRAGMA table_info(call_transcriptions)")}
+        for name, sql_type in {
+            "transcript_json": "TEXT", "transcript_txt": "TEXT",
+            "telegram_refreshed_at": "INTEGER", "telegram_refresh_next_attempt_at": "INTEGER",
+            "telegram_refresh_attempts": "INTEGER NOT NULL DEFAULT 0", "telegram_refresh_error": "TEXT",
+            "telegram_refresh_lease_until": "INTEGER", "telegram_refresh_lease_token": "TEXT",
+        }.items():
+            if name not in transcription_columns:
+                conn.execute(f"ALTER TABLE call_transcriptions ADD COLUMN {name} {sql_type}")
 
         # `sale_marked_at` has only one-second precision.  Give
         # legacy result clicks a stable monotonic order so a rebuild
@@ -6904,7 +6893,7 @@ def enqueue_transcription_in_transaction(
             updated_at
         )
 
-        VALUES (?, 'queued', 0, ?, 'openai', ?, ?, ?)
+        VALUES (?, 'queued', 0, ?, 'local', ?, ?, ?)
         """,
         (
             call["id"],
@@ -7181,153 +7170,33 @@ def normalize_transcription_audio(
     source_path: Path,
     target_path: Path,
 ):
+    # Compatibility wrapper for existing callers. No additional lossy Opus pass.
+    from call_transcription.audio import normalize_audio
+    from call_transcription.config import TranscriptionConfig
+    normalize_audio(source_path, target_path, TranscriptionConfig.from_env())
 
-    probe = subprocess.run(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            str(source_path),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
 
-    duration = float(
-        probe.stdout.strip()
-        or 0
-    )
-
-    if duration <= 0:
-        raise ValueError(
-            "Пустая запись"
-        )
-
-    if duration > TRANSCRIPTION_MAX_DURATION_SECONDS:
-        raise ValueError(
-            "Запись длиннее разрешённого лимита"
-        )
-
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(source_path),
-            "-vn",
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-c:a",
-            "libopus",
-            "-b:a",
-            "24k",
-            str(target_path),
-        ],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        timeout=120,
-    )
+@lru_cache(maxsize=1)
+def get_local_call_transcriber():
+    from call_transcription import CallTranscriber
+    return CallTranscriber()
 
 
 def transcribe_audio_file(
     audio_path: Path,
+    *,
+    call_id=None,
+    context_terms=None,
 ):
-
-    if not TRANSCRIPTION_API_KEY:
-        raise RuntimeError(
-            "TRANSCRIPTION_API_KEY не указан"
-        )
-
-    parsed = urlparse(
-        TRANSCRIPTION_API_URL
-    )
-
-    if parsed.scheme.casefold() != "https":
-        raise RuntimeError(
-            "TRANSCRIPTION_API_URL должен использовать HTTPS"
-        )
-
-    session = requests.Session()
-
-    with audio_path.open(
-        "rb"
-    ) as audio_file:
-
-        response = session.post(
-            TRANSCRIPTION_API_URL,
-            headers={
-                "Authorization": (
-                    "Bearer "
-                    + TRANSCRIPTION_API_KEY
-                ),
-            },
-            data={
-                "model": TRANSCRIPTION_MODEL,
-                "response_format": "json",
-                "prompt": (
-                    "TEXNIKACH, OLX, Instagram, Telegram, "
-                    "объявление, e'lon, eski mijoz. "
-                    "Разговор может быть на русском или узбекском."
-                ),
-            },
-            files={
-                "file": (
-                    "call.ogg",
-                    audio_file,
-                    "audio/ogg",
-                ),
-            },
-            timeout=(15, TRANSCRIPTION_TIMEOUT_SECONDS),
-        )
-
-    response.raise_for_status()
-    result = response.json()
-
-    transcript = str(
-        result.get(
-            "text"
-        )
-        or ""
-    ).strip()
-
-    if not transcript:
-        raise RuntimeError(
-            "Сервис вернул пустую расшифровку"
-        )
-
-    language = result.get(
-        "language"
-    )
-
-    languages = result.get(
-        "languages"
-    )
-
-    if not language and languages:
-        first_language = languages[0]
-        language = (
-            first_language.get("code")
-            if isinstance(
-                first_language,
-                dict,
-            )
-            else str(
-                first_language
-            )
-        )
-
+    result = get_local_call_transcriber().transcribe(audio_path, context_terms, call_id=call_id)
     return {
-        "text": transcript,
-        "language": language,
+        "text": result.full_text,
+        # Per-segment languages are authoritative; do not invent one language for a call.
+        "language": None,
+        "provider": "local:" + result.backend,
+        "model": result.model,
+        "transcript": result.to_dict(),
+        "txt": result.to_txt(),
     }
 
 
@@ -7618,10 +7487,12 @@ def complete_transcription_job(
                 status = 'completed',
                 lease_token = NULL,
                 lease_until = NULL,
-                provider = 'openai',
+                provider = ?,
                 model = ?,
                 language = ?,
                 transcript_text = ?,
+                transcript_json = ?,
+                transcript_txt = ?,
                 audio_sha256 = ?,
                 error = NULL,
                 lead_source_code = ?,
@@ -7638,11 +7509,15 @@ def complete_transcription_job(
                 AND lease_token = ?
             """,
             (
-                TRANSCRIPTION_MODEL,
+                transcript_result.get("provider", "local"),
+                transcript_result.get("model", TRANSCRIPTION_MODEL),
                 transcript_result.get(
                     "language"
                 ),
                 transcript_result["text"],
+                json.dumps(transcript_result["transcript"], ensure_ascii=False, allow_nan=False)
+                    if transcript_result.get("transcript") else None,
+                transcript_result.get("txt"),
                 audio_sha256,
                 detected["code"],
                 detected["confidence"],
@@ -7703,34 +7578,8 @@ def complete_transcription_job(
 
         conn.commit()
 
-    if updated.rowcount == 1:
-        try:
-            call = get_call(
-                job["call_id"]
-            )
-
-            if (
-                call
-                and call["telegram_chat_id"]
-                and call["telegram_message_id"]
-                and not call[
-                    "is_internal_contact"
-                ]
-            ):
-                edit_reply_markup(
-                    call["telegram_chat_id"],
-                    call["telegram_message_id"],
-                    build_call_state_keyboard(
-                        call
-                    ),
-                )
-
-        except Exception as exc:
-            print(
-                "TRANSCRIPTION TELEGRAM REFRESH ERROR:",
-                job["call_id"],
-                type(exc).__name__,
-            )
+    # Durable Telegram refresh is independent of ASR completion/retries. In
+    # particular it still runs if ASR finished before mark_telegram_sent.
 
     return updated.rowcount == 1
 
@@ -7912,23 +7761,17 @@ def process_one_transcription_job():
                 tmpdir
             ) / "source_audio"
 
-            audio_path = Path(
-                tmpdir
-            ) / "call.ogg"
-
             audio_sha256 = download_recording_limited(
                 job["recording"],
                 source_path,
             )
 
-            normalize_transcription_audio(
-                source_path,
-                audio_path,
-            )
-
             transcript_result = transcribe_audio_file(
-                audio_path
+                source_path, call_id=job["call_id"],
             )
+            # Do not persist a vanished temporary path in the machine-readable record.
+            if transcript_result.get("transcript"):
+                transcript_result["transcript"]["audio_path"] = "call:" + str(job["call_id"])
 
         completed = complete_transcription_job(
             job,
@@ -7944,7 +7787,8 @@ def process_one_transcription_job():
 
     except Exception as exc:
 
-        retry_allowed = True
+        from call_transcription.errors import AudioDecodeError, ConfigurationError, NoSpeechDetectedError, ModelMemoryError
+        retry_allowed = not isinstance(exc, (AudioDecodeError, ConfigurationError, NoSpeechDetectedError, ModelMemoryError))
         retry_after = None
 
         if isinstance(
@@ -7974,7 +7818,7 @@ def process_one_transcription_job():
 
         failed = fail_transcription_job(
             job,
-            repr(exc),
+            type(exc).__name__,
             retry_allowed=retry_allowed,
             delay_override=retry_after,
         )
@@ -7992,6 +7836,74 @@ def process_one_transcription_job():
             timeout=1,
         )
 
+    return True
+
+
+def get_call_transcript_data(call_id):
+    with connect_db() as conn:
+        row = conn.execute(
+            "SELECT transcript_json FROM call_transcriptions WHERE call_id = ? AND status = 'completed'",
+            (call_id,),
+        ).fetchone()
+    return json.loads(row["transcript_json"]) if row and row["transcript_json"] else None
+
+
+def process_one_transcription_refresh():
+    """Leased, retryable edit of the existing call post; never send another post."""
+    now = int(time.time())
+    token = uuid.uuid4().hex
+    with connect_db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """SELECT t.call_id, t.telegram_refresh_attempts FROM call_transcriptions t
+               JOIN calls c ON c.id = t.call_id
+               WHERE t.status = 'completed' AND t.transcript_json IS NOT NULL
+                 AND t.telegram_refreshed_at IS NULL AND t.telegram_refresh_attempts < 10
+                 AND COALESCE(t.telegram_refresh_next_attempt_at, 0) <= ?
+                 AND COALESCE(t.telegram_refresh_lease_until, 0) < ?
+                 AND c.telegram_message_kind IN ('text', 'voice')
+                 AND c.telegram_message_id IS NOT NULL AND c.telegram_chat_id IS NOT NULL
+                 AND COALESCE(c.is_internal_contact, 0) = 0
+               ORDER BY t.completed_at, t.call_id LIMIT 1""", (now, now),
+        ).fetchone()
+        if not row:
+            return False
+        conn.execute(
+            "UPDATE call_transcriptions SET telegram_refresh_lease_token = ?, telegram_refresh_lease_until = ?, "
+            "telegram_refresh_attempts = telegram_refresh_attempts + 1 WHERE call_id = ?",
+            (token, now + 90, row["call_id"]),
+        )
+    error = None
+    try:
+        call = get_call(row["call_id"])
+        voice = call["telegram_message_kind"] == "voice"
+        text = build_telegram_message({}, {}, call["duration"], call=call, transcript_limit=1024 if voice else 4096)
+        data = {"chat_id": call["telegram_chat_id"], "message_id": call["telegram_message_id"],
+                "parse_mode": "HTML", "caption" if voice else "text": text,
+                "reply_markup": json.dumps(build_call_state_keyboard(call), ensure_ascii=False)}
+        if not voice:
+            data["disable_web_page_preview"] = True
+        telegram_api("editMessageCaption" if voice else "editMessageText", data=data, timeout=30)
+    except Exception as exc:
+        description = str(exc).lower()
+        if isinstance(exc, requests.HTTPError) and exc.response is not None:
+            try:
+                description = exc.response.json().get("description", "").lower()
+            except (ValueError, AttributeError):
+                pass
+        # A crash after a successful Telegram edit is recovered idempotently.
+        if "message is not modified" not in description:
+            error = type(exc).__name__
+            print("TRANSCRIPTION TELEGRAM REFRESH ERROR:", row["call_id"], error)
+    with connect_db() as conn:
+        conn.execute(
+            """UPDATE call_transcriptions SET telegram_refreshed_at = ?, telegram_refresh_error = ?,
+               telegram_refresh_next_attempt_at = ?, telegram_refresh_lease_until = NULL,
+               telegram_refresh_lease_token = NULL WHERE call_id = ? AND telegram_refresh_lease_token = ?""",
+            (None if error else now, error,
+             now + min(3600, 30 * 2 ** row["telegram_refresh_attempts"]) if error else None,
+             row["call_id"], token),
+        )
     return True
 
 
@@ -8027,6 +7939,7 @@ class TranscriptionWorker:
         while not self._stop_event.is_set():
 
             try:
+                await asyncio.to_thread(process_one_transcription_refresh)
                 processed = await asyncio.to_thread(
                     process_one_transcription_job
                 )
@@ -9626,6 +9539,7 @@ def save_call(
 def mark_telegram_sent(
     call_id: int,
     telegram_result: dict | None,
+    message_kind: str | None = None,
 ):
 
     if not call_id:
@@ -9668,6 +9582,7 @@ def mark_telegram_sent(
                 telegram_reserved_at = NULL,
                 telegram_chat_id = ?,
                 telegram_message_id = ?
+                ,telegram_message_kind = ?
 
             WHERE id = ?
             """,
@@ -9682,6 +9597,8 @@ def mark_telegram_sent(
                 ),
 
                 telegram_message_id,
+
+                message_kind or ("voice" if telegram_result and telegram_result.get("result", {}).get("voice") else "text"),
 
                 call_id,
             ),
@@ -9915,6 +9832,7 @@ def build_telegram_message(
     webhook: dict,
     talk_duration: int,
     call=None,
+    transcript_limit=1024,
 ):
 
     if call:
@@ -10264,9 +10182,17 @@ def build_telegram_message(
             ]
         )
 
-    return "\n".join(
-        lines
-    )
+    text = "\n".join(lines)
+    if call:
+        transcript = get_call_transcript_data(call["id"])
+        if transcript:
+            from call_transcription.telegram import append_transcript_quote
+            full_url = (
+                PUBLIC_BASE_URL.rstrip("/") + f'/stats/transcription/{call["id"]}?format=txt'
+                if PUBLIC_BASE_URL else None
+            )
+            text = append_transcript_quote(text, transcript, limit=transcript_limit, full_url=full_url)
+    return text
 
 
 # =========================================================
@@ -18057,6 +17983,24 @@ def parse_saved_json(
     return parsed
 
 
+@app.get("/stats/transcription/{call_id}")
+def call_transcription_details(call_id: int, format: str = "json"):
+    # /stats/* already uses the existing manager-session middleware. No new
+    # public transcript URL, access token in a link, or unauthenticated API.
+    with connect_db() as conn:
+        row = conn.execute(
+            "SELECT status, transcript_json, transcript_txt FROM call_transcriptions WHERE call_id = ?",
+            (call_id,),
+        ).fetchone()
+    if not row or not row["transcript_json"]:
+        raise HTTPException(status_code=404, detail="Расшифровка ещё не готова")
+    if format == "txt":
+        return PlainTextResponse(row["transcript_txt"] or "", headers={"Cache-Control": "no-store, private"})
+    if format != "json":
+        raise HTTPException(status_code=400, detail="Формат: json или txt")
+    return JSONResponse(json.loads(row["transcript_json"]), headers={"Cache-Control": "no-store, private"})
+
+
 @app.get(
     "/stats/rating/details/{call_id}"
 )
@@ -18181,6 +18125,10 @@ def rating_details(
                     AS transcription_language
                 ,transcription.transcript_text
                     AS transcript_text
+                ,transcription.transcript_txt
+                    AS transcript_txt
+                ,transcription.transcript_json
+                    AS transcript_json
                 ,transcription.error
                     AS transcription_error
                 ,transcription.completed_at
@@ -18362,7 +18310,8 @@ def rating_details(
                     "Модель": row["transcription_model"] or "—",
                     "Язык": row["transcription_language"] or "—",
                     "Готово": format_uz_datetime(row["transcription_completed_at"]),
-                    "Текст": row["transcript_text"] or "—",
+                    "Текст": row["transcript_txt"] or row["transcript_text"] or "—",
+                    "Диалог JSON": parse_saved_json(row["transcript_json"]),
                     "Кандидаты источника": parse_saved_json(
                         row["lead_source_candidates_json"]
                     ),
@@ -23053,6 +23002,7 @@ async def moizvonki_webhook(
             mark_telegram_sent(
                 call_id,
                 telegram_result,
+                message_kind="voice" if answered and voice_bytes else "text",
             )
 
             telegram_status = "sent"

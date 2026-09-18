@@ -1417,16 +1417,120 @@ class CallSourceTests(unittest.TestCase):
             False,
         )
 
-    def test_transcription_missing_key_blocks_worker_without_claiming(self):
-        old_key = bot.TRANSCRIPTION_API_KEY
-        bot.TRANSCRIPTION_API_KEY = ""
-
-        try:
+    def test_transcription_missing_local_models_blocks_worker_without_claiming(self):
+        with mock.patch.dict(os.environ, {"LOCAL_WHISPER_MODEL_PATH": str(Path(self.tmp.name) / "missing-model")}):
             error = bot.get_transcription_config_error()
-        finally:
-            bot.TRANSCRIPTION_API_KEY = old_key
+        self.assertIn("LOCAL_WHISPER_MODEL_PATH", error)
 
-        self.assertIn("API_KEY", error)
+    def completed_local_transcription(self, *, voice=False, sent=True):
+        from test_call_transcription import example_result
+        event = self.event(991, "+998900000991", 0)
+        event["recording"] = "https://tenant.moizvonki.ru/example.mp3"
+        with mock.patch.object(bot, "TRANSCRIPTION_ENABLED", True):
+            saved = self.save("texnikach@gmail.com", event)
+        job = bot.claim_transcription_job()
+        result = example_result()
+        result.audio_path = "call:" + str(saved["call_id"])
+        payload = {"text": result.full_text, "txt": result.to_txt(), "transcript": result.to_dict(),
+                   "model": "large-v3-turbo", "provider": "local:mlx", "language": None}
+        self.assertTrue(bot.complete_transcription_job(job, payload, "abc"))
+        self.assertFalse(bot.complete_transcription_job(job, payload, "abc"))
+        if sent:
+            bot.mark_telegram_sent(saved["call_id"], {"result": {"message_id": 88, "chat": {"id": -100}}},
+                                   message_kind="voice" if voice else "text")
+        return saved["call_id"], job, payload
+
+    def test_local_transcription_persists_json_txt_and_survives_restart(self):
+        call_id, _, payload = self.completed_local_transcription()
+        bot.init_db()
+        with bot.connect_db() as conn:
+            row = conn.execute("SELECT * FROM call_transcriptions WHERE call_id = ?", (call_id,)).fetchone()
+        self.assertEqual(row["provider"], "local:mlx")
+        self.assertEqual(json.loads(row["transcript_json"]), payload["transcript"])
+        self.assertEqual(row["transcript_txt"], payload["txt"])
+        response = bot.call_transcription_details(call_id)
+        self.assertEqual(json.loads(response.body)["segments"][1]["language"], "uz")
+        self.assertIn("Клиент", bot.call_transcription_details(call_id, format="txt").body.decode())
+
+    def test_local_transcription_edits_existing_text_post_and_keeps_buttons(self):
+        call_id, _, _ = self.completed_local_transcription()
+        with mock.patch.object(bot, "telegram_api", return_value={"ok": True}) as telegram:
+            self.assertTrue(bot.process_one_transcription_refresh())
+            self.assertFalse(bot.process_one_transcription_refresh())
+        telegram.assert_called_once()
+        self.assertEqual(telegram.call_args.args[0], "editMessageText")
+        data = telegram.call_args.kwargs["data"]
+        self.assertEqual(data["message_id"], 88)
+        self.assertIn("<blockquote expandable>", data["text"])
+        self.assertGreater(data["text"].index("<blockquote"), data["text"].index("👤 Менеджер"))
+        self.assertEqual(json.loads(data["reply_markup"]), bot.build_call_state_keyboard(bot.get_call(call_id)))
+
+    def test_local_transcription_edits_voice_caption_within_limit(self):
+        call_id, _, payload = self.completed_local_transcription(voice=True)
+        payload["transcript"]["segments"][0]["text"] = "Да < нет & 📝 " * 500
+        with bot.connect_db() as conn:
+            conn.execute("UPDATE call_transcriptions SET transcript_json = ? WHERE call_id = ?",
+                         (json.dumps(payload["transcript"]), call_id))
+        with mock.patch.object(bot, "telegram_api", return_value={"ok": True}) as telegram:
+            self.assertTrue(bot.process_one_transcription_refresh())
+        self.assertEqual(telegram.call_args.args[0], "editMessageCaption")
+        text = telegram.call_args.kwargs["data"]["caption"]
+        import html
+        import re
+        from call_transcription.telegram import utf16_length
+        self.assertLessEqual(utf16_length(html.unescape(re.sub(r"<[^>]+>", "", text))), 1024)
+        self.assertIn("Фрагмент", text)
+        self.assertIn("&lt;", text)
+
+    def test_local_transcription_refresh_waits_for_initial_telegram_send(self):
+        call_id, _, _ = self.completed_local_transcription(sent=False)
+        with mock.patch.object(bot, "telegram_api", return_value={"ok": True}) as telegram:
+            self.assertFalse(bot.process_one_transcription_refresh())
+            telegram.assert_not_called()
+            bot.mark_telegram_sent(call_id, {"result": {"message_id": 88, "chat": {"id": -100}}}, message_kind="voice")
+            self.assertTrue(bot.process_one_transcription_refresh())
+        self.assertEqual(telegram.call_args.args[0], "editMessageCaption")
+
+    def test_local_transcription_refresh_retries_without_retranscribing(self):
+        call_id, _, _ = self.completed_local_transcription()
+        with mock.patch.object(bot, "telegram_api", side_effect=RuntimeError("private error")):
+            self.assertTrue(bot.process_one_transcription_refresh())
+            self.assertFalse(bot.process_one_transcription_refresh())
+        with bot.connect_db() as conn:
+            row = conn.execute("SELECT * FROM call_transcriptions WHERE call_id = ?", (call_id,)).fetchone()
+            self.assertEqual(row["status"], "completed")
+            self.assertEqual(row["attempts"], 1)
+            self.assertEqual(row["telegram_refresh_error"], "RuntimeError")
+            conn.execute("UPDATE call_transcriptions SET telegram_refresh_next_attempt_at = 0 WHERE call_id = ?", (call_id,))
+        bot.init_db()
+        with mock.patch.object(bot, "telegram_api", side_effect=RuntimeError("Bad Request: message is not modified")):
+            self.assertTrue(bot.process_one_transcription_refresh())
+            self.assertFalse(bot.process_one_transcription_refresh())
+
+    def test_local_transcription_adapter_makes_no_http_request(self):
+        from test_call_transcription import example_result
+        service = mock.Mock()
+        service.transcribe.return_value = example_result()
+        with mock.patch.object(bot, "get_local_call_transcriber", return_value=service), \
+             mock.patch.object(bot.requests, "Session") as session, mock.patch.object(bot.HTTP, "post") as post:
+            result = bot.transcribe_audio_file(Path("call.wav"), call_id=42, context_terms=["iPhone 17"])
+        session.assert_not_called()
+        post.assert_not_called()
+        self.assertIn("transcript", result)
+        service.transcribe.assert_called_once_with(Path("call.wav"), ["iPhone 17"], call_id=42)
+
+    def test_local_transcription_endpoint_uses_existing_auth_before_returning_text(self):
+        from starlette.requests import Request
+        request = Request({"type": "http", "method": "GET", "path": "/stats/transcription/1",
+                           "query_string": b"format=txt", "headers": []})
+        auth = mock.Mock()
+        auth.principal.side_effect = bot.HTTPException(status_code=401, detail="session_required")
+        handler = mock.AsyncMock()
+        with mock.patch.object(bot, "monitoring_settings", mock.Mock(enabled=True)), \
+             mock.patch.object(bot, "get_monitoring_auth", return_value=auth):
+            response = asyncio.run(bot.protect_legacy_manager_routes(request, handler))
+        self.assertEqual(response.status_code, 401)
+        handler.assert_not_called()
 
     def test_moizvonki_secret_is_checked_before_body_is_read(self):
         request = mock.Mock()
