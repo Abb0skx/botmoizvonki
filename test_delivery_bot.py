@@ -1470,6 +1470,19 @@ class RepositoryTests(unittest.TestCase):
 
         self.assertTrue(text.startswith("✅✅✅✅✅✅✅\n✅ "))
         self.assertIn("📦 A7 Pro", text)
+        self.assertIn("📱 +998 90 133 39 99", text)
+
+    def test_completed_card_keeps_both_client_phones(self):
+        order = self.repo.create(
+            manager_id=1,
+            manager_name="A",
+            data={**self.data, "client_phone_2": "+998998765432"},
+        )
+
+        text = completed_card(order, "15:42")
+
+        self.assertIn("+998 90 133 39 99", text)
+        self.assertIn("+998 99 876 54 32", text)
 
     def test_completed_card_keeps_estimated_and_actual_delivery_time(self):
         order = self.repo.create(manager_id=1, manager_name="A", data=self.data)

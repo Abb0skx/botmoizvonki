@@ -564,6 +564,7 @@ def completed_card(order: Order, local_time: str) -> str:
         f"✅ <b>Заказ №{order.order_number} доставлен</b>{photo_result}\n"
         f"📦 {escape(order.product)}\n"
         f"{payment_result}\n"
+        f"{phones_text(order)}\n"
         f"👤 {escape(order.courier_name or '—')}\n{timing}"
     )
 
