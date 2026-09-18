@@ -65,23 +65,26 @@ def valid_turns(turns, duration):
     return sorted(result, key=lambda t: (t.start, t.end, t.speaker))
 
 
-def speech_chunks(turns, max_seconds):
-    """Partition speech at speaker changes; never give long silences to Whisper.
+def speech_chunks(turns, max_seconds, max_gap=0.8):
+    """Union nearby speech into bounded ASR windows, excluding long silences.
 
-    The partition also ensures overlapping voices are transcribed once rather
-    than duplicating the same audio for each speaker.
+    Speaker changes are NOT ASR boundaries: short isolated words lose context
+    and repeat Whisper's encoder work. Word timestamps are still aligned against
+    all original turns afterwards, including uncertain simultaneous speech.
     """
-    boundaries = sorted({t.start for t in turns} | {t.end for t in turns})
+    if not math.isfinite(max_seconds) or max_seconds <= 0:
+        raise ValueError("max_seconds must be positive and finite")
+    if not math.isfinite(max_gap) or max_gap < 0:
+        raise ValueError("max_gap must be non-negative and finite")
     windows = []
-    for start, end in zip(boundaries, boundaries[1:]):
-        active = frozenset(t.speaker for t in turns if t.start < end and t.end > start)
-        if not active:
+    for turn in sorted(turns, key=lambda t: (t.start, t.end)):
+        if not math.isfinite(turn.start) or not math.isfinite(turn.end) or turn.end <= turn.start:
             continue
-        if windows and windows[-1][2] == active and start - windows[-1][1] <= 0.15:
-            windows[-1] = (windows[-1][0], end, active)
+        if windows and turn.start <= windows[-1][1] + max_gap:
+            windows[-1] = (windows[-1][0], max(windows[-1][1], turn.end))
         else:
-            windows.append((start, end, active))
-    for start, end, _ in windows:
+            windows.append((turn.start, turn.end))
+    for start, end in windows:
         while start < end:
             stop = min(end, start + max_seconds)
             yield start, stop

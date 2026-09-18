@@ -26,6 +26,7 @@ class TranscriptionConfig:
     max_duration_seconds: float = 1800
     max_bytes: int = 100 * 1024 * 1024
     chunk_seconds: float = 20
+    speech_gap_seconds: float = 0.8
     cpu_threads: int = 2
     diarization_batch_size: int = 32
     role_confidence_threshold: float = 0.8
@@ -47,6 +48,8 @@ class TranscriptionConfig:
             raise ConfigurationError("Проверьте num_speakers (1–8) и merge_gap_seconds (0–5)")
         if not 1 <= self.chunk_seconds <= 30 or self.max_duration_seconds <= 0:
             raise ConfigurationError("chunk_seconds: 1–30; max_duration_seconds > 0")
+        if not 0 <= self.speech_gap_seconds <= 3:
+            raise ConfigurationError("speech_gap_seconds: 0–3")
         if self.cpu_threads < 1 or self.max_bytes < 1 or not 0 <= self.role_confidence_threshold <= 1:
             raise ConfigurationError("Некорректные лимиты локального распознавания")
         if not 1 <= self.diarization_batch_size <= 64:
@@ -68,6 +71,7 @@ class TranscriptionConfig:
                 merge_gap_seconds=float(os.getenv("LOCAL_TRANSCRIPTION_MERGE_GAP", "0.8")),
                 cpu_threads=int(os.getenv("LOCAL_TRANSCRIPTION_CPU_THREADS", "2")),
                 diarization_batch_size=int(os.getenv("LOCAL_DIARIZATION_BATCH_SIZE", "32")),
+                speech_gap_seconds=float(os.getenv("LOCAL_TRANSCRIPTION_SPEECH_GAP", "0.8")),
                 max_duration_seconds=float(os.getenv("TRANSCRIPTION_MAX_DURATION_SECONDS", "1800")),
                 max_bytes=int(os.getenv("TRANSCRIPTION_MAX_BYTES", str(100 * 1024 * 1024))),
                 identify_roles=flag("LOCAL_TRANSCRIPTION_IDENTIFY_ROLES", True),

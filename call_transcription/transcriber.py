@@ -83,7 +83,7 @@ class CallTranscriber:
             if len(speakers_found) != config.num_speakers:
                 warnings.append("speaker_count_mismatch")
             aligned, previous = [], None
-            for start, end in speech_chunks(turns, config.chunk_seconds):
+            for start, end in speech_chunks(turns, config.chunk_seconds, config.speech_gap_seconds):
                 for segment in self.backend.transcribe(path, start=start, end=end, initial_prompt=build_prompt(terms)):
                     if suspicious_segment(segment, previous):
                         warnings.append("suspicious_asr_segment_filtered")

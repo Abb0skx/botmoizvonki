@@ -1,0 +1,6 @@
+# Exact tested CPU base; models and private venv are mounted, not copied to Git/image.
+FROM nylgfmvjodgie9dga7ngprgl:59c26a7fc0c76f29d00fbdbcfcc5d97b10d457c5
+COPY botmoizvonki.py /app/botmoizvonki.py
+COPY call_transcription /app/call_transcription
+WORKDIR /app
+CMD ["/stage/venv/bin/python", "-m", "call_transcription.worker"]

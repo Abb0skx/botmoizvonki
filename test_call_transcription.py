@@ -45,6 +45,23 @@ def example_result():
 
 
 class LocalTranscriptionUnitTests(unittest.TestCase):
+    def test_faster_whisper_native_numbers_are_json_serializable(self):
+        from call_transcription.asr.faster_whisper_backend import FasterWhisperBackend
+        # NumPy scalars returned by real inference need explicit conversion.
+        class NativeNumber:
+            def __float__(self):
+                return 0.9
+        result = SimpleNamespace(start=NativeNumber(), end=NativeNumber(), text="Да",
+            words=[SimpleNamespace(start=NativeNumber(), end=NativeNumber(), word="Да", probability=NativeNumber())],
+            avg_logprob=-0.2, no_speech_prob=NativeNumber(), compression_ratio=NativeNumber())
+        backend = FasterWhisperBackend(TranscriptionConfig())
+        backend._model = Mock()
+        backend._model.transcribe.return_value = ([result], None)
+        with patch("call_transcription.asr.faster_whisper_backend.read_samples", return_value=[]):
+            segments = backend.transcribe("fake.wav", start=0, end=1, initial_prompt="")
+        from dataclasses import asdict
+        json.dumps([asdict(s) for s in segments], allow_nan=False)
+
     def test_diarization_batch_env_and_validation(self):
         from call_transcription.errors import ConfigurationError
         with patch.dict(os.environ, {"LOCAL_DIARIZATION_BATCH_SIZE": "1"}):
@@ -143,8 +160,20 @@ class LocalTranscriptionUnitTests(unittest.TestCase):
     def test_vad_chunks_skip_silence_and_do_not_duplicate_overlap(self):
         turns = [SpeakerTurn("A", 0, 2), SpeakerTurn("B", 1, 3), SpeakerTurn("A", 40, 45)]
         chunks = list(speech_chunks(turns, 20))
-        self.assertEqual(chunks, [(0, 1), (1, 2), (2, 3), (40, 45)])
+        self.assertEqual(chunks, [(0, 3), (40, 45)])
         self.assertEqual(list(speech_chunks([SpeakerTurn("A", 0, 45)], 20)), [(0, 20), (20, 40), (40, 45)])
+
+    def test_nearby_different_speakers_share_asr_window_but_keep_word_roles(self):
+        turns = [SpeakerTurn("B", 1.3, 2), SpeakerTurn("A", 0, 1), SpeakerTurn("B", 5, 6)]
+        self.assertEqual(list(speech_chunks(turns, 20)), [(0, 2), (5, 6)])
+        asr = ASRSegment(0, 2, "Да. Ha.", [Word(0.1, .7, "Да.", .9), Word(1.4, 1.8, "Ha.", .9)])
+        result = align_segment(asr, 0, 2, turns)
+        self.assertEqual([s.speaker_id for s in result], ["A", "B"])
+
+    def test_speech_windows_never_repeat_nested_or_overlapping_audio(self):
+        turns = [SpeakerTurn("A", 0, 10), SpeakerTurn("B", 1, 2), SpeakerTurn("B", 8, 23)]
+        self.assertEqual(list(speech_chunks(turns, 10)), [(0, 10), (10, 20), (20, 23)])
+        self.assertEqual(list(speech_chunks([], 20)), [])
 
     def test_json_export(self):
         with tempfile.TemporaryDirectory() as directory:

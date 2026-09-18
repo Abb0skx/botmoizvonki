@@ -41,9 +41,9 @@ class FasterWhisperBackend(TranscriptionBackend):
                     temperature=0, beam_size=5, no_speech_threshold=0.6,
                 )
                 return [ASRSegment(
-                    s.start, s.end, s.text,
-                    [Word(w.start, w.end, w.word, w.probability) for w in (s.words or [])],
-                    math.exp(min(0, s.avg_logprob)), s.no_speech_prob, s.avg_logprob, s.compression_ratio,
+                    float(s.start), float(s.end), s.text,
+                    [Word(float(w.start), float(w.end), w.word, float(w.probability)) for w in (s.words or [])],
+                    math.exp(min(0, s.avg_logprob)), float(s.no_speech_prob), float(s.avg_logprob), float(s.compression_ratio),
                 ) for s in segments]
             except ImportError as exc:
                 raise ConfigurationError("Установите requirements-transcription-linux.txt") from exc

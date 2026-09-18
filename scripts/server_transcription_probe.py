@@ -10,6 +10,7 @@ from pathlib import Path
 import resource
 import sys
 import time
+import traceback
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -81,5 +82,8 @@ if __name__ == "__main__":
         while current is not None and len(chain) < 6:
             chain.append(type(current).__name__)
             current = current.__cause__
-        emit("error", errors=chain)
+        emit("error", errors=chain, frames=[
+            {"file": Path(frame.filename).name, "line": frame.lineno, "function": frame.name}
+            for frame in traceback.extract_tb(exc.__traceback__)
+        ])
         raise SystemExit(1) from None
