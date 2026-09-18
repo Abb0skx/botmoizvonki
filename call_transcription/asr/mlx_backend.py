@@ -33,7 +33,8 @@ class MLXWhisperBackend(TranscriptionBackend):
                 return [ASRSegment(
                     s["start"], s["end"], s["text"],
                     [Word(w["start"], w["end"], w["word"], w.get("probability")) for w in s.get("words", [])],
-                    math.exp(min(0, s.get("avg_logprob", 0))), s.get("no_speech_prob", 0),
+                    math.exp(min(0, s["avg_logprob"])) if s.get("avg_logprob") is not None else None,
+                    s.get("no_speech_prob", 0),
                     s.get("avg_logprob", 0), s.get("compression_ratio", 0),
                 ) for s in result.get("segments", [])]
             except ImportError as exc:
