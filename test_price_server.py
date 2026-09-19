@@ -1597,6 +1597,7 @@ class PriceRepositoryTests(unittest.TestCase):
             "smartphones-google-pixel": 5024,
             "smartphones-infinix": 4992,
             "smartphones-tecno": 4944,
+            "smartphones-7tech-connect-u7": 5111,
             "smartphones-keypad": 4904,
             "tablets-apple": 4931,
             "tablets-samsung": 5022,
@@ -1670,6 +1671,22 @@ class PriceRepositoryTests(unittest.TestCase):
             "wearables-xiaomi": 5028,
             "wearables-iqibla": 4758,
         })
+        smartphones = next(
+            spec for spec in QUICK_LINK_POST_SPECS
+            if spec["quick_post_key"] == "quick-index-smartphones"
+        )
+        self.assertIn(
+            "• iPhone 18 / Duo (Скоро)",
+            smartphones["template_html"],
+        )
+        self.assertNotIn(
+            "{{post_url:smartphones-iphone-18-duo}}",
+            smartphones["template_html"],
+        )
+        self.assertNotIn(
+            "smartphones-iphone-18-duo",
+            {target["link_key"] for target in smartphones["targets"]},
+        )
         master = next(
             spec for spec in QUICK_LINK_POST_SPECS
             if spec["quick_post_key"] == "quick-index-catalog"

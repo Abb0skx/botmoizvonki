@@ -50,7 +50,7 @@ def _secondary(
     quick_post_key: str,
     title: str,
     message_id: int,
-    links: Sequence[tuple[str, str]],
+    links: Sequence[tuple[str | None, str]],
     targets: Sequence[dict[str, Any]],
     *,
     reconcile_on_install: bool = True,
@@ -64,7 +64,11 @@ def _secondary(
         "template_html": (
             f"<b>{title}</b>\n\n"
             + "\n\n".join(
-                f'• <a href="{{{{post_url:{link_key}}}}}">{label}</a>'
+                (
+                    f'• <a href="{{{{post_url:{link_key}}}}}">{label}</a>'
+                    if link_key is not None
+                    else f"• {label}"
+                )
                 for link_key, label in links
             )
         ),
@@ -135,12 +139,16 @@ QUICK_LINK_POST_SPECS: tuple[dict[str, Any], ...] = (
         (
             ("smartphones-xiaomi-poco", "Xiaomi, Redmi, Poco"),
             ("smartphones-samsung", "Samsung"),
+            # Keep this entry non-clickable until the price source starts
+            # sending smartphones-iphone-18-duo and its first post exists.
+            (None, "iPhone 18 / Duo (Скоро)"),
             ("smartphones-iphone-air-17", "iPhone Air / 17 Series"),
             ("smartphones-iphone-13-16", "iPhone 13–16 Series"),
             ("smartphones-honor-huawei", "Honor / Huawei"),
             ("smartphones-google-pixel", "Google Pixel"),
             ("smartphones-infinix", "Infinix"),
             ("smartphones-tecno", "Tecno"),
+            ("smartphones-7tech-connect-u7", "7Tech Connect U7"),
             ("smartphones-keypad", "Кнопочные — Nokia / Samsung / Novey"),
         ),
         (
@@ -152,6 +160,7 @@ QUICK_LINK_POST_SPECS: tuple[dict[str, Any], ...] = (
             _target("smartphones-google-pixel", 5024),
             _target("smartphones-infinix", 4992),
             _target("smartphones-tecno", 4944),
+            _target("smartphones-7tech-connect-u7", 5111),
             _target("smartphones-keypad", 4904),
         ),
     ),
