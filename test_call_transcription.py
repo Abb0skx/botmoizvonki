@@ -56,6 +56,9 @@ class LocalTranscriptionUnitTests(unittest.TestCase):
             avg_logprob=-0.2, no_speech_prob=NativeNumber(), compression_ratio=NativeNumber())
         backend = FasterWhisperBackend(TranscriptionConfig())
         backend._model = Mock()
+        backend._model.detect_language.return_value = (
+            "ru", 0.9, [("ru", 0.9), ("uz", 0.1)]
+        )
         backend._model.transcribe.return_value = ([result], None)
         with patch("call_transcription.asr.faster_whisper_backend.read_samples", return_value=[]):
             segments = backend.transcribe("fake.wav", start=0, end=1, initial_prompt="")
@@ -141,6 +144,14 @@ class LocalTranscriptionUnitTests(unittest.TestCase):
         for text in ("Да", "Нет", "Bor", "Yo'q", "Ha", "Aha"):
             self.assertFalse(suspicious_segment(ASRSegment(0, 0.3, text, no_speech_probability=0.7, avg_logprob=-1.1)))
         self.assertTrue(suspicious_segment(ASRSegment(0, 3, "Выдуманный длинный текст", no_speech_probability=0.95, avg_logprob=-2)))
+
+    def test_other_language_scripts_are_filtered(self):
+        for text in ("好, 好", "Sağolun", "Nə qədər", "مرحبا"):
+            with self.subTest(text=text):
+                self.assertTrue(suspicious_segment(ASRSegment(0, 1, text)))
+        for text in ("Assalomu alaykum", "Yo'q, oka", "Здравствуйте", "Google Pixel"):
+            with self.subTest(text=text):
+                self.assertFalse(suspicious_segment(ASRSegment(0, 1, text)))
 
     def test_only_low_confidence_long_repetitions_filtered(self):
         first = ASRSegment(0, 1, "Подписывайтесь на наш канал пожалуйста")
@@ -324,6 +335,9 @@ class BackendContractTests(unittest.TestCase):
     def test_faster_whisper_local_multilingual_model_loaded_once(self):
         from call_transcription.asr.faster_whisper_backend import FasterWhisperBackend
         factory = Mock()
+        factory.return_value.detect_language.return_value = (
+            "tr", 0.8, [("tr", 0.8), ("uz", 0.15), ("ru", 0.05)]
+        )
         factory.return_value.transcribe.return_value = ([], SimpleNamespace())
         with patch.dict("sys.modules", {"faster_whisper": SimpleNamespace(WhisperModel=factory),
                                       "ctranslate2": SimpleNamespace(get_cuda_device_count=lambda: 0)}), \
@@ -335,9 +349,23 @@ class BackendContractTests(unittest.TestCase):
         self.assertEqual(factory.call_args.kwargs["device"], "cpu")
         self.assertTrue(factory.call_args.kwargs["local_files_only"])
         options = factory.return_value.transcribe.call_args.kwargs
-        self.assertIsNone(options["language"])
-        self.assertTrue(options["multilingual"])
+        self.assertEqual(options["language"], "uz")
+        self.assertFalse(options["multilingual"])
         self.assertEqual(options["task"], "transcribe")
+        factory.return_value.detect_language.assert_called()
+
+    def test_faster_whisper_restricts_chinese_detection_to_ru(self):
+        from call_transcription.asr.faster_whisper_backend import FasterWhisperBackend
+        model = Mock()
+        model.detect_language.return_value = (
+            "zh", 0.7, [("zh", 0.7), ("ru", 0.2), ("uz", 0.1)]
+        )
+        model.transcribe.return_value = ([], SimpleNamespace())
+        backend = FasterWhisperBackend(TranscriptionConfig())
+        backend._model = model
+        with patch("call_transcription.asr.faster_whisper_backend.read_samples", return_value=[]):
+            backend.transcribe("test.wav", start=0, end=1, initial_prompt="RU/UZ")
+        self.assertEqual(model.transcribe.call_args.kwargs["language"], "ru")
 
     def test_mlx_never_forces_ru_or_logs_speech(self):
         from call_transcription.asr.mlx_backend import MLXWhisperBackend

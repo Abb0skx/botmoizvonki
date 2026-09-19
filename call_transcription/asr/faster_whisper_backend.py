@@ -33,9 +33,19 @@ class FasterWhisperBackend(TranscriptionBackend):
                         compute_type=compute, cpu_threads=self.config.cpu_threads,
                         local_files_only=True, num_workers=1,
                     )
+                samples = read_samples(audio_path, start, end)
+                _, _, language_probs = self._model.detect_language(audio=samples)
+                probabilities = dict(language_probs)
+                # Whisper's unrestricted detector frequently confuses Uzbek
+                # telephone speech with Turkish/Azerbaijani and may even emit
+                # CJK. Pick only between the two languages this business uses.
+                language = max(
+                    self.config.languages,
+                    key=lambda code: probabilities.get(code, 0.0),
+                )
                 segments, _ = self._model.transcribe(
-                    read_samples(audio_path, start, end), task="transcribe", language=None,
-                    multilingual=True, initial_prompt=initial_prompt, word_timestamps=True,
+                    samples, task="transcribe", language=language,
+                    multilingual=False, initial_prompt=initial_prompt, word_timestamps=True,
                     condition_on_previous_text=False, vad_filter=self.config.use_vad,
                     vad_parameters={"min_silence_duration_ms": 300, "min_speech_duration_ms": 100},
                     temperature=0, beam_size=5, no_speech_threshold=0.6,

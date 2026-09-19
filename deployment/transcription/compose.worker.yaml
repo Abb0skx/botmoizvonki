@@ -5,8 +5,8 @@ services:
     restart: unless-stopped
     init: true
     cpus: 1.5
-    mem_limit: 4g
-    memswap_limit: 4608m
+    mem_limit: 4352m
+    memswap_limit: 5120m
     oom_score_adj: 500
     pids_limit: 128
     stop_grace_period: 5m

@@ -11,6 +11,10 @@ BRANDS = (
 
 _UZ = set("ha yo'q yoq bor bormi narx narxi qancha necha salom assalomu alaykum rahmat kerak rang qora oq xotira gigabayt million ming so'm som dollar yetkazib beramiz hozir tekshiraman eshitaman do'kon dukon uchun ham bilan bo'ladi boladi mumkin yo'qmi yoqmi aha yaxshi xop xo'p haqiqat bor ekan men biz siz olaman bermoq olib berish xizmat qaysi shu bu sizga qanday yordam beraman narxini ayting йўқ ҳа бор борми нархи қанча керак раҳмат салом эшитаман дўкон ҳозир етказиб берамиз".split())
 _RU = set("да нет здравствуйте магазин слушаю вас чем могу помочь есть наличии сейчас посмотрю цена доставка можем доставить оставьте номер черный черный чёрный тоже сколько стоит нужен нужна какой память гигабайт рублей сум долларов пожалуйста спасибо хорошо кажется цвет это можно мне мы я вы вам у нас будет".split())
+_FORBIDDEN_SCRIPT = re.compile(
+    r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af\u0600-\u06ff]"
+)
+_NON_RU_UZ_LATIN = re.compile(r"[ğĞşŞıİöÖüÜçÇəƏ]", flags=re.UNICODE)
 
 
 def normalized_words(text):
@@ -39,6 +43,8 @@ def normalize_text(text):
 
 def suspicious_segment(segment, previous=None):
     short_answer = " ".join(normalized_words(segment.text)) in {"да", "нет", "bor", "yo'q", "yoq", "ha", "aha"}
+    if _FORBIDDEN_SCRIPT.search(segment.text) or _NON_RU_UZ_LATIN.search(segment.text):
+        return True
     if segment.no_speech_probability > 0.9 and segment.avg_logprob < -1.5:
         return True
     if not short_answer and segment.no_speech_probability > 0.6 and segment.avg_logprob < -1:
@@ -84,7 +90,8 @@ def build_prompt(context_terms):
     terms = list(dict.fromkeys((*context_terms, "TEXNIKACH", "OLX", "Instagram", "Telegram", *BRANDS)))
     vocabulary = ", ".join(normalize_text(str(t)) for t in terms[:60])[:1000]
     return (
-        "Телефонный разговор клиента и менеджера магазина на русском и узбекском языках. "
+        "Телефонный разговор клиента и менеджера магазина только на русском и узбекском языках. "
+        "Распознавать только русскую или узбекскую речь. "
         "Не переводить речь. Сохранять русские слова на русском, узбекские на узбекском, "
         "включая смешанные фразы. Названия электроники, модели, цены, числа и валюты. "
         "Suhbat rus va o'zbek tillarida. Tarjima qilmang. " + vocabulary
