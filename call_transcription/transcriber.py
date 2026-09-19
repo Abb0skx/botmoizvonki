@@ -72,13 +72,25 @@ class CallTranscriber:
             terms = list(context_terms or [])
             if self.context_terms_provider:
                 terms.extend(self.context_terms_provider(call_id) or [])
-            if config.use_diarization or config.use_vad:
+            long_audio_without_diarization = (
+                config.use_diarization
+                and duration > config.diarization_max_duration_seconds
+            )
+            if long_audio_without_diarization:
+                # Pyannote clustering becomes disproportionately expensive on
+                # long CPU-only calls. Preserve all speech for ASR, but do not
+                # invent speaker identities when diarization is deliberately
+                # skipped.
+                turns = [SpeakerTurn("SPEAKER_UNKNOWN", 0, duration)]
+            elif config.use_diarization or config.use_vad:
                 turns = valid_turns(self.diarizer.diarize(path), duration)
             else:
                 turns = [SpeakerTurn("SPEAKER_UNKNOWN", 0, duration)]
             if not turns:
                 raise NoSpeechDetectedError("В записи не обнаружена речь")
             warnings = []
+            if long_audio_without_diarization:
+                warnings.append("diarization_skipped_for_long_audio")
             speakers_found = {t.speaker for t in turns}
             if len(speakers_found) != config.num_speakers:
                 warnings.append("speaker_count_mismatch")

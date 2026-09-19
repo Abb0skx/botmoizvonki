@@ -37,8 +37,10 @@ running containers. Use the previous successful calls deployment/image in Coolif
 after stopping the worker. The DB changes are additive; do NOT restore an older
 DB over newer calls. Keep the SQLite backup for recovery, not routine rollback.
 
-Limits: one CPU-int8 large-v3-turbo model, pyannote batch 1, CPU threads 2,
-1.5 CPU quota, 3 GiB RAM, at most 512 MiB container swap. Inference is local and
+Limits: one CPU-int8 full large-v3 model, pyannote batch 1, CPU threads 2,
+1.5 CPU quota, 4 GiB RAM, at most 512 MiB container swap. Calls longer than
+180 seconds keep their complete text but deliberately skip CPU-heavy diarization;
+their speakers remain unresolved. Inference is local and
 model access is offline. Runtime network is needed only for downloading authorized
 call recordings and updating the existing Telegram call card. Client speech is
 not sent to an external ASR/LLM. Full transcript text is not printed in logs.

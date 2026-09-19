@@ -29,6 +29,7 @@ class TranscriptionConfig:
     speech_gap_seconds: float = 0.8
     cpu_threads: int = 2
     diarization_batch_size: int = 32
+    diarization_max_duration_seconds: float = 180
     role_confidence_threshold: float = 0.8
     ffmpeg: str = "ffmpeg"
     ffprobe: str = "ffprobe"
@@ -54,6 +55,8 @@ class TranscriptionConfig:
             raise ConfigurationError("Некорректные лимиты локального распознавания")
         if not 1 <= self.diarization_batch_size <= 64:
             raise ConfigurationError("diarization_batch_size: 1–64")
+        if self.diarization_max_duration_seconds <= 0:
+            raise ConfigurationError("diarization_max_duration_seconds должен быть больше 0")
 
     @classmethod
     def from_env(cls):
@@ -71,6 +74,7 @@ class TranscriptionConfig:
                 merge_gap_seconds=float(os.getenv("LOCAL_TRANSCRIPTION_MERGE_GAP", "0.8")),
                 cpu_threads=int(os.getenv("LOCAL_TRANSCRIPTION_CPU_THREADS", "2")),
                 diarization_batch_size=int(os.getenv("LOCAL_DIARIZATION_BATCH_SIZE", "32")),
+                diarization_max_duration_seconds=float(os.getenv("LOCAL_DIARIZATION_MAX_DURATION_SECONDS", "180")),
                 speech_gap_seconds=float(os.getenv("LOCAL_TRANSCRIPTION_SPEECH_GAP", "0.8")),
                 max_duration_seconds=float(os.getenv("TRANSCRIPTION_MAX_DURATION_SECONDS", "1800")),
                 max_bytes=int(os.getenv("TRANSCRIPTION_MAX_BYTES", str(100 * 1024 * 1024))),

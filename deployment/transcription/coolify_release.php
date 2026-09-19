@@ -6,8 +6,12 @@ $laravel = require '/var/www/html/bootstrap/app.php';
 $laravel->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();
 $resource = App\Models\Application::where('uuid', 'nylgfmvjodgie9dga7ngprgl')->firstOrFail();
 $mode = getenv('ASR_RELEASE_ACTION') ?: 'inspect';
-$backup = '/tmp/texnikach-transcription-coolify-before-20260918.json';
-$settings = ['TRANSCRIPTION_ENABLED' => 'true', 'TRANSCRIPTION_WORKER_MODE' => 'external'];
+$backup = '/tmp/texnikach-transcription-coolify-before-large-v3-20260919.json';
+$settings = [
+    'TRANSCRIPTION_ENABLED' => 'true',
+    'TRANSCRIPTION_WORKER_MODE' => 'external',
+    'LOCAL_WHISPER_MODEL' => 'large-v3',
+];
 
 if ($mode === 'status') {
     $latest = App\Models\ApplicationDeploymentQueue::where('application_id', $resource->id)

@@ -5,8 +5,8 @@ services:
     restart: unless-stopped
     init: true
     cpus: 1.5
-    mem_limit: 3g
-    memswap_limit: 3584m
+    mem_limit: 4g
+    memswap_limit: 4608m
     oom_score_adj: 500
     pids_limit: 128
     stop_grace_period: 5m
@@ -22,10 +22,12 @@ services:
       LOCAL_TRANSCRIPTION_BACKEND: faster-whisper
       LOCAL_TRANSCRIPTION_DEVICE: cpu
       LOCAL_TRANSCRIPTION_COMPUTE_TYPE: int8
+      LOCAL_WHISPER_MODEL: large-v3
       LOCAL_TRANSCRIPTION_CPU_THREADS: "2"
       LOCAL_DIARIZATION_BATCH_SIZE: "1"
+      LOCAL_DIARIZATION_MAX_DURATION_SECONDS: "180"
       LOCAL_TRANSCRIPTION_SPEECH_GAP: "1.5"
-      LOCAL_WHISPER_MODEL_PATH: /models/whisper
+      LOCAL_WHISPER_MODEL_PATH: /models/whisper-large-v3
       LOCAL_DIARIZATION_MODEL_PATH: /models/diarization
       DB_PATH: /app/data/calls.db
       HF_HUB_OFFLINE: "1"
@@ -46,7 +48,7 @@ services:
       - calls-data:/app/data
       - /opt/texnikach-transcription-20260918/venv:/stage/venv:ro
       - /opt/texnikach-transcription-20260918/models/diarization:/models/diarization:ro
-      - /opt/texnikach-transcription-probe-20260918/whisper:/models/whisper:ro
+      - /opt/texnikach-transcription-models/whisper-large-v3:/models/whisper-large-v3:ro
     logging:
       driver: json-file
       options:

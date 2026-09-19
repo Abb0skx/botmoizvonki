@@ -249,6 +249,15 @@ class LocalPipelineTests(unittest.TestCase):
             self.transcriber().transcribe(self.audio)
         self.backend.transcribe.assert_not_called()
 
+    def test_long_audio_skips_diarization_but_keeps_asr(self):
+        self.config = replace(self.config, diarization_max_duration_seconds=5)
+        result = self.transcriber().transcribe(self.audio)
+        self.diarizer.diarize.assert_not_called()
+        self.backend.transcribe.assert_called_once()
+        self.assertEqual(result.segments[0].speaker_id, "SPEAKER_UNKNOWN")
+        self.assertIn("diarization_skipped_for_long_audio", result.warnings)
+        self.assertIsNone(result.segments[0].role)
+
     def test_missing_file(self):
         with self.assertRaises(FileNotFoundError):
             self.transcriber().transcribe(Path(self.tmp.name) / "not-here.mp3")
