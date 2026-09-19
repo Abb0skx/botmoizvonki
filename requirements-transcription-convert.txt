@@ -3,3 +3,4 @@
 -r requirements-transcription-cpu.txt
 transformers==4.56.2
 accelerate==1.10.1
+regex==2025.9.18

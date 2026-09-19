@@ -18,7 +18,8 @@ Release order:
    `PRAGMA quick_check`.
 2. `coolify_release.php` actions `inspect`, then `backup`. Export its backup from
    the Coolify container before proceeding.
-3. Build `Dockerfile.worker` against the existing production base. Prepare its
+3. Build `Dockerfile.worker` against the exact existing production base by
+   passing `--build-arg CALLS_BASE_IMAGE=<verified image>`. Prepare its
    private environment with `prepare_worker_env.py`.
 4. Push the feature commit. Run the PHP helper with `ASR_RELEASE_ACTION=deploy`
    and `ASR_RELEASE_COMMIT=<full tested SHA>`. This sets only the calls app branch
