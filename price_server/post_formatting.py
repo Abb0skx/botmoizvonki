@@ -27,6 +27,11 @@ PRICE_INFO_UZ_HTML = (
 PRICE_INFO_RU_HTML = (
     f'<a href="{PRICE_INFO_URL}">ⓘ Магазин · Связь · Доставка</a>'
 )
+PRICE_NOTICE_UZ = "Narxlar o'zgarishi mumkin."
+PRICE_NOTICE_RU = "Цены могут меняться."
+PRICE_NOTICE_HTML = (
+    f"<blockquote>{PRICE_NOTICE_UZ}\n{PRICE_NOTICE_RU}</blockquote>"
+)
 
 _MEMORY_RE = re.compile(
     r"(?<![A-Za-z0-9])(?P<first>\d+)\s*/\s*(?P<second>\d+)\s*"
@@ -40,6 +45,7 @@ _VARIANT_RE = re.compile(
     r"(?:\s+(?P<details>.*?))?\s*$"
 )
 _TAG_RE = re.compile(r"<[^>]+>")
+_BR_TAG_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
 _MULTIPLE_BLANKS_RE = re.compile(r"\n{3,}")
 _INFO_UZ_RE = re.compile(
     r"^(?:📌|ⓘ)\s*do[‘’']kon\s*(?:\||│|·)\s*(?:📞\s*)?aloqa"
@@ -84,6 +90,17 @@ def _visible_line(value: str) -> str:
 def _is_information_line(value: str) -> bool:
     visible = re.sub(r"\s+", " ", _visible_line(value)).strip()
     return bool(_INFO_UZ_RE.fullmatch(visible) or _INFO_RU_RE.fullmatch(visible))
+
+
+def _is_price_notice_line(value: str) -> bool:
+    source = _BR_TAG_RE.sub("\n", str(value))
+    visible = html.unescape(_TAG_RE.sub("", source))
+    normalized = re.sub(r"\s+", " ", visible).strip().casefold()
+    return normalized in {
+        PRICE_NOTICE_UZ.casefold(),
+        PRICE_NOTICE_RU.casefold(),
+        f"{PRICE_NOTICE_UZ} {PRICE_NOTICE_RU}".casefold(),
+    }
 
 
 def _is_source_title(value: str, section_key: str, title: str) -> bool:
@@ -195,6 +212,8 @@ def _clean_source_block(value: str, section_key: str, title: str) -> str:
     title_removed = False
     for line in lines:
         if _is_information_line(line):
+            continue
+        if _is_price_notice_line(line):
             continue
         if not title_removed and _is_source_title(line, section_key, title):
             title_removed = True
@@ -381,7 +400,11 @@ def format_price_sections(
     if not sections:
         raise ValueError("at least one price section is required")
     wrapper_units = telegram_text_units(
-        PRICE_INFO_UZ_HTML + "\n\n\n\n" + PRICE_INFO_RU_HTML
+        PRICE_INFO_UZ_HTML
+        + "\n\n\n\n"
+        + PRICE_NOTICE_HTML
+        + "\n\n"
+        + PRICE_INFO_RU_HTML
     )
     max_body_units = TELEGRAM_MESSAGE_LIMIT - wrapper_units
     target_body_units = min(
@@ -404,7 +427,8 @@ def format_price_sections(
         max_units=max_body_units,
     )
     result = [
-        f"{PRICE_INFO_UZ_HTML}\n\n{chunk}\n\n{PRICE_INFO_RU_HTML}"
+        f"{PRICE_INFO_UZ_HTML}\n\n{chunk}\n\n"
+        f"{PRICE_NOTICE_HTML}\n\n{PRICE_INFO_RU_HTML}"
         for chunk in chunks
     ]
     if any(telegram_text_units(item) > TELEGRAM_MESSAGE_LIMIT for item in result):

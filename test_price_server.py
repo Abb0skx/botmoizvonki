@@ -32,6 +32,7 @@ from price_server.quick_links import (
 from price_server.post_formatting import (
     PRICE_INFO_RU_HTML,
     PRICE_INFO_UZ_HTML,
+    PRICE_NOTICE_HTML,
     format_price_sections,
 )
 from price_server.scheduler import PriceScheduler
@@ -423,7 +424,11 @@ class PriceRepositoryTests(unittest.TestCase):
         self.assertEqual(len(rendered), 1)
         message = rendered[0]
         self.assertTrue(message.startswith(PRICE_INFO_UZ_HTML + "\n\n"))
-        self.assertTrue(message.endswith("\n\n" + PRICE_INFO_RU_HTML))
+        self.assertTrue(
+            message.endswith(
+                "\n\n" + PRICE_NOTICE_HTML + "\n\n" + PRICE_INFO_RU_HTML
+            )
+        )
         self.assertEqual(message.count("https://texnikach.uz/go"), 2)
         self.assertIn("<b>━━ ТЕЛЕФОНЫ · INFINIX ━━</b>", message)
         self.assertIn("• 3/64 GB · Black, Silver — <b>130</b>", message)
@@ -452,6 +457,36 @@ class PriceRepositoryTests(unittest.TestCase):
             rendered,
         )
         self.assertNotIn("· ·", message)
+
+    def test_price_notice_is_moved_to_the_end_of_every_price_post(self):
+        raw = (
+            "<b>【 iPhone 18 / Duo 】</b>\n"
+            "<blockquote>Narxlar o'zgarishi mumkin.\n"
+            "Цены могут меняться.</blockquote>\n"
+            "Apple iPhone 18 Pro\n"
+            "• 256Gb Black: 2200"
+        )
+
+        rendered = format_price_sections([
+            ("smartphones-iphone-18-duo", "iPhone 18 / Duo", [raw]),
+            ("audio-sony", "Наушники Sony", ["Sony Test\n• Black: 100"]),
+        ])
+
+        self.assertTrue(rendered)
+        for message in rendered:
+            self.assertEqual(message.count(PRICE_NOTICE_HTML), 1)
+            self.assertTrue(
+                message.endswith(
+                    "\n\n"
+                    + PRICE_NOTICE_HTML
+                    + "\n\n"
+                    + PRICE_INFO_RU_HTML
+                )
+            )
+            self.assertLess(
+                message.index(PRICE_NOTICE_HTML),
+                message.index(PRICE_INFO_RU_HTML),
+            )
 
     def test_price_post_format_compacts_long_heading_and_bolds_prices(self):
         raw = (
@@ -509,7 +544,7 @@ class PriceRepositoryTests(unittest.TestCase):
         )
 
     def test_price_post_format_splits_one_oversized_html_block_safely(self):
-        long_text = "x" * 4050
+        long_text = "X" * 4050
         raw = (
             "<b>【 Long 】</b>\n"
             f'<a href="https://example.test/long">{long_text}</a>'
@@ -517,7 +552,7 @@ class PriceRepositoryTests(unittest.TestCase):
         rendered = format_price_sections([("long", "Long", [raw])])
         self.assertGreater(len(rendered), 1)
         self.assertEqual(
-            sum(telegram_visible_text(item).count("x") for item in rendered),
+            sum(telegram_visible_text(item).count("X") for item in rendered),
             len(long_text),
         )
         self.assertTrue(all(
@@ -530,7 +565,13 @@ class PriceRepositoryTests(unittest.TestCase):
         self.assertTrue(all(item.count("</a>") >= 3 for item in rendered))
         self.assertTrue(all(
             item.startswith(PRICE_INFO_UZ_HTML + "\n\n")
-            and item.endswith("\n\n" + PRICE_INFO_RU_HTML)
+            and item.endswith(
+                "\n\n" + PRICE_NOTICE_HTML + "\n\n" + PRICE_INFO_RU_HTML
+            )
+            for item in rendered
+        ))
+        self.assertTrue(all(
+            item.count(PRICE_NOTICE_HTML) == 1
             for item in rendered
         ))
 
