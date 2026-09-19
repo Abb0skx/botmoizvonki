@@ -14,7 +14,13 @@ from unittest.mock import Mock, patch
 
 from call_transcription import CallTranscriber, TranscriptionConfig, CallTranscript, TranscriptSegment
 from call_transcription.audio import prepared_audio
-from call_transcription.diarization import align_segment, assign_speaker, speaker_speech_chunks, speech_chunks
+from call_transcription.diarization import (
+    align_segment,
+    assign_speaker,
+    resolve_two_speaker_unknowns,
+    speaker_speech_chunks,
+    speech_chunks,
+)
 from call_transcription.errors import (
     AudioDecodeError,
     ConfigurationError,
@@ -55,6 +61,13 @@ class LocalTranscriptionUnitTests(unittest.TestCase):
             normalize_text("So 'ramoqchi edim, yo 'q. Bo ‘ yicha."),
             "So'ramoqchi edim, yo'q. Bo‘yicha.",
         )
+
+    def test_excessive_whisper_word_repetition_is_collapsed(self):
+        self.assertEqual(
+            normalize_text("Ha. Ha. Ha. Ha. Ha. Ha. Ha."),
+            "Ha.",
+        )
+        self.assertEqual(normalize_text("Ha. Ha. Ha."), "Ha. Ha. Ha.")
 
     def test_faster_whisper_native_numbers_are_json_serializable(self):
         from call_transcription.asr.faster_whisper_backend import FasterWhisperBackend
@@ -178,6 +191,26 @@ class LocalTranscriptionUnitTests(unittest.TestCase):
         self.assertEqual([s.start for s in aligned], [10.2, 12.1])
         self.assertEqual(assign_speaker(1, 2, [SpeakerTurn("A", 0, 3), SpeakerTurn("B", 0, 3)]), ("SPEAKER_UNKNOWN", True))
         self.assertEqual(assign_speaker(5, 6, turns), ("SPEAKER_UNKNOWN", False))
+
+    def test_two_party_call_resolves_unknown_without_inventing_third_speaker(self):
+        turns = [
+            SpeakerTurn("SPEAKER_00", 0, 2.2),
+            SpeakerTurn("SPEAKER_01", 2.0, 4.0),
+        ]
+        segments = [
+            segment("Здравствуйте.", "SPEAKER_00", 0.5, 1.5),
+            replace(segment("Ha.", "SPEAKER_UNKNOWN", 2.0, 2.2), overlap=True),
+            segment("Xo'p.", "SPEAKER_01", 2.3, 3.0),
+        ]
+
+        resolved = resolve_two_speaker_unknowns(segments, turns)
+
+        self.assertEqual(
+            {item.speaker_id for item in resolved},
+            {"SPEAKER_00", "SPEAKER_01"},
+        )
+        self.assertEqual(resolved[1].speaker_id, "SPEAKER_01")
+        self.assertTrue(resolved[1].overlap)
 
     def test_vad_chunks_skip_silence_and_do_not_duplicate_overlap(self):
         turns = [SpeakerTurn("A", 0, 2), SpeakerTurn("B", 1, 3), SpeakerTurn("A", 40, 45)]

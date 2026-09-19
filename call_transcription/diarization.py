@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import threading
+from dataclasses import replace
 from pathlib import Path
 
 from .audio import read_samples
@@ -149,3 +150,84 @@ def align_segment(segment, offset, chunk_end, turns):
             confidence=confidence, overlap=overlap,
         ))
     return result
+
+
+def resolve_two_speaker_unknowns(segments, turns):
+    """Assign ambiguous words when the call is known to contain two people.
+
+    ``assign_speaker`` deliberately marks comparable overlap as unknown. For a
+    two-party phone call that uncertainty should remain in ``overlap=True``, but
+    it should not create a fictitious third participant. Prefer the nearest
+    known transcript neighbour, then diarization overlap/distance. The actual
+    two pyannote speaker IDs are never renamed or merged.
+    """
+    speaker_ids = sorted({turn.speaker for turn in turns})
+    if len(speaker_ids) != 2:
+        return list(segments)
+
+    resolved = [replace(segment) for segment in segments]
+
+    def neighbour(index, step):
+        cursor = index + step
+        while 0 <= cursor < len(resolved):
+            if resolved[cursor].speaker_id in speaker_ids:
+                return resolved[cursor]
+            cursor += step
+        return None
+
+    for index, segment in enumerate(resolved):
+        if segment.speaker_id != "SPEAKER_UNKNOWN":
+            continue
+
+        previous = neighbour(index, -1)
+        following = neighbour(index, 1)
+        candidates = set(speaker_ids)
+
+        scores = {speaker: 0.0 for speaker in speaker_ids}
+        for turn in turns:
+            overlap = max(
+                0.0,
+                min(segment.end, turn.end) - max(segment.start, turn.start),
+            )
+            scores[turn.speaker] += overlap
+        best_score = max(scores.values())
+        if best_score > 0:
+            candidates = {
+                speaker
+                for speaker, score in scores.items()
+                if math.isclose(score, best_score, rel_tol=0.05, abs_tol=0.02)
+            }
+
+        chosen = None
+        if previous and following and previous.speaker_id == following.speaker_id:
+            if previous.speaker_id in candidates:
+                chosen = previous.speaker_id
+        elif previous or following:
+            previous_gap = (
+                max(0.0, segment.start - previous.end)
+                if previous and previous.speaker_id in candidates
+                else math.inf
+            )
+            following_gap = (
+                max(0.0, following.start - segment.end)
+                if following and following.speaker_id in candidates
+                else math.inf
+            )
+            if previous_gap <= following_gap and previous_gap < math.inf:
+                chosen = previous.speaker_id
+            elif following_gap < math.inf:
+                chosen = following.speaker_id
+
+        if chosen is None:
+            def speaker_distance(speaker):
+                return min(
+                    max(turn.start - segment.end, segment.start - turn.end, 0.0)
+                    for turn in turns
+                    if turn.speaker == speaker
+                )
+
+            chosen = min(candidates, key=lambda speaker: (speaker_distance(speaker), speaker))
+
+        resolved[index] = replace(segment, speaker_id=chosen, overlap=True)
+
+    return resolved

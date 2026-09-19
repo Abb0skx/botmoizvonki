@@ -15,6 +15,10 @@ _FORBIDDEN_SCRIPT = re.compile(
     r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af\u0600-\u06ff]"
 )
 _NON_RU_UZ_LATIN = re.compile(r"[ğĞşŞıİöÖüÜçÇəƏ]", flags=re.UNICODE)
+_EXCESSIVE_WORD_REPEAT = re.compile(
+    r"(?i)(?<!\w)([^\W\d_]+(?:['’‘ʻʼ`][^\W\d_]+)*)([.!?,;:]?)"
+    r"(?:\s+\1[.!?,;:]?){3,}(?!\w)"
+)
 
 
 def normalized_words(text):
@@ -67,6 +71,14 @@ def normalize_text(text):
     text = re.sub(
         r"(?<=\w)\s*(['’‘ʻʼ`])\s*(?=\w)",
         lambda match: match.group(1),
+        text,
+    )
+    # Whisper can repeat a short token many times on telephone noise. Four or
+    # more identical consecutive words are an ASR artefact for this two-party
+    # workflow. Preserve one occurrence; ordinary double/triple emphasis and
+    # short real answers remain untouched.
+    text = _EXCESSIVE_WORD_REPEAT.sub(
+        lambda match: match.group(1) + (match.group(2) or ""),
         text,
     )
     return re.sub(r"\s+([,.!?;:])", r"\1", text)

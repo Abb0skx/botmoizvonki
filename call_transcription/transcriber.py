@@ -10,7 +10,14 @@ from pathlib import Path
 
 from .audio import prepared_audio
 from .config import TranscriptionConfig
-from .diarization import PyannoteDiarizer, align_segment, speaker_speech_chunks, speech_chunks, valid_turns
+from .diarization import (
+    PyannoteDiarizer,
+    align_segment,
+    resolve_two_speaker_unknowns,
+    speaker_speech_chunks,
+    speech_chunks,
+    valid_turns,
+)
 from .errors import NoSpeechDetectedError
 from .models import CallTranscript, SpeakerTurn
 from .processing import build_prompt, detect_language, merge_same_speaker, suspicious_segment
@@ -110,6 +117,8 @@ class CallTranscriber:
                         continue
                     aligned.extend(align_segment(segment, start, end, turns))
                     previous = segment
+            if config.num_speakers == 2:
+                aligned = resolve_two_speaker_unknowns(aligned, turns)
             segments = merge_same_speaker(aligned, config.merge_gap_seconds)
             if not segments:
                 raise NoSpeechDetectedError("Нет достоверно распознанной речи")
