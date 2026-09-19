@@ -1591,6 +1591,7 @@ class PriceRepositoryTests(unittest.TestCase):
             "accessories-combined": 4824,
             "smartphones-xiaomi-poco": 5031,
             "smartphones-samsung": 5037,
+            "smartphones-iphone-18-duo": 5203,
             "smartphones-iphone-air-17": 5041,
             "smartphones-iphone-13-16": 5042,
             "smartphones-honor-huawei": 4964,
@@ -1676,14 +1677,11 @@ class PriceRepositoryTests(unittest.TestCase):
             if spec["quick_post_key"] == "quick-index-smartphones"
         )
         self.assertIn(
-            "• iPhone 18 / Duo (Скоро)",
-            smartphones["template_html"],
-        )
-        self.assertNotIn(
             "{{post_url:smartphones-iphone-18-duo}}",
             smartphones["template_html"],
         )
-        self.assertNotIn(
+        self.assertNotIn("(Скоро)", smartphones["template_html"])
+        self.assertIn(
             "smartphones-iphone-18-duo",
             {target["link_key"] for target in smartphones["targets"]},
         )

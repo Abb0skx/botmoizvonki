@@ -139,9 +139,7 @@ QUICK_LINK_POST_SPECS: tuple[dict[str, Any], ...] = (
         (
             ("smartphones-xiaomi-poco", "Xiaomi, Redmi, Poco"),
             ("smartphones-samsung", "Samsung"),
-            # Keep this entry non-clickable until the price source starts
-            # sending smartphones-iphone-18-duo and its first post exists.
-            (None, "iPhone 18 / Duo (Скоро)"),
+            ("smartphones-iphone-18-duo", "iPhone 18 / Duo"),
             ("smartphones-iphone-air-17", "iPhone Air / 17 Series"),
             ("smartphones-iphone-13-16", "iPhone 13–16 Series"),
             ("smartphones-honor-huawei", "Honor / Huawei"),
@@ -154,6 +152,7 @@ QUICK_LINK_POST_SPECS: tuple[dict[str, Any], ...] = (
         (
             _target("smartphones-xiaomi-poco", 5031),
             _target("smartphones-samsung", 5037),
+            _target("smartphones-iphone-18-duo", 5203),
             _target("smartphones-iphone-air-17", 5041),
             _target("smartphones-iphone-13-16", 5042),
             _target("smartphones-honor-huawei", 4964),
