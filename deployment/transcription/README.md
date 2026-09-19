@@ -37,13 +37,16 @@ running containers. Use the previous successful calls deployment/image in Coolif
 after stopping the worker. The DB changes are additive; do NOT restore an older
 DB over newer calls. Keep the SQLite backup for recovery, not routine rollback.
 
-Limits: one CPU-int8 full large-v3 model, pyannote batch 1, CPU threads 2,
-1.5 CPU quota, 4.25 GiB RAM, at most 768 MiB container swap. Calls longer than
+Limits: one CPU-int8 Whisper small model plus Vosk Uzbek, pyannote batch 1,
+CPU threads 2, 1.5 CPU quota, 3.5 GiB RAM, at most 512 MiB container swap. Calls longer than
 180 seconds keep their complete text but deliberately skip CPU-heavy diarization;
 their speakers remain unresolved. Inference is local and
 model access is offline. Runtime network is needed only for downloading authorized
 call recordings and updating the existing Telegram call card. Client speech is
 not sent to an external ASR/LLM. Full transcript text is not printed in logs.
 
-Accuracy and manager/client roles still require operator review. Unknown roles
+Hybrid routing runs both local recognizers sequentially per speaker turn: Vosk
+for Uzbek and Russian-only Whisper small. This deliberately trades some speed
+for avoiding whole-call language selection; arbitrary Turkish/CJK output is not
+accepted. Accuracy and manager/client roles still require operator review. Unknown roles
 remain speaker labels. No historical backfill runs automatically.

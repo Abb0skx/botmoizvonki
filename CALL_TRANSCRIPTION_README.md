@@ -6,12 +6,12 @@
 слов к говорящим, RU/UZ-классификация реплик, осторожное определение ролей,
 JSON/TXT и интеграция с существующей SQLite-очередью/Telegram.
 
-Production `faster-whisper` не принимает свободный языковой выбор Whisper:
-перед каждым ASR-окном сравниваются только вероятности `ru` и `uz`, после чего
-декодер принудительно использует выбранный из этих двух языков с
-`task="transcribe"`. CJK/арабская письменность и характерные турецкие/
-азербайджанские диакритики фильтруются как ложные сегменты. Это не переводит и
-не перефразирует смешанную RU/UZ речь.
+Production-гибрид обрабатывает каждую diarization-реплику двумя локальными
+движками последовательно: Vosk Uzbek и Russian-only faster-whisper small.
+Выбор делается по письменности, RU/UZ-лексике, покрытию и confidence; один язык
+больше не назначается всему звонку. CJK/арабская письменность и характерные
+турецкие/азербайджанские диакритики фильтруются как ложные сегменты. Это не
+переводит и не перефразирует смешанную RU/UZ речь.
 
 Unit/integration-тесты используют fakes. Они **не подтверждают качество Whisper
 или diarization на настоящих клиентах**. Для приёмки нужен реальный звонок,
@@ -80,6 +80,7 @@ python3.11 -m venv .venv-transcription
 
 - `mlx-whisper==0.4.3`: Whisper/Metal на Apple Silicon, модель кешируется MLX;
 - `faster-whisper==1.2.1`: Whisper/CTranslate2 на CPU/CUDA, также содержит Silero VAD;
+- `vosk==0.3.45`: лёгкая локальная узбекская модель для гибридного Linux-worker;
 - `pyannote.audio==4.0.7`: локальные голосовые интервалы и VAD; подтягивает PyTorch/numpy;
 - ffmpeg + ffprobe: системное декодирование mp3/m4a/wav/ogg/opus в PCM16 mono 16 kHz.
 
@@ -103,7 +104,8 @@ PyTorch 2.8/torchaudio и совместимый TorchCodec 0.7. На небол
 ```sh
 .venv-transcription/bin/python scripts/download_transcription_models.py \
   --backend mlx --model large-v3-turbo --directory /absolute/path/models
-# Linux: --backend faster-whisper; также поддерживается --model large-v3
+# Production Linux hybrid: --backend hybrid --model small. Официальную модель
+# vosk-model-small-uz-0.22 скачайте отдельно и задайте LOCAL_VOSK_MODEL_PATH.
 ```
 
 Скачивание — отдельный явный шаг, не часть обработки звонка. Не принимайте
@@ -112,9 +114,10 @@ PyTorch 2.8/torchaudio и совместимый TorchCodec 0.7. На небол
 
 ```sh
 export LOCAL_WHISPER_MODEL_PATH=/absolute/path/models/whisper
+export LOCAL_VOSK_MODEL_PATH=/absolute/path/models/vosk-model-small-uz-0.22
 export LOCAL_DIARIZATION_MODEL_PATH=/absolute/path/models/diarization
-export LOCAL_WHISPER_MODEL=large-v3-turbo
-export LOCAL_TRANSCRIPTION_BACKEND=auto
+export LOCAL_WHISPER_MODEL=small
+export LOCAL_TRANSCRIPTION_BACKEND=hybrid
 ```
 
 После скачивания отключите интернет и проверьте CLI. Runtime принимает только

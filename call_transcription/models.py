@@ -44,6 +44,7 @@ class ASRSegment:
     no_speech_probability: float = 0
     avg_logprob: float = 0
     compression_ratio: float = 0
+    language: str | None = None
 
 
 def timestamp(seconds):

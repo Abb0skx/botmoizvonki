@@ -14,7 +14,7 @@ from unittest.mock import Mock, patch
 
 from call_transcription import CallTranscriber, TranscriptionConfig, CallTranscript, TranscriptSegment
 from call_transcription.audio import prepared_audio
-from call_transcription.diarization import align_segment, assign_speaker, speech_chunks
+from call_transcription.diarization import align_segment, assign_speaker, speaker_speech_chunks, speech_chunks
 from call_transcription.errors import AudioDecodeError, NoSpeechDetectedError, ModelMemoryError
 from call_transcription.models import ASRSegment, SpeakerTurn, Word
 from call_transcription.processing import (
@@ -186,6 +186,16 @@ class LocalTranscriptionUnitTests(unittest.TestCase):
         self.assertEqual(list(speech_chunks(turns, 10)), [(0, 10), (10, 20), (20, 23)])
         self.assertEqual(list(speech_chunks([], 20)), [])
 
+    def test_hybrid_chunks_do_not_join_different_speakers(self):
+        turns = [
+            SpeakerTurn("A", 0, 2), SpeakerTurn("B", 2.1, 4),
+            SpeakerTurn("A", 4.2, 5), SpeakerTurn("A", 5.1, 7),
+        ]
+        self.assertEqual(
+            list(speaker_speech_chunks(turns, 20)),
+            [(0, 2), (2.1, 4), (4.2, 7)],
+        )
+
     def test_json_export(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "result.json"
@@ -311,6 +321,59 @@ class LocalPipelineTests(unittest.TestCase):
 
 
 class BackendContractTests(unittest.TestCase):
+    def test_hybrid_selects_russian_cyrillic_and_uzbek_lexicon(self):
+        from call_transcription.asr.hybrid_backend import choose_ru_uz
+
+        russian = [ASRSegment(0, 1, "Здравствуйте, сколько стоит?", confidence=.88, language="ru")]
+        uzbek_noise = [ASRSegment(0, 1, "zdrast vuyte skolko", confidence=.9, language="uz")]
+        self.assertIs(choose_ru_uz(russian, uzbek_noise), russian)
+
+        russian_noise = [ASRSegment(0, 1, "Алло, борми нархи", confidence=.6, language="ru")]
+        uzbek = [ASRSegment(0, 1, "Assalomu alaykum, narxi qancha?", confidence=.86, language="uz")]
+        self.assertIs(choose_ru_uz(russian_noise, uzbek), uzbek)
+
+    def test_hybrid_runs_backends_sequentially_and_sets_language(self):
+        from call_transcription.asr.hybrid_backend import HybridRUUZBackend
+
+        order = []
+        uz = Mock()
+        ru = Mock()
+        uz.transcribe.side_effect = lambda *args, **kwargs: order.append("uz") or [
+            ASRSegment(0, 1, "narxi qancha", confidence=.9)
+        ]
+        ru.transcribe.side_effect = lambda *args, **kwargs: order.append("ru") or [
+            ASRSegment(0, 1, "нархи канча", confidence=.4)
+        ]
+        backend = HybridRUUZBackend(TranscriptionConfig(backend="hybrid"), russian_backend=ru, uzbek_backend=uz)
+        result = backend.transcribe("call.wav", start=0, end=1, initial_prompt="")
+        self.assertEqual(order, ["uz", "ru"])
+        self.assertEqual(result[0].language, "uz")
+
+    def test_vosk_backend_returns_word_timestamps_without_real_model(self):
+        from call_transcription.asr.vosk_backend import VoskUzbekBackend
+
+        recognizer = Mock()
+        recognizer.AcceptWaveform.return_value = False
+        recognizer.FinalResult.return_value = json.dumps({
+            "text": "assalomu alaykum",
+            "result": [
+                {"word": "assalomu", "start": 0.1, "end": 0.4, "conf": 0.91},
+                {"word": "alaykum", "start": 0.4, "end": 0.8, "conf": 0.89},
+            ],
+        })
+        vosk = SimpleNamespace(
+            SetLogLevel=Mock(), Model=Mock(return_value=object()),
+            KaldiRecognizer=Mock(return_value=recognizer),
+        )
+        config = TranscriptionConfig(backend="hybrid", vosk_model_path="/models/vosk")
+        backend = VoskUzbekBackend(config)
+        with patch.dict("sys.modules", {"vosk": vosk}), \
+             patch("call_transcription.asr.vosk_backend.read_samples", return_value=[0.1] * 16000):
+            result = backend.transcribe("call.wav", start=0, end=1, initial_prompt="ignored")
+        self.assertEqual(result[0].language, "uz")
+        self.assertEqual([word.text for word in result[0].words], ["assalomu", "alaykum"])
+        self.assertAlmostEqual(result[0].confidence, 0.9)
+
     def test_pyannote_model_loaded_once_and_overlap_retained(self):
         from call_transcription.diarization import PyannoteDiarizer
         pipeline = Mock()

@@ -91,6 +91,32 @@ def speech_chunks(turns, max_seconds, max_gap=0.8):
             start = stop
 
 
+def speaker_speech_chunks(turns, max_seconds, max_gap=0.35):
+    """Short speaker-homogeneous windows for per-utterance language routing.
+
+    Consecutive turns from different speakers are never joined. This costs more
+    ASR calls than ``speech_chunks`` but prevents one language decision from
+    being applied to both sides of a bilingual conversation.
+    """
+    if not math.isfinite(max_seconds) or max_seconds <= 0:
+        raise ValueError("max_seconds must be positive and finite")
+    windows = []
+    for turn in sorted(turns, key=lambda item: (item.start, item.end, item.speaker)):
+        if not math.isfinite(turn.start) or not math.isfinite(turn.end) or turn.end <= turn.start:
+            continue
+        if (windows and windows[-1][2] == turn.speaker
+                and turn.start <= windows[-1][1] + max_gap):
+            windows[-1] = (windows[-1][0], max(windows[-1][1], turn.end), turn.speaker)
+        else:
+            windows.append((turn.start, turn.end, turn.speaker))
+    for window_start, window_end, _ in windows:
+        start = window_start
+        while start < window_end:
+            stop = min(window_end, start + max_seconds)
+            yield start, stop
+            start = stop
+
+
 def assign_speaker(start, end, turns):
     scores = {}
     for turn in turns:
@@ -118,5 +144,8 @@ def align_segment(segment, offset, chunk_end, turns):
         speaker, overlap = assign_speaker(start, end, turns)
         text = normalize_text(unit.text)
         confidence = unit.confidence
-        result.append(TranscriptSegment(start, end, speaker, None, text, confidence=confidence, overlap=overlap))
+        result.append(TranscriptSegment(
+            start, end, speaker, None, text, language=segment.language or "unknown",
+            confidence=confidence, overlap=overlap,
+        ))
     return result

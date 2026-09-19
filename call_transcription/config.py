@@ -14,6 +14,7 @@ class TranscriptionConfig:
     whisper_model: str = "large-v3-turbo"
     model_path: str = "models/whisper"
     diarization_model_path: str = "models/diarization"
+    vosk_model_path: str = "models/vosk-uz"
     device: str = "auto"
     compute_type: str = "auto"
     num_speakers: int = 2
@@ -37,10 +38,10 @@ class TranscriptionConfig:
     archive_original_dir: str | None = None
 
     def __post_init__(self):
-        if self.whisper_model not in {"large-v3", "large-v3-turbo"}:
-            raise ConfigurationError("Для RU/UZ нужна мультиязычная модель large-v3 или large-v3-turbo")
-        if self.backend not in {"auto", "mlx", "faster-whisper"}:
-            raise ConfigurationError("backend: auto, mlx или faster-whisper")
+        if self.whisper_model not in {"small", "medium", "large-v3", "large-v3-turbo"}:
+            raise ConfigurationError("whisper_model: small, medium, large-v3 или large-v3-turbo")
+        if self.backend not in {"auto", "mlx", "faster-whisper", "hybrid"}:
+            raise ConfigurationError("backend: auto, mlx, faster-whisper или hybrid")
         if self.device not in {"auto", "cpu", "cuda"}:
             raise ConfigurationError("device: auto, cpu или cuda")
         if self.languages != ("ru", "uz"):
@@ -68,6 +69,7 @@ class TranscriptionConfig:
                 whisper_model=os.getenv("LOCAL_WHISPER_MODEL", "large-v3-turbo"),
                 model_path=os.getenv("LOCAL_WHISPER_MODEL_PATH", "models/whisper"),
                 diarization_model_path=os.getenv("LOCAL_DIARIZATION_MODEL_PATH", "models/diarization"),
+                vosk_model_path=os.getenv("LOCAL_VOSK_MODEL_PATH", "models/vosk-uz"),
                 device=os.getenv("LOCAL_TRANSCRIPTION_DEVICE", "auto"),
                 compute_type=os.getenv("LOCAL_TRANSCRIPTION_COMPUTE_TYPE", "auto"),
                 num_speakers=int(os.getenv("LOCAL_TRANSCRIPTION_NUM_SPEAKERS", "2")),
@@ -93,10 +95,14 @@ class TranscriptionConfig:
         path = Path(self.model_path)
         if not path.is_dir() or not (path / "config.json").is_file():
             raise ConfigurationError("Нет локальной модели Whisper: задайте LOCAL_WHISPER_MODEL_PATH")
-        if self.resolved_backend() == "faster-whisper" and not (path / "model.bin").is_file():
+        if self.resolved_backend() in {"faster-whisper", "hybrid"} and not (path / "model.bin").is_file():
             raise ConfigurationError("В LOCAL_WHISPER_MODEL_PATH нет CTranslate2 model.bin")
         if self.resolved_backend() == "mlx" and not (list(path.glob("*.safetensors")) or list(path.glob("*.npz"))):
             raise ConfigurationError("В LOCAL_WHISPER_MODEL_PATH нет MLX весов")
+        if self.resolved_backend() == "hybrid":
+            vosk_path = Path(self.vosk_model_path)
+            if not vosk_path.is_dir() or not (vosk_path / "conf" / "model.conf").is_file():
+                raise ConfigurationError("Нет локальной модели Vosk Uzbek: задайте LOCAL_VOSK_MODEL_PATH")
         if (self.use_diarization or self.use_vad) and not Path(self.diarization_model_path, "config.yaml").is_file():
             raise ConfigurationError("Нет локальной модели pyannote: задайте LOCAL_DIARIZATION_MODEL_PATH")
 

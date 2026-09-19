@@ -16,7 +16,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from call_transcription import CallTranscriber, TranscriptionConfig
 from call_transcription.audio import prepared_audio
-from call_transcription.asr.faster_whisper_backend import FasterWhisperBackend
 from call_transcription.diarization import PyannoteDiarizer
 
 
@@ -54,7 +53,12 @@ def main():
     started = time.monotonic()
     emit("probe_start", mode=args.mode)
     diarizer = Measured(PyannoteDiarizer(config))
-    backend = Measured(FasterWhisperBackend(config))
+    if config.resolved_backend() == "hybrid":
+        from call_transcription.asr.hybrid_backend import HybridRUUZBackend
+        backend = Measured(HybridRUUZBackend(config))
+    else:
+        from call_transcription.asr.faster_whisper_backend import FasterWhisperBackend
+        backend = Measured(FasterWhisperBackend(config))
     if args.mode == "full":
         result = CallTranscriber(config, backend=backend, diarizer=diarizer).transcribe(args.audio)
         result.save_json(args.output + ".json")

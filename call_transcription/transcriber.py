@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .audio import prepared_audio
 from .config import TranscriptionConfig
-from .diarization import PyannoteDiarizer, align_segment, speech_chunks, valid_turns
+from .diarization import PyannoteDiarizer, align_segment, speaker_speech_chunks, speech_chunks, valid_turns
 from .errors import NoSpeechDetectedError
 from .models import CallTranscript, SpeakerTurn
 from .processing import build_prompt, detect_language, merge_same_speaker, suspicious_segment
@@ -36,7 +36,10 @@ class CallTranscriber:
         if not self._injected:
             self.config.check_model_paths()
         if self.backend is None:
-            if self.config.resolved_backend() == "mlx":
+            if self.config.resolved_backend() == "hybrid":
+                from .asr.hybrid_backend import HybridRUUZBackend
+                self.backend = HybridRUUZBackend(self.config)
+            elif self.config.resolved_backend() == "mlx":
                 from .asr.mlx_backend import MLXWhisperBackend
                 self.backend = MLXWhisperBackend(self.config)
             else:
@@ -95,7 +98,12 @@ class CallTranscriber:
             if len(speakers_found) != config.num_speakers:
                 warnings.append("speaker_count_mismatch")
             aligned, previous = [], None
-            for start, end in speech_chunks(turns, config.chunk_seconds, config.speech_gap_seconds):
+            chunks = speaker_speech_chunks(
+                turns, config.chunk_seconds,
+            ) if getattr(self.backend, "requires_speaker_chunks", False) is True else speech_chunks(
+                turns, config.chunk_seconds, config.speech_gap_seconds,
+            )
+            for start, end in chunks:
                 for segment in self.backend.transcribe(path, start=start, end=end, initial_prompt=build_prompt(terms)):
                     if suspicious_segment(segment, previous):
                         warnings.append("suspicious_asr_segment_filtered")
@@ -106,7 +114,12 @@ class CallTranscriber:
             if not segments:
                 raise NoSpeechDetectedError("Нет достоверно распознанной речи")
             for segment in segments:
-                segment.language = detect_language(segment.text, terms)
+                detected = detect_language(segment.text, terms)
+                hinted = segment.language if segment.language in {"ru", "uz"} else None
+                segment.language = (
+                    "mixed" if hinted and detected in {"ru", "uz"} and detected != hinted
+                    else hinted or detected
+                )
             resolution = RoleResolution()
             if config.identify_roles and config.use_diarization:
                 resolution = self.role_resolver.resolve(segments, threshold=config.role_confidence_threshold)
@@ -130,7 +143,8 @@ class CallTranscriber:
                 warnings.append("overlapping_speech_not_separated")
             result = CallTranscript(
                 str(audio_path), duration, segments, "\n".join(s.text for s in segments), speakers,
-                backend=config.resolved_backend(), model=config.whisper_model,
+                backend=config.resolved_backend(),
+                model=(f"{config.whisper_model}+vosk-uz" if config.resolved_backend() == "hybrid" else config.whisper_model),
                 role_resolution=resolution.to_dict(), warnings=sorted(set(warnings)),
             )
         if config.archive_original_dir:

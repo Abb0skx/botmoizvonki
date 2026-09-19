@@ -35,6 +35,29 @@ def detect_language(text, context_terms=()):
     return "mixed" if ru and uz else "ru" if ru else "uz" if uz else "unknown"
 
 
+def language_evidence(text, context_terms=()):
+    """Comparable lexical/script evidence used only to choose a local backend."""
+    cleaned = text
+    for term in sorted((*BRANDS, *context_terms), key=len, reverse=True):
+        cleaned = re.sub(r"(?<!\w)" + re.escape(term) + r"(?!\w)", " ", cleaned, flags=re.I)
+    words = normalized_words(cleaned)
+    lowered = cleaned.casefold()
+    latin = [word for word in words if re.search(r"[a-z]", word)]
+    cyrillic = [word for word in words if re.search(r"[а-яёўқғҳ]", word)]
+    uz_hits = sum(word in _UZ for word in words)
+    ru_hits = sum(word in _RU for word in words)
+    uz_hits += len(re.findall(r"\b\w+(?:ning|dan|ga|da|lar|mi|chi|siz|miz)\b", lowered))
+    if re.search(r"[ўқғҳ]", lowered):
+        uz_hits += 2
+    return {
+        "uz": uz_hits,
+        "ru": ru_hits,
+        "latin": len(latin),
+        "cyrillic": len(cyrillic),
+        "words": len(words),
+    }
+
+
 def normalize_text(text):
     # No paraphrasing, capitalization guesses, numeral conversion or punctuation invention.
     text = re.sub(r"\s+", " ", text).strip()
@@ -66,9 +89,11 @@ def merge_same_speaker(segments, merge_gap=0.8):
                 and 0 <= segment.start - merged[-1].end <= merge_gap):
             previous = merged[-1]
             confidence = [c for c in (previous.confidence, segment.confidence) if c is not None]
+            languages = {value for value in (previous.language, segment.language) if value not in {None, "unknown"}}
+            language = next(iter(languages)) if len(languages) == 1 else "mixed" if languages else "unknown"
             merged[-1] = replace(
                 previous, end=segment.end, text=normalize_text(previous.text + " " + segment.text),
-                confidence=min(confidence) if confidence else None,
+                confidence=min(confidence) if confidence else None, language=language,
             )
         else:
             merged.append(replace(segment))

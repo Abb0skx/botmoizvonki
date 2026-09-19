@@ -13,9 +13,10 @@ def main(argv=None):
     parser.add_argument("audio")
     parser.add_argument("--json", dest="json_path")
     parser.add_argument("--txt", dest="txt_path")
-    parser.add_argument("--backend", choices=["auto", "mlx", "faster-whisper"])
+    parser.add_argument("--backend", choices=["auto", "mlx", "faster-whisper", "hybrid"])
     parser.add_argument("--model-path")
     parser.add_argument("--diarization-model-path")
+    parser.add_argument("--vosk-model-path")
     parser.add_argument("--term", action="append", default=[])
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -24,6 +25,7 @@ def main(argv=None):
         changes = {k: v for k, v in {
             "backend": args.backend, "model_path": args.model_path,
             "diarization_model_path": args.diarization_model_path,
+            "vosk_model_path": args.vosk_model_path,
         }.items() if v is not None}
         result = CallTranscriber(replace(config, **changes)).transcribe(args.audio, context_terms=args.term)
         if args.json_path:
