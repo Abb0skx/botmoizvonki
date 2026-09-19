@@ -29,6 +29,10 @@ class Measured:
     def __init__(self, inner):
         self.inner = inner
 
+    @property
+    def requires_speaker_chunks(self):
+        return getattr(self.inner, "requires_speaker_chunks", False)
+
     def diarize(self, *args, **kwargs):
         emit("diarization_start")
         result = self.inner.diarize(*args, **kwargs)

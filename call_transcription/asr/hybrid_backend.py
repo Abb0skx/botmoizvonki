@@ -3,6 +3,7 @@ from __future__ import annotations
 from .base import TranscriptionBackend
 from .faster_whisper_backend import FasterWhisperBackend
 from .vosk_backend import VoskUzbekBackend
+from ..models import ASRSegment, Word
 from ..processing import language_evidence, normalize_text
 
 
@@ -54,10 +55,53 @@ def choose_ru_uz(russian_segments, uzbek_segments, context_terms=()):
     return uzbek_segments if uz["score"] > ru["score"] + 0.2 else russian_segments
 
 
+def _slice_segments(segments, start, end, language):
+    words = [
+        word
+        for segment in segments
+        for word in segment.words
+        if start <= (word.start + word.end) / 2 < end
+    ]
+    if words:
+        text = normalize_text(" ".join(word.text for word in words))
+        confidence_values = [word.confidence for word in words if word.confidence is not None]
+        confidence = sum(confidence_values) / len(confidence_values) if confidence_values else None
+        safe_words = [Word(word.start, word.end, word.text, word.confidence) for word in words]
+        return [ASRSegment(
+            safe_words[0].start, safe_words[-1].end, text, safe_words,
+            confidence=confidence, language=language,
+        )]
+    overlapping = [
+        segment for segment in segments
+        if start <= (segment.start + segment.end) / 2 < end
+    ]
+    return overlapping
+
+
+def choose_ru_uz_by_time(russian_segments, uzbek_segments, *, window_seconds=6.0):
+    """Route bounded time slices after running each model once per ASR window."""
+    all_segments = [*russian_segments, *uzbek_segments]
+    if not all_segments:
+        return []
+    first = min(segment.start for segment in all_segments)
+    last = max(segment.end for segment in all_segments)
+    selected = []
+    start = first
+    while start < last:
+        end = min(last + 1e-6, start + window_seconds)
+        ru = _slice_segments(russian_segments, start, end, "ru")
+        uz = _slice_segments(uzbek_segments, start, end, "uz")
+        choice = choose_ru_uz(ru, uz)
+        language = "uz" if choice is uz else "ru"
+        for segment in choice:
+            segment.language = language
+        selected.extend(choice)
+        start = end
+    return sorted(selected, key=lambda segment: (segment.start, segment.end))
+
+
 class HybridRUUZBackend(TranscriptionBackend):
     """Vosk Uzbek + Russian-only faster-whisper, selected per speaker turn."""
-
-    requires_speaker_chunks = True
 
     def __init__(self, config, *, russian_backend=None, uzbek_backend=None):
         self.config = config
@@ -72,8 +116,4 @@ class HybridRUUZBackend(TranscriptionBackend):
         russian = self.russian.transcribe(
             audio_path, start=start, end=end, initial_prompt=initial_prompt,
         )
-        selected = choose_ru_uz(russian, uzbek)
-        language = "uz" if selected is uzbek else "ru"
-        for segment in selected:
-            segment.language = language
-        return selected
+        return choose_ru_uz_by_time(russian, uzbek)

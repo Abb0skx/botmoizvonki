@@ -349,6 +349,22 @@ class BackendContractTests(unittest.TestCase):
         self.assertEqual(order, ["uz", "ru"])
         self.assertEqual(result[0].language, "uz")
 
+    def test_hybrid_routes_separate_time_slices_without_reloading_models(self):
+        from call_transcription.asr.hybrid_backend import choose_ru_uz_by_time
+
+        russian = [ASRSegment(0, 12, "", words=[
+            Word(1, 2, "Здравствуйте", .9), Word(2, 3, "сколько", .9),
+            Word(8, 9, "нархи", .4), Word(9, 10, "канча", .4),
+        ])]
+        uzbek = [ASRSegment(0, 12, "", words=[
+            Word(1, 2, "zdrastvuyte", .5), Word(2, 3, "skolko", .5),
+            Word(8, 9, "narxi", .9), Word(9, 10, "qancha", .9),
+        ])]
+        result = choose_ru_uz_by_time(russian, uzbek, window_seconds=6)
+        self.assertEqual([segment.language for segment in result], ["ru", "uz"])
+        self.assertIn("Здравствуйте", result[0].text)
+        self.assertIn("narxi", result[1].text)
+
     def test_vosk_backend_returns_word_timestamps_without_real_model(self):
         from call_transcription.asr.vosk_backend import VoskUzbekBackend
 
