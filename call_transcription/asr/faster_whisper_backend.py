@@ -10,10 +10,18 @@ from ..models import ASRSegment, Word
 
 
 class FasterWhisperBackend(TranscriptionBackend):
-    def __init__(self, config, *, language=None, model_path=None):
+    def __init__(
+        self,
+        config,
+        *,
+        language=None,
+        model_path=None,
+        use_initial_prompt=True,
+    ):
         self.config = config
         self.language = language
         self.model_path = model_path or config.model_path
+        self.use_initial_prompt = use_initial_prompt
         self._model = None
         self._lock = threading.Lock()
 
@@ -47,12 +55,26 @@ class FasterWhisperBackend(TranscriptionBackend):
                         self.config.languages,
                         key=lambda code: probabilities.get(code, 0.0),
                     )
+                options = {
+                    "task": "transcribe",
+                    "language": language,
+                    "multilingual": False,
+                    "word_timestamps": True,
+                    "condition_on_previous_text": False,
+                    "vad_filter": self.config.use_vad,
+                    "vad_parameters": {
+                        "min_silence_duration_ms": 300,
+                        "min_speech_duration_ms": 100,
+                    },
+                    "temperature": 0,
+                    "beam_size": 5,
+                    "no_speech_threshold": 0.6,
+                }
+                if self.use_initial_prompt and initial_prompt:
+                    options["initial_prompt"] = initial_prompt
                 segments, _ = self._model.transcribe(
-                    samples, task="transcribe", language=language,
-                    multilingual=False, initial_prompt=initial_prompt, word_timestamps=True,
-                    condition_on_previous_text=False, vad_filter=self.config.use_vad,
-                    vad_parameters={"min_silence_duration_ms": 300, "min_speech_duration_ms": 100},
-                    temperature=0, beam_size=5, no_speech_threshold=0.6,
+                    samples,
+                    **options,
                 )
                 return [ASRSegment(
                     float(s.start), float(s.end), s.text,

@@ -114,6 +114,10 @@ class HybridRUUZBackend(TranscriptionBackend):
             config,
             language="uz",
             model_path=config.uzbek_model_path,
+            # This fine-tuned checkpoint was trained with anti-hallucination
+            # decoding and is materially less stable with a long RU/catalog
+            # prompt. Keep its recommended prompt-free decode.
+            use_initial_prompt=False,
         )
 
     def transcribe(self, audio_path, *, start, end, initial_prompt):

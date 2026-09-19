@@ -9,7 +9,7 @@ BRANDS = (
     "PlayStation", "Xbox", "Dyson", "JBL", "Marshall", "Sony", "Anker", "Nothing", "CMF", "Amazfit",
 )
 
-_UZ = set("ha yo'q yoq bor bormi narx narxi qancha necha salom assalomu alaykum rahmat kerak rang qora oq xotira gigabayt million ming so'm som dollar yetkazib beramiz hozir tekshiraman eshitaman do'kon dukon uchun ham bilan bo'ladi boladi mumkin yo'qmi yoqmi aha yaxshi xop xo'p haqiqat bor ekan men biz siz olaman bermoq olib berish xizmat qaysi shu bu sizga qanday yordam beraman narxini ayting йўқ ҳа бор борми нархи қанча керак раҳмат салом эшитаман дўкон ҳозир етказиб берамиз".split())
+_UZ = set("ha yo'q yoq bor bormi narx narxi qancha necha salom assalomu assalamu alaykum alaikum alo aka yaxshimisiz rahmat kerak rang qora oq xotira gigabayt million ming so'm som dollar telefon obyavleniya chexol sotyapsizlar sotmaysizlar yetkazib beramiz hozir tekshiraman eshitaman do'kon dukon uchun ham bilan bo'ladi boladi mumkin yo'qmi yoqmi aha yaxshi xop xo'p haqiqat bor ekan men biz siz olaman bermoq olib berish xizmat qaysi shu bu sizga qanday yordam beraman narxini ayting йўқ ҳа бор борми нархи қанча керак раҳмат салом эшитаман дўкон ҳозир етказиб берамиз".split())
 _RU = set("да нет здравствуйте магазин слушаю вас чем могу помочь есть наличии сейчас посмотрю цена доставка можем доставить оставьте номер черный черный чёрный тоже сколько стоит нужен нужна какой память гигабайт рублей сум долларов пожалуйста спасибо хорошо кажется цвет это можно мне мы я вы вам у нас будет".split())
 _FORBIDDEN_SCRIPT = re.compile(
     r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af\u0600-\u06ff]"
@@ -61,6 +61,14 @@ def language_evidence(text, context_terms=()):
 def normalize_text(text):
     # No paraphrasing, capitalization guesses, numeral conversion or punctuation invention.
     text = re.sub(r"\s+", " ", text).strip()
+    # Word timestamps can expose the Uzbek apostrophe as a separate token
+    # ("so 'ramoqchi", "yo 'q"). Joining it inside a word preserves the
+    # recognized characters and prevents diarization from adding fake spaces.
+    text = re.sub(
+        r"(?<=\w)\s*(['’‘ʻʼ`])\s*(?=\w)",
+        lambda match: match.group(1),
+        text,
+    )
     return re.sub(r"\s+([,.!?;:])", r"\1", text)
 
 

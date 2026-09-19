@@ -50,6 +50,12 @@ def example_result():
 
 
 class LocalTranscriptionUnitTests(unittest.TestCase):
+    def test_uzbek_apostrophe_tokens_are_joined_without_rewriting_words(self):
+        self.assertEqual(
+            normalize_text("So 'ramoqchi edim, yo 'q. Bo ‘ yicha."),
+            "So'ramoqchi edim, yo'q. Bo‘yicha.",
+        )
+
     def test_faster_whisper_native_numbers_are_json_serializable(self):
         from call_transcription.asr.faster_whisper_backend import FasterWhisperBackend
         # NumPy scalars returned by real inference need explicit conversion.
@@ -374,8 +380,34 @@ class BackendContractTests(unittest.TestCase):
             {
                 "language": "uz",
                 "model_path": "/models/whisper-uzbek-callcenter-medium",
+                "use_initial_prompt": False,
             },
         )
+
+    def test_callcenter_backend_does_not_forward_catalog_prompt(self):
+        from call_transcription.asr.faster_whisper_backend import FasterWhisperBackend
+
+        model = Mock()
+        model.transcribe.return_value = ([], SimpleNamespace())
+        backend = FasterWhisperBackend(
+            TranscriptionConfig(),
+            language="uz",
+            model_path="/models/uzbek",
+            use_initial_prompt=False,
+        )
+        backend._model = model
+        with patch(
+            "call_transcription.asr.faster_whisper_backend.read_samples",
+            return_value=[],
+        ):
+            backend.transcribe(
+                "test.wav",
+                start=0,
+                end=1,
+                initial_prompt="TEXNIKACH, Sony, Samsung",
+            )
+
+        self.assertNotIn("initial_prompt", model.transcribe.call_args.kwargs)
 
     def test_hybrid_model_paths_require_converted_uzbek_model(self):
         with tempfile.TemporaryDirectory() as directory:
