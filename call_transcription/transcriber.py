@@ -20,7 +20,13 @@ from .diarization import (
 )
 from .errors import NoSpeechDetectedError
 from .models import CallTranscript, SpeakerTurn
-from .processing import build_prompt, detect_language, merge_same_speaker, suspicious_segment
+from .processing import (
+    build_prompt,
+    detect_language,
+    merge_same_speaker,
+    suspicious_segment,
+    transcription_artifact,
+)
 from .roles import RoleResolver, RoleResolution
 
 logger = logging.getLogger(__name__)
@@ -119,7 +125,11 @@ class CallTranscriber:
                     previous = segment
             if config.num_speakers == 2:
                 aligned = resolve_two_speaker_unknowns(aligned, turns)
-            segments = merge_same_speaker(aligned, config.merge_gap_seconds)
+            segments = [
+                segment
+                for segment in merge_same_speaker(aligned, config.merge_gap_seconds)
+                if not transcription_artifact(segment.text)
+            ]
             if not segments:
                 raise NoSpeechDetectedError("Нет достоверно распознанной речи")
             for segment in segments:

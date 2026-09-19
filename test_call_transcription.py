@@ -35,6 +35,7 @@ from call_transcription.processing import (
     normalize_text,
     sanitize_transcript_dict,
     suspicious_segment,
+    transcription_artifact,
     transcript_dict_to_txt,
 )
 from call_transcription.roles import RoleResolver
@@ -102,6 +103,13 @@ class LocalTranscriptionUnitTests(unittest.TestCase):
         self.assertIn("Ha.", repaired["full_text"])
         self.assertNotIn("Ha. Ha. Ha. Ha.", repaired["full_text"])
         self.assertNotIn("speaker_unknown", transcript_dict_to_txt(repaired))
+
+    def test_known_noise_only_transcript_artifacts(self):
+        self.assertTrue(transcription_artifact("Hello, Hello, Hello,"))
+        self.assertTrue(transcription_artifact("—"))
+        self.assertFalse(transcription_artifact("Ha."))
+        self.assertFalse(transcription_artifact("Google Pixel 9A"))
+        self.assertFalse(transcription_artifact("Hali to'qqizlar bor-a?"))
 
     def test_faster_whisper_native_numbers_are_json_serializable(self):
         from call_transcription.asr.faster_whisper_backend import FasterWhisperBackend

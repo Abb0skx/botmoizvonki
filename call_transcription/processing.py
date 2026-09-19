@@ -21,6 +21,7 @@ _EXCESSIVE_WORD_REPEAT = re.compile(
     r"(?i)(?<!\w)([^\W\d_]+(?:['’‘ʻʼ`][^\W\d_]+)*)([.!?,;:]?)"
     r"(?:\s+\1[.!?,;:]?){3,}(?!\w)"
 )
+_PUNCTUATION_ONLY = re.compile(r"^[\s\W_]+$", flags=re.UNICODE)
 
 
 def normalized_words(text):
@@ -84,6 +85,21 @@ def normalize_text(text):
         text,
     )
     return re.sub(r"\s+([,.!?;:])", r"\1", text)
+
+
+def transcription_artifact(text):
+    """Identify only narrow, high-confidence non-speech artefacts.
+
+    Calls in this project are restricted to Russian and Uzbek. Whisper may emit
+    the English greeting ``Hello`` repeatedly on telephone noise. Do not apply
+    a general foreign-word filter because Latin-script Uzbek and product names
+    are valid; discard only a segment made exclusively from that known token.
+    """
+    normalized = normalize_text(text)
+    if not normalized or _PUNCTUATION_ONLY.fullmatch(normalized):
+        return True
+    words = normalized_words(normalized)
+    return bool(words) and set(words) == {"hello"}
 
 
 def suspicious_segment(segment, previous=None):
@@ -210,7 +226,11 @@ def sanitize_transcript_dict(payload):
                 overlap=True,
             )
 
-    segments = merge_same_speaker(segments)
+    segments = [
+        segment
+        for segment in merge_same_speaker(segments)
+        if not transcription_artifact(segment.text)
+    ]
     speakers = {
         key: value
         for key, value in (result.get("speakers") or {}).items()
