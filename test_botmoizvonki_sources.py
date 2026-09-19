@@ -1440,6 +1440,24 @@ class CallSourceTests(unittest.TestCase):
                                    message_kind="voice" if voice else "text")
         return saved["call_id"], job, payload
 
+    def test_reprocessing_archives_previous_version_and_reschedules_telegram(self):
+        call_id, _, payload = self.completed_local_transcription()
+        with bot.connect_db() as conn:
+            conn.execute("UPDATE call_transcriptions SET status='queued', telegram_refreshed_at=123, next_attempt_at=0 WHERE call_id=?", (call_id,))
+        job = bot.claim_transcription_job()
+        newer = {**payload, 'model': 'new-local-model', 'txt': 'new version',
+                 'transcript': {**payload['transcript'], 'model': 'new-local-model'}}
+        self.assertTrue(bot.complete_transcription_job(job, newer, 'new-hash'))
+        self.assertFalse(bot.complete_transcription_job(job, newer, 'new-hash'))
+        with bot.connect_db() as conn:
+            versions = conn.execute('SELECT * FROM call_transcription_versions WHERE call_id=?',(call_id,)).fetchall()
+            current = conn.execute('SELECT * FROM call_transcriptions WHERE call_id=?',(call_id,)).fetchone()
+        self.assertEqual(len(versions), 1)
+        self.assertEqual(json.loads(versions[0]['transcript_json']), payload['transcript'])
+        self.assertEqual(versions[0]['transcript_txt'], payload['txt'])
+        self.assertEqual(current['model'], 'new-local-model')
+        self.assertIsNone(current['telegram_refreshed_at'])
+
     def test_local_transcription_persists_json_txt_and_survives_restart(self):
         call_id, _, payload = self.completed_local_transcription()
         bot.init_db()

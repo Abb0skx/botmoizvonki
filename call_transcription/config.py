@@ -38,12 +38,25 @@ class TranscriptionConfig:
     ffprobe: str = "ffprobe"
     # Never delete a caller-owned input. By default, no additional original is retained.
     archive_original_dir: str | None = None
+    russian_engine: str = "whisper"
+    gigaam_model: str = "multilingual_ctc"
+    gigaam_model_path: str = "models/gigaam"
+    exclusive_diarization: bool = True
+    catalog_path: str | None = None
+    uncertainty_threshold: float = 0.25
+    retry_uncertain: bool = False
 
     def __post_init__(self):
         if self.whisper_model not in {"small", "medium", "large-v3", "large-v3-turbo"}:
             raise ConfigurationError("whisper_model: small, medium, large-v3 или large-v3-turbo")
-        if self.backend not in {"auto", "mlx", "faster-whisper", "hybrid"}:
-            raise ConfigurationError("backend: auto, mlx, faster-whisper или hybrid")
+        if self.backend not in {"auto", "mlx", "faster-whisper", "hybrid", "gigaam"}:
+            raise ConfigurationError("backend: auto, mlx, faster-whisper, hybrid или gigaam")
+        if self.russian_engine not in {"whisper", "gigaam"}:
+            raise ConfigurationError("russian_engine: whisper или gigaam")
+        if self.gigaam_model not in {"multilingual_ctc", "v3_rnnt"}:
+            raise ConfigurationError("gigaam_model: multilingual_ctc или v3_rnnt")
+        if not 0 <= self.uncertainty_threshold <= 1:
+            raise ConfigurationError("uncertainty_threshold: 0–1")
         if self.device not in {"auto", "cpu", "cuda"}:
             raise ConfigurationError("device: auto, cpu или cuda")
         if self.languages != ("ru", "uz"):
@@ -92,6 +105,13 @@ class TranscriptionConfig:
                 max_bytes=int(os.getenv("TRANSCRIPTION_MAX_BYTES", str(100 * 1024 * 1024))),
                 identify_roles=flag("LOCAL_TRANSCRIPTION_IDENTIFY_ROLES", True),
                 archive_original_dir=os.getenv("LOCAL_TRANSCRIPTION_ARCHIVE_DIR") or None,
+                russian_engine=os.getenv("LOCAL_RUSSIAN_ENGINE", "whisper"),
+                gigaam_model=os.getenv("LOCAL_GIGAAM_MODEL", "multilingual_ctc"),
+                gigaam_model_path=os.getenv("LOCAL_GIGAAM_MODEL_PATH", "models/gigaam"),
+                exclusive_diarization=flag("LOCAL_EXCLUSIVE_DIARIZATION", True),
+                catalog_path=os.getenv("LOCAL_TRANSCRIPTION_CATALOG_PATH") or None,
+                uncertainty_threshold=float(os.getenv("LOCAL_TRANSCRIPTION_UNCERTAINTY_THRESHOLD", "0.25")),
+                retry_uncertain=flag("LOCAL_TRANSCRIPTION_RETRY_UNCERTAIN", False),
             )
         except ValueError as exc:
             raise ConfigurationError("Некорректное числовое значение LOCAL_TRANSCRIPTION_* / TRANSCRIPTION_*") from exc
@@ -102,6 +122,14 @@ class TranscriptionConfig:
         return "mlx" if platform.system() == "Darwin" and platform.machine() == "arm64" else "faster-whisper"
 
     def check_model_paths(self):
+        if self.resolved_backend() == "gigaam" or self.russian_engine == "gigaam":
+            name = self.gigaam_model if self.resolved_backend() == "gigaam" else "v3_rnnt"
+            if not Path(self.gigaam_model_path, name + ".ckpt").is_file():
+                raise ConfigurationError("Нет локального checkpoint GigaAM: " + name)
+        if self.resolved_backend() == "gigaam":
+            if (self.use_diarization or self.use_vad) and not Path(self.diarization_model_path, "config.yaml").is_file():
+                raise ConfigurationError("Нет локальной модели pyannote")
+            return
         path = Path(self.model_path)
         if not path.is_dir() or not (path / "config.json").is_file():
             raise ConfigurationError("Нет локальной модели Whisper: задайте LOCAL_WHISPER_MODEL_PATH")

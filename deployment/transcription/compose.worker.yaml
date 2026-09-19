@@ -1,6 +1,6 @@
 services:
   worker:
-    image: texnikach-transcription-worker:20260919-uzbek-callcenter
+    image: texnikach-transcription-worker:20260919-quality
     container_name: texnikach-transcription-worker
     restart: unless-stopped
     init: true
@@ -20,12 +20,19 @@ services:
       TRANSCRIPTION_ENABLED: "true"
       TRANSCRIPTION_WORKER_MODE: external
       LOCAL_TRANSCRIPTION_BACKEND: hybrid
+      LOCAL_RUSSIAN_ENGINE: gigaam
+      LOCAL_GIGAAM_MODEL_PATH: /quality/models
+      LOCAL_EXCLUSIVE_DIARIZATION: "true"
+      LOCAL_TRANSCRIPTION_CATALOG_PATH: /catalog/catalog.json
+      LOCAL_TRANSCRIPTION_RETRY_UNCERTAIN: "true"
+      LOCAL_TRANSCRIPTION_UNCERTAINTY_THRESHOLD: "0.25"
+      PYTHONPATH: /quality/deps:/app
       LOCAL_TRANSCRIPTION_DEVICE: cpu
       LOCAL_TRANSCRIPTION_COMPUTE_TYPE: int8
       LOCAL_WHISPER_MODEL: small
       LOCAL_TRANSCRIPTION_CPU_THREADS: "2"
       LOCAL_DIARIZATION_BATCH_SIZE: "1"
-      LOCAL_DIARIZATION_MAX_DURATION_SECONDS: "180"
+      LOCAL_DIARIZATION_MAX_DURATION_SECONDS: "1800"
       LOCAL_TRANSCRIPTION_SPEECH_GAP: "1.5"
       LOCAL_WHISPER_MODEL_PATH: /models/whisper-small
       LOCAL_UZBEK_WHISPER_MODEL: Abduqayum/whisper-uzbek-medium-callcenter
@@ -49,6 +56,9 @@ services:
     volumes:
       - calls-data:/app/data
       - /opt/texnikach-transcription-20260918/venv:/stage/venv:ro
+      - /opt/texnikach-asr-quality-20260919/deps:/quality/deps:ro
+      - /opt/texnikach-asr-quality-20260919/models:/quality/models:ro
+      - /opt/texnikach-asr-quality-20260919/catalog:/catalog:ro
       - /opt/texnikach-transcription-20260918/models/diarization:/models/diarization:ro
       - /opt/texnikach-transcription-models/whisper-small:/models/whisper-small:ro
       - /opt/texnikach-transcription-models/whisper-uzbek-callcenter-medium:/models/whisper-uzbek-callcenter-medium:ro

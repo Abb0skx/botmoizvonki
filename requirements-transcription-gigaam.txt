@@ -1,0 +1,6 @@
+# Additional local ASR engines; install in the dedicated worker, never the web.
+# Pinned upstream includes character-level RU/UZ CTC and word timestamps.
+gigaam @ git+https://github.com/salute-developers/GigaAM.git@7447938d791c4f3e643386ee22c33777004293a5
+hydra-core==1.3.2
+omegaconf==2.3.0
+sentencepiece==0.2.1

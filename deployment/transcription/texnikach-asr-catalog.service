@@ -1,0 +1,7 @@
+[Unit]
+Description=Export product names for local call transcription
+
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=/usr/bin/python3 /opt/texnikach-asr-quality-20260919/project/scripts/export_asr_catalog.py --db /opt/texnikach-price-server/data/price_server.db --output /opt/texnikach-asr-quality-20260919/catalog/catalog.json

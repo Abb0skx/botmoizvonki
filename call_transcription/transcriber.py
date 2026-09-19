@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from dataclasses import asdict
 
 from .audio import prepared_audio
 from .config import TranscriptionConfig
@@ -26,6 +27,7 @@ from .processing import (
     merge_same_speaker,
     suspicious_segment,
     transcription_artifact,
+    ProductNameNormalizer,
 )
 from .roles import RoleResolver, RoleResolution
 
@@ -44,12 +46,16 @@ class CallTranscriber:
         self.voiceprint_matcher = voiceprint_matcher
         self._injected = backend is not None and diarizer is not None
         self._lock = threading.Lock()
+        self._catalog = ([], {})
 
     def _initialize(self):
         if not self._injected:
             self.config.check_model_paths()
         if self.backend is None:
-            if self.config.resolved_backend() == "hybrid":
+            if self.config.resolved_backend() == "gigaam":
+                from .asr.gigaam_backend import GigaAMBackend
+                self.backend = GigaAMBackend(self.config)
+            elif self.config.resolved_backend() == "hybrid":
                 from .asr.hybrid_backend import HybridRUUZBackend
                 self.backend = HybridRUUZBackend(self.config)
             elif self.config.resolved_backend() == "mlx":
@@ -60,6 +66,10 @@ class CallTranscriber:
                 self.backend = FasterWhisperBackend(self.config)
         if self.diarizer is None:
             self.diarizer = PyannoteDiarizer(self.config)
+        if self.config.retry_uncertain:
+            from .asr.review_backend import ReviewBackend
+            if not isinstance(self.backend, ReviewBackend):
+                self.backend = ReviewBackend(self.backend)
 
     def transcribe(self, audio_path, context_terms=None, *, call_id=None):
         started = time.monotonic()
@@ -85,9 +95,20 @@ class CallTranscriber:
             if duration < 0.1:
                 raise NoSpeechDetectedError("Запись короче 0.1 секунды")
             self._initialize()
+            from .asr.review_backend import ReviewBackend
+            if isinstance(self.backend, ReviewBackend):
+                self.backend.begin_call(duration)
             terms = list(context_terms or [])
+            from .catalog import load_catalog, catalogue_aliases
+            catalog_terms, aliases = load_catalog(config.catalog_path)
+            if catalog_terms:
+                self._catalog = catalog_terms, aliases
+            elif self._catalog[0]:
+                catalog_terms, aliases = self._catalog
+            terms.extend(catalog_terms)
             if self.context_terms_provider:
                 terms.extend(self.context_terms_provider(call_id) or [])
+            product_normalizer = ProductNameNormalizer(terms, catalogue_aliases(terms, aliases))
             long_audio_without_diarization = (
                 config.use_diarization
                 and duration > config.diarization_max_duration_seconds
@@ -110,7 +131,7 @@ class CallTranscriber:
             speakers_found = {t.speaker for t in turns}
             if len(speakers_found) != config.num_speakers:
                 warnings.append("speaker_count_mismatch")
-            aligned, previous = [], None
+            aligned, previous, raw_segments = [], None, []
             chunks = speaker_speech_chunks(
                 turns, config.chunk_seconds,
             ) if getattr(self.backend, "requires_speaker_chunks", False) is True else speech_chunks(
@@ -118,6 +139,7 @@ class CallTranscriber:
             )
             for start, end in chunks:
                 for segment in self.backend.transcribe(path, start=start, end=end, initial_prompt=build_prompt(terms)):
+                    raw_segments.append({**asdict(segment), "window_start": start, "window_end": end})
                     if suspicious_segment(segment, previous):
                         warnings.append("suspicious_asr_segment_filtered")
                         continue
@@ -125,6 +147,19 @@ class CallTranscriber:
                     previous = segment
             if config.num_speakers == 2:
                 aligned = resolve_two_speaker_unknowns(aligned, turns)
+            # Preserve original simultaneous-speech evidence even when the
+            # exclusive timeline assigns exactly one speaker to each word.
+            overlap_intervals = getattr(self.diarizer, "overlap_intervals", [])
+            if isinstance(overlap_intervals, list):
+                for segment in aligned:
+                    if any(min(segment.end, b) > max(segment.start, a) for a, b in overlap_intervals):
+                        segment.overlap = True
+            for segment in aligned:
+                segment.raw_text = segment.text
+                if segment.confidence is not None and segment.confidence < config.uncertainty_threshold:
+                    segment.uncertain = True
+                    segment.text = "[неразборчиво]"
+                    warnings.append("low_confidence_speech")
             segments = [
                 segment
                 for segment in merge_same_speaker(aligned, config.merge_gap_seconds)
@@ -133,6 +168,8 @@ class CallTranscriber:
             if not segments:
                 raise NoSpeechDetectedError("Нет достоверно распознанной речи")
             for segment in segments:
+                if not segment.uncertain:
+                    segment.text = product_normalizer.normalize(segment.text)
                 detected = detect_language(segment.text, terms)
                 hinted = segment.language if segment.language in {"ru", "uz"} else None
                 segment.language = (
@@ -164,12 +201,19 @@ class CallTranscriber:
                 str(audio_path), duration, segments, "\n".join(s.text for s in segments), speakers,
                 backend=config.resolved_backend(),
                 model=(
-                    f"{config.whisper_model}+{config.uzbek_whisper_model}"
+                    f"{('GigaAM-v3-rnnt' if config.russian_engine == 'gigaam' else config.whisper_model)}+{config.uzbek_whisper_model}"
                     if config.resolved_backend() == "hybrid"
-                    else config.whisper_model
+                    else config.gigaam_model if config.resolved_backend() == "gigaam" else config.whisper_model
                 ),
                 role_resolution=resolution.to_dict(), warnings=sorted(set(warnings)),
+                raw_segments=raw_segments,
+                quality={"uncertain_segments": sum(s.uncertain for s in segments),
+                         "catalog_terms": len(catalog_terms),
+                         "confidence_calibrated": False,
+                         "exclusive_diarization": config.exclusive_diarization},
             )
+            if isinstance(self.backend, ReviewBackend):
+                result.quality["reviews"] = self.backend.reviews
         if config.archive_original_dir:
             directory = Path(config.archive_original_dir)
             directory.mkdir(parents=True, exist_ok=True, mode=0o700)

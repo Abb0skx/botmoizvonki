@@ -14,15 +14,28 @@ def main():
     stop = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: stop.set())
+
+    def refresh_cards():
+        # Telegram editing must not wait behind a CPU-heavy audio job.
+        # The existing SQLite lease serializes edits across processes.
+        while not stop.is_set():
+            try:
+                bot.process_one_transcription_refresh()
+            except Exception as exc:
+                logging.warning("transcript_card_refresh_failed error=%s", type(exc).__name__)
+            stop.wait(2)
+
+    refresher = threading.Thread(target=refresh_cards, name="transcript-cards", daemon=True)
+    refresher.start()
     while not stop.is_set():
         try:
-            refreshed = bot.process_one_transcription_refresh()
             processed = bot.process_one_transcription_job()
         except Exception as exc:
             print("LOCAL TRANSCRIPTION WORKER ERROR:", type(exc).__name__)
-            refreshed = processed = False
-        if not processed and not refreshed:
+            processed = False
+        if not processed:
             stop.wait(bot.TRANSCRIPTION_POLL_SECONDS)
+    refresher.join(timeout=35)
 
 
 if __name__ == "__main__":

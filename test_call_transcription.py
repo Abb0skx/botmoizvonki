@@ -143,6 +143,7 @@ class LocalTranscriptionUnitTests(unittest.TestCase):
         from call_transcription.diarization import PyannoteDiarizer
         pipeline = Mock()
         pipeline.return_value.speaker_diarization.itertracks.return_value = []
+        pipeline.return_value.exclusive_speaker_diarization = None
         factory = Mock(return_value=pipeline)
         torch = Mock()
         with patch.dict("sys.modules", {"torch": torch, "pyannote.audio": SimpleNamespace(
@@ -557,6 +558,7 @@ class BackendContractTests(unittest.TestCase):
             (SimpleNamespace(start=0, end=2), "track1", "SPEAKER_00"),
             (SimpleNamespace(start=1, end=3), "track2", "SPEAKER_01"),
         ]
+        pipeline.return_value.exclusive_speaker_diarization = None
         factory = Mock(return_value=pipeline)
         torch = Mock()
         torch.cuda.is_available.return_value = False

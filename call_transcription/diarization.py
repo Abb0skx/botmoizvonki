@@ -17,6 +17,7 @@ class PyannoteDiarizer:
         self.config = config
         self._pipeline = None
         self._lock = threading.Lock()
+        self.overlap_intervals = []
 
     def diarize(self, path):
         enforce_offline()
@@ -41,8 +42,22 @@ class PyannoteDiarizer:
                     {"waveform": torch.from_numpy(samples).unsqueeze(0), "sample_rate": 16000},
                     num_speakers=self.config.num_speakers if self.config.use_diarization else 1,
                 )
-                # Keep overlapping turns: exclusive diarization would hide uncertainty.
+                regular = [SpeakerTurn(str(speaker), float(turn.start), float(turn.end))
+                           for turn, _, speaker in output.speaker_diarization.itertracks(yield_label=True)]
+                self.overlap_intervals = []
+                for index, first in enumerate(regular):
+                    for second in regular[index + 1:]:
+                        if second.start >= first.end:
+                            break
+                        if first.speaker != second.speaker:
+                            a, b = max(first.start, second.start), min(first.end, second.end)
+                            if b > a:
+                                self.overlap_intervals.append((a, b))
                 annotation = output.speaker_diarization
+                if self.config.exclusive_diarization:
+                    exclusive = getattr(output, "exclusive_speaker_diarization", None)
+                    if exclusive is not None:
+                        annotation = exclusive
                 return [SpeakerTurn(
                     str(speaker) if self.config.use_diarization else "SPEAKER_UNKNOWN",
                     float(turn.start), float(turn.end),

@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import math
 import re
-from dataclasses import replace
+from dataclasses import asdict, replace
 
 BRANDS = (
     "Apple", "iPhone", "Samsung", "Galaxy", "Xiaomi", "Redmi", "Poco", "Honor", "Huawei",
@@ -124,6 +124,7 @@ def merge_same_speaker(segments, merge_gap=0.8):
     for segment in sorted(segments, key=lambda s: (s.start, s.end)):
         if (merged and merged[-1].speaker_id == segment.speaker_id
                 and merged[-1].role == segment.role and merged[-1].overlap == segment.overlap
+                and merged[-1].uncertain == segment.uncertain
                 and 0 <= segment.start - merged[-1].end <= merge_gap):
             previous = merged[-1]
             confidence = [c for c in (previous.confidence, segment.confidence) if c is not None]
@@ -132,6 +133,7 @@ def merge_same_speaker(segments, merge_gap=0.8):
             merged[-1] = replace(
                 previous, end=segment.end, text=normalize_text(previous.text + " " + segment.text),
                 confidence=min(confidence) if confidence else None, language=language,
+                raw_text=" ".join((previous.raw_text or previous.text, segment.raw_text or segment.text)),
             )
         else:
             merged.append(replace(segment))
@@ -168,6 +170,8 @@ def sanitize_transcript_dict(payload):
                 language=item.get("language") or "unknown",
                 confidence=item.get("confidence"),
                 overlap=bool(item.get("overlap", False)),
+                uncertain=bool(item.get("uncertain", False)),
+                raw_text=item.get("raw_text"),
             ))
         except (KeyError, TypeError, ValueError):
             continue
@@ -236,19 +240,7 @@ def sanitize_transcript_dict(payload):
         for key, value in (result.get("speakers") or {}).items()
         if key != "SPEAKER_UNKNOWN" or not resolved_unknowns
     }
-    result["segments"] = [
-        {
-            "start": segment.start,
-            "end": segment.end,
-            "speaker_id": segment.speaker_id,
-            "role": segment.role,
-            "text": segment.text,
-            "language": segment.language,
-            "confidence": segment.confidence,
-            "overlap": segment.overlap,
-        }
-        for segment in segments
-    ]
+    result["segments"] = [asdict(segment) for segment in segments]
     result["speakers"] = speakers
     result["full_text"] = "\n".join(segment.text for segment in segments)
     result["dialogue"] = [

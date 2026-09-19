@@ -57,7 +57,10 @@ def main():
     started = time.monotonic()
     emit("probe_start", mode=args.mode)
     diarizer = Measured(PyannoteDiarizer(config))
-    if config.resolved_backend() == "hybrid":
+    if config.resolved_backend() == "gigaam":
+        from call_transcription.asr.gigaam_backend import GigaAMBackend
+        backend = Measured(GigaAMBackend(config))
+    elif config.resolved_backend() == "hybrid":
         from call_transcription.asr.hybrid_backend import HybridRUUZBackend
         backend = Measured(HybridRUUZBackend(config))
     else:

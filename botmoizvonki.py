@@ -2557,6 +2557,10 @@ def init_db():
         )
 
         transcription_columns = {row["name"] for row in conn.execute("PRAGMA table_info(call_transcriptions)")}
+        conn.execute("""CREATE TABLE IF NOT EXISTS call_transcription_versions (
+            call_id INTEGER NOT NULL, content_hash TEXT NOT NULL,
+            model TEXT, transcript_json TEXT NOT NULL, transcript_txt TEXT,
+            saved_at INTEGER NOT NULL, PRIMARY KEY(call_id, content_hash))""")
         for name, sql_type in {
             "transcript_json": "TEXT", "transcript_txt": "TEXT",
             "telegram_refreshed_at": "INTEGER", "telegram_refresh_next_attempt_at": "INTEGER",
@@ -7479,6 +7483,19 @@ def complete_transcription_job(
             "BEGIN IMMEDIATE"
         )
 
+        previous = conn.execute(
+            "SELECT model, transcript_json, transcript_txt FROM call_transcriptions "
+            "WHERE call_id=? AND status='processing' AND lease_token=?",
+            (job["call_id"], job["lease_token"]),
+        ).fetchone()
+        if previous and previous["transcript_json"]:
+            conn.execute(
+                "INSERT OR IGNORE INTO call_transcription_versions "
+                "(call_id, content_hash, model, transcript_json, transcript_txt, saved_at) VALUES (?,?,?,?,?,?)",
+                (job["call_id"], hashlib.sha256(previous["transcript_json"].encode()).hexdigest(),
+                 previous["model"], previous["transcript_json"], previous["transcript_txt"], now_ts),
+            )
+
         updated = conn.execute(
             """
             UPDATE call_transcriptions
@@ -7501,7 +7518,13 @@ def complete_transcription_job(
                 lead_source_candidates_json = ?,
                 classifier_version = ?,
                 completed_at = ?,
-                updated_at = ?
+                updated_at = ?,
+                telegram_refreshed_at = NULL,
+                telegram_refresh_error = NULL,
+                telegram_refresh_next_attempt_at = 0,
+                telegram_refresh_attempts = 0,
+                telegram_refresh_lease_token = NULL,
+                telegram_refresh_lease_until = NULL
 
             WHERE
                 call_id = ?

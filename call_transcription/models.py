@@ -17,6 +17,8 @@ class TranscriptSegment:
     language: str | None = "unknown"
     confidence: float | None = None
     overlap: bool = False
+    uncertain: bool = False
+    raw_text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -77,6 +79,8 @@ class CallTranscript:
     processing_seconds: float = 0
     role_resolution: dict = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    raw_segments: list[dict] = field(default_factory=list)
+    quality: dict = field(default_factory=dict)
 
     @property
     def dialogue(self):

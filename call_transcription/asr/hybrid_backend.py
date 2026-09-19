@@ -4,6 +4,9 @@ from .base import TranscriptionBackend
 from .faster_whisper_backend import FasterWhisperBackend
 from ..models import ASRSegment, Word
 from ..processing import language_evidence, normalize_text
+from ..processing import normalized_words
+
+_RU_TRANSLITERATION = set("zdravstvuyte zdravstvuite zdrastvuyte podskazhite podkazite pojaluysta pozhaluysta skolko kakiye kakie tsvet tsveta tsvetlar chorny chorniy cherniy spasibo bolshe xorosho horosho ponyatno vosem nalichii naliki".split())
 
 
 def _candidate(segments, language, context_terms=()):
@@ -14,11 +17,15 @@ def _candidate(segments, language, context_terms=()):
         for word in segment.words
         if word.confidence is not None
     ] or [segment.confidence for segment in segments if segment.confidence is not None]
-    confidence = sum(confidences) / len(confidences) if confidences else 0.0
+    # GigaAM does not provide Whisper-style posterior scores. Missing scores
+    # must not automatically lose to a confident but wrong Whisper hypothesis.
+    confidence = sum(confidences) / len(confidences) if confidences else 0.65
     evidence = language_evidence(text, context_terms)
     lexical = evidence[language]
     script = evidence["cyrillic" if language == "ru" else "latin"]
     score = confidence * 2.0 + min(evidence["words"], 8) * 0.04 + lexical * 0.45 + script * 0.06
+    if language == "uz":
+        score -= 1.1 * len(set(normalized_words(text)) & _RU_TRANSLITERATION)
     return {
         "segments": segments,
         "text": text,
@@ -44,6 +51,9 @@ def choose_ru_uz(russian_segments, uzbek_segments, context_terms=()):
         return russian_segments
 
     ru_ev, uz_ev = ru["evidence"], uz["evidence"]
+    transliterated_ru = len(set(normalized_words(uz["text"])) & _RU_TRANSLITERATION)
+    if transliterated_ru and ru_ev["ru"] >= 1 and ru_ev["cyrillic"] >= 2 and uz_ev["uz"] <= 1:
+        return russian_segments
     if ru_ev["ru"] >= 1 and ru_ev["cyrillic"] >= 2 and uz_ev["uz"] == 0:
         return russian_segments
     if uz_ev["uz"] >= 2 and ru_ev["ru"] == 0:
@@ -99,8 +109,42 @@ def choose_ru_uz_by_time(russian_segments, uzbek_segments, *, window_seconds=6.0
     return sorted(selected, key=lambda segment: (segment.start, segment.end))
 
 
+def choose_ru_uz_by_phrases(russian_segments, uzbek_segments):
+    """Route complete short spans, keeping each model's word order intact.
+
+    Prefer actual pauses shared by both hypotheses. Limit spans to ~3 seconds
+    for within-sentence language switches. Never transliterate a recognized
+    word or manufacture a catalogue name to make the output look plausible.
+    """
+    units = sorted(
+        [word for segment in [*russian_segments, *uzbek_segments]
+         for word in (segment.words or [segment])], key=lambda word: word.start,
+    )
+    if not units:
+        return []
+    first, last = units[0].start, max(w.end for w in units)
+    boundaries = [first]
+    covered_until = first
+    for unit in units:
+        if unit.start - covered_until >= 0.2 and covered_until - boundaries[-1] >= 0.7:
+            boundaries.append((covered_until + unit.start) / 2)
+        elif unit.start - boundaries[-1] >= 3.0:
+            boundaries.append(unit.start)
+        covered_until = max(covered_until, unit.end)
+    boundaries.append(last + 1e-6)
+    selected = []
+    for start, end in zip(boundaries, boundaries[1:]):
+        ru = _slice_segments(russian_segments, start, end, "ru")
+        uz = _slice_segments(uzbek_segments, start, end, "uz")
+        choice = choose_ru_uz(ru, uz)
+        for segment in choice:
+            segment.language = "uz" if choice is uz else "ru"
+        selected.extend(choice)
+    return sorted(selected, key=lambda segment: (segment.start, segment.end))
+
+
 class HybridRUUZBackend(TranscriptionBackend):
-    """Russian Whisper + telephone-tuned Uzbek Whisper, selected by time slice.
+    """Russian GigaAM/Whisper + telephone-tuned Uzbek Whisper by short phrase.
 
     The two models run sequentially. This costs more CPU than one multilingual
     pass, but keeps the proven Russian recognizer and gives Uzbek calls a model
@@ -109,7 +153,13 @@ class HybridRUUZBackend(TranscriptionBackend):
 
     def __init__(self, config, *, russian_backend=None, uzbek_backend=None):
         self.config = config
-        self.russian = russian_backend or FasterWhisperBackend(config, language="ru")
+        if russian_backend is not None:
+            self.russian = russian_backend
+        elif config.russian_engine == "gigaam":
+            from .gigaam_backend import GigaAMBackend
+            self.russian = GigaAMBackend(config, model_name="v3_rnnt")
+        else:
+            self.russian = FasterWhisperBackend(config, language="ru")
         self.uzbek = uzbek_backend or FasterWhisperBackend(
             config,
             language="uz",
@@ -128,4 +178,4 @@ class HybridRUUZBackend(TranscriptionBackend):
         russian = self.russian.transcribe(
             audio_path, start=start, end=end, initial_prompt=initial_prompt,
         )
-        return choose_ru_uz_by_time(russian, uzbek)
+        return choose_ru_uz_by_phrases(russian, uzbek)
