@@ -15,7 +15,12 @@ from unittest.mock import Mock, patch
 from call_transcription import CallTranscriber, TranscriptionConfig, CallTranscript, TranscriptSegment
 from call_transcription.audio import prepared_audio
 from call_transcription.diarization import align_segment, assign_speaker, speaker_speech_chunks, speech_chunks
-from call_transcription.errors import AudioDecodeError, NoSpeechDetectedError, ModelMemoryError
+from call_transcription.errors import (
+    AudioDecodeError,
+    ConfigurationError,
+    ModelMemoryError,
+    NoSpeechDetectedError,
+)
 from call_transcription.models import ASRSegment, SpeakerTurn, Word
 from call_transcription.processing import (
     ProductNameNormalizer, detect_language, merge_same_speaker, normalize_text, suspicious_segment,
@@ -348,6 +353,54 @@ class BackendContractTests(unittest.TestCase):
         result = backend.transcribe("call.wav", start=0, end=1, initial_prompt="")
         self.assertEqual(order, ["uz", "ru"])
         self.assertEqual(result[0].language, "uz")
+
+    def test_hybrid_uses_callcenter_whisper_for_uzbek(self):
+        from call_transcription.asr.hybrid_backend import HybridRUUZBackend
+
+        config = TranscriptionConfig(
+            backend="hybrid",
+            model_path="/models/whisper-small",
+            uzbek_model_path="/models/whisper-uzbek-callcenter-medium",
+        )
+        with patch(
+            "call_transcription.asr.hybrid_backend.FasterWhisperBackend"
+        ) as factory:
+            HybridRUUZBackend(config)
+
+        self.assertEqual(factory.call_count, 2)
+        self.assertEqual(factory.call_args_list[0].kwargs, {"language": "ru"})
+        self.assertEqual(
+            factory.call_args_list[1].kwargs,
+            {
+                "language": "uz",
+                "model_path": "/models/whisper-uzbek-callcenter-medium",
+            },
+        )
+
+    def test_hybrid_model_paths_require_converted_uzbek_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            russian = root / "russian"
+            uzbek = root / "uzbek"
+            diarization = root / "diarization"
+            russian.mkdir()
+            uzbek.mkdir()
+            diarization.mkdir()
+            for path in (russian, uzbek):
+                (path / "config.json").write_text("{}", encoding="utf-8")
+                (path / "model.bin").write_bytes(b"model")
+            (diarization / "config.yaml").write_text("pipeline: test", encoding="utf-8")
+
+            config = TranscriptionConfig(
+                backend="hybrid",
+                model_path=str(russian),
+                uzbek_model_path=str(uzbek),
+                diarization_model_path=str(diarization),
+            )
+            config.check_model_paths()
+            (uzbek / "model.bin").unlink()
+            with self.assertRaises(ConfigurationError):
+                config.check_model_paths()
 
     def test_hybrid_routes_separate_time_slices_without_reloading_models(self):
         from call_transcription.asr.hybrid_backend import choose_ru_uz_by_time

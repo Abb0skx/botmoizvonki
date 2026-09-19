@@ -1,0 +1,5 @@
+# Provisioning-only packages. Runtime inference uses CTranslate2 and does not
+# import Transformers or load the 3.06 GB source checkpoint.
+-r requirements-transcription-cpu.txt
+transformers==4.56.2
+accelerate==1.10.1

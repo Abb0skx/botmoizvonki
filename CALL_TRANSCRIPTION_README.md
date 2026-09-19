@@ -7,7 +7,8 @@
 JSON/TXT и интеграция с существующей SQLite-очередью/Telegram.
 
 Production-гибрид обрабатывает каждую diarization-реплику двумя локальными
-движками последовательно: Vosk Uzbek и Russian-only faster-whisper small.
+движками последовательно: Russian-only faster-whisper small и отдельным
+Whisper Medium, настроенным на узбекскую телефонную речь.
 Выбор делается по письменности, RU/UZ-лексике, покрытию и confidence; один язык
 больше не назначается всему звонку. CJK/арабская письменность и характерные
 турецкие/азербайджанские диакритики фильтруются как ложные сегменты. Это не
@@ -80,7 +81,8 @@ python3.11 -m venv .venv-transcription
 
 - `mlx-whisper==0.4.3`: Whisper/Metal на Apple Silicon, модель кешируется MLX;
 - `faster-whisper==1.2.1`: Whisper/CTranslate2 на CPU/CUDA, также содержит Silero VAD;
-- `vosk==0.3.45`: лёгкая локальная узбекская модель для гибридного Linux-worker;
+- `Abduqayum/whisper-uzbek-medium-callcenter`: узбекский Whisper Medium,
+  дообученный на узбекской речи с телефонным диапазоном, шумом и тишиной;
 - `pyannote.audio==4.0.7`: локальные голосовые интервалы и VAD; подтягивает PyTorch/numpy;
 - ffmpeg + ffprobe: системное декодирование mp3/m4a/wav/ogg/opus в PCM16 mono 16 kHz.
 
@@ -104,8 +106,9 @@ PyTorch 2.8/torchaudio и совместимый TorchCodec 0.7. На небол
 ```sh
 .venv-transcription/bin/python scripts/download_transcription_models.py \
   --backend mlx --model large-v3-turbo --directory /absolute/path/models
-# Production Linux hybrid: --backend hybrid --model small. Официальную модель
-# vosk-model-small-uz-0.22 скачайте отдельно и задайте LOCAL_VOSK_MODEL_PATH.
+# Production Linux hybrid: сначала --backend hybrid --model small, затем:
+.venv-transcription/bin/python scripts/prepare_uzbek_callcenter_model.py \
+  --output-dir /absolute/path/models/whisper-uzbek-callcenter-medium
 ```
 
 Скачивание — отдельный явный шаг, не часть обработки звонка. Не принимайте
@@ -114,7 +117,8 @@ PyTorch 2.8/torchaudio и совместимый TorchCodec 0.7. На небол
 
 ```sh
 export LOCAL_WHISPER_MODEL_PATH=/absolute/path/models/whisper
-export LOCAL_VOSK_MODEL_PATH=/absolute/path/models/vosk-model-small-uz-0.22
+export LOCAL_UZBEK_WHISPER_MODEL=Abduqayum/whisper-uzbek-medium-callcenter
+export LOCAL_UZBEK_WHISPER_MODEL_PATH=/absolute/path/models/whisper-uzbek-callcenter-medium
 export LOCAL_DIARIZATION_MODEL_PATH=/absolute/path/models/diarization
 export LOCAL_WHISPER_MODEL=small
 export LOCAL_TRANSCRIPTION_BACKEND=hybrid
@@ -124,6 +128,14 @@ export LOCAL_TRANSCRIPTION_BACKEND=hybrid
 локальные каталоги, включает HF offline и отключает telemetry pyannote/HF.
 При недостающих весах он должен завершиться ошибкой, не использовать облачный
 fallback и не скачивать веса во время обработки клиента.
+
+Исходный Uzbek checkpoint занимает около 3 ГБ. Он нужен только при явной
+подготовке модели. Скрипт фиксирует revision, загружает веса с уменьшенным
+потреблением CPU RAM и сохраняет CTranslate2/int8. Production-worker не
+импортирует Transformers, не хранит исходные F32-веса и не обращается в сеть
+за моделями. Для конвертации установите отдельно
+`requirements-transcription-convert.txt`; результат обязательно проверьте
+ресурсно ограниченным probe до включения очереди.
 
 ## Python API
 

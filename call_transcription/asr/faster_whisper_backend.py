@@ -10,9 +10,10 @@ from ..models import ASRSegment, Word
 
 
 class FasterWhisperBackend(TranscriptionBackend):
-    def __init__(self, config, *, language=None):
+    def __init__(self, config, *, language=None, model_path=None):
         self.config = config
         self.language = language
+        self.model_path = model_path or config.model_path
         self._model = None
         self._lock = threading.Lock()
 
@@ -30,7 +31,7 @@ class FasterWhisperBackend(TranscriptionBackend):
                     if compute == "auto":
                         compute = "float16" if device == "cuda" else "int8"
                     self._model = WhisperModel(
-                        str(Path(self.config.model_path).resolve()), device=device,
+                        str(Path(self.model_path).resolve()), device=device,
                         compute_type=compute, cpu_threads=self.config.cpu_threads,
                         local_files_only=True, num_workers=1,
                     )

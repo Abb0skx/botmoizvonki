@@ -1,12 +1,12 @@
 services:
   worker:
-    image: texnikach-transcription-worker:20260919-hybrid
+    image: texnikach-transcription-worker:20260919-uzbek-callcenter
     container_name: texnikach-transcription-worker
     restart: unless-stopped
     init: true
     cpus: 1.5
-    mem_limit: 3584m
-    memswap_limit: 4096m
+    mem_limit: 4608m
+    memswap_limit: 5120m
     oom_score_adj: 500
     pids_limit: 128
     stop_grace_period: 5m
@@ -28,7 +28,8 @@ services:
       LOCAL_DIARIZATION_MAX_DURATION_SECONDS: "180"
       LOCAL_TRANSCRIPTION_SPEECH_GAP: "1.5"
       LOCAL_WHISPER_MODEL_PATH: /models/whisper-small
-      LOCAL_VOSK_MODEL_PATH: /models/vosk-uz
+      LOCAL_UZBEK_WHISPER_MODEL: Abduqayum/whisper-uzbek-medium-callcenter
+      LOCAL_UZBEK_WHISPER_MODEL_PATH: /models/whisper-uzbek-callcenter-medium
       LOCAL_DIARIZATION_MODEL_PATH: /models/diarization
       DB_PATH: /app/data/calls.db
       HF_HUB_OFFLINE: "1"
@@ -50,7 +51,7 @@ services:
       - /opt/texnikach-transcription-20260918/venv:/stage/venv:ro
       - /opt/texnikach-transcription-20260918/models/diarization:/models/diarization:ro
       - /opt/texnikach-transcription-models/whisper-small:/models/whisper-small:ro
-      - /opt/texnikach-transcription-models/vosk-model-small-uz-0.22:/models/vosk-uz:ro
+      - /opt/texnikach-transcription-models/whisper-uzbek-callcenter-medium:/models/whisper-uzbek-callcenter-medium:ro
     logging:
       driver: json-file
       options:

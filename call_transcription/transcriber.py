@@ -144,7 +144,11 @@ class CallTranscriber:
             result = CallTranscript(
                 str(audio_path), duration, segments, "\n".join(s.text for s in segments), speakers,
                 backend=config.resolved_backend(),
-                model=(f"{config.whisper_model}+vosk-uz" if config.resolved_backend() == "hybrid" else config.whisper_model),
+                model=(
+                    f"{config.whisper_model}+{config.uzbek_whisper_model}"
+                    if config.resolved_backend() == "hybrid"
+                    else config.whisper_model
+                ),
                 role_resolution=resolution.to_dict(), warnings=sorted(set(warnings)),
             )
         if config.archive_original_dir:

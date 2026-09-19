@@ -13,6 +13,8 @@ class TranscriptionConfig:
     backend: str = "auto"
     whisper_model: str = "large-v3-turbo"
     model_path: str = "models/whisper"
+    uzbek_whisper_model: str = "Abduqayum/whisper-uzbek-medium-callcenter"
+    uzbek_model_path: str = "models/whisper-uzbek-callcenter-medium"
     diarization_model_path: str = "models/diarization"
     vosk_model_path: str = "models/vosk-uz"
     device: str = "auto"
@@ -68,6 +70,14 @@ class TranscriptionConfig:
                 backend=os.getenv("LOCAL_TRANSCRIPTION_BACKEND", "auto"),
                 whisper_model=os.getenv("LOCAL_WHISPER_MODEL", "large-v3-turbo"),
                 model_path=os.getenv("LOCAL_WHISPER_MODEL_PATH", "models/whisper"),
+                uzbek_whisper_model=os.getenv(
+                    "LOCAL_UZBEK_WHISPER_MODEL",
+                    "Abduqayum/whisper-uzbek-medium-callcenter",
+                ),
+                uzbek_model_path=os.getenv(
+                    "LOCAL_UZBEK_WHISPER_MODEL_PATH",
+                    "models/whisper-uzbek-callcenter-medium",
+                ),
                 diarization_model_path=os.getenv("LOCAL_DIARIZATION_MODEL_PATH", "models/diarization"),
                 vosk_model_path=os.getenv("LOCAL_VOSK_MODEL_PATH", "models/vosk-uz"),
                 device=os.getenv("LOCAL_TRANSCRIPTION_DEVICE", "auto"),
@@ -100,9 +110,16 @@ class TranscriptionConfig:
         if self.resolved_backend() == "mlx" and not (list(path.glob("*.safetensors")) or list(path.glob("*.npz"))):
             raise ConfigurationError("В LOCAL_WHISPER_MODEL_PATH нет MLX весов")
         if self.resolved_backend() == "hybrid":
-            vosk_path = Path(self.vosk_model_path)
-            if not vosk_path.is_dir() or not (vosk_path / "conf" / "model.conf").is_file():
-                raise ConfigurationError("Нет локальной модели Vosk Uzbek: задайте LOCAL_VOSK_MODEL_PATH")
+            uzbek_path = Path(self.uzbek_model_path)
+            if not uzbek_path.is_dir() or not (uzbek_path / "config.json").is_file():
+                raise ConfigurationError(
+                    "Нет локальной Uzbek Callcenter модели: "
+                    "задайте LOCAL_UZBEK_WHISPER_MODEL_PATH"
+                )
+            if not (uzbek_path / "model.bin").is_file():
+                raise ConfigurationError(
+                    "В LOCAL_UZBEK_WHISPER_MODEL_PATH нет CTranslate2 model.bin"
+                )
         if (self.use_diarization or self.use_vad) and not Path(self.diarization_model_path, "config.yaml").is_file():
             raise ConfigurationError("Нет локальной модели pyannote: задайте LOCAL_DIARIZATION_MODEL_PATH")
 

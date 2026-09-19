@@ -26,7 +26,11 @@ def main():
     snapshot_download(repo, local_dir=root / "whisper", token=token)
     snapshot_download("pyannote/speaker-diarization-community-1", local_dir=root / "diarization", token=token)
     if args.backend == "hybrid":
-        print("Whisper/diarization downloaded. Also provision official Vosk Uzbek model and set LOCAL_VOSK_MODEL_PATH.")
+        print(
+            "Whisper/diarization downloaded. Prepare the Uzbek telephone model with "
+            "scripts/prepare_uzbek_callcenter_model.py and set "
+            "LOCAL_UZBEK_WHISPER_MODEL_PATH."
+        )
     print("Models downloaded. Disconnect the network and run the benchmark before activation.")
 
 

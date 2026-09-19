@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from .base import TranscriptionBackend
 from .faster_whisper_backend import FasterWhisperBackend
-from .vosk_backend import VoskUzbekBackend
 from ..models import ASRSegment, Word
 from ..processing import language_evidence, normalize_text
 
@@ -101,12 +100,21 @@ def choose_ru_uz_by_time(russian_segments, uzbek_segments, *, window_seconds=6.0
 
 
 class HybridRUUZBackend(TranscriptionBackend):
-    """Vosk Uzbek + Russian-only faster-whisper, selected per speaker turn."""
+    """Russian Whisper + telephone-tuned Uzbek Whisper, selected by time slice.
+
+    The two models run sequentially. This costs more CPU than one multilingual
+    pass, but keeps the proven Russian recognizer and gives Uzbek calls a model
+    explicitly fine-tuned for narrowband/noisy call-centre audio.
+    """
 
     def __init__(self, config, *, russian_backend=None, uzbek_backend=None):
         self.config = config
         self.russian = russian_backend or FasterWhisperBackend(config, language="ru")
-        self.uzbek = uzbek_backend or VoskUzbekBackend(config)
+        self.uzbek = uzbek_backend or FasterWhisperBackend(
+            config,
+            language="uz",
+            model_path=config.uzbek_model_path,
+        )
 
     def transcribe(self, audio_path, *, start, end, initial_prompt):
         # Sequential execution keeps peak transient memory lower than parallel inference.
