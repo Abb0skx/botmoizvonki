@@ -1482,6 +1482,26 @@ class CallSourceTests(unittest.TestCase):
         self.assertIn("Фрагмент", text)
         self.assertIn("&lt;", text)
 
+    def test_local_transcription_refresh_detects_legacy_voice_card(self):
+        call_id, _, _ = self.completed_local_transcription(voice=True)
+        with bot.connect_db() as conn:
+            conn.execute("UPDATE calls SET telegram_message_kind = NULL WHERE id = ?", (call_id,))
+        with mock.patch.object(bot, "telegram_api", return_value={"ok": True}) as telegram:
+            self.assertTrue(bot.process_one_transcription_refresh())
+        self.assertEqual(telegram.call_args.args[0], "editMessageCaption")
+        self.assertEqual(bot.get_call(call_id)["telegram_message_kind"], "voice")
+
+    def test_local_transcription_refresh_falls_back_for_legacy_text_card(self):
+        call_id, _, _ = self.completed_local_transcription()
+        with bot.connect_db() as conn:
+            conn.execute("UPDATE calls SET telegram_message_kind = NULL WHERE id = ?", (call_id,))
+        no_caption = RuntimeError("Bad Request: there is no caption in the message to edit")
+        with mock.patch.object(bot, "telegram_api", side_effect=[no_caption, {"ok": True}]) as telegram:
+            self.assertTrue(bot.process_one_transcription_refresh())
+        self.assertEqual([call.args[0] for call in telegram.call_args_list],
+                         ["editMessageCaption", "editMessageText"])
+        self.assertEqual(bot.get_call(call_id)["telegram_message_kind"], "text")
+
     def test_local_transcription_refresh_waits_for_initial_telegram_send(self):
         call_id, _, _ = self.completed_local_transcription(sent=False)
         with mock.patch.object(bot, "telegram_api", return_value={"ok": True}) as telegram:

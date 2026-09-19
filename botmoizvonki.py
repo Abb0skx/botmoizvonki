@@ -7861,7 +7861,7 @@ def process_one_transcription_refresh():
                  AND t.telegram_refreshed_at IS NULL AND t.telegram_refresh_attempts < 10
                  AND COALESCE(t.telegram_refresh_next_attempt_at, 0) <= ?
                  AND COALESCE(t.telegram_refresh_lease_until, 0) < ?
-                 AND c.telegram_message_kind IN ('text', 'voice')
+                 AND (c.telegram_message_kind IN ('text', 'voice') OR c.telegram_message_kind IS NULL)
                  AND c.telegram_message_id IS NOT NULL AND c.telegram_chat_id IS NOT NULL
                  AND COALESCE(c.is_internal_contact, 0) = 0
                ORDER BY t.completed_at, t.call_id LIMIT 1""", (now, now),
@@ -7876,14 +7876,38 @@ def process_one_transcription_refresh():
     error = None
     try:
         call = get_call(row["call_id"])
-        voice = call["telegram_message_kind"] == "voice"
-        text = build_telegram_message({}, {}, call["duration"], call=call, transcript_limit=1024 if voice else 4096)
-        data = {"chat_id": call["telegram_chat_id"], "message_id": call["telegram_message_id"],
-                "parse_mode": "HTML", "caption" if voice else "text": text,
-                "reply_markup": json.dumps(build_call_state_keyboard(call), ensure_ascii=False)}
-        if not voice:
-            data["disable_web_page_preview"] = True
-        telegram_api("editMessageCaption" if voice else "editMessageText", data=data, timeout=30)
+        message_kind = call["telegram_message_kind"]
+        kinds = [message_kind] if message_kind in {"text", "voice"} else ["voice", "text"]
+        for index, kind in enumerate(kinds):
+            voice = kind == "voice"
+            text = build_telegram_message({}, {}, call["duration"], call=call, transcript_limit=1024 if voice else 4096)
+            data = {"chat_id": call["telegram_chat_id"], "message_id": call["telegram_message_id"],
+                    "parse_mode": "HTML", "caption" if voice else "text": text,
+                    "reply_markup": json.dumps(build_call_state_keyboard(call), ensure_ascii=False)}
+            if not voice:
+                data["disable_web_page_preview"] = True
+            try:
+                telegram_api("editMessageCaption" if voice else "editMessageText", data=data, timeout=30)
+            except Exception as exc:
+                description = str(exc).lower()
+                if isinstance(exc, requests.HTTPError) and exc.response is not None:
+                    try:
+                        description = exc.response.json().get("description", "").lower()
+                    except (ValueError, AttributeError):
+                        pass
+                legacy_text_card = any(marker in description for marker in (
+                    "there is no caption", "message has no caption", "not a media message",
+                ))
+                if index == 0 and message_kind is None and voice and legacy_text_card:
+                    continue
+                raise
+            if message_kind is None:
+                with connect_db() as conn:
+                    conn.execute(
+                        "UPDATE calls SET telegram_message_kind = ? WHERE id = ? AND telegram_message_kind IS NULL",
+                        (kind, row["call_id"]),
+                    )
+            break
     except Exception as exc:
         description = str(exc).lower()
         if isinstance(exc, requests.HTTPError) and exc.response is not None:
