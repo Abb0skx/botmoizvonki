@@ -29,7 +29,13 @@ from call_transcription.errors import (
 )
 from call_transcription.models import ASRSegment, SpeakerTurn, Word
 from call_transcription.processing import (
-    ProductNameNormalizer, detect_language, merge_same_speaker, normalize_text, suspicious_segment,
+    ProductNameNormalizer,
+    detect_language,
+    merge_same_speaker,
+    normalize_text,
+    sanitize_transcript_dict,
+    suspicious_segment,
+    transcript_dict_to_txt,
 )
 from call_transcription.roles import RoleResolver
 from call_transcription.telegram import append_transcript_quote, utf16_length
@@ -68,6 +74,34 @@ class LocalTranscriptionUnitTests(unittest.TestCase):
             "Ha.",
         )
         self.assertEqual(normalize_text("Ha. Ha. Ha."), "Ha. Ha. Ha.")
+
+    def test_saved_two_party_transcript_removes_unknown_and_repeat_artifact(self):
+        payload = {
+            "speakers": {
+                "SPEAKER_00": {"role": None, "label": "speaker_1"},
+                "SPEAKER_01": {"role": None, "label": "speaker_2"},
+                "SPEAKER_UNKNOWN": {"role": None, "label": "speaker_unknown"},
+            },
+            "segments": [
+                {"start": 0, "end": 1, "speaker_id": "SPEAKER_00", "role": None,
+                 "text": "Алло.", "language": "ru", "confidence": .9, "overlap": False},
+                {"start": 1, "end": 2, "speaker_id": "SPEAKER_UNKNOWN", "role": None,
+                 "text": "Ha. Ha. Ha. Ha. Ha.", "language": "uz", "confidence": .7, "overlap": True},
+                {"start": 2.1, "end": 3, "speaker_id": "SPEAKER_01", "role": None,
+                 "text": "Xo'p.", "language": "uz", "confidence": .9, "overlap": False},
+            ],
+        }
+
+        repaired = sanitize_transcript_dict(payload)
+
+        self.assertNotIn("SPEAKER_UNKNOWN", repaired["speakers"])
+        self.assertNotIn(
+            "SPEAKER_UNKNOWN",
+            {item["speaker_id"] for item in repaired["segments"]},
+        )
+        self.assertIn("Ha.", repaired["full_text"])
+        self.assertNotIn("Ha. Ha. Ha. Ha.", repaired["full_text"])
+        self.assertNotIn("speaker_unknown", transcript_dict_to_txt(repaired))
 
     def test_faster_whisper_native_numbers_are_json_serializable(self):
         from call_transcription.asr.faster_whisper_backend import FasterWhisperBackend

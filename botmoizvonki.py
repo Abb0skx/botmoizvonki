@@ -7845,7 +7845,10 @@ def get_call_transcript_data(call_id):
             "SELECT transcript_json FROM call_transcriptions WHERE call_id = ? AND status = 'completed'",
             (call_id,),
         ).fetchone()
-    return json.loads(row["transcript_json"]) if row and row["transcript_json"] else None
+    if not row or not row["transcript_json"]:
+        return None
+    from call_transcription.processing import sanitize_transcript_dict
+    return sanitize_transcript_dict(json.loads(row["transcript_json"]))
 
 
 def process_one_transcription_refresh():
@@ -18018,11 +18021,16 @@ def call_transcription_details(call_id: int, format: str = "json"):
         ).fetchone()
     if not row or not row["transcript_json"]:
         raise HTTPException(status_code=404, detail="Расшифровка ещё не готова")
+    from call_transcription.processing import sanitize_transcript_dict, transcript_dict_to_txt
+    transcript = sanitize_transcript_dict(json.loads(row["transcript_json"]))
     if format == "txt":
-        return PlainTextResponse(row["transcript_txt"] or "", headers={"Cache-Control": "no-store, private"})
+        return PlainTextResponse(
+            transcript_dict_to_txt(transcript),
+            headers={"Cache-Control": "no-store, private"},
+        )
     if format != "json":
         raise HTTPException(status_code=400, detail="Формат: json или txt")
-    return JSONResponse(json.loads(row["transcript_json"]), headers={"Cache-Control": "no-store, private"})
+    return JSONResponse(transcript, headers={"Cache-Control": "no-store, private"})
 
 
 @app.get(

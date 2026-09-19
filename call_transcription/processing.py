@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import math
 import re
 from dataclasses import replace
 
@@ -118,6 +120,148 @@ def merge_same_speaker(segments, merge_gap=0.8):
         else:
             merged.append(replace(segment))
     return merged
+
+
+def sanitize_transcript_dict(payload):
+    """Repair display-only artefacts in an already stored transcript.
+
+    Historical rows may contain ``SPEAKER_UNKNOWN`` from overlap alignment.
+    With exactly two known participants, attach those fragments to the closest
+    neighbouring real speaker and keep ``overlap=true`` as the uncertainty
+    signal. This function never invents or rewrites lexical content beyond the
+    conservative normalization used during live transcription.
+    """
+    from .models import TranscriptSegment
+
+    result = copy.deepcopy(payload)
+    raw_segments = result.get("segments")
+    if not isinstance(raw_segments, list):
+        return result
+
+    segments = []
+    for item in raw_segments:
+        if not isinstance(item, dict):
+            continue
+        try:
+            segments.append(TranscriptSegment(
+                start=float(item["start"]),
+                end=float(item["end"]),
+                speaker_id=str(item["speaker_id"]),
+                role=item.get("role"),
+                text=normalize_text(str(item.get("text") or "")),
+                language=item.get("language") or "unknown",
+                confidence=item.get("confidence"),
+                overlap=bool(item.get("overlap", False)),
+            ))
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    known = sorted({
+        segment.speaker_id
+        for segment in segments
+        if segment.speaker_id != "SPEAKER_UNKNOWN"
+    })
+    resolved_unknowns = len(known) == 2
+    if resolved_unknowns:
+        for index, segment in enumerate(segments):
+            if segment.speaker_id != "SPEAKER_UNKNOWN":
+                continue
+            previous = next(
+                (
+                    candidate
+                    for candidate in reversed(segments[:index])
+                    if candidate.speaker_id in known
+                ),
+                None,
+            )
+            following = next(
+                (
+                    candidate
+                    for candidate in segments[index + 1:]
+                    if candidate.speaker_id in known
+                ),
+                None,
+            )
+            if previous and following and previous.speaker_id == following.speaker_id:
+                chosen = previous.speaker_id
+            elif previous or following:
+                previous_gap = (
+                    max(0.0, segment.start - previous.end)
+                    if previous
+                    else math.inf
+                )
+                following_gap = (
+                    max(0.0, following.start - segment.end)
+                    if following
+                    else math.inf
+                )
+                chosen = (
+                    previous.speaker_id
+                    if previous_gap <= following_gap
+                    else following.speaker_id
+                )
+            else:
+                chosen = known[0]
+            speaker = (result.get("speakers") or {}).get(chosen, {})
+            segments[index] = replace(
+                segment,
+                speaker_id=chosen,
+                role=segment.role or speaker.get("role"),
+                overlap=True,
+            )
+
+    segments = merge_same_speaker(segments)
+    speakers = {
+        key: value
+        for key, value in (result.get("speakers") or {}).items()
+        if key != "SPEAKER_UNKNOWN" or not resolved_unknowns
+    }
+    result["segments"] = [
+        {
+            "start": segment.start,
+            "end": segment.end,
+            "speaker_id": segment.speaker_id,
+            "role": segment.role,
+            "text": segment.text,
+            "language": segment.language,
+            "confidence": segment.confidence,
+            "overlap": segment.overlap,
+        }
+        for segment in segments
+    ]
+    result["speakers"] = speakers
+    result["full_text"] = "\n".join(segment.text for segment in segments)
+    result["dialogue"] = [
+        {
+            "role": segment.role or speakers.get(segment.speaker_id, {}).get(
+                "label",
+                segment.speaker_id,
+            ),
+            "text": segment.text,
+        }
+        for segment in segments
+    ]
+    return result
+
+
+def transcript_dict_to_txt(payload):
+    from .models import timestamp
+
+    speakers = payload.get("speakers") or {}
+    lines = []
+    for segment in payload.get("segments") or []:
+        role = segment.get("role")
+        label = {"manager": "Менеджер", "client": "Клиент"}.get(
+            role,
+            speakers.get(segment.get("speaker_id"), {}).get(
+                "label",
+                segment.get("speaker_id", "speaker"),
+            ),
+        )
+        lines.append(
+            f"[{timestamp(segment.get('start', 0))}] {label}:\n{segment.get('text', '')}"
+        )
+    return "\n".join(lines) + ("\n" if lines else "")
 
 
 class ProductNameNormalizer:
