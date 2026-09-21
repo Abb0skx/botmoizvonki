@@ -16,7 +16,7 @@ from .price_entry import EntryError, now
 
 MAX_TEXT = 12_000
 MAX_MODELS = 100
-MAX_VARIANTS = 10_000
+MAX_VARIANTS = 500
 _PREFIX = re.compile(r"^(?:добавить|новая)\s+модель\s*:?\s*$", re.I)
 _CATEGORY = re.compile(r"^категория\s*:\s*(.+)$", re.I)
 _MODEL = re.compile(r"^модель\s*:\s*(.+)$", re.I)
@@ -163,7 +163,7 @@ def _parse_labelled(lines: list[str]) -> list[dict]:
                 raise EntryError("duplicate_catalog_variant", 409)
             seen.add(marker)
             variants.append(item)
-    if not 1 <= len(variants) <= 100:
+    if not 1 <= len(variants) <= MAX_VARIANTS:
         raise EntryError("invalid_catalog_variants")
     return [{
         "category_id": None,

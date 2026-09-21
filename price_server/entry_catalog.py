@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .price_entry import EntryError, identity, now
 
-MAX_VARIANTS = 100
+MAX_VARIANTS = 500
 
 
 def _digest(value) -> str:

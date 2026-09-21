@@ -155,6 +155,26 @@ class EntryCatalogTests(unittest.TestCase):
             self.service.update(1, request, str(uuid.uuid4()))
         self.assertEqual(caught.exception.code, "catalog_model_changed")
 
+    def test_large_existing_model_remains_editable(self):
+        variants = [{"memory": f"{index} GB", "color": "Black"}
+                    for index in range(101)]
+        created = self.service.create(
+            self.request(model_name="Large Model", variants=variants), str(uuid.uuid4()))
+        anchor = created["created"][0]["product_id"]
+        detail = self.service.model(anchor)
+        result = self.service.update(anchor, {
+            "category_id": detail["category_id"],
+            "model_name": "Large Model Updated",
+            "variants": [{
+                "product_id": item["product_id"],
+                "memory": item["memory"],
+                "color": item["color"],
+            } for item in detail["variants"]],
+            "add_variants": [],
+            "expected_revision": detail["revision"],
+        }, str(uuid.uuid4()))
+        self.assertEqual(result["updated_count"], 101)
+
     def test_install_rejects_unknown_category_and_high_water_regression(self):
         other = Path(self.folder.name) / "other.db"
         initialize(other, [{"sheet_id": 1, "title": "1-First", "rows": [sample()]}])
