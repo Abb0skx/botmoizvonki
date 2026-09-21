@@ -105,8 +105,10 @@
   function renderRows() {
     const slice = state.filtered.slice(state.page * PAGE_SIZE, (state.page + 1) * PAGE_SIZE);
     const fragment = document.createDocumentFragment();
-    slice.forEach(row => {
+    slice.forEach((row, rowIndex) => {
       const tr = node("tr");
+      const previous = slice[rowIndex - 1];
+      if (!previous || previous.model_name !== row.model_name || previous.category_name !== row.category_name) tr.classList.add("model-start");
       if (state.selected.has(row.key)) tr.classList.add("row-selected");
       if (PRICE_FIELDS.some(f => state.edits.has(key(row, f)))) tr.classList.add("row-dirty");
       const checkCell = node("td"), check = node("input");
@@ -115,7 +117,12 @@
       check.addEventListener("change", () => { check.checked ? state.selected.add(row.key) : state.selected.delete(row.key); renderRows(); });
       checkCell.append(check); tr.append(checkCell);
       const product = node("td"); product.append(node("div", row.model_name, "product-name"), node("div", "ID " + row.product_id + " · " + row.category_name, "product-meta")); tr.append(product);
-      const variant = node("td"); variant.append(node("div", row.memory || "—", "variant-memory"), node("div", row.color || "—", "variant-color")); tr.append(variant);
+      const memory = node("td", undefined, "memory-cell");
+      memory.append(node("span", row.memory || "—", "variant-memory"));
+      tr.append(memory);
+      const color = node("td", undefined, "color-cell");
+      color.append(node("span", "", "color-marker"), node("span", row.color || "—", "variant-color"));
+      tr.append(color);
       PRICE_FIELDS.forEach(field => {
         const td = node("td"), input = node("input");
         input.type = "text"; input.inputMode = "numeric"; input.autocomplete = "off"; input.maxLength = 6; input.placeholder = "—";

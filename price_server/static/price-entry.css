@@ -4,3 +4,50 @@
 .minimum strong,.minimum small{display:block}.minimum strong{color:#3f6656;font-size:13px}.minimum small{font-size:9px;line-height:1.35;margin-top:3px;overflow-wrap:anywhere}.minimum .cell-history-button{margin-top:4px}.change-values{white-space:normal;text-align:right}.min-col{width:155px}
 @media(max-width:720px){:root .mobile-only{display:block}.private-label{display:none}.table-wrap{overflow:visible}table{min-width:0;display:block;table-layout:auto}thead{display:none}tbody{display:block}#rows tr{display:grid;grid-template-columns:24px 1fr 1fr;gap:8px 12px;padding:17px 14px;border-top:1px solid var(--line)}td{border:0;padding:0!important;display:block;background:transparent!important}td:first-child{grid-column:1;grid-row:1 / 4}td:nth-child(2){grid-column:2 / 4}.product-name{font-size:13px}.product-meta{line-height:1.5;font-size:9px}td:nth-child(3){grid-column:2 / 4;display:flex;gap:9px}.variant-color,.variant-memory{font-size:11px;margin:0}td:nth-child(4){grid-column:2}td:nth-child(5){grid-column:3}td:nth-child(4)::before,td:nth-child(5)::before{display:block;font-size:9px;letter-spacing:.5px;color:var(--muted);margin-bottom:5px;content:'1 МЕС. · USD'}td:nth-child(5)::before{content:'12 МЕС. · USD'}.price-input{width:100%;font-size:16px;padding:11px 10px}td:nth-child(6){grid-column:2 / 4;font-size:10px}td:nth-child(6)::before{content:'Мин. в таблице: ';color:#93a197}.row-selected{background:#f0f8f3}.row-dirty{background:#fffcf5}.check-col{display:none}}
 .heading-actions{display:flex;gap:10px;align-items:center}.catalog-form{display:grid;gap:17px}.catalog-form label{display:grid;gap:7px}.catalog-form label>span{font-weight:600;color:#395248}.catalog-form input,.catalog-form select,.catalog-form textarea{width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:7px;background:white;color:var(--ink);font:inherit}.catalog-form textarea{resize:vertical;line-height:1.6}.catalog-form small{color:var(--muted);line-height:1.6}@media(max-width:720px){.heading-actions{width:100%}.heading-actions .button{width:100%}.catalog-form textarea{font-size:16px}}
+
+/* Scannable catalogue columns: model, memory and colour stay visually distinct. */
+.table-wrap table{min-width:1020px}
+.product-col{width:29%}
+.memory-col{width:112px}
+.color-col{width:18%}
+.price-col{width:112px}
+.min-col{width:165px}
+#rows td{transition:background-color .12s ease}
+#rows tr:not(.row-selected):not(.row-dirty):hover td{background:#f7faf8}
+#rows tr:focus-within td{background:#f3f8f5}
+#rows tr.model-start:not(:first-child) td{border-top:2px solid #dbe6df}
+.product-name{font-size:14px;font-weight:700;line-height:1.35;color:#183c31;margin-bottom:7px}
+.product-meta{line-height:1.45}
+.memory-cell,.color-cell{padding-right:12px}
+.variant-memory{display:inline-flex;align-items:center;min-height:28px;padding:5px 9px;margin:0;border:1px solid #dce9e2;border-radius:6px;background:#f1f7f3;color:#214c3e;font-size:12px;font-weight:700;line-height:1.25;white-space:normal}
+.color-cell{display:flex;align-items:center;gap:8px}
+.color-marker{width:8px;height:8px;flex:0 0 8px;border:2px solid #9aaba2;border-radius:50%;background:#fff}
+.variant-color{color:#435c52;font-size:12px;font-weight:550;line-height:1.4;overflow-wrap:anywhere}
+
+@media(max-width:1150px){.table-wrap table{min-width:960px}.product-col{width:270px}.color-col{width:170px}}
+@media(max-width:720px){
+  .table-wrap table{min-width:0}
+  #rows tr{grid-template-columns:24px minmax(0,1fr) minmax(0,1fr);gap:10px 9px;padding:18px 13px}
+  #rows tr.model-start:not(:first-child){border-top:3px solid #dbe6df;margin-top:5px}
+  #rows tr.model-start:not(:first-child) td{border-top:0}
+  #rows td:first-child{grid-column:1;grid-row:1 / 5}
+  #rows td:nth-child(2){grid-column:2 / 4}
+  #rows td.memory-cell{grid-column:2}
+  #rows td.color-cell{grid-column:3}
+  #rows td.memory-cell,#rows td.color-cell{display:grid;align-content:start;gap:5px;min-height:63px;padding:9px 10px!important;border:1px solid #e4ebe7;border-radius:7px;background:#f7f9f7!important}
+  #rows td.memory-cell::before,#rows td.color-cell::before{display:block;margin:0;color:#8b9991;font-size:8px;font-weight:650;letter-spacing:.8px}
+  #rows td.memory-cell::before{content:'ПАМЯТЬ'}
+  #rows td.color-cell::before{content:'ЦВЕТ'}
+  #rows .variant-memory{min-height:0;padding:0;border:0;background:transparent;font-size:12px}
+  #rows .color-marker{display:none}
+  #rows .variant-color{font-size:11px;line-height:1.35}
+  #rows td:nth-child(5){grid-column:2}
+  #rows td:nth-child(6){grid-column:3}
+  #rows td:nth-child(4)::before{content:'ЦВЕТ';display:block}
+  #rows td:nth-child(5)::before,#rows td:nth-child(6)::before{display:block;font-size:9px;letter-spacing:.5px;color:var(--muted);margin-bottom:5px}
+  #rows td:nth-child(5)::before{content:'1 МЕС. · USD'}
+  #rows td:nth-child(6)::before{content:'12 МЕС. · USD'}
+  #rows td:nth-child(7){grid-column:2 / 4;font-size:10px}
+  #rows td:nth-child(7)::before{content:'МИНИМУМ: ';color:#93a197}
+  #rows .product-name{font-size:15px;line-height:1.35;margin-bottom:5px}
+}
