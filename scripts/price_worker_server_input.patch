@@ -1,39 +1,45 @@
---- a/Cod/import db.py	2026-09-21
-+++ b/Cod/import db.py	2026-09-21
-@@ -104 +103,0 @@
--sh = gc.open_by_key(SPREADSHEET_ID)
-@@ -129,12 +128,22 @@
--worksheets = sh.worksheets()
--values_by_title = {
--    worksheet.title: worksheet.get_all_values()
--    for worksheet in worksheets
--}
--
--restored_ids = restore_blank_supplier_ids(
--    sh,
--    worksheets,
--    values_by_title,
--    reference_supplier_id=REFERENCE_SUPPLIER_ID,
--)
-+price_input_source = os.getenv("PRICE_INPUT_SOURCE", "google_sheets").strip()
-+if price_input_source == "server":
-+    from types import SimpleNamespace
-+    from server_price_source import load_server_prices
+--- a/Cod/import db.py
++++ b/Cod/import db.py
+@@
+-price_input_source = os.getenv("PRICE_INPUT_SOURCE", "google_sheets").strip()
++price_input_source = os.getenv("PRICE_INPUT_SOURCE", "server").strip()
+ if price_input_source == "server":
+     from types import SimpleNamespace
+     from server_price_source import load_server_prices
+
+-    values_by_title = load_server_prices()
++    server_price_data = load_server_prices()
++    values_by_title = server_price_data
+     worksheets = [SimpleNamespace(title=title) for title in values_by_title]
+     restored_ids = []
+     print("✅ Источник цен: серверный сайт (Google Price не используется)")
+-elif price_input_source == "google_sheets":
+-    sh = gc.open_by_key(SPREADSHEET_ID)
+-    worksheets = sh.worksheets()
+-    values_by_title = {
+-        worksheet.title: worksheet.get_all_values()
+-        for worksheet in worksheets
+-    }
+-    restored_ids = restore_blank_supplier_ids(
+-        sh, worksheets, values_by_title,
+-        reference_supplier_id=REFERENCE_SUPPLIER_ID,
+-    )
+ else:
+-    raise RuntimeError("Unknown PRICE_INPUT_SOURCE; import stopped without fallback")
++    raise RuntimeError("Google Price source is disabled; PRICE_INPUT_SOURCE must be server")
+@@
+-def save_product_prices(final_data, deleted_product_ids):
++def save_product_prices(final_data, deleted_product_ids, server_data=None):
+     conn = sqlite3.connect(DATABASE_PATH)
+     cursor = conn.cursor()
+
+     try:
++        if server_data is not None:
++            from server_price_source import reconcile_catalog
 +
-+    values_by_title = load_server_prices()
-+    worksheets = [SimpleNamespace(title=title) for title in values_by_title]
-+    restored_ids = []
-+    print("✅ Источник цен: серверный сайт (Google Price не используется)")
-+elif price_input_source == "google_sheets":
-+    sh = gc.open_by_key(SPREADSHEET_ID)
-+    worksheets = sh.worksheets()
-+    values_by_title = {
-+        worksheet.title: worksheet.get_all_values()
-+        for worksheet in worksheets
-+    }
-+    restored_ids = restore_blank_supplier_ids(
-+        sh, worksheets, values_by_title,
-+        reference_supplier_id=REFERENCE_SUPPLIER_ID,
-+    )
-+else:
-+    raise RuntimeError("Unknown PRICE_INPUT_SOURCE; import stopped without fallback")
++            created_products = reconcile_catalog(conn, server_data)
++            if created_products:
++                print(f"✅ Из сайта добавлено новых вариантов товаров: {created_products}")
+@@
+-    save_product_prices(final_data, deleted_products.ids)
++    save_product_prices(final_data, deleted_products.ids, server_price_data)

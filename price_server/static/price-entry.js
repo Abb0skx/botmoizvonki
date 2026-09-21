@@ -1,7 +1,7 @@
 (() => {
   "use strict";
   const $ = id => document.getElementById(id);
-  const state = {suppliers: [], sheet: null, rows: [], filtered: [], edits: new Map(), selected: new Set(), page: 0, busy: false, uncertain: false};
+  const state = {suppliers: [], categories: [], sheet: null, rows: [], filtered: [], edits: new Map(), selected: new Set(), page: 0, busy: false, uncertain: false};
   const PAGE_SIZE = 50;
   const number = value => Number(value).toLocaleString("ru-RU");
   const shownPrice = value => value === null || value === "" ? "нет" : number(value);
@@ -19,6 +19,14 @@
     save_outcome_unknown: "Не удалось подтвердить результат сохранения. Не отправляйте правки повторно. Проверьте историю сохранений и обновите данные перед новой попыткой.",
     supplier_not_found: "Лист поставщика не найден. Обновите страницу.",
     invalid_change_count: "За один раз можно сохранить от 1 до 200 цен.",
+    catalog_management_not_initialized: "Добавление моделей ещё не подготовлено. Ввод цен продолжает работать.",
+    invalid_catalog_request: "Проверьте название модели, категорию и варианты.",
+    invalid_catalog_text: "Название, память или цвет заполнены некорректно.",
+    invalid_catalog_variants: "Добавьте от 1 до 100 вариантов модели.",
+    duplicate_catalog_variant: "Одинаковый вариант памяти и цвета указан дважды.",
+    catalog_category_exists: "Такая категория уже существует. Выберите её из списка.",
+    catalog_category_not_found: "Категория больше не существует. Обновите страницу.",
+    catalog_product_exists: "Такой вариант модели уже существует в каталоге.",
   };
 
   function node(tag, text, className) {
@@ -171,8 +179,6 @@
       $("total-count").textContent = number(data.rows.length);
       $("priced-count").textContent = number(data.rows.filter(r => Number(r.price_1) > 0 || Number(r.price_12) > 0).length);
       $("fetched-time").textContent = new Date(data.fetched_at).toLocaleTimeString("ru-RU", {hour: "2-digit", minute: "2-digit"});
-      $("sheet-link").hidden = !data.spreadsheet_url;
-      if (data.spreadsheet_url) $("sheet-link").href = data.spreadsheet_url;
       const previousCategory = $("category").value;
       $("category").replaceChildren(new Option("Все категории", ""), ...[...new Set(data.rows.map(r => r.category_name))].filter(Boolean).sort().map(c => new Option(c, c)));
       if ([...$("category").options].some(o => o.value === previousCategory)) $("category").value = previousCategory;
@@ -190,6 +196,54 @@
   }
   function button(text, action, primary = false) {
     const b = node("button", text, "button " + (primary ? "primary" : "secondary")); b.addEventListener("click", action); return b;
+  }
+  function showAddModel() {
+    if (!mayDiscard()) return;
+    const form = node("div", undefined, "catalog-form");
+    const categoryLabel = node("label"), categoryTitle = node("span", "Категория"), category = node("select");
+    category.append(...state.categories.map(item => new Option(item.name, String(item.category_id))), new Option("＋ Новая категория", "__new__"));
+    categoryLabel.append(categoryTitle, category);
+    const newCategoryLabel = node("label"), newCategoryTitle = node("span", "Название новой категории"), newCategory = node("input");
+    newCategory.type = "text"; newCategory.maxLength = 200; newCategory.placeholder = "Например: Смартфоны бренда …";
+    newCategoryLabel.append(newCategoryTitle, newCategory); newCategoryLabel.hidden = true;
+    category.addEventListener("change", () => { newCategoryLabel.hidden = category.value !== "__new__"; if (!newCategoryLabel.hidden) newCategory.focus(); });
+    const modelLabel = node("label"), modelTitle = node("span", "Название модели"), model = node("input");
+    model.type = "text"; model.maxLength = 250; model.placeholder = "Например: Apple iPhone 18 Pro"; modelLabel.append(modelTitle, model);
+    const variantsLabel = node("label"), variantsTitle = node("span", "Варианты: память | цвет"), variants = node("textarea");
+    variants.rows = 7; variants.placeholder = "256 GB | Black\n256 GB | Silver\n512 GB | Black";
+    variantsLabel.append(variantsTitle, variants, node("small", "Один вариант в строке. Если памяти или цвета нет, оставьте соответствующую сторону пустой:  | Black или 256 GB | ."));
+    const status = node("p", "После создания модель появится у каждого поставщика без цены. ID товара и версий 1/12 месяцев создаст сервер.", "cell-history-note");
+    form.append(categoryLabel, newCategoryLabel, modelLabel, variantsLabel, status);
+    const create = button("Создать модель", async () => {
+      const lines = variants.value.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+      const parsed = [];
+      for (const line of lines) {
+        const separator = line.indexOf("|");
+        if (separator < 0 || line.indexOf("|", separator + 1) >= 0) {
+          status.textContent = "В каждой строке нужен один разделитель | между памятью и цветом."; status.classList.add("danger"); return;
+        }
+        parsed.push({memory: line.slice(0, separator).trim(), color: line.slice(separator + 1).trim()});
+      }
+      if (!model.value.trim() || !parsed.length || parsed.length > 100 || (category.value === "__new__" && !newCategory.value.trim())) {
+        status.textContent = "Заполните модель, категорию и от 1 до 100 вариантов."; status.classList.add("danger"); return;
+      }
+      create.disabled = true; status.classList.remove("danger"); status.textContent = "Создаём модель…";
+      try {
+        const result = await api("products", {
+          category_id: category.value === "__new__" ? null : Number(category.value),
+          new_category_name: category.value === "__new__" ? newCategory.value.trim() : null,
+          model_name: model.value.trim(), variants: parsed,
+        }, crypto.randomUUID());
+        $("dialog").close();
+        const createdName = model.value.trim();
+        const catalog = await api("categories"); state.categories = catalog.categories;
+        await load(state.sheet);
+        $("search").value = createdName; $("availability").value = "empty"; state.page = 0; filter();
+        notice(`Создано вариантов: ${result.created_count}. Модель добавлена всем поставщикам с пустыми ценами и будет передана в worker при очередном импорте.`);
+      } catch (error) { status.textContent = error.message; status.classList.add("danger"); create.disabled = false; }
+    }, true);
+    modal("Добавить новую модель", [form], [button("Отмена", () => $("dialog").close()), create]);
+    model.focus();
   }
   function showCellHistory(row, field) {
     const sheet = state.sheet;
@@ -293,6 +347,7 @@
   });
   $("close-dialog").addEventListener("click", () => $("dialog").close());
   $("history-mobile").addEventListener("click", () => $("history").click());
+  $("add-model").addEventListener("click", showAddModel);
   $("supplier").addEventListener("change", () => { if (mayDiscard()) load(Number($("supplier").value)); else $("supplier").value = String(state.sheet); });
   $("refresh").addEventListener("click", () => { if (state.sheet !== null && mayDiscard()) load(state.sheet); });
   $("discard").addEventListener("click", () => { if (mayDiscard()) { state.edits.clear(); filter(); } });
@@ -312,6 +367,14 @@
       $("source-note").textContent = data.source === "sqlite" ? "Google Price больше не нужен. Цены и история сохраняются в базе с резервным копированием." : "Два интерфейса. Один источник цен. Таблица продолжает работать.";
       if (!data.suppliers.length) throw new Error("Поставщики не найдены.");
       $("supplier").replaceChildren(...data.suppliers.map(s => new Option(s.name, s.sheet_id)));
+      try {
+        const catalog = await api("categories");
+        state.categories = catalog.categories;
+        $("add-model").hidden = false;
+      } catch (error) {
+        $("add-model").hidden = true;
+        if (error.code !== "catalog_management_not_initialized") throw error;
+      }
       $("workspace").hidden = false;
       await load(data.suppliers[0].sheet_id);
     } catch (error) { notice(error.message, true); }

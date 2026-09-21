@@ -96,10 +96,16 @@ class SQLitePriceSource:
         with self.database() as db:
             self.ready(db)
             state = dict(db.execute("SELECT revision,updated_at FROM entry_input_state WHERE id=1").fetchone())
+            has_catalog = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='entry_catalog_state'"
+            ).fetchone() and db.execute("SELECT 1 FROM entry_catalog_state WHERE id=1").fetchone()
             result = {"schema_version": 1, "source": "sqlite", **state,
                       "suppliers": [dict(r) for r in db.execute("SELECT * FROM entry_suppliers ORDER BY supplier_id")],
                       "products": [json.loads(r[0]) for r in db.execute("SELECT metadata_json FROM entry_products ORDER BY position")],
                       "prices": [list(r) for r in db.execute("SELECT sheet_id,product_key,price_1,price_12 FROM entry_prices ORDER BY sheet_id,product_key")]}
+            if has_catalog:
+                result["categories"] = [dict(r) for r in db.execute(
+                    "SELECT category_id,name FROM entry_categories ORDER BY category_id")]
             result["content_hash"] = digest(result)
             return result
 

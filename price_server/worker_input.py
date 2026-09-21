@@ -15,6 +15,15 @@ HEADERS = ["product_id", "model_name", "color", "memory", "version_id_1",
            "price_1", "version_id_12", "price_12", "min_price", "category_name"]
 
 
+class ServerPriceData(dict):
+    """Worksheet-compatible mapping plus the canonical server catalogue."""
+
+    def __init__(self, values, *, categories, products):
+        super().__init__(values)
+        self.categories = categories
+        self.products = products
+
+
 def decode(payload):
     data = dict(payload)
     checksum = data.pop("content_hash", None)
@@ -25,13 +34,28 @@ def decode(payload):
     products, suppliers, prices = data["products"], data["suppliers"], data["prices"]
     if not 1 <= len(products) <= 25000 or not 1 <= len(suppliers) <= 100:
         raise RuntimeError("Server price source: invalid catalog size")
-    keys, versions = [], set()
+    categories = data.get("categories", [])
+    category_by_id, category_names = {}, set()
+    for category in categories:
+        if (not isinstance(category, dict) or set(category) != {"category_id", "name"}
+                or type(category["category_id"]) is not int or category["category_id"] <= 0
+                or not isinstance(category["name"], str) or not category["name"].strip()
+                or category["category_id"] in category_by_id
+                or category["name"].casefold() in category_names):
+            raise RuntimeError("Server price source: invalid category")
+        category_by_id[category["category_id"]] = category["name"]
+        category_names.add(category["name"].casefold())
+    keys, versions, product_ids = [], set(), set()
     for row in products:
         ids = [str(row[k]) for k in ("product_id", "version_id_1", "version_id_12")]
         if (not all(re.fullmatch(r"[1-9][0-9]*", v) for v in ids)
-                or ids[1] == ids[2] or versions.intersection(ids[1:])):
+                or ids[0] in product_ids or ids[1] == ids[2]
+                or versions.intersection(ids[1:])):
             raise RuntimeError("Server price source: invalid product identity")
-        versions.update(ids[1:]); keys.append(":".join(ids))
+        if categories and (type(row.get("category_id")) is not int
+                           or category_by_id.get(row["category_id"]) != row.get("category_name")):
+            raise RuntimeError("Server price source: invalid product category")
+        product_ids.add(ids[0]); versions.update(ids[1:]); keys.append(":".join(ids))
     if len(set(keys)) != len(keys):
         raise RuntimeError("Server price source: duplicate product")
     supplier_ids, sheets, titles = set(), set(), set()
@@ -58,7 +82,60 @@ def decode(payload):
             row = dict(product, price_1=p1, price_12=p12, min_price="")
             rows.append(["" if row[k] is None else row[k] for k in HEADERS])
         result[supplier["title"]] = rows
-    return result
+    return ServerPriceData(result, categories=categories, products=products)
+
+
+def reconcile_catalog(connection, server_data):
+    """Add server-created catalogue rows inside the worker import transaction.
+
+    Existing rows are checked, never overwritten or deleted. Any identity
+    mismatch aborts the whole price import before ``product_prices`` changes.
+    """
+    if not isinstance(server_data, ServerPriceData) or not server_data.categories:
+        raise RuntimeError("Server price source: catalogue management is not initialized")
+    cursor = connection.cursor()
+    for category in server_data.categories:
+        category_id, name = category["category_id"], category["name"]
+        by_id = cursor.execute("SELECT name FROM categories WHERE id=?", (category_id,)).fetchone()
+        by_name = cursor.execute("SELECT id FROM categories WHERE name=? COLLATE NOCASE", (name,)).fetchone()
+        if by_id and str(by_id[0]) != name:
+            raise RuntimeError("Server catalogue: category ID conflict")
+        if by_name and int(by_name[0]) != category_id:
+            raise RuntimeError("Server catalogue: category name conflict")
+        if not by_id:
+            cursor.execute("INSERT INTO categories(id,name) VALUES (?,?)", (category_id, name))
+
+    created = 0
+    for product in server_data.products:
+        product_id = int(product["product_id"])
+        expected = (str(product["model_name"]), int(product["category_id"]),
+                    str(product.get("memory") or ""), str(product.get("color") or ""))
+        row = cursor.execute("""SELECT model_name,category_id,
+            COALESCE(memory,''),COALESCE(color,'') FROM products WHERE id=?""",
+                             (product_id,)).fetchone()
+        if row:
+            actual = (str(row[0]), int(row[1]), str(row[2]), str(row[3]))
+            if actual != expected:
+                raise RuntimeError("Server catalogue: product ID conflict")
+        else:
+            duplicate = cursor.execute("""SELECT id FROM products
+                WHERE model_name=? AND category_id=? AND COALESCE(memory,'')=?
+                  AND COALESCE(color,'')=?""", expected).fetchone()
+            if duplicate:
+                raise RuntimeError("Server catalogue: duplicate product identity")
+            cursor.execute("""INSERT INTO products(id,model_name,category_id,memory,color)
+                VALUES (?,?,?,?,?)""", (product_id, *expected))
+            created += 1
+        for field, warranty in (("version_id_1", "1"), ("version_id_12", "12")):
+            version_id = int(product[field])
+            version = cursor.execute("""SELECT product_id,warranty_period
+                FROM product_versions WHERE version_id=?""", (version_id,)).fetchone()
+            if version and (int(version[0]), str(version[1])) != (product_id, warranty):
+                raise RuntimeError("Server catalogue: version ID conflict")
+            if not version:
+                cursor.execute("""INSERT INTO product_versions(version_id,product_id,warranty_period)
+                    VALUES (?,?,?)""", (version_id, product_id, warranty))
+    return created
 
 
 def load_server_prices():

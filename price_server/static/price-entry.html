@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="robots" content="noindex,nofollow">
   <title>Ввод цен · Texnikach</title>
-  <link rel="stylesheet" href="/price/assets/price-entry.css?v=1">
-  <script src="/price/assets/price-entry.js?v=1" defer></script>
+  <link rel="stylesheet" href="/price/assets/price-entry.css?v=2">
+  <script src="/price/assets/price-entry.js?v=2" defer></script>
 </head>
 <body>
 <aside class="sidebar">
@@ -20,7 +20,7 @@
 </aside>
 <main>
   <header class="topline"><span>Каталог <span class="slash">/</span> <strong>Ввод цен</strong></span><button class="text-button mobile-only" id="history-mobile">История</button><span class="private-label">Закрытый доступ</span></header>
-  <section class="page-heading"><div><div class="eyebrow">УПРАВЛЕНИЕ ПРАЙСОМ</div><h1>Цены поставщиков<span>.</span></h1><p>Найдите товар, измените цену и сохраните правки.</p></div><a class="button secondary" id="sheet-link" target="_blank" rel="noopener noreferrer" hidden>Открыть Google Sheets ↗</a></section>
+  <section class="page-heading"><div><div class="eyebrow">УПРАВЛЕНИЕ ПРАЙСОМ</div><h1>Цены поставщиков<span>.</span></h1><p>Найдите товар, измените цену или добавьте новую модель.</p></div><div class="heading-actions"><button class="button primary" id="add-model" hidden>＋ Добавить модель</button></div></section>
   <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
   <section id="login-panel" class="empty-state" hidden><h2>Войдите в рабочий кабинет</h2><p>Цены доступны только сотрудникам с правом управления прайсом.</p><a class="button primary" href="/monitoring/login?next=%2Fprice%2Fentry">Войти</a></section>
   <div id="workspace" hidden>
@@ -32,7 +32,7 @@
       <div id="empty" class="empty-state" hidden><h3>Ничего не найдено</h3><p>Попробуйте другое название или измените фильтры.</p></div>
       <footer class="pagination"><span id="page-label">—</span><div><button class="button small" id="previous" aria-label="Предыдущая страница">←</button><button class="button small" id="next" aria-label="Следующая страница">→</button></div></footer>
     </section>
-    <div class="help-line"><span>ⓘ</span><p>Пустая цена или 0 — нет предложения. Можно вставить одну или две колонки цен из таблицы, начиная с выбранной ячейки. Формулы и ID защищены. Цены попадут в прайс при очередном импорте; эта страница не отправляет посты в Telegram.</p></div>
+    <div class="help-line"><span>ⓘ</span><p>Пустая цена или 0 — нет предложения. Новая модель автоматически появляется у всех поставщиков с пустыми ценами. Товар и версии гарантии получают безопасные ID на сервере. Цены попадут в прайс при очередном импорте; эта страница не отправляет посты в Telegram.</p></div>
   </div>
   <footer class="savebar" id="savebar" hidden><div><span class="unsaved-dot"></span><strong id="change-count">Нет изменений</strong><small>Проверьте перед сохранением</small></div><div class="save-actions"><button class="button secondary" id="discard">Отменить правки</button><button class="button primary" id="review">Проверить и сохранить →</button></div></footer>
 </main>

@@ -167,7 +167,7 @@ class PriceEntryService:
         self.db_path = Path(db_path)
         self._transaction = None
         if source is None:
-            mode = os.getenv("PRICE_ENTRY_SOURCE", "google_sheets")
+            mode = os.getenv("PRICE_ENTRY_SOURCE", "sqlite")
             if mode == "sqlite":
                 from .entry_store import SQLitePriceSource
                 source = SQLitePriceSource(self.db_path)

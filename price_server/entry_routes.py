@@ -12,6 +12,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from .price_entry import EntryError, PriceEntryService
+from .entry_catalog import EntryCatalogService
 
 LOG = logging.getLogger(__name__)
 STATIC = Path(__file__).parent / "static"
@@ -20,6 +21,9 @@ STATIC = Path(__file__).parent / "static"
 def install_entry_routes(router, admin, enabled, settings):
     def service():
         return PriceEntryService(settings.db_path)
+
+    def catalog_service():
+        return EntryCatalogService(settings.db_path)
 
     def call(function, *args):
         try:
@@ -53,7 +57,14 @@ def install_entry_routes(router, admin, enabled, settings):
         enabled()
         admin(request, action=False)
         return {"suppliers": call(service().source.suppliers),
-                "source": os.getenv("PRICE_ENTRY_SOURCE", "google_sheets")}
+                "source": os.getenv("PRICE_ENTRY_SOURCE", "sqlite")}
+
+    @router.get("/price/api/v1/entry/categories")
+    def categories(request: Request):
+        enabled()
+        admin(request, action=False)
+        return JSONResponse(call(catalog_service().categories),
+                            headers={"Cache-Control": "no-store"})
 
     @router.get("/price/api/v1/entry/export")
     def export(request: Request):
@@ -62,7 +73,7 @@ def install_entry_routes(router, admin, enabled, settings):
         if not key or not secrets.compare_digest(request.headers.get("X-Price-Sync-Key", ""), key):
             raise HTTPException(401)
         from .entry_store import SQLitePriceSource
-        if os.getenv("PRICE_ENTRY_SOURCE", "google_sheets") != "sqlite":
+        if os.getenv("PRICE_ENTRY_SOURCE", "sqlite") != "sqlite":
             raise HTTPException(409, {"code": "local_price_source_disabled"})
         return JSONResponse(call(SQLitePriceSource(settings.db_path).export),
                             headers={"Cache-Control": "no-store"})
@@ -100,4 +111,21 @@ def install_entry_routes(router, admin, enabled, settings):
             raise HTTPException(400, {"code": "invalid_json"}) from None
         result = await run_in_threadpool(call, service().save, sheet_id, body,
                                         request.headers.get("idempotency-key", ""))
+        return JSONResponse(result)
+
+    @router.post("/price/api/v1/entry/products")
+    async def create_product(request: Request):
+        enabled()
+        admin(request, action=True)
+        raw = await request.body()
+        if len(raw) > 64 * 1024:
+            raise HTTPException(413)
+        try:
+            body = json.loads(raw)
+        except (ValueError, UnicodeError):
+            raise HTTPException(400, {"code": "invalid_json"}) from None
+        result = await run_in_threadpool(
+            call, catalog_service().create, body,
+            request.headers.get("idempotency-key", ""),
+        )
         return JSONResponse(result)
