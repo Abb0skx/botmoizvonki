@@ -731,7 +731,9 @@ class MonitoringRouteTests(unittest.TestCase):
         )
 
     def test_price_entry_proxy_is_authenticated_and_csrf_protected(self):
-        paths = ["entry/suppliers", "entry/history", "entry/catalog/1027960070"]
+        paths = ["entry/suppliers", "entry/history", "entry/catalog/1027960070",
+                 "entry/cell-history/1027960070/1:10:11/price_1/0",
+                 "entry/cell-history/1027960070/1:10:11/price_12/123"]
         for path in paths:
             self.assertEqual(self.client.get("/monitoring/api/prices/admin/" + path).status_code, 401)
         csrf = self.login()
@@ -739,7 +741,12 @@ class MonitoringRouteTests(unittest.TestCase):
         with patch.object(monitoring_router.prices_adapter.PriceAdapter, "admin_request", new=upstream):
             for path in paths:
                 self.assertEqual(self.client.get("/monitoring/api/prices/admin/" + path).status_code, 200)
-            for path in ["entry/catalog/-1", "entry/catalog/abc", "entry/save/1"]:
+                self.assertEqual(upstream.await_args.args, ("GET", "/price/api/v1/" + path))
+            for path in ["entry/catalog/-1", "entry/catalog/abc", "entry/save/1",
+                         "entry/cell-history/1/1:10:11/min_price/0",
+                         "entry/cell-history/1/1:10:11/price_1/-1",
+                         "entry/cell-history/1/bad/price_1/0",
+                         "entry/cell-history/1/1:10:11/price_1/0/extra"]:
                 self.assertEqual(self.client.get("/monitoring/api/prices/admin/" + path).status_code, 404)
             url = "/monitoring/api/prices/admin/entry/save/1027960070"
             self.assertEqual(self.client.post(url, json={"changes": []}).status_code, 403)
