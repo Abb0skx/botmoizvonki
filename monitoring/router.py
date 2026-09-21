@@ -42,7 +42,9 @@ TEMPLATES = ROOT / "templates"
 STATIC = ROOT / "static"
 DELIVERY_TEMPLATES = ROOT.parent / "app" / "templates"
 
-_PRICE_ADMIN_GET_PATHS = frozenset({"jobs", "sections", "entry/suppliers", "entry/history"})
+_PRICE_ADMIN_GET_PATHS = frozenset({
+    "jobs", "sections", "entry/suppliers", "entry/history", "entry/categories",
+})
 _PRICE_ADMIN_POST_PATHS = (
     re.compile(
         r"sections/[a-z0-9][a-z0-9-]{0,127}/"
@@ -55,6 +57,7 @@ _PRICE_ADMIN_POST_PATHS = (
     ),
     re.compile(r"posts/update-all"),
     re.compile(r"entry/save/[0-9]{1,12}"),
+    re.compile(r"entry/products"),
 )
 
 router = APIRouter(tags=["manager-monitoring"])
