@@ -763,6 +763,16 @@ class MonitoringRouteTests(unittest.TestCase):
                 "X-CSRF-Token": csrf, "Origin": "https://bot.texnikach.uz",
                 "Idempotency-Key": "123e4567-e89b-42d3-a456-426614174000"}).status_code, 200)
             self.assertEqual(upstream.await_args.args, ("POST", "/price/api/v1/entry/products"))
+            category_url = "/monitoring/api/prices/admin/entry/categories"
+            self.assertEqual(self.client.post(category_url, json={}, headers={
+                "X-CSRF-Token": csrf, "Origin": "https://bot.texnikach.uz",
+                "Idempotency-Key": "123e4567-e89b-42d3-a456-426614174000"}).status_code, 200)
+            self.assertEqual(upstream.await_args.args, ("POST", "/price/api/v1/entry/categories"))
+            category_url = "/monitoring/api/prices/admin/entry/categories/10"
+            self.assertEqual(self.client.post(category_url, json={}, headers={
+                "X-CSRF-Token": csrf, "Origin": "https://bot.texnikach.uz",
+                "Idempotency-Key": "123e4567-e89b-42d3-a456-426614174000"}).status_code, 200)
+            self.assertEqual(upstream.await_args.args, ("POST", "/price/api/v1/entry/categories/10"))
             model_url = "/monitoring/api/prices/admin/entry/models/1"
             self.assertEqual(self.client.post(model_url, json={}, headers={
                 "X-CSRF-Token": csrf, "Origin": "https://bot.texnikach.uz",
@@ -787,6 +797,7 @@ class MonitoringRouteTests(unittest.TestCase):
             self.assertEqual(upstream.await_args.args, ("POST", "/price/api/v1/entry/model-inbox/1/dismissed"))
         self.assertEqual(_safe_next("/price/entry"), "/price/entry")
         self.assertEqual(_safe_next("/price/models"), "/price/models")
+        self.assertEqual(_safe_next("/price/categories"), "/price/categories")
 
     def test_price_admin_proxy_restores_manager_actions_with_csrf(self):
         self.assertEqual(self.client.get(
