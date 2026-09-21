@@ -55,6 +55,13 @@ def install_entry_routes(router, admin, enabled, settings):
         response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
         return response
 
+    @router.get("/price/categories", include_in_schema=False)
+    def categories_page():
+        response = HTMLResponse(STATIC.joinpath("price-categories.html").read_text())
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+        return response
+
     @router.get("/price/assets/price-entry.{extension}", include_in_schema=False)
     def entry_asset(extension: str):
         if extension not in {"js", "css"}:
@@ -71,6 +78,14 @@ def install_entry_routes(router, admin, enabled, settings):
         return Response(STATIC.joinpath("price-models." + extension).read_bytes(), media_type=media,
                         headers={"Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff"})
 
+    @router.get("/price/assets/price-categories.{extension}", include_in_schema=False)
+    def categories_asset(extension: str):
+        if extension not in {"js", "css"}:
+            raise HTTPException(404)
+        media = "text/javascript" if extension == "js" else "text/css"
+        return Response(STATIC.joinpath("price-categories." + extension).read_bytes(), media_type=media,
+                        headers={"Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff"})
+
     @router.get("/price/api/v1/entry/suppliers")
     def suppliers(request: Request):
         enabled()
@@ -84,6 +99,40 @@ def install_entry_routes(router, admin, enabled, settings):
         admin(request, action=False)
         return JSONResponse(call(catalog_service().categories),
                             headers={"Cache-Control": "no-store"})
+
+    @router.post("/price/api/v1/entry/categories")
+    async def create_category(request: Request):
+        enabled()
+        admin(request, action=True)
+        raw = await request.body()
+        if len(raw) > 16 * 1024:
+            raise HTTPException(413)
+        try:
+            body = json.loads(raw)
+        except (ValueError, UnicodeError):
+            raise HTTPException(400, {"code": "invalid_json"}) from None
+        result = await run_in_threadpool(
+            call, catalog_service().create_category, body,
+            request.headers.get("idempotency-key", ""),
+        )
+        return JSONResponse(result)
+
+    @router.post("/price/api/v1/entry/categories/{category_id}")
+    async def update_category(request: Request, category_id: int):
+        enabled()
+        admin(request, action=True)
+        raw = await request.body()
+        if len(raw) > 16 * 1024:
+            raise HTTPException(413)
+        try:
+            body = json.loads(raw)
+        except (ValueError, UnicodeError):
+            raise HTTPException(400, {"code": "invalid_json"}) from None
+        result = await run_in_threadpool(
+            call, catalog_service().update_category, category_id, body,
+            request.headers.get("idempotency-key", ""),
+        )
+        return JSONResponse(result)
 
     @router.get("/price/api/v1/entry/models")
     def models(request: Request):

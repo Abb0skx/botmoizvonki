@@ -99,11 +99,11 @@ def reconcile_catalog(connection, server_data):
         category_id, name = category["category_id"], category["name"]
         by_id = cursor.execute("SELECT name FROM categories WHERE id=?", (category_id,)).fetchone()
         by_name = cursor.execute("SELECT id FROM categories WHERE name=? COLLATE NOCASE", (name,)).fetchone()
-        if by_id and str(by_id[0]) != name:
-            raise RuntimeError("Server catalogue: category ID conflict")
         if by_name and int(by_name[0]) != category_id:
             raise RuntimeError("Server catalogue: category name conflict")
-        if not by_id:
+        if by_id and str(by_id[0]) != name:
+            cursor.execute("UPDATE categories SET name=? WHERE id=?", (name, category_id))
+        elif not by_id:
             cursor.execute("INSERT INTO categories(id,name) VALUES (?,?)", (category_id, name))
 
     desired_by_id = {

@@ -94,6 +94,52 @@ class EntryCatalogTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "duplicate_catalog_variant")
         self.assertEqual(len(SQLitePriceSource(self.path).read(1)["rows"]), before)
 
+    def test_category_page_create_and_rename_preserve_ids_and_prices(self):
+        created = self.service.create_category(
+            {"name": "Wearables"}, str(uuid.uuid4()))
+        self.assertEqual(created["category"]["category_id"], 21)
+        self.assertEqual(created["category"]["model_count"], 0)
+        self.assertEqual(created["category"]["variant_count"], 0)
+
+        before = SQLitePriceSource(self.path).read(1)["rows"][0]
+        category = next(item for item in self.service.categories()["categories"]
+                        if item["category_id"] == 10)
+        operation = str(uuid.uuid4())
+        result = self.service.update_category(10, {
+            "name": "Phones and Smartphones",
+            "expected_revision": category["revision"],
+        }, operation)
+        self.assertEqual(result["updated_variant_count"], 1)
+        self.assertEqual(result["category"]["model_count"], 1)
+        self.assertEqual(self.service.update_category(10, {
+            "name": "Phones and Smartphones",
+            "expected_revision": category["revision"],
+        }, operation), result)
+        after = SQLitePriceSource(self.path).read(1)["rows"][0]
+        self.assertEqual(after["product_id"], before["product_id"])
+        self.assertEqual(after["version_id_1"], before["version_id_1"])
+        self.assertEqual(after["version_id_12"], before["version_id_12"])
+        self.assertEqual(after["price_1"], before["price_1"])
+        self.assertEqual(after["price_12"], before["price_12"])
+        self.assertEqual(after["category_name"], "Phones and Smartphones")
+
+    def test_category_rename_rejects_duplicate_and_stale_revision(self):
+        category = next(item for item in self.service.categories()["categories"]
+                        if item["category_id"] == 10)
+        with self.assertRaises(EntryError) as caught:
+            self.service.update_category(10, {
+                "name": "Tablets", "expected_revision": category["revision"],
+            }, str(uuid.uuid4()))
+        self.assertEqual(caught.exception.code, "catalog_category_exists")
+        self.service.update_category(10, {
+            "name": "Smartphones", "expected_revision": category["revision"],
+        }, str(uuid.uuid4()))
+        with self.assertRaises(EntryError) as caught:
+            self.service.update_category(10, {
+                "name": "Phones Again", "expected_revision": category["revision"],
+            }, str(uuid.uuid4()))
+        self.assertEqual(caught.exception.code, "catalog_category_changed")
+
     def test_existing_variant_and_idempotency_conflict_are_safe(self):
         operation = str(uuid.uuid4())
         self.service.create(self.request(variants=[{"memory": "", "color": ""}]), operation)
@@ -306,6 +352,20 @@ class EntryCatalogTests(unittest.TestCase):
             "SELECT model_name,category_id,memory,color FROM products WHERE id=1"
         ).fetchone(), ("Server Name", 20, "512 GB", "Green"))
 
+    def test_worker_reconcile_applies_server_authoritative_category_rename(self):
+        worker = self.worker_db()
+        category = next(item for item in self.service.categories()["categories"]
+                        if item["category_id"] == 10)
+        self.service.update_category(10, {
+            "name": "Smartphones", "expected_revision": category["revision"],
+        }, str(uuid.uuid4()))
+        data = decode(SQLitePriceSource(self.path).export())
+        self.assertEqual(reconcile_catalog(worker, data), 0)
+        self.assertEqual(worker.execute(
+            "SELECT name FROM categories WHERE id=10").fetchone(), ("Smartphones",))
+        self.assertEqual(worker.execute(
+            "SELECT category_id FROM products WHERE id=1").fetchone(), (10,))
+
     def test_worker_reconcile_allows_atomic_variant_swap(self):
         self.service.create(self.request(model_name="Swap Phone"), str(uuid.uuid4()))
         worker = self.worker_db()
@@ -347,6 +407,17 @@ class EntryCatalogRouteTests(unittest.TestCase):
         with patch("price_server.entry_routes.EntryCatalogService") as service:
             service.return_value.categories.return_value = {"categories": []}
             self.assertEqual(self.client.get("/price/api/v1/entry/categories").status_code, 200)
+            service.return_value.create_category.return_value = {"status": "created"}
+            self.assertEqual(self.client.post(
+                "/price/api/v1/entry/categories", json={"name": "Wearables"}, headers={
+                    "Idempotency-Key": "123e4567-e89b-42d3-a456-426614174000"
+                }).status_code, 200)
+            service.return_value.update_category.return_value = {"status": "updated"}
+            self.assertEqual(self.client.post(
+                "/price/api/v1/entry/categories/10",
+                json={"name": "Phones", "expected_revision": "a" * 64}, headers={
+                    "Idempotency-Key": "123e4567-e89b-42d3-a456-426614174000"
+                }).status_code, 200)
             service.return_value.create.return_value = {"status": "created"}
             response = self.client.post("/price/api/v1/entry/products", json={}, headers={
                 "Idempotency-Key": "123e4567-e89b-42d3-a456-426614174000"})

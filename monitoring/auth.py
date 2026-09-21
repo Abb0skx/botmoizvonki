@@ -64,6 +64,7 @@ def _safe_next(value: str | None) -> str:
     allowed_pages = {
         "/price/entry",
         "/price/models",
+        "/price/categories",
         "/monitoring",
         "/monitoring/calls",
         "/monitoring/site",

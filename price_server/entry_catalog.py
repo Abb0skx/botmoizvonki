@@ -84,6 +84,10 @@ def _model_revision(products: list[dict]) -> str:
     ])
 
 
+def _category_revision(category_id: int, name: str) -> str:
+    return _digest({"category_id": category_id, "name": name})
+
+
 def _operation(db: sqlite3.Connection, operation_id: str, request_hash: str):
     try:
         uuid.UUID(operation_id)
@@ -207,10 +211,165 @@ class EntryCatalogService:
             state = db.execute("SELECT * FROM entry_catalog_state WHERE id=1").fetchone()
             if not state:
                 raise EntryError("catalog_management_not_initialized", 503)
-            categories = [dict(r) for r in db.execute(
-                "SELECT category_id,name FROM entry_categories ORDER BY name COLLATE NOCASE,category_id")]
+            model_names: dict[int, set[str]] = {}
+            variant_counts: dict[int, int] = {}
+            for _, metadata in _metadata_rows(db):
+                category_id = int(metadata["category_id"])
+                model_names.setdefault(category_id, set()).add(
+                    str(metadata["model_name"]).casefold()
+                )
+                variant_counts[category_id] = variant_counts.get(category_id, 0) + 1
+            categories = []
+            for row in db.execute(
+                    "SELECT category_id,name FROM entry_categories "
+                    "ORDER BY name COLLATE NOCASE,category_id"):
+                category_id = int(row["category_id"])
+                name = str(row["name"])
+                categories.append({
+                    "category_id": category_id,
+                    "name": name,
+                    "model_count": len(model_names.get(category_id, set())),
+                    "variant_count": variant_counts.get(category_id, 0),
+                    "revision": _category_revision(category_id, name),
+                })
             return {"categories": categories, "source": "sqlite",
                     "next_product_id": state["next_product_id"]}
+
+    def create_category(self, body: dict, operation_id: str) -> dict:
+        if not isinstance(body, dict) or set(body) != {"name"}:
+            raise EntryError("invalid_catalog_request")
+        name = _text(body["name"], maximum=200, required=True)
+        canonical = {"action": "create_category", "name": name}
+        request_hash = _digest(canonical)
+        with sqlite3.connect(self.db_path, timeout=30) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys=ON")
+            db.execute("BEGIN IMMEDIATE")
+            _tables(db)
+            previous = _operation(db, operation_id, request_hash)
+            if previous is not None:
+                return previous
+            state = db.execute("SELECT * FROM entry_catalog_state WHERE id=1").fetchone()
+            if not state:
+                raise EntryError("catalog_management_not_initialized", 503)
+            duplicate = db.execute(
+                "SELECT category_id FROM entry_categories WHERE name=? COLLATE NOCASE",
+                (name,),
+            ).fetchone()
+            if duplicate:
+                raise EntryError("catalog_category_exists", 409,
+                                 category_id=int(duplicate["category_id"]))
+            category_id = int(state["next_category_id"])
+            db.execute("INSERT INTO entry_categories(category_id,name) VALUES (?,?)",
+                       (category_id, name))
+            db.execute(
+                "UPDATE entry_catalog_state SET next_category_id=? WHERE id=1",
+                (category_id + 1,),
+            )
+            db.execute(
+                "UPDATE entry_input_state SET revision=revision+1,updated_at=? WHERE id=1",
+                (now(),),
+            )
+            result = {
+                "status": "created",
+                "category": {
+                    "category_id": category_id,
+                    "name": name,
+                    "model_count": 0,
+                    "variant_count": 0,
+                    "revision": _category_revision(category_id, name),
+                },
+                "import": "next_scheduled_import",
+            }
+            _store_operation(db, operation_id, request_hash, canonical, result)
+            if db.execute("PRAGMA foreign_key_check").fetchone():
+                raise EntryError("catalog_category_integrity_failed")
+            return result
+
+    def update_category(self, category_id: int, body: dict,
+                        operation_id: str) -> dict:
+        category_id = _positive(category_id)
+        if not isinstance(body, dict) or set(body) != {"name", "expected_revision"}:
+            raise EntryError("invalid_catalog_request")
+        name = _text(body["name"], maximum=200, required=True)
+        expected_revision = body["expected_revision"]
+        if not isinstance(expected_revision, str) or not re.fullmatch(
+                r"[0-9a-f]{64}", expected_revision):
+            raise EntryError("invalid_catalog_revision")
+        canonical = {
+            "action": "update_category",
+            "category_id": category_id,
+            "name": name,
+            "expected_revision": expected_revision,
+        }
+        request_hash = _digest(canonical)
+        with sqlite3.connect(self.db_path, timeout=30) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys=ON")
+            db.execute("BEGIN IMMEDIATE")
+            _tables(db)
+            previous = _operation(db, operation_id, request_hash)
+            if previous is not None:
+                return previous
+            state = db.execute("SELECT 1 FROM entry_catalog_state WHERE id=1").fetchone()
+            if not state:
+                raise EntryError("catalog_management_not_initialized", 503)
+            category = db.execute(
+                "SELECT name FROM entry_categories WHERE category_id=?", (category_id,)
+            ).fetchone()
+            if not category:
+                raise EntryError("catalog_category_not_found", 404)
+            old_name = str(category["name"])
+            if not secrets.compare_digest(
+                    _category_revision(category_id, old_name), expected_revision):
+                raise EntryError("catalog_category_changed", 409)
+            duplicate = db.execute(
+                "SELECT category_id FROM entry_categories "
+                "WHERE name=? COLLATE NOCASE AND category_id<>?",
+                (name, category_id),
+            ).fetchone()
+            if duplicate:
+                raise EntryError("catalog_category_exists", 409,
+                                 category_id=int(duplicate["category_id"]))
+
+            category_products = [
+                (row, metadata) for row, metadata in _metadata_rows(db)
+                if int(metadata["category_id"]) == category_id
+            ]
+            updated_count = 0
+            if name != old_name:
+                db.execute("UPDATE entry_categories SET name=? WHERE category_id=?",
+                           (name, category_id))
+                for row, metadata in category_products:
+                    metadata["category_name"] = name
+                    db.execute(
+                        "UPDATE entry_products SET metadata_json=? WHERE product_key=?",
+                        (json.dumps(metadata, ensure_ascii=False), row["product_key"]),
+                    )
+                    updated_count += 1
+                db.execute(
+                    "UPDATE entry_input_state SET revision=revision+1,updated_at=? WHERE id=1",
+                    (now(),),
+                )
+            result = {
+                "status": "updated",
+                "category": {
+                    "category_id": category_id,
+                    "name": name,
+                    "model_count": len({
+                        str(metadata["model_name"]).casefold()
+                        for _, metadata in category_products
+                    }),
+                    "variant_count": len(category_products),
+                    "revision": _category_revision(category_id, name),
+                },
+                "updated_variant_count": updated_count,
+                "import": "next_scheduled_import",
+            }
+            _store_operation(db, operation_id, request_hash, canonical, result)
+            if db.execute("PRAGMA foreign_key_check").fetchone():
+                raise EntryError("catalog_category_integrity_failed")
+            return result
 
     def models(self) -> dict:
         with sqlite3.connect(self.db_path, timeout=10) as db:
