@@ -59,6 +59,7 @@ _PRICE_ADMIN_POST_PATHS = (
     re.compile(r"posts/update-all"),
     re.compile(r"entry/save/[0-9]{1,12}"),
     re.compile(r"entry/products"),
+    re.compile(r"entry/model-import/(?:preview|apply)"),
     re.compile(r"entry/models/[1-9][0-9]{0,18}"),
     re.compile(r"entry/model-inbox/[1-9][0-9]{0,18}/(?:applied|dismissed)"),
 )

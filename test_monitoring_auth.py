@@ -768,6 +768,18 @@ class MonitoringRouteTests(unittest.TestCase):
                 "X-CSRF-Token": csrf, "Origin": "https://bot.texnikach.uz",
                 "Idempotency-Key": "123e4567-e89b-42d3-a456-426614174000"}).status_code, 200)
             self.assertEqual(upstream.await_args.args, ("POST", "/price/api/v1/entry/models/1"))
+            preview_url = "/monitoring/api/prices/admin/entry/model-import/preview"
+            self.assertEqual(self.client.post(preview_url, json={}, headers={
+                "X-CSRF-Token": csrf, "Origin": "https://bot.texnikach.uz",
+                "Idempotency-Key": "123e4567-e89b-42d3-a456-426614174000"}).status_code, 200)
+            self.assertEqual(upstream.await_args.args,
+                             ("POST", "/price/api/v1/entry/model-import/preview"))
+            apply_url = "/monitoring/api/prices/admin/entry/model-import/apply"
+            self.assertEqual(self.client.post(apply_url, json={}, headers={
+                "X-CSRF-Token": csrf, "Origin": "https://bot.texnikach.uz",
+                "Idempotency-Key": "123e4567-e89b-42d3-a456-426614174000"}).status_code, 200)
+            self.assertEqual(upstream.await_args.args,
+                             ("POST", "/price/api/v1/entry/model-import/apply"))
             inbox_url = "/monitoring/api/prices/admin/entry/model-inbox/1/dismissed"
             self.assertEqual(self.client.post(inbox_url, json={}, headers={
                 "X-CSRF-Token": csrf, "Origin": "https://bot.texnikach.uz",
