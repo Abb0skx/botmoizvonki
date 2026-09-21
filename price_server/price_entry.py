@@ -165,10 +165,23 @@ class SheetsPriceSource:
 class PriceEntryService:
     def __init__(self, db_path: Path, source=None):
         self.db_path = Path(db_path)
-        self.source = source or SheetsPriceSource()
+        self._transaction = None
+        if source is None:
+            mode = os.getenv("PRICE_ENTRY_SOURCE", "google_sheets")
+            if mode == "sqlite":
+                from .entry_store import SQLitePriceSource
+                source = SQLitePriceSource(self.db_path)
+            elif mode == "google_sheets":
+                source = SheetsPriceSource()
+            else:
+                raise EntryError("invalid_price_source", 503)
+        self.source = source
 
     @contextmanager
     def database(self):
+        if self._transaction is not None:
+            yield self._transaction
+            return
         connection = sqlite3.connect(self.db_path, timeout=10)
         connection.row_factory = sqlite3.Row
         try:
@@ -183,6 +196,24 @@ class PriceEntryService:
             connection.commit()
         finally:
             connection.close()
+
+    @contextmanager
+    def atomic_local_save(self):
+        from .entry_store import SQLitePriceSource
+        if not isinstance(self.source, SQLitePriceSource):
+            yield
+            return
+        with self.database() as db:
+            db.execute("PRAGMA foreign_keys=ON")
+            db.execute("BEGIN IMMEDIATE")
+            self._transaction = self.source.connection = db
+            try:
+                yield
+            except BaseException:
+                db.rollback()
+                raise
+            finally:
+                self._transaction = self.source.connection = None
 
     @contextmanager
     def write_lock(self):
@@ -209,6 +240,8 @@ class PriceEntryService:
                        (status, now(), json.dumps(result, ensure_ascii=False), operation_id))
 
     def save(self, sheet_id: int, body: dict, operation_id: str) -> dict:
+        if os.getenv("PRICE_ENTRY_WRITES_PAUSED", "").lower() in {"1", "true", "yes"}:
+            raise EntryError("price_entry_maintenance", 503)
         try:
             uuid.UUID(operation_id)
         except (ValueError, TypeError, AttributeError):
@@ -219,7 +252,7 @@ class PriceEntryService:
         if not isinstance(edits, list) or not 1 <= len(edits) <= MAX_CHANGES:
             raise EntryError("invalid_change_count")
         request_hash = hashlib.sha256(json.dumps([sheet_id, body], sort_keys=True).encode()).hexdigest()
-        with self.write_lock():
+        with self.write_lock(), self.atomic_local_save():
             with self.database() as db:
                 existing = db.execute("SELECT * FROM price_entry_operations WHERE operation_id=?", (operation_id,)).fetchone()
             if existing:

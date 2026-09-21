@@ -7,14 +7,16 @@
   const shownPrice = value => value === null || value === "" ? "нет" : number(value);
   const fields = {price_1: "1 месяц", price_12: "12 месяцев"};
   const errors = {
-    price_entry_unavailable: "Не удалось связаться с таблицей. Цены не загружены. Попробуйте ещё раз позже.",
+    price_entry_unavailable: "Не удалось загрузить цены. Попробуйте ещё раз позже.",
+    local_prices_not_initialized: "Серверный каталог ещё не подготовлен. Цены не изменены.",
+    price_entry_maintenance: "Перенос цен на сервер. Сохранение временно приостановлено — не закрывайте черновик.",
     supplier_schema_changed: "Структура листа изменилась. Редактирование остановлено: нужно проверить заголовки в таблице.",
     duplicate_product_identity: "В таблице есть повторяющиеся ID товаров. Редактирование остановлено до исправления.",
-    prices_changed: "Цены или данные товаров изменились в Google Sheets после загрузки страницы. Ничего не записано. Сверьте правки и обновите данные.",
+    prices_changed: "Цены или данные товаров изменились после загрузки страницы. Ничего не записано. Сверьте правки и обновите данные.",
     cell_read_only: "Одна из ячеек теперь защищена или содержит формулу. Ничего не записано.",
     save_in_progress: "Другое сохранение ещё выполняется. Подождите и попробуйте снова.",
     invalid_price: "Цена должна быть целым числом от 0 до 100 000. Пустая ячейка означает отсутствие предложения.",
-    save_outcome_unknown: "Не удалось подтвердить результат сохранения. Не отправляйте правки повторно. Откройте Google Sheets, проверьте цены и затем обновите данные. Операция сохранена в истории.",
+    save_outcome_unknown: "Не удалось подтвердить результат сохранения. Не отправляйте правки повторно. Проверьте историю сохранений и обновите данные перед новой попыткой.",
     supplier_not_found: "Лист поставщика не найден. Обновите страницу.",
     invalid_change_count: "За один раз можно сохранить от 1 до 200 цен.",
   };
@@ -164,7 +166,8 @@
       $("total-count").textContent = number(data.rows.length);
       $("priced-count").textContent = number(data.rows.filter(r => Number(r.price_1) > 0 || Number(r.price_12) > 0).length);
       $("fetched-time").textContent = new Date(data.fetched_at).toLocaleTimeString("ru-RU", {hour: "2-digit", minute: "2-digit"});
-      $("sheet-link").href = data.spreadsheet_url; $("sheet-link").hidden = false;
+      $("sheet-link").hidden = !data.spreadsheet_url;
+      if (data.spreadsheet_url) $("sheet-link").href = data.spreadsheet_url;
       const previousCategory = $("category").value;
       $("category").replaceChildren(new Option("Все категории", ""), ...[...new Set(data.rows.map(r => r.category_name))].filter(Boolean).sort().map(c => new Option(c, c)));
       if ([...$("category").options].some(o => o.value === previousCategory)) $("category").value = previousCategory;
@@ -173,7 +176,7 @@
       notice(error.message, true);
     } finally { state.busy = false; $("workspace").classList.remove("loading"); filter(); }
   }
-  function mayDiscard() { return !state.edits.size || window.confirm("На странице есть несохранённые правки. Отменить их и загрузить цены из таблицы?"); }
+  function mayDiscard() { return !state.edits.size || window.confirm("На странице есть несохранённые правки. Отменить их и загрузить актуальные цены?"); }
   function modal(title, content, buttons = []) {
     $("dialog-title").textContent = title;
     $("dialog-body").replaceChildren(...content);
@@ -195,13 +198,13 @@
     const edits = [...state.edits.values()];
     if (!edits.length || edits.length > 200 || edits.some(e => !validPrice(e.raw))) return;
     const operation = crypto.randomUUID();
-    const save = button("Сохранить в общую таблицу", async () => {
+    const save = button("Сохранить цены", async () => {
       save.disabled = true; state.busy = true; updateSavebar(); $("dialog").close(); renderRows();
       try {
         const result = await api("save/" + state.sheet, {changes: edits.map(e => ({key: e.key, field: e.field, revision: e.revision, value: value(e.raw)}))}, operation);
         state.edits.clear(); state.busy = false;
         await load(state.sheet);
-        notice(`Сохранено цен: ${result.changed}. Google Sheets обновлена. Прайс подхватит изменения при очередном плановом импорте.`);
+        notice(`Сохранено цен: ${result.changed}. ${state.source === "sqlite" ? "Цены записаны на сервере, Google Price не используется." : "Google Sheets обновлена."} Прайс подхватит изменения при очередном плановом импорте.`);
       } catch (error) {
         // A proxy timeout/network loss may follow a successful Sheets write.
         if (!error.status || error.status >= 500 || error.code === "save_outcome_unknown") {
@@ -237,7 +240,7 @@
         op.changes.forEach(c => detail.append(node("div", `${c.model} · ${c.memory} · ${c.color} · ${fields[c.field]}: ${shownPrice(c.before)} → ${shownPrice(c.after)}`)));
         return detail;
       });
-      modal("История сохранений сайта", [node("p", "Последние 100 операций. Изменения, сделанные напрямую в Google Sheets, смотрите в истории самой таблицы."), ...(content.length ? content : [node("p", "Сохранений с сайта пока нет.")])], [button("Закрыть", () => $("dialog").close())]);
+      modal("История сохранений сайта", [node("p", "Последние 100 операций: поставщик, прежняя и новая цена, время сохранения."), ...(content.length ? content : [node("p", "Сохранений с сайта пока нет.")])], [button("Закрыть", () => $("dialog").close())]);
     } catch (error) { notice(error.message, true); }
   });
   $("close-dialog").addEventListener("click", () => $("dialog").close());
@@ -252,10 +255,14 @@
   window.addEventListener("beforeunload", e => { if (state.edits.size || state.busy) { e.preventDefault(); e.returnValue = ""; } });
   document.addEventListener("keydown", e => { if (e.key === "/" && !["INPUT", "SELECT", "TEXTAREA"].includes(document.activeElement.tagName)) { e.preventDefault(); $("search").focus(); } });
   async function init() {
-    notice("Подключаемся к общей таблице цен…");
+    notice("Загружаем цены…");
     try {
       const data = await api("suppliers"); state.suppliers = data.suppliers;
-      if (!data.suppliers.length) throw new Error("В таблице не найдены листы поставщиков.");
+      state.source = data.source;
+      $("source-mode").textContent = data.source === "sqlite" ? "Самостоятельный режим" : "Переходный режим";
+      $("source-title").textContent = data.source === "sqlite" ? "Цены на сервере" : "Сайт + Google Sheets";
+      $("source-note").textContent = data.source === "sqlite" ? "Google Price больше не нужен. Цены и история сохраняются в базе с резервным копированием." : "Два интерфейса. Один источник цен. Таблица продолжает работать.";
+      if (!data.suppliers.length) throw new Error("Поставщики не найдены.");
       $("supplier").replaceChildren(...data.suppliers.map(s => new Option(s.name, s.sheet_id)));
       $("workspace").hidden = false;
       await load(data.suppliers[0].sheet_id);

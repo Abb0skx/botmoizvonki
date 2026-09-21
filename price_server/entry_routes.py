@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import secrets
 from pathlib import Path
 
 from fastapi import HTTPException, Request
@@ -50,7 +52,20 @@ def install_entry_routes(router, admin, enabled, settings):
     def suppliers(request: Request):
         enabled()
         admin(request, action=False)
-        return {"suppliers": call(service().source.suppliers)}
+        return {"suppliers": call(service().source.suppliers),
+                "source": os.getenv("PRICE_ENTRY_SOURCE", "google_sheets")}
+
+    @router.get("/price/api/v1/entry/export")
+    def export(request: Request):
+        enabled()
+        key = getattr(settings, "sync_api_key", "")
+        if not key or not secrets.compare_digest(request.headers.get("X-Price-Sync-Key", ""), key):
+            raise HTTPException(401)
+        from .entry_store import SQLitePriceSource
+        if os.getenv("PRICE_ENTRY_SOURCE", "google_sheets") != "sqlite":
+            raise HTTPException(409, {"code": "local_price_source_disabled"})
+        return JSONResponse(call(SQLitePriceSource(settings.db_path).export),
+                            headers={"Cache-Control": "no-store"})
 
     @router.get("/price/api/v1/entry/catalog/{sheet_id}")
     def catalog(request: Request, sheet_id: int):
