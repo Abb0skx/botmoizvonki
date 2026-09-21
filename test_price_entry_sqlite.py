@@ -72,11 +72,54 @@ class SQLiteEntryTests(unittest.TestCase):
 
     def test_minimum_recalculates_and_empty_price_is_sparse(self):
         self.service.save(1, self.edit(80), str(uuid.uuid4()))
-        self.assertEqual(self.source.read(7)["rows"][0]["min_price"], 80)
+        minimum = self.source.read(7)["rows"][0]
+        self.assertEqual(minimum["min_price"], 80)
+        self.assertEqual(minimum["min_supplier_name"], "First")
+        self.assertEqual(minimum["min_supplier_id"], 1)
+        self.assertEqual(minimum["min_supplier_sheet_id"], 1)
+        self.assertEqual(minimum["min_price_field"], "price_1")
         self.service.save(1, self.edit(None), str(uuid.uuid4()))
-        self.assertEqual(self.source.read(1)["rows"][0]["min_price"], 95)
+        minimum = self.source.read(1)["rows"][0]
+        self.assertEqual(minimum["min_price"], 95)
+        self.assertEqual(minimum["min_supplier_name"], "Reference")
         with sqlite3.connect(self.path) as db:
             self.assertEqual(db.execute("SELECT count(*) FROM entry_prices WHERE sheet_id=1").fetchone()[0], 0)
+
+    def test_minimum_history_tracks_price_supplier_and_warranty(self):
+        operations = []
+
+        def save(sheet_id, field, value):
+            row = self.source.read(sheet_id)["rows"][0]
+            operation = str(uuid.uuid4()); operations.append(operation)
+            self.service.save(sheet_id, {"changes": [{
+                "key": row["key"], "field": field,
+                "revision": row["revision"], "value": value,
+            }]}, operation)
+
+        save(1, "price_1", 80)
+        save(1, "price_1", 120)
+        save(7, "price_12", 70)
+        history = self.service.cell_history(1, sample()["key"], "min_price")
+        self.assertEqual([entry["operation_id"] for entry in history["entries"]],
+                         list(reversed(operations)))
+        newest = history["entries"][0]
+        self.assertEqual((newest["before"], newest["before_supplier_name"], newest["before_field"]),
+                         (95, "Reference", "price_1"))
+        self.assertEqual((newest["after"], newest["after_supplier_name"], newest["after_field"]),
+                         (70, "Reference", "price_12"))
+        switched = history["entries"][1]
+        self.assertEqual((switched["before"], switched["before_supplier_name"]), (80, "First"))
+        self.assertEqual((switched["after"], switched["after_supplier_name"]), (95, "Reference"))
+        self.assertIsNone(history["next_before"])
+
+    def test_empty_minimum_history_before_first_save(self):
+        fresh = Path(self.folder.name) / "fresh.sqlite"
+        sqlite3.connect(fresh).close()
+        initialize(fresh, self.catalogs)
+        service = PriceEntryService(fresh, SQLitePriceSource(fresh))
+        history = service.cell_history(1, sample()["key"], "min_price")
+        self.assertEqual(history["entries"], [])
+        self.assertIsNone(history["next_before"])
 
     def test_failure_rolls_back_prices_and_journal_together(self):
         original = self.source.write

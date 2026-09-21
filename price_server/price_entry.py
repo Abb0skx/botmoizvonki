@@ -247,9 +247,19 @@ class PriceEntryService:
         if (type(sheet_id) is not int or not 0 <= sheet_id < 10**12
                 or not isinstance(product_key, str)
                 or not re.fullmatch(r"[1-9][0-9]{0,18}:[1-9][0-9]{0,18}:[1-9][0-9]{0,18}", product_key)
-                or field not in PRICE_COLUMNS
+                or field not in (*PRICE_COLUMNS, "min_price")
                 or type(before) is not int or not 0 <= before < 2**63):
             raise EntryError("invalid_history_cell")
+        if field == "min_price":
+            from .entry_store import SQLitePriceSource
+            if not isinstance(self.source, SQLitePriceSource):
+                raise EntryError("invalid_history_cell")
+            # Ensure the journal exists even before the first price save.
+            with self.database():
+                pass
+            result = self.source.minimum_history(product_key, before)
+            return {"sheet_id": sheet_id, "product_key": product_key,
+                    "field": field, **result}
         with self.database() as db:
             items = db.execute("""SELECT o.rowid AS sequence, o.operation_id,
                     o.created_at, o.status, c.value AS change_json

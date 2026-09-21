@@ -5,7 +5,10 @@
   const PAGE_SIZE = 50;
   const number = value => Number(value).toLocaleString("ru-RU");
   const shownPrice = value => value === null || value === "" ? "нет" : number(value);
-  const fields = {price_1: "1 месяц", price_12: "12 месяцев"};
+  const fields = {price_1: "1 месяц", price_12: "12 месяцев", min_price: "минимальная цена"};
+  const warranty = field => field === "price_1" ? "1 мес." : field === "price_12" ? "12 мес." : "";
+  const minimumText = (value, supplier, field) => value === null || value === "" || Number(value) <= 0
+    ? "нет" : `${number(value)} $ · ${supplier || "поставщик не указан"}${field ? ` · ${warranty(field)}` : ""}`;
   const errors = {
     price_entry_unavailable: "Не удалось загрузить цены. Попробуйте ещё раз позже.",
     local_prices_not_initialized: "Серверный каталог ещё не подготовлен. Цены не изменены.",
@@ -157,7 +160,17 @@
         history.addEventListener("click", () => showCellHistory(row, field));
         td.append(input, history); tr.append(td);
       });
-      tr.append(node("td", Number(row.min_price) > 0 ? number(row.min_price) : "—", "minimum"));
+      const minimum = node("td", undefined, "minimum");
+      if (Number(row.min_price) > 0) {
+        minimum.append(node("strong", number(row.min_price)),
+          node("small", `${row.min_supplier_name || "Поставщик не указан"}${row.min_price_field ? ` · ${warranty(row.min_price_field)}` : ""}`));
+      } else minimum.append(node("span", "—"));
+      const minimumHistory = node("button", "◷ История", "cell-history-button");
+      minimumHistory.type = "button";
+      minimumHistory.setAttribute("aria-label", `История минимальной цены: ${row.model_name} ${row.memory} ${row.color}`);
+      minimumHistory.title = "История изменения минимальной цены и поставщика";
+      minimumHistory.addEventListener("click", () => showCellHistory(row, "min_price"));
+      minimum.append(minimumHistory); tr.append(minimum);
       fragment.append(tr);
     });
     $("rows").replaceChildren(fragment);
@@ -248,10 +261,15 @@
   function showCellHistory(row, field) {
     const sheet = state.sheet;
     const supplier = state.suppliers.find(s => s.sheet_id === sheet)?.name || String(sheet);
-    const description = node("p", `${supplier} · ${row.model_name} · ${row.memory || "—"} · ${row.color || "—"} · ${fields[field]}`, "cell-history-description");
-    const scope = node("p", "Только сохранённые изменения с сайта. Правки напрямую в Google Price до перехода на сайт в этот журнал не входили.", "cell-history-note");
-    const saved = node("p", `Цена в загруженном каталоге: ${shownPrice(row[field])}${row[field] === null ? "" : " $"}.`, "cell-history-note");
-    if (state.edits.has(key(row, field))) saved.append(node("strong", " Несохранённый черновик в историю не входит."));
+    const isMinimum = field === "min_price";
+    const description = node("p", `${isMinimum ? "Все поставщики" : supplier} · ${row.model_name} · ${row.memory || "—"} · ${row.color || "—"} · ${fields[field]}`, "cell-history-description");
+    const scope = node("p", isMinimum
+      ? "Минимум пересчитывается по ценам 1 и 12 месяцев всех поставщиков. История построена по подтверждённым сохранениям на сайте."
+      : "Только сохранённые изменения с сайта. Правки напрямую в Google Price до перехода на сайт в этот журнал не входили.", "cell-history-note");
+    const saved = node("p", isMinimum
+      ? `Текущий минимум: ${minimumText(row.min_price, row.min_supplier_name, row.min_price_field)}.`
+      : `Цена в загруженном каталоге: ${shownPrice(row[field])}${row[field] === null ? "" : " $"}.`, "cell-history-note");
+    if (!isMinimum && state.edits.has(key(row, field))) saved.append(node("strong", " Несохранённый черновик в историю не входит."));
     const list = node("div", undefined, "cell-history-list");
     const status = node("p", "Загружаем историю…", "cell-history-note");
     status.setAttribute("role", "status");
@@ -275,11 +293,15 @@
           label.append(node("small", applied ? "Сохранено" : entry.status === "sending" ? "Результат пока не подтверждён" : "Сохранение не подтверждено — требуется проверка"));
           if (!applied) item.classList.add("history-unconfirmed");
           const values = node("div", undefined, "change-values");
-          values.append(node("del", shownPrice(entry.before)), node("span", " → "), node("strong", shownPrice(entry.after)));
+          if (isMinimum) {
+            values.append(node("del", minimumText(entry.before, entry.before_supplier_name, entry.before_field)),
+              node("span", " → "),
+              node("strong", minimumText(entry.after, entry.after_supplier_name, entry.after_field)));
+          } else values.append(node("del", shownPrice(entry.before)), node("span", " → "), node("strong", shownPrice(entry.after)));
           item.append(label, values); list.append(item);
         }
         total += data.entries.length; cursor = data.next_before;
-        status.textContent = total ? `Показано записей: ${total}.${cursor === null ? " Это вся сохранённая история ячейки." : ""}` : "Эту цену на сайте ещё не меняли.";
+        status.textContent = total ? `Показано записей: ${total}.${cursor === null ? ` Это вся сохранённая история ${isMinimum ? "минимальной цены" : "ячейки"}.` : ""}` : isMinimum ? "Минимальная цена после сохранений на сайте ещё не менялась." : "Эту цену на сайте ещё не меняли.";
         more.textContent = "Показать ещё"; more.hidden = cursor === null;
       } catch (error) {
         if (!list.isConnected || !$("dialog").open) return;

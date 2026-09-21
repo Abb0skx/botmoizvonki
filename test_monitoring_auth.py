@@ -734,7 +734,8 @@ class MonitoringRouteTests(unittest.TestCase):
         paths = ["entry/suppliers", "entry/history", "entry/categories", "entry/models",
                  "entry/model-inbox", "entry/models/1", "entry/catalog/1027960070",
                  "entry/cell-history/1027960070/1:10:11/price_1/0",
-                 "entry/cell-history/1027960070/1:10:11/price_12/123"]
+                 "entry/cell-history/1027960070/1:10:11/price_12/123",
+                 "entry/cell-history/1027960070/1:10:11/min_price/0"]
         for path in paths:
             self.assertEqual(self.client.get("/monitoring/api/prices/admin/" + path).status_code, 401)
         csrf = self.login()
@@ -744,7 +745,7 @@ class MonitoringRouteTests(unittest.TestCase):
                 self.assertEqual(self.client.get("/monitoring/api/prices/admin/" + path).status_code, 200)
                 self.assertEqual(upstream.await_args.args, ("GET", "/price/api/v1/" + path))
             for path in ["entry/catalog/-1", "entry/catalog/abc", "entry/save/1",
-                         "entry/cell-history/1/1:10:11/min_price/0",
+                         "entry/cell-history/1/1:10:11/product_id/0",
                          "entry/cell-history/1/1:10:11/price_1/-1",
                          "entry/cell-history/1/bad/price_1/0",
                          "entry/cell-history/1/1:10:11/price_1/0/extra"]:

@@ -55,28 +55,118 @@ class SQLitePriceSource:
             self.ready(db)
             return [dict(r) for r in db.execute("SELECT * FROM entry_suppliers ORDER BY supplier_id")]
 
+    @staticmethod
+    def _minimum(offers, suppliers):
+        """Return the deterministic cheapest offer, including its supplier."""
+        candidates = []
+        for (sheet_id, field), value in offers.items():
+            if value is None or sheet_id not in suppliers:
+                continue
+            supplier = suppliers[sheet_id]
+            candidates.append((value, supplier["supplier_id"],
+                               0 if field == "price_1" else 1, sheet_id,
+                               field, supplier["name"]))
+        if not candidates:
+            return None
+        value, supplier_id, _, sheet_id, field, name = min(candidates)
+        return {"price": value, "supplier_id": supplier_id,
+                "supplier_sheet_id": sheet_id, "supplier_name": name,
+                "field": field}
+
+    def _minimums(self, db):
+        suppliers = {row["sheet_id"]: dict(row) for row in db.execute(
+            "SELECT sheet_id,supplier_id,name FROM entry_suppliers")}
+        offers = {}
+        for row in db.execute("SELECT sheet_id,product_key,price_1,price_12 FROM entry_prices"):
+            product = offers.setdefault(row["product_key"], {})
+            product[(row["sheet_id"], "price_1")] = row["price_1"]
+            product[(row["sheet_id"], "price_12")] = row["price_12"]
+        return {key: self._minimum(values, suppliers) for key, values in offers.items()}
+
     def read(self, sheet_id):
         with self.database() as db:
             self.ready(db)
             supplier = db.execute("SELECT * FROM entry_suppliers WHERE sheet_id=?", (sheet_id,)).fetchone()
             if not supplier:
                 raise EntryError("supplier_not_found", 404)
-            minima = dict(db.execute("""SELECT product_key, MIN(value) FROM (
-                SELECT product_key, price_1 AS value FROM entry_prices
-                UNION ALL SELECT product_key, price_12 FROM entry_prices
-            ) WHERE value IS NOT NULL GROUP BY product_key"""))
+            minima = self._minimums(db)
             rows = []
             for stored in db.execute("""SELECT p.*, v.price_1, v.price_12 FROM entry_products p
                 LEFT JOIN entry_prices v ON p.product_key=v.product_key AND v.sheet_id=?
                 ORDER BY p.position""", (sheet_id,)):
                 row = json.loads(stored["metadata_json"])
+                minimum = minima.get(stored["product_key"])
                 row.update(price_1=stored["price_1"], price_12=stored["price_12"],
-                           min_price=minima.get(stored["product_key"], 0),
+                           min_price=minimum["price"] if minimum else 0,
+                           min_supplier_name=minimum["supplier_name"] if minimum else None,
+                           min_supplier_id=minimum["supplier_id"] if minimum else None,
+                           min_supplier_sheet_id=minimum["supplier_sheet_id"] if minimum else None,
+                           min_price_field=minimum["field"] if minimum else None,
                            key=stored["product_key"], row=stored["position"] + 2, locked=[])
                 row["revision"] = revision(row)
                 rows.append(row)
             return {"sheet_id": sheet_id, "title": supplier["title"], "rows": rows,
                     "source": "sqlite", "fetched_at": now(), "spreadsheet_url": None}
+
+    def minimum_history(self, product_key, before=0):
+        """Reconstruct minimum changes from the normalized price journal.
+
+        The current price table is the latest state. Walking confirmed journal
+        operations backwards yields the state on both sides of every save, so
+        minimum history needs no second audit table or duplicated price data.
+        """
+        with self.database() as db:
+            self.ready(db)
+            suppliers = {row["sheet_id"]: dict(row) for row in db.execute(
+                "SELECT sheet_id,supplier_id,name FROM entry_suppliers")}
+            offers = {}
+            for row in db.execute(
+                    "SELECT sheet_id,price_1,price_12 FROM entry_prices WHERE product_key=?",
+                    (product_key,)):
+                offers[(row["sheet_id"], "price_1")] = row["price_1"]
+                offers[(row["sheet_id"], "price_12")] = row["price_12"]
+            operations = db.execute("""SELECT o.rowid AS sequence, o.operation_id,
+                    o.sheet_id, o.created_at, o.status, o.changes_json
+                FROM price_entry_operations o
+                WHERE o.status='applied' AND EXISTS (
+                    SELECT 1 FROM json_each(o.changes_json) c
+                    WHERE json_extract(c.value, '$.key')=?
+                      AND json_extract(c.value, '$.field') IN ('price_1','price_12'))
+                ORDER BY o.rowid DESC""", (product_key,)).fetchall()
+
+        events = []
+        for operation in operations:
+            after = self._minimum(offers, suppliers)
+            for change in json.loads(operation["changes_json"]):
+                if change.get("key") != product_key or change.get("field") not in PRICE_COLUMNS:
+                    continue
+                key = (operation["sheet_id"], change["field"])
+                if change.get("before") is None:
+                    offers.pop(key, None)
+                else:
+                    offers[key] = change["before"]
+            previous = self._minimum(offers, suppliers)
+            if previous == after or operation["sequence"] >= (before or 2**63 - 1):
+                continue
+            events.append({
+                "sequence": operation["sequence"],
+                "operation_id": operation["operation_id"],
+                "created_at": operation["created_at"],
+                "status": operation["status"],
+                "before": previous["price"] if previous else None,
+                "after": after["price"] if after else None,
+                "before_supplier_name": previous["supplier_name"] if previous else None,
+                "after_supplier_name": after["supplier_name"] if after else None,
+                "before_supplier_id": previous["supplier_id"] if previous else None,
+                "after_supplier_id": after["supplier_id"] if after else None,
+                "before_field": previous["field"] if previous else None,
+                "after_field": after["field"] if after else None,
+            })
+        page = events[:51]
+        entries = [{k: v for k, v in event.items() if k != "sequence"}
+                   for event in page[:50]]
+        return {"entries": entries,
+                "next_before": page[49]["sequence"] if len(page) > 50 else None}
 
     def write(self, sheet_id, changes):
         # Caller owns the transaction containing validation AND the audit log.
