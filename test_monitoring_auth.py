@@ -730,6 +730,28 @@ class MonitoringRouteTests(unittest.TestCase):
             redirect.headers["location"], "/monitoring/prices/manage"
         )
 
+    def test_price_entry_proxy_is_authenticated_and_csrf_protected(self):
+        paths = ["entry/suppliers", "entry/history", "entry/catalog/1027960070"]
+        for path in paths:
+            self.assertEqual(self.client.get("/monitoring/api/prices/admin/" + path).status_code, 401)
+        csrf = self.login()
+        upstream = AsyncMock(return_value=(200, b'{"rows":[]}', "application/json"))
+        with patch.object(monitoring_router.prices_adapter.PriceAdapter, "admin_request", new=upstream):
+            for path in paths:
+                self.assertEqual(self.client.get("/monitoring/api/prices/admin/" + path).status_code, 200)
+            for path in ["entry/catalog/-1", "entry/catalog/abc", "entry/save/1"]:
+                self.assertEqual(self.client.get("/monitoring/api/prices/admin/" + path).status_code, 404)
+            url = "/monitoring/api/prices/admin/entry/save/1027960070"
+            self.assertEqual(self.client.post(url, json={"changes": []}).status_code, 403)
+            self.assertEqual(self.client.post(url, json={"changes": []}, headers={
+                "X-CSRF-Token": csrf, "Origin": "https://evil.example"}).status_code, 403)
+            response = self.client.post(url, json={"changes": []}, headers={
+                "X-CSRF-Token": csrf, "Origin": "https://bot.texnikach.uz",
+                "Idempotency-Key": "123e4567-e89b-42d3-a456-426614174000"})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(upstream.await_args.args, ("POST", "/price/api/v1/entry/save/1027960070"))
+        self.assertEqual(_safe_next("/price/entry"), "/price/entry")
+
     def test_price_admin_proxy_restores_manager_actions_with_csrf(self):
         self.assertEqual(self.client.get(
             "/monitoring/api/prices/admin/sections"

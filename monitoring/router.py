@@ -42,7 +42,7 @@ TEMPLATES = ROOT / "templates"
 STATIC = ROOT / "static"
 DELIVERY_TEMPLATES = ROOT.parent / "app" / "templates"
 
-_PRICE_ADMIN_GET_PATHS = frozenset({"jobs", "sections"})
+_PRICE_ADMIN_GET_PATHS = frozenset({"jobs", "sections", "entry/suppliers", "entry/history"})
 _PRICE_ADMIN_POST_PATHS = (
     re.compile(
         r"sections/[a-z0-9][a-z0-9-]{0,127}/"
@@ -54,6 +54,7 @@ _PRICE_ADMIN_POST_PATHS = (
         r"quick-link-rotations/[1-9][0-9]*/(?:reconcile|retry)"
     ),
     re.compile(r"posts/update-all"),
+    re.compile(r"entry/save/[0-9]{1,12}"),
 )
 
 router = APIRouter(tags=["manager-monitoring"])
@@ -184,7 +185,7 @@ def _price_manage_html(content: bytes) -> Response:
 
 
 def _price_admin_target(method: str, path: str) -> str:
-    allowed = path in _PRICE_ADMIN_GET_PATHS if method == "GET" else any(
+    allowed = (path in _PRICE_ADMIN_GET_PATHS or bool(re.fullmatch(r"entry/catalog/[0-9]{1,12}", path))) if method == "GET" else any(
         pattern.fullmatch(path) for pattern in _PRICE_ADMIN_POST_PATHS
     )
     if not allowed:

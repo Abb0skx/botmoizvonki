@@ -86,7 +86,7 @@ class PriceAdapter:
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(15.0, connect=2.0),
+            timeout=httpx.Timeout(45.0 if path.startswith("/price/api/v1/entry/") else 15.0, connect=2.0),
             follow_redirects=False,
         ) as client:
             response = await client.request(
@@ -95,7 +95,8 @@ class PriceAdapter:
                 headers=headers,
                 content=body if method == "POST" else None,
             )
-        if len(response.content) > 4 * 1024 * 1024:
+        response_limit = 16 if path.startswith("/price/api/v1/entry/") else 4
+        if len(response.content) > response_limit * 1024 * 1024:
             raise RuntimeError("price_source_response_too_large")
         return (
             response.status_code,
