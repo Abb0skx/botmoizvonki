@@ -11,6 +11,7 @@ import uuid
 from pathlib import Path
 
 from .price_entry import EntryError, identity, now
+from .model_import import prepare_model_import
 
 MAX_VARIANTS = 500
 
@@ -278,6 +279,116 @@ class EntryCatalogService:
                     "version_id_12": int(item["version_id_12"]),
                 } for item in products],
             }
+
+    def preview_import(self, raw_text: str, category_id: int) -> dict:
+        preview = prepare_model_import(raw_text, category_id)
+        with sqlite3.connect(self.db_path, timeout=10) as db:
+            db.row_factory = sqlite3.Row
+            _tables(db)
+            category = db.execute(
+                "SELECT name FROM entry_categories WHERE category_id=?", (category_id,)
+            ).fetchone()
+            if not category:
+                raise EntryError("catalog_category_not_found", 404)
+            existing_names = {
+                (int(metadata.get("category_id", -1)),
+                 str(metadata.get("model_name", "")).casefold())
+                for _, metadata in _metadata_rows(db)
+            }
+            collisions = [item["model_name"] for item in preview["models"]
+                          if (category_id, item["model_name"].casefold()) in existing_names]
+            if collisions:
+                raise EntryError("catalog_model_exists", 409, model_names=collisions)
+        preview["category_name"] = str(category["name"])
+        return preview
+
+    def import_models(self, raw_text: str, category_id: int,
+                      preview_hash: str, operation_id: str) -> dict:
+        prepared = prepare_model_import(raw_text, category_id)
+        if not isinstance(preview_hash, str) or not secrets.compare_digest(
+                prepared["preview_hash"], preview_hash):
+            raise EntryError("catalog_preview_changed", 409)
+        canonical = {
+            "action": "bulk_import",
+            "category_id": category_id,
+            "models": prepared["models"],
+            "preview_hash": preview_hash,
+        }
+        request_hash = _digest(canonical)
+        with sqlite3.connect(self.db_path, timeout=30) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys=ON")
+            db.execute("BEGIN IMMEDIATE")
+            _tables(db)
+            previous = _operation(db, operation_id, request_hash)
+            if previous is not None:
+                return previous
+            state = db.execute("SELECT * FROM entry_catalog_state WHERE id=1").fetchone()
+            if not state:
+                raise EntryError("catalog_management_not_initialized", 503)
+            category = db.execute(
+                "SELECT name FROM entry_categories WHERE category_id=?", (category_id,)
+            ).fetchone()
+            if not category:
+                raise EntryError("catalog_category_not_found", 404)
+
+            rows = _metadata_rows(db)
+            existing_names = {
+                (int(metadata.get("category_id", -1)),
+                 str(metadata.get("model_name", "")).casefold())
+                for _, metadata in rows
+            }
+            collisions = [item["model_name"] for item in prepared["models"]
+                          if (category_id, item["model_name"].casefold()) in existing_names]
+            if collisions:
+                raise EntryError("catalog_model_exists", 409, model_names=collisions)
+
+            product_id = int(state["next_product_id"])
+            version_id = int(state["next_version_id"])
+            max_position = max((int(row["position"]) for row, _ in rows), default=-1)
+            created = []
+            for model in prepared["models"]:
+                for variant in model["variants"]:
+                    metadata = {
+                        "product_id": product_id,
+                        "model_name": model["model_name"],
+                        "color": variant["color"],
+                        "memory": variant["memory"],
+                        "version_id_1": version_id,
+                        "version_id_12": version_id + 1,
+                        "category_name": str(category["name"]),
+                        "category_id": category_id,
+                    }
+                    product_key = identity(metadata)
+                    db.execute(
+                        "INSERT INTO entry_products(product_key,position,metadata_json) VALUES (?,?,?)",
+                        (product_key, max_position + 1 + len(created),
+                         json.dumps(metadata, ensure_ascii=False)),
+                    )
+                    created.append({**metadata, "key": product_key})
+                    product_id += 1
+                    version_id += 2
+            db.execute(
+                "UPDATE entry_catalog_state SET next_product_id=?,next_version_id=? WHERE id=1",
+                (product_id, version_id),
+            )
+            db.execute(
+                "UPDATE entry_input_state SET revision=revision+1,updated_at=? WHERE id=1",
+                (now(),),
+            )
+            result = {
+                "status": "created",
+                "created": created,
+                "created_count": len(created),
+                "model_count": len(prepared["models"]),
+                "category_id": category_id,
+                "category_name": str(category["name"]),
+                "import": "next_scheduled_import",
+            }
+            _store_operation(db, operation_id, request_hash, canonical, result)
+            if db.execute("PRAGMA foreign_key_check").fetchone():
+                raise EntryError("catalog_create_integrity_failed")
+            return result
 
     def create(self, body: dict, operation_id: str) -> dict:
         if not isinstance(body, dict) or set(body) != {

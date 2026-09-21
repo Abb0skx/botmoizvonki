@@ -6,8 +6,8 @@
   <meta name="robots" content="noindex,nofollow">
   <title>Модели · Texnikach</title>
   <link rel="stylesheet" href="/price/assets/price-entry.css?v=3">
-  <link rel="stylesheet" href="/price/assets/price-models.css?v=1">
-  <script src="/price/assets/price-models.js?v=1" defer></script>
+  <link rel="stylesheet" href="/price/assets/price-models.css?v=2">
+  <script src="/price/assets/price-models.js?v=2" defer></script>
 </head>
 <body>
 <aside class="sidebar">
@@ -26,12 +26,33 @@
   <section id="login-panel" class="empty-state" hidden><h2>Войдите в рабочий кабинет</h2><p>Каталог доступен только сотрудникам с правом управления прайсом.</p><a class="button primary" href="/monitoring/login?next=%2Fprice%2Fmodels">Войти</a></section>
   <div id="workspace" hidden>
     <section class="summary-grid model-summary"><div class="summary-card"><span>МОДЕЛЕЙ</span><strong id="model-count">—</strong><small>Сгруппировано по названию</small></div><div class="summary-card"><span>ВАРИАНТОВ</span><strong id="variant-count">—</strong><small>Память и цвет</small></div><div class="summary-card"><span>КАТЕГОРИЙ</span><strong id="category-count">—</strong><small>Доступно для выбора</small></div><div class="summary-card"><span>ИСТОЧНИК</span><strong>Сервер</strong><small>Google Price не используется</small></div></section>
-    <section class="telegram-panel" id="telegram-panel">
-      <div><div class="eyebrow">MODEL YEGISH → ЧЕРНОВИК</div><h2>Новые модели из Telegram</h2><p>Привычный список из группы не меняет каталог сам. Бот разбирает каждую модель в отдельный черновик, который нужно проверить.</p><pre class="telegram-example">0. 3
+    <section class="import-panel" id="import-panel">
+      <div class="import-intro"><div class="eyebrow">МАССОВОЕ ДОБАВЛЕНИЕ</div><h2>Подготовить новые модели</h2><p>Вставьте привычный список, выберите категорию по названию и сначала проверьте готовый результат. Каталог изменится только после второго подтверждения.</p><pre class="import-example">0. 26
 1. Samsung Galaxy A57 5G
 2. 8/128Gb, 8/256Gb
 3. Black, Gray, Blue</pre></div>
-      <div id="drafts" class="drafts"></div>
+      <div class="import-form">
+        <label class="field-label" for="import-category-search">Категория</label>
+        <div class="category-picker" id="import-category-picker">
+          <input id="import-category-search" type="search" placeholder="Начните вводить название категории…" autocomplete="off" aria-autocomplete="list" aria-expanded="false">
+          <div class="category-suggestions" id="import-category-suggestions" role="listbox" hidden></div>
+        </div>
+        <p class="selected-category" id="import-category-selected">Категория не выбрана</p>
+        <label class="field-label" for="import-text">Список моделей</label>
+        <textarea id="import-text" rows="12" placeholder="0. 26&#10;1. Apple Watch Series 12 Aluminum&#10;2. 42mm, 46mm&#10;3. Black, Dark Bronze, Light Gold, Space Gray"></textarea>
+        <button class="button primary" id="preview-import" type="button">Подготовить к проверке</button>
+      </div>
+      <div class="import-preview" id="import-preview" hidden>
+        <div class="preview-head"><div><div class="eyebrow">ПРЕДВАРИТЕЛЬНАЯ ПРОВЕРКА</div><h3 id="preview-title">Готово к добавлению</h3><p id="preview-summary"></p></div><button class="text-button" id="reset-import" type="button">Изменить данные</button></div>
+        <div id="preview-warning" class="preview-warning" hidden></div>
+        <div id="preview-models" class="preview-models"></div>
+        <div class="sorting-grid">
+          <label>Модели для сортировки<textarea id="sorting-models" readonly></textarea><button class="text-button copy-list" type="button" data-copy="sorting-models">Скопировать</button></label>
+          <label>Память / размеры<textarea id="sorting-memories" readonly></textarea><button class="text-button copy-list" type="button" data-copy="sorting-memories">Скопировать</button></label>
+          <label>Цвета<textarea id="sorting-colors" readonly></textarea><button class="text-button copy-list" type="button" data-copy="sorting-colors">Скопировать</button></label>
+        </div>
+        <div class="confirm-import"><p>Проверьте названия, размеры и цвета. После подтверждения всем вариантам будут выданы новые ID.</p><button class="button primary" id="apply-import" type="button">Добавить модели в каталог</button></div>
+      </div>
     </section>
     <section class="catalog-panel model-panel">
       <div class="toolbar"><label class="search"><span>⌕</span><input id="search" type="search" placeholder="Название модели или ID…" autocomplete="off" aria-label="Поиск моделей"><kbd>/</kbd></label><select id="category" aria-label="Категория"><option value="">Все категории</option></select></div>

@@ -14,6 +14,7 @@ from price_server.entry_catalog import EntryCatalogService, install_catalog
 from price_server.entry_routes import install_entry_routes
 from price_server.entry_store import SQLitePriceSource, initialize
 from price_server.model_inbox import ModelInbox, parse_model_draft, parse_model_drafts
+from price_server.model_import import prepare_model_import
 from price_server.price_entry import EntryError, revision
 from price_server.worker_input import decode, reconcile_catalog
 from test_price_entry import sample
@@ -175,6 +176,63 @@ class EntryCatalogTests(unittest.TestCase):
         }, str(uuid.uuid4()))
         self.assertEqual(result["updated_count"], 101)
 
+    def test_site_import_previews_selected_category_and_sorting_lists(self):
+        text = """0. 26
+1. Apple Watch Series 12 Aluminum
+2. 42mm, 46mm
+3. Black, Dark Bronze, Light Gold, Space Gray
+
+0. 26
+1. Apple Watch Series 12 Ceramic
+2. 42mm, 46mm
+3. Night Blue, Pearl White
+"""
+        preview = self.service.preview_import(text, 10)
+        self.assertEqual(preview["category_name"], "Phones")
+        self.assertEqual(preview["model_count"], 2)
+        self.assertEqual(preview["variant_count"], 16)
+        self.assertEqual(preview["source_category_ids"], [26])
+        self.assertEqual(preview["warnings"], ["source_category_ignored"])
+        self.assertEqual(preview["sorting"]["memories"], ["42mm", "46mm"])
+        self.assertIn("Space Gray", preview["sorting"]["colors"])
+
+    def test_site_import_is_atomic_and_idempotent(self):
+        text = """0. 26
+1. Watch One
+2. 42mm, 46mm
+3. Black, Silver
+1. Watch Two
+2. 49mm
+3. Natural
+"""
+        preview = self.service.preview_import(text, 10)
+        operation = str(uuid.uuid4())
+        result = self.service.import_models(
+            text, 10, preview["preview_hash"], operation)
+        self.assertEqual(result["model_count"], 2)
+        self.assertEqual(result["created_count"], 7)
+        self.assertEqual(self.service.import_models(
+            text, 10, preview["preview_hash"], operation), result)
+        self.assertIn("Watch One", [item["model_name"] for item in self.service.models()["models"]])
+
+    def test_site_import_rejects_changed_preview_and_existing_model_without_partial_write(self):
+        text = "0. 26\n1. New One\n2. 42mm\n3. Black"
+        preview = self.service.preview_import(text, 10)
+        with self.assertRaises(EntryError) as caught:
+            self.service.import_models(text + "\n", 10, "0" * 64, str(uuid.uuid4()))
+        self.assertEqual(caught.exception.code, "catalog_preview_changed")
+        self.service.create(self.request(model_name="Already Here",
+                                         variants=[{"memory": "", "color": ""}]),
+                            str(uuid.uuid4()))
+        before = self.service.models()["model_count"]
+        collision = "0. 10\n1. Fresh\n2. 1\n3. A\n1. Already Here\n2. 2\n3. B"
+        collision_preview = prepare_model_import(collision, 10)
+        with self.assertRaises(EntryError) as caught:
+            self.service.import_models(collision, 10, collision_preview["preview_hash"],
+                                       str(uuid.uuid4()))
+        self.assertEqual(caught.exception.code, "catalog_model_exists")
+        self.assertEqual(self.service.models()["model_count"], before)
+
     def test_install_rejects_unknown_category_and_high_water_regression(self):
         other = Path(self.folder.name) / "other.db"
         initialize(other, [{"sheet_id": 1, "title": "1-First", "rows": [sample()]}])
@@ -302,6 +360,16 @@ class EntryCatalogRouteTests(unittest.TestCase):
                 "/price/api/v1/entry/models/1", json={}, headers={
                     "Idempotency-Key": "123e4567-e89b-42d3-a456-426614174000"
                 }).status_code, 200)
+            service.return_value.preview_import.return_value = {"models": []}
+            self.assertEqual(self.client.post(
+                "/price/api/v1/entry/model-import/preview",
+                json={"category_id": 10, "text": "0. 10"}).status_code, 200)
+            service.return_value.import_models.return_value = {"status": "created"}
+            self.assertEqual(self.client.post(
+                "/price/api/v1/entry/model-import/apply",
+                json={"category_id": 10, "text": "0. 10", "preview_hash": "a" * 64},
+                headers={"Idempotency-Key": "123e4567-e89b-42d3-a456-426614174000"}
+            ).status_code, 200)
         self.assertEqual(self.client.post(
             "/price/api/v1/entry/products", content=b"x" * 65537).status_code, 413)
 

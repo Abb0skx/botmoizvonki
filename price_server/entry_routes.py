@@ -171,6 +171,44 @@ def install_entry_routes(router, admin, enabled, settings):
         )
         return JSONResponse(result)
 
+    @router.post("/price/api/v1/entry/model-import/preview")
+    async def preview_model_import(request: Request):
+        enabled()
+        admin(request, action=True)
+        raw = await request.body()
+        if len(raw) > 64 * 1024:
+            raise HTTPException(413)
+        try:
+            body = json.loads(raw)
+        except (ValueError, UnicodeError):
+            raise HTTPException(400, {"code": "invalid_json"}) from None
+        if not isinstance(body, dict) or set(body) != {"category_id", "text"}:
+            raise HTTPException(400, {"code": "invalid_catalog_request"})
+        result = await run_in_threadpool(
+            call, catalog_service().preview_import, body["text"], body["category_id"]
+        )
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @router.post("/price/api/v1/entry/model-import/apply")
+    async def apply_model_import(request: Request):
+        enabled()
+        admin(request, action=True)
+        raw = await request.body()
+        if len(raw) > 64 * 1024:
+            raise HTTPException(413)
+        try:
+            body = json.loads(raw)
+        except (ValueError, UnicodeError):
+            raise HTTPException(400, {"code": "invalid_json"}) from None
+        if not isinstance(body, dict) or set(body) != {
+                "category_id", "text", "preview_hash"}:
+            raise HTTPException(400, {"code": "invalid_catalog_request"})
+        result = await run_in_threadpool(
+            call, catalog_service().import_models, body["text"], body["category_id"],
+            body["preview_hash"], request.headers.get("idempotency-key", "")
+        )
+        return JSONResponse(result)
+
     @router.post("/price/api/v1/entry/models/{product_id}")
     async def update_model(request: Request, product_id: int):
         enabled()
