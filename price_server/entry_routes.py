@@ -79,6 +79,14 @@ def install_entry_routes(router, admin, enabled, settings):
         admin(request, action=False)
         return call(service().history)
 
+    @router.get("/price/api/v1/entry/cell-history/{sheet_id}/{product_key}/{field}/{before}")
+    def cell_history(request: Request, sheet_id: int, product_key: str, field: str, before: int):
+        enabled()
+        admin(request, action=False)
+        result = call(service().cell_history, sheet_id, product_key, field, before)
+        result["timezone"] = getattr(settings, "timezone", "Asia/Tashkent")
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
     @router.post("/price/api/v1/entry/save/{sheet_id}")
     async def save(request: Request, sheet_id: int):
         enabled()

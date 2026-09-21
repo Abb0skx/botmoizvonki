@@ -142,7 +142,12 @@
           pending.forEach(args => edit(...args)); renderRows();
           notice(`В черновик вставлено ячеек: ${pending.length}. Проверьте соответствие товарам перед сохранением.`);
         });
-        td.append(input); tr.append(td);
+        const history = node("button", "◷ История", "cell-history-button");
+        history.type = "button";
+        history.setAttribute("aria-label", `История цены: ${row.model_name} ${row.memory} ${row.color}, ${fields[field]}`);
+        history.title = "История сохранённых изменений этой цены";
+        history.addEventListener("click", () => showCellHistory(row, field));
+        td.append(input, history); tr.append(td);
       });
       tr.append(node("td", Number(row.min_price) > 0 ? number(row.min_price) : "—", "minimum"));
       fragment.append(tr);
@@ -185,6 +190,49 @@
   }
   function button(text, action, primary = false) {
     const b = node("button", text, "button " + (primary ? "primary" : "secondary")); b.addEventListener("click", action); return b;
+  }
+  function showCellHistory(row, field) {
+    const sheet = state.sheet;
+    const supplier = state.suppliers.find(s => s.sheet_id === sheet)?.name || String(sheet);
+    const description = node("p", `${supplier} · ${row.model_name} · ${row.memory || "—"} · ${row.color || "—"} · ${fields[field]}`, "cell-history-description");
+    const scope = node("p", "Только сохранённые изменения с сайта. Правки напрямую в Google Price до перехода на сайт в этот журнал не входили.", "cell-history-note");
+    const saved = node("p", `Цена в загруженном каталоге: ${shownPrice(row[field])}${row[field] === null ? "" : " $"}.`, "cell-history-note");
+    if (state.edits.has(key(row, field))) saved.append(node("strong", " Несохранённый черновик в историю не входит."));
+    const list = node("div", undefined, "cell-history-list");
+    const status = node("p", "Загружаем историю…", "cell-history-note");
+    status.setAttribute("role", "status");
+    const time = node("p", "", "cell-history-note");
+    let cursor = 0, total = 0;
+    const more = button("Показать ещё", loadPage);
+    more.hidden = true;
+    const close = button("Закрыть", () => $("dialog").close());
+    modal("История цены", [description, saved, scope, time, list, status], [more, close]);
+    async function loadPage() {
+      more.disabled = true; status.textContent = "Загружаем историю…";
+      try {
+        const data = await api(`cell-history/${sheet}/${encodeURIComponent(row.key)}/${field}/${cursor}`);
+        // The user may close this dialog and open a different cell while waiting.
+        if (!list.isConnected || !$("dialog").open) return;
+        time.textContent = "Часовой пояс: " + data.timezone;
+        for (const entry of data.entries) {
+          const item = node("div", undefined, "change-item cell-history-entry");
+          const label = node("div", new Date(entry.created_at).toLocaleString("ru-RU", {timeZone: data.timezone}));
+          const applied = entry.status === "applied";
+          label.append(node("small", applied ? "Сохранено" : entry.status === "sending" ? "Результат пока не подтверждён" : "Сохранение не подтверждено — требуется проверка"));
+          if (!applied) item.classList.add("history-unconfirmed");
+          const values = node("div", undefined, "change-values");
+          values.append(node("del", shownPrice(entry.before)), node("span", " → "), node("strong", shownPrice(entry.after)));
+          item.append(label, values); list.append(item);
+        }
+        total += data.entries.length; cursor = data.next_before;
+        status.textContent = total ? `Показано записей: ${total}.${cursor === null ? " Это вся сохранённая история ячейки." : ""}` : "Эту цену на сайте ещё не меняли.";
+        more.textContent = "Показать ещё"; more.hidden = cursor === null;
+      } catch (error) {
+        if (!list.isConnected || !$("dialog").open) return;
+        status.textContent = error.message; more.textContent = "Повторить загрузку"; more.hidden = false;
+      } finally { more.disabled = false; }
+    }
+    loadPage();
   }
   function changesList(edits) {
     return edits.map(e => {

@@ -191,6 +191,9 @@ class PriceEntryService:
                 updated_at TEXT NOT NULL, status TEXT NOT NULL,
                 changes_json TEXT NOT NULL, result_json TEXT NOT NULL DEFAULT '{}'
             )""")
+            # SQLite indexes include rowid: supplier lookup + reverse journal
+            # pagination does not need a second copy of every cell change.
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_price_entry_operations_supplier ON price_entry_operations(sheet_id)")
             connection.commit()
             yield connection
             connection.commit()
@@ -233,6 +236,38 @@ class PriceEntryService:
         return {"operations": [{"operation_id": r["operation_id"], "sheet_id": r["sheet_id"],
                                 "created_at": r["created_at"], "status": r["status"],
                                 "changes": json.loads(r["changes_json"])} for r in items]}
+
+    def cell_history(self, sheet_id: int, product_key: str, field: str, before: int = 0) -> dict:
+        """Full journal for one cell, newest first; not limited to global last 100.
+
+        Stable rowids paginate through concurrent inserts. A save cannot contain
+        two changes for the same cell, so a cursor cannot split an operation.
+        Uncertain Google writes remain labelled intents, not proven changes.
+        """
+        if (type(sheet_id) is not int or not 0 <= sheet_id < 10**12
+                or not isinstance(product_key, str)
+                or not re.fullmatch(r"[1-9][0-9]{0,18}:[1-9][0-9]{0,18}:[1-9][0-9]{0,18}", product_key)
+                or field not in PRICE_COLUMNS
+                or type(before) is not int or not 0 <= before < 2**63):
+            raise EntryError("invalid_history_cell")
+        with self.database() as db:
+            items = db.execute("""SELECT o.rowid AS sequence, o.operation_id,
+                    o.created_at, o.status, c.value AS change_json
+                FROM price_entry_operations o, json_each(o.changes_json) c
+                WHERE o.sheet_id=? AND o.rowid < ?
+                  AND json_extract(c.value, '$.key')=?
+                  AND json_extract(c.value, '$.field')=?
+                ORDER BY o.rowid DESC LIMIT 51""",
+                (sheet_id, before or 2**63 - 1, product_key, field)).fetchall()
+        entries = []
+        for row in items[:50]:
+            change = json.loads(row["change_json"])
+            entries.append({"operation_id": row["operation_id"],
+                            "created_at": row["created_at"], "status": row["status"],
+                            "before": change["before"], "after": change["after"]})
+        return {"sheet_id": sheet_id, "product_key": product_key, "field": field,
+                "entries": entries,
+                "next_before": items[49]["sequence"] if len(items) > 50 else None}
 
     def finish(self, operation_id, status, result):
         with self.database() as db:
