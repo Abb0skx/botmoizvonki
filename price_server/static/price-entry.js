@@ -70,6 +70,11 @@
   function validPrice(raw) { return raw === "" || (/^[0-9]{1,6}$/.test(raw) && Number(raw) <= 100000); }
   function value(raw) { return raw === "" ? null : Number(raw); }
   function key(row, field) { return row.key + "/" + field; }
+  function categoryView() { return Boolean($("category").value); }
+  function shownRows() {
+    if (categoryView()) return state.filtered;
+    return state.filtered.slice(state.page * PAGE_SIZE, (state.page + 1) * PAGE_SIZE);
+  }
   function edit(row, field, raw) {
     const k = key(row, field);
     if (validPrice(raw) && value(raw) === row[field]) state.edits.delete(k);
@@ -100,11 +105,13 @@
       if (availability === "changed" && !["price_1", "price_12"].some(f => state.edits.has(key(row, f)))) return false;
       return true;
     });
-    state.page = Math.min(state.page, Math.max(0, Math.ceil(state.filtered.length / PAGE_SIZE) - 1));
+    state.page = categoryView() ? 0 : Math.min(state.page, Math.max(0, Math.ceil(state.filtered.length / PAGE_SIZE) - 1));
     renderRows();
   }
   function renderRows() {
-    const slice = state.filtered.slice(state.page * PAGE_SIZE, (state.page + 1) * PAGE_SIZE);
+    const slice = shownRows();
+    const fullCategory = categoryView();
+    const categoryName = fullCategory ? $("category").selectedOptions[0]?.textContent : "";
     const fragment = document.createDocumentFragment();
     slice.forEach((row, rowIndex) => {
       const tr = node("tr");
@@ -185,11 +192,15 @@
     $("rows").replaceChildren(fragment);
     $("found-count").textContent = `${number(state.filtered.length)} позиций`;
     $("empty").hidden = state.filtered.length !== 0;
-    $("page-label").textContent = slice.length ? `${number(state.page * PAGE_SIZE + 1)}–${number(state.page * PAGE_SIZE + slice.length)} из ${number(state.filtered.length)}` : "0 позиций";
+    $("page-label").textContent = fullCategory
+      ? `${categoryName} · вся категория на одной странице · ${number(state.filtered.length)} позиций`
+      : slice.length ? `${number(state.page * PAGE_SIZE + 1)}–${number(state.page * PAGE_SIZE + slice.length)} из ${number(state.filtered.length)}` : "0 позиций";
+    $("page-actions").hidden = fullCategory;
     $("previous").disabled = state.page === 0;
-    $("next").disabled = (state.page + 1) * PAGE_SIZE >= state.filtered.length;
+    $("next").disabled = fullCategory || (state.page + 1) * PAGE_SIZE >= state.filtered.length;
     $("select-page").checked = !!slice.length && slice.every(r => state.selected.has(r.key));
     $("select-page").indeterminate = slice.some(r => state.selected.has(r.key)) && !$("select-page").checked;
+    $("select-page").setAttribute("aria-label", fullCategory ? "Выбрать всю категорию" : "Выбрать текущую страницу");
     updateSavebar();
   }
   async function load(sheetId) {
@@ -406,7 +417,7 @@
   ["search", "category", "availability"].forEach(id => $(id).addEventListener(id === "search" ? "input" : "change", () => { state.page = 0; filter(); }));
   $("previous").addEventListener("click", () => { state.page--; renderRows(); });
   $("next").addEventListener("click", () => { state.page++; renderRows(); });
-  $("select-page").addEventListener("change", () => { state.filtered.slice(state.page * PAGE_SIZE, (state.page + 1) * PAGE_SIZE).forEach(r => $("select-page").checked ? state.selected.add(r.key) : state.selected.delete(r.key)); renderRows(); });
+  $("select-page").addEventListener("change", () => { shownRows().forEach(r => $("select-page").checked ? state.selected.add(r.key) : state.selected.delete(r.key)); renderRows(); });
   window.addEventListener("beforeunload", e => { if (state.edits.size || state.busy) { e.preventDefault(); e.returnValue = ""; } });
   document.addEventListener("keydown", e => { if (e.key === "/" && !["INPUT", "SELECT", "TEXTAREA"].includes(document.activeElement.tagName)) { e.preventDefault(); $("search").focus(); } });
   async function init() {
