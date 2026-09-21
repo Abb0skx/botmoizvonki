@@ -5,6 +5,7 @@
   const PAGE_SIZE = 50;
   const number = value => Number(value).toLocaleString("ru-RU");
   const shownPrice = value => value === null || value === "" ? "нет" : number(value);
+  const PRICE_FIELDS = ["price_1", "price_12"];
   const fields = {price_1: "1 месяц", price_12: "12 месяцев", min_price: "минимальная цена"};
   const warranty = field => field === "price_1" ? "1 мес." : field === "price_12" ? "12 мес." : "";
   const minimumText = (value, supplier, field) => value === null || value === "" || Number(value) <= 0
@@ -107,7 +108,7 @@
     slice.forEach(row => {
       const tr = node("tr");
       if (state.selected.has(row.key)) tr.classList.add("row-selected");
-      if (Object.keys(fields).some(f => state.edits.has(key(row, f)))) tr.classList.add("row-dirty");
+      if (PRICE_FIELDS.some(f => state.edits.has(key(row, f)))) tr.classList.add("row-dirty");
       const checkCell = node("td"), check = node("input");
       check.type = "checkbox"; check.checked = state.selected.has(row.key);
       check.setAttribute("aria-label", "Выбрать " + row.model_name + " " + row.memory + " " + row.color);
@@ -115,7 +116,7 @@
       checkCell.append(check); tr.append(checkCell);
       const product = node("td"); product.append(node("div", row.model_name, "product-name"), node("div", "ID " + row.product_id + " · " + row.category_name, "product-meta")); tr.append(product);
       const variant = node("td"); variant.append(node("div", row.memory || "—", "variant-memory"), node("div", row.color || "—", "variant-color")); tr.append(variant);
-      Object.keys(fields).forEach(field => {
+      PRICE_FIELDS.forEach(field => {
         const td = node("td"), input = node("input");
         input.type = "text"; input.inputMode = "numeric"; input.autocomplete = "off"; input.maxLength = 6; input.placeholder = "—";
         input.setAttribute("aria-label", `${row.model_name} ${row.memory} ${row.color}, ${fields[field]}`);
@@ -129,7 +130,7 @@
           edit(row, field, input.value.trim());
           input.classList.toggle("dirty", state.edits.has(key(row, field)));
           input.classList.toggle("invalid", !validPrice(input.value.trim()));
-          tr.classList.toggle("row-dirty", Object.keys(fields).some(f => state.edits.has(key(row, f))));
+          tr.classList.toggle("row-dirty", PRICE_FIELDS.some(f => state.edits.has(key(row, f))));
         });
         input.addEventListener("keydown", event => { if (event.key === "Enter") { const all = [...document.querySelectorAll(".price-input:not(:disabled)")]; const next = all[all.indexOf(input) + 1]; if (next) next.focus(); } });
         input.addEventListener("paste", event => {

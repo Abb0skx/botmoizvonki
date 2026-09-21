@@ -230,7 +230,11 @@ class EntryRouteTests(unittest.TestCase):
         self.assertNotIn("<script>", response.text)
 
     def test_public_assets_whitelisted(self):
-        self.assertEqual(self.client.get("/price/assets/price-entry.js").status_code, 200)
+        entry_js = self.client.get("/price/assets/price-entry.js")
+        self.assertEqual(entry_js.status_code, 200)
+        self.assertIn('const PRICE_FIELDS = ["price_1", "price_12"]', entry_js.text)
+        self.assertIn('PRICE_FIELDS.forEach(field =>', entry_js.text)
+        self.assertNotIn('Object.keys(fields).forEach(field =>', entry_js.text)
         self.assertEqual(self.client.get("/price/assets/price-entry.env").status_code, 404)
         self.assertEqual(self.client.get("/price/models").status_code, 200)
         self.assertEqual(self.client.get("/price/assets/price-models.js").status_code, 200)
