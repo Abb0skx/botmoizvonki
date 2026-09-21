@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <title>Ввод цен · Texnikach</title>
+  <link rel="stylesheet" href="/price/assets/price-entry.css?v=1">
+  <script src="/price/assets/price-entry.js?v=1" defer></script>
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="/monitoring"><span class="brand-mark">t.</span> texnikach<span class="brand-sub">РАБОЧЕЕ ПРОСТРАНСТВО</span></a>
+  <div class="nav-label">ПРАЙС И КАТАЛОГ</div>
+  <a class="nav-item active" href="/price/entry"><span>▦</span> Ввод цен <span class="nav-dot"></span></a>
+  <a class="nav-item" href="/monitoring/prices/manage"><span>↗</span> Прайс и публикации</a>
+  <button class="nav-item" id="history"><span>◷</span> История сохранений</button>
+  <div class="sidebar-note"><span class="green-dot"></span> Переходный режим<strong>Сайт + Google Sheets</strong><p>Два интерфейса. Один источник цен. Таблица продолжает работать.</p></div>
+  <a class="back-link" href="/monitoring">← Вернуться в портал</a>
+</aside>
+<main>
+  <header class="topline"><span>Каталог <span class="slash">/</span> <strong>Ввод цен</strong></span><button class="text-button mobile-only" id="history-mobile">История</button><span class="private-label">Закрытый доступ</span></header>
+  <section class="page-heading"><div><div class="eyebrow">УПРАВЛЕНИЕ ПРАЙСОМ</div><h1>Цены поставщиков<span>.</span></h1><p>Найдите товар, измените цену и сохраните правки в общую таблицу.</p></div><a class="button secondary" id="sheet-link" target="_blank" rel="noopener noreferrer" hidden>Открыть Google Sheets ↗</a></section>
+  <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+  <section id="login-panel" class="empty-state" hidden><h2>Войдите в рабочий кабинет</h2><p>Цены доступны только сотрудникам с правом управления прайсом.</p><a class="button primary" href="/monitoring/login?next=%2Fprice%2Fentry">Войти</a></section>
+  <div id="workspace" hidden>
+    <section class="summary-grid"><div class="summary-card"><span>ПОСТАВЩИК</span><select id="supplier" aria-label="Поставщик"></select><small>Цены в долларах США</small></div><div class="summary-card"><span>ПОЗИЦИЙ В КАТАЛОГЕ</span><strong id="total-count">—</strong><small>Модель, память и цвет</small></div><div class="summary-card"><span>С ЗАПОЛНЕННОЙ ЦЕНОЙ</span><strong id="priced-count">—</strong><small>У выбранного поставщика</small></div><div class="summary-card"><span>ПОЛУЧЕНО ИЗ ТАБЛИЦЫ</span><strong id="fetched-time">—</strong><button class="text-button" id="refresh">↻ Обновить данные</button></div></section>
+    <section class="catalog-panel">
+      <div class="toolbar"><label class="search"><span>⌕</span><input id="search" type="search" placeholder="Модель, память, цвет или ID…" autocomplete="off" aria-label="Поиск товаров"><kbd>/</kbd></label><select id="category" aria-label="Категория"><option value="">Все категории</option></select><select id="availability" aria-label="Наличие цены"><option value="all">Все позиции</option><option value="priced">С ценой</option><option value="empty">Без цены</option><option value="changed">Только мои правки</option></select></div>
+      <div class="table-meta"><div><strong id="found-count">Загрузка…</strong><span id="selected-count"></span></div><button class="button small" id="bulk" disabled>Изменить выбранные</button></div>
+      <div class="table-wrap"><table><thead><tr><th class="check-col"><input id="select-page" type="checkbox" aria-label="Выбрать текущую страницу"></th><th class="product-col">ТОВАР</th><th>ПАМЯТЬ / ЦВЕТ</th><th class="price-col">1 МЕС. <span>USD</span></th><th class="price-col">12 МЕС. <span>USD</span></th><th class="min-col">МИН. В ТАБЛИЦЕ</th></tr></thead><tbody id="rows"></tbody></table></div>
+      <div id="empty" class="empty-state" hidden><h3>Ничего не найдено</h3><p>Попробуйте другое название или измените фильтры.</p></div>
+      <footer class="pagination"><span id="page-label">—</span><div><button class="button small" id="previous" aria-label="Предыдущая страница">←</button><button class="button small" id="next" aria-label="Следующая страница">→</button></div></footer>
+    </section>
+    <div class="help-line"><span>ⓘ</span><p>Пустая цена или 0 — нет предложения. Можно вставить одну или две колонки цен из таблицы, начиная с выбранной ячейки. Формулы и ID защищены. Цены попадут в прайс при очередном импорте; эта страница не отправляет посты в Telegram.</p></div>
+  </div>
+  <footer class="savebar" id="savebar" hidden><div><span class="unsaved-dot"></span><strong id="change-count">Нет изменений</strong><small>Проверьте перед сохранением</small></div><div class="save-actions"><button class="button secondary" id="discard">Отменить правки</button><button class="button primary" id="review">Проверить и сохранить →</button></div></footer>
+</main>
+<dialog id="dialog"><div class="dialog-header"><div><div class="eyebrow" id="dialog-eyebrow">ВВОД ЦЕН</div><h2 id="dialog-title"></h2></div><button class="close" id="close-dialog" aria-label="Закрыть">×</button></div><div id="dialog-body"></div><div id="dialog-actions" class="dialog-actions"></div></dialog>
+</body></html>

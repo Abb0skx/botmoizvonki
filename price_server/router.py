@@ -806,3 +806,8 @@ async def cancel_price_job(job_id: int, request: Request) -> dict[str, Any]:
     if not cancelled:
         raise HTTPException(status_code=409, detail="job_cannot_be_cancelled")
     return {"status": "cancelled", "job_id": job_id}
+
+
+from .entry_routes import install_entry_routes  # noqa: E402
+
+install_entry_routes(router, _admin, _require_enabled, settings)
