@@ -1,6 +1,14 @@
 (() => {
   "use strict";
 
+  document.addEventListener("DOMContentLoaded", () => {
+    const link = document.createElement("a");
+    link.href = "/price/entry";
+    link.textContent = "Ввод цен →";
+    link.style.cssText = "position:fixed;bottom:20px;left:20px;z-index:9999;padding:12px 18px;background:#075e54;color:white;border-radius:12px;font:600 15px system-ui;text-decoration:none;box-shadow:0 4px 18px #0003";
+    document.body.appendChild(link);
+  });
+
   const upstreamPrefix = "/price/api/v1/";
   const portalPrefix = "/monitoring/api/prices/admin/";
   const originalFetch = window.fetch.bind(window);

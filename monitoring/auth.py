@@ -62,6 +62,7 @@ def _safe_next(value: str | None) -> str:
         return "/monitoring"
     parsed = urlparse(candidate)
     allowed_pages = {
+        "/price/entry",
         "/monitoring",
         "/monitoring/calls",
         "/monitoring/site",
