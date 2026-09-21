@@ -3923,6 +3923,15 @@ class PricePageAuthTests(unittest.TestCase):
         self.assertIn("предыдущий главный пост станет", script)
 
     def test_enabled_price_page_is_password_protected(self):
+        from dataclasses import replace
+        from unittest.mock import patch
+
+        # The redirect branch is only enabled with the shared portal. Do not
+        # depend on another test importing an enabled monitoring configuration.
+        monitoring = importlib.import_module("monitoring.router")
+        portal = patch.object(monitoring, "settings", replace(monitoring.settings, enabled=True))
+        portal.start()
+        self.addCleanup(portal.stop)
         module = importlib.import_module("price_server.router")
         with tempfile.TemporaryDirectory() as folder:
             legacy = Path(folder) / "index.html"
