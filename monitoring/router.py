@@ -185,7 +185,10 @@ def _price_manage_html(content: bytes) -> Response:
 
 
 def _price_admin_target(method: str, path: str) -> str:
-    allowed = (path in _PRICE_ADMIN_GET_PATHS or bool(re.fullmatch(r"entry/catalog/[0-9]{1,12}", path))) if method == "GET" else any(
+    allowed = (path in _PRICE_ADMIN_GET_PATHS or bool(re.fullmatch(
+        r"entry/catalog/[0-9]{1,12}|entry/cell-history/[0-9]{1,12}/"
+        r"[1-9][0-9]{0,18}:[1-9][0-9]{0,18}:[1-9][0-9]{0,18}/"
+        r"(?:price_1|price_12)/[0-9]{1,19}", path))) if method == "GET" else any(
         pattern.fullmatch(path) for pattern in _PRICE_ADMIN_POST_PATHS
     )
     if not allowed:
