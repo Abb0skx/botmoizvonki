@@ -469,6 +469,8 @@ class TelegramClient:
             "timeout": 0,
             "allowed_updates": [
                 "callback_query",
+                "message",
+                "edited_message",
                 "channel_post",
                 "edited_channel_post",
             ],

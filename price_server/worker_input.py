@@ -88,8 +88,9 @@ def decode(payload):
 def reconcile_catalog(connection, server_data):
     """Add server-created catalogue rows inside the worker import transaction.
 
-    Existing rows are checked, never overwritten or deleted. Any identity
-    mismatch aborts the whole price import before ``product_prices`` changes.
+    Existing rows are updated by their immutable server ID after collision
+    checks. Rows absent from the server are never deleted, so rollback and
+    legacy history remain intact.
     """
     if not isinstance(server_data, ServerPriceData) or not server_data.categories:
         raise RuntimeError("Server price source: catalogue management is not initialized")
@@ -105,6 +106,13 @@ def reconcile_catalog(connection, server_data):
         if not by_id:
             cursor.execute("INSERT INTO categories(id,name) VALUES (?,?)", (category_id, name))
 
+    desired_by_id = {
+        int(product["product_id"]): (
+            str(product["model_name"]), int(product["category_id"]),
+            str(product.get("memory") or ""), str(product.get("color") or ""),
+        )
+        for product in server_data.products
+    }
     created = 0
     for product in server_data.products:
         product_id = int(product["product_id"])
@@ -116,7 +124,18 @@ def reconcile_catalog(connection, server_data):
         if row:
             actual = (str(row[0]), int(row[1]), str(row[2]), str(row[3]))
             if actual != expected:
-                raise RuntimeError("Server catalogue: product ID conflict")
+                duplicate = cursor.execute("""SELECT id FROM products
+                    WHERE model_name=? AND category_id=? AND COALESCE(memory,'')=?
+                      AND COALESCE(color,'')=? AND id<>?""",
+                    (*expected, product_id)).fetchone()
+                duplicate_id = int(duplicate[0]) if duplicate else None
+                if duplicate_id is not None and (
+                    duplicate_id not in desired_by_id
+                    or desired_by_id[duplicate_id] == expected
+                ):
+                    raise RuntimeError("Server catalogue: duplicate product identity")
+                cursor.execute("""UPDATE products SET model_name=?,category_id=?,
+                    memory=?,color=? WHERE id=?""", (*expected, product_id))
         else:
             duplicate = cursor.execute("""SELECT id FROM products
                 WHERE model_name=? AND category_id=? AND COALESCE(memory,'')=?

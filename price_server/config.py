@@ -52,6 +52,7 @@ class PriceSettings:
     )
     bot_settings_sheet_name: str = "bot_settings"
     daily_post_refresh_enabled: bool = False
+    model_inbox_chat_id: str = ""
     # ``embedded`` preserves the original monolith behaviour.  A dedicated
     # price runtime uses ``external``; ``disabled`` is the explicit safety
     # fence for an old monolith after that migration.
@@ -153,6 +154,9 @@ class PriceSettings:
             daily_post_refresh_enabled=_bool(
                 "PRICE_DAILY_POST_REFRESH_ENABLED", True
             ),
+            model_inbox_chat_id=os.getenv(
+                "PRICE_MODEL_INBOX_CHAT_ID", ""
+            ).strip(),
             scheduler_mode=(
                 os.getenv("PRICE_SCHEDULER_MODE", "embedded")
                 .strip()
@@ -195,6 +199,19 @@ class PriceSettings:
             raise RuntimeError(
                 "PRICE_TELEGRAM_CHANNEL_USERNAME is required for public post links"
             )
+        if self.model_inbox_chat_id:
+            inbox = self.model_inbox_chat_id
+            if not (inbox.startswith("-") and inbox[1:].isdigit()):
+                raise RuntimeError(
+                    "PRICE_MODEL_INBOX_CHAT_ID must be a negative Telegram chat ID"
+                )
+            if inbox in {
+                self.telegram_channel_id,
+                self.telegram_preview_channel_id,
+            }:
+                raise RuntimeError(
+                    "Model inbox, preview and publication chats must be different"
+                )
         if len(self.post_index_sheet_name) > 100:
             raise RuntimeError(
                 "PRICE_POST_INDEX_SHEET_NAME must be at most 100 characters"
@@ -237,3 +254,7 @@ class PriceSettings:
             self.telegram_bot_token
             and self.telegram_preview_channel_id
         )
+
+    @property
+    def model_inbox_configured(self) -> bool:
+        return bool(self.telegram_bot_token and self.model_inbox_chat_id)

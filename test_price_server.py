@@ -37,6 +37,7 @@ from price_server.post_formatting import (
 )
 from price_server.scheduler import PriceScheduler
 from price_server.service import PricePublicationService
+from price_server.model_inbox import ModelInbox
 from price_server.sheets_registry import (
     QUICK_LINK_HEADERS,
     QUICK_LINK_ROTATION_HEADERS,
@@ -1372,6 +1373,43 @@ class PriceRepositoryTests(unittest.TestCase):
             "cancelled",
         )
         self.assertEqual(fake.callback_answers[-1][1], "Публикация отменена")
+
+    def test_model_inbox_group_message_becomes_reviewable_drafts(self):
+        fake = FakeTelegram()
+        settings = PriceSettings(
+            enabled=True,
+            db_path=Path(self.temp.name) / "price.db",
+            legacy_html_path=Path(self.temp.name) / "legacy.html",
+            admin_username="admin",
+            admin_password="secret",
+            sync_api_key="sync",
+            telegram_bot_token="fake-token",
+            telegram_channel_id="-1001234567890",
+            telegram_channel_username="testchannel",
+            product_sort_sheet_id="sheet",
+            posts_sheet_name="Telegram Posts",
+            timezone="Asia/Tashkent",
+            scheduler_poll_seconds=1,
+            sync_max_bytes=2_000_000,
+            telegram_preview_channel_id="-1003922029862",
+            model_inbox_chat_id="-5581249831",
+        )
+        fake.updates.append({
+            "update_id": 77,
+            "message": {
+                "message_id": 501,
+                "chat": {"id": -5581249831, "type": "group"},
+                "from": {"id": 77, "is_bot": False},
+                "text": "0. 3\n1. Phone X\n2. 256 GB\n3. Black, Silver\n1. Phone Y\n3. Blue",
+            },
+        })
+        service = PricePublicationService(settings, self.repo, telegram=fake)
+        self.assertEqual(service.poll_preview_updates(), 1)
+        drafts = ModelInbox(settings.db_path).list()["drafts"]
+        self.assertEqual(len(drafts), 2)
+        self.assertTrue(all(draft["source_message_id"] == 501 for draft in drafts))
+        self.assertEqual({draft["parsed"]["model_name"] for draft in drafts},
+                         {"Phone X", "Phone Y"})
 
     def test_permanent_delete_failure_requests_manual_cleanup(self):
         self.repo.ingest_snapshot(snapshot(self.now))

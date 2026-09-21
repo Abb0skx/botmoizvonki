@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from price_server.entry_catalog import EntryCatalogService, install_catalog
 from price_server.entry_routes import install_entry_routes
 from price_server.entry_store import SQLitePriceSource, initialize
+from price_server.model_inbox import ModelInbox, parse_model_draft, parse_model_drafts
 from price_server.price_entry import EntryError, revision
 from price_server.worker_input import decode, reconcile_catalog
 from test_price_entry import sample
@@ -103,6 +104,57 @@ class EntryCatalogTests(unittest.TestCase):
             self.service.create(self.request(variants=[{"memory": "", "color": ""}]), str(uuid.uuid4()))
         self.assertEqual(caught.exception.code, "catalog_product_exists")
 
+    def test_model_listing_and_update_preserve_ids_prices_and_add_variants(self):
+        before = SQLitePriceSource(self.path).read(1)["rows"][0]
+        detail = self.service.model(before["product_id"])
+        body = {
+            "category_id": 20,
+            "model_name": "Renamed Phone",
+            "variants": [{
+                "product_id": before["product_id"],
+                "memory": "1 TB",
+                "color": "Blue",
+            }],
+            "add_variants": [{"memory": "2 TB", "color": "Silver"}],
+            "expected_revision": detail["revision"],
+        }
+        operation = str(uuid.uuid4())
+        result = self.service.update(before["product_id"], body, operation)
+        self.assertEqual(result["updated_count"], 1)
+        self.assertEqual(result["created_count"], 1)
+        self.assertEqual(self.service.update(before["product_id"], body, operation), result)
+        rows = [row for row in SQLitePriceSource(self.path).read(1)["rows"]
+                if row["model_name"] == "Renamed Phone"]
+        self.assertEqual(len(rows), 2)
+        existing = next(row for row in rows if row["product_id"] == before["product_id"])
+        self.assertEqual(existing["category_id"], 20)
+        self.assertEqual(existing["category_name"], "Tablets")
+        self.assertEqual(existing["price_1"], before["price_1"])
+        self.assertEqual(existing["price_12"], before["price_12"])
+        added = next(row for row in rows if row["product_id"] != before["product_id"])
+        self.assertIsNone(added["price_1"])
+        self.assertIsNone(added["price_12"])
+        listing = self.service.models()
+        self.assertIn("Renamed Phone", [item["model_name"] for item in listing["models"]])
+
+    def test_model_update_rejects_stale_or_missing_variants_atomically(self):
+        detail = self.service.model(1)
+        request = {
+            "category_id": detail["category_id"],
+            "model_name": detail["model_name"],
+            "variants": [],
+            "add_variants": [],
+            "expected_revision": detail["revision"],
+        }
+        with self.assertRaises(EntryError) as caught:
+            self.service.update(1, request, str(uuid.uuid4()))
+        self.assertEqual(caught.exception.code, "invalid_catalog_variants")
+        request["variants"] = [{"product_id": 1, "memory": "", "color": "Black"}]
+        request["expected_revision"] = "0" * 64
+        with self.assertRaises(EntryError) as caught:
+            self.service.update(1, request, str(uuid.uuid4()))
+        self.assertEqual(caught.exception.code, "catalog_model_changed")
+
     def test_install_rejects_unknown_category_and_high_water_regression(self):
         other = Path(self.folder.name) / "other.db"
         initialize(other, [{"sheet_id": 1, "title": "1-First", "rows": [sample()]}])
@@ -160,6 +212,45 @@ class EntryCatalogTests(unittest.TestCase):
         worker.rollback()
         self.assertEqual(worker.execute("SELECT count(*) FROM products WHERE id=1001").fetchone()[0], 0)
 
+    def test_worker_reconcile_applies_server_authoritative_model_edits(self):
+        worker = self.worker_db()
+        detail = self.service.model(1)
+        self.service.update(1, {
+            "category_id": 20,
+            "model_name": "Server Name",
+            "variants": [{"product_id": 1, "memory": "512 GB", "color": "Green"}],
+            "add_variants": [],
+            "expected_revision": detail["revision"],
+        }, str(uuid.uuid4()))
+        data = decode(SQLitePriceSource(self.path).export())
+        self.assertEqual(reconcile_catalog(worker, data), 0)
+        self.assertEqual(worker.execute(
+            "SELECT model_name,category_id,memory,color FROM products WHERE id=1"
+        ).fetchone(), ("Server Name", 20, "512 GB", "Green"))
+
+    def test_worker_reconcile_allows_atomic_variant_swap(self):
+        self.service.create(self.request(model_name="Swap Phone"), str(uuid.uuid4()))
+        worker = self.worker_db()
+        detail = self.service.model(1001)
+        self.service.update(1001, {
+            "category_id": 10,
+            "model_name": "Swap Phone",
+            "variants": [
+                {"product_id": 1001, "memory": "512 GB", "color": "Silver"},
+                {"product_id": 1002, "memory": "256 GB", "color": "Black"},
+            ],
+            "add_variants": [],
+            "expected_revision": detail["revision"],
+        }, str(uuid.uuid4()))
+        data = decode(SQLitePriceSource(self.path).export())
+        self.assertEqual(reconcile_catalog(worker, data), 0)
+        self.assertEqual(worker.execute(
+            "SELECT memory,color FROM products WHERE id=1001"
+        ).fetchone(), ("512 GB", "Silver"))
+        self.assertEqual(worker.execute(
+            "SELECT memory,color FROM products WHERE id=1002"
+        ).fetchone(), ("256 GB", "Black"))
+
 
 class EntryCatalogRouteTests(unittest.TestCase):
     def setUp(self):
@@ -182,8 +273,93 @@ class EntryCatalogRouteTests(unittest.TestCase):
             response = self.client.post("/price/api/v1/entry/products", json={}, headers={
                 "Idempotency-Key": "123e4567-e89b-42d3-a456-426614174000"})
             self.assertEqual(response.status_code, 200)
+            service.return_value.models.return_value = {"models": []}
+            service.return_value.model.return_value = {"variants": []}
+            self.assertEqual(self.client.get("/price/api/v1/entry/models").status_code, 200)
+            self.assertEqual(self.client.get("/price/api/v1/entry/models/1").status_code, 200)
+            service.return_value.update.return_value = {"status": "updated"}
+            self.assertEqual(self.client.post(
+                "/price/api/v1/entry/models/1", json={}, headers={
+                    "Idempotency-Key": "123e4567-e89b-42d3-a456-426614174000"
+                }).status_code, 200)
         self.assertEqual(self.client.post(
             "/price/api/v1/entry/products", content=b"x" * 65537).status_code, 413)
+
+
+class ModelInboxTests(unittest.TestCase):
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.addCleanup(self.folder.cleanup)
+        self.path = Path(self.folder.name) / "price.db"
+        self.inbox = ModelInbox(self.path)
+
+    def test_parser_supports_labels_and_comma_separated_colors(self):
+        parsed = parse_model_draft("""Добавить модель
+Категория: Смартфоны бренда Apple
+Модель: Apple iPhone 18 Pro
+256 GB | Black, Silver
+512 GB | Blue
+""")
+        self.assertEqual(parsed["model_name"], "Apple iPhone 18 Pro")
+        self.assertEqual(parsed["variants"], [
+            {"memory": "256 GB", "color": "Black"},
+            {"memory": "256 GB", "color": "Silver"},
+            {"memory": "512 GB", "color": "Blue"},
+        ])
+
+    def test_parser_preserves_existing_model_yegish_multi_model_format(self):
+        parsed = parse_model_drafts("""0. 3
+1. Samsung Galaxy A57 5G
+2. 8/128Gb, 8/256Gb
+3. Black, Gray, Blue
+
+1. Samsung Galaxy A37 5G
+2. 8/128Gb
+3. Black
+""")
+        self.assertEqual([item["model_name"] for item in parsed], [
+            "Samsung Galaxy A57 5G", "Samsung Galaxy A37 5G",
+        ])
+        self.assertTrue(all(item["category_id"] == 3 for item in parsed))
+        self.assertEqual(len(parsed[0]["variants"]), 8)
+        self.assertIn({"memory": "8/128Gb", "color": ""}, parsed[0]["variants"])
+        self.assertEqual(parsed[1]["variants"], [
+            {"memory": "8/128Gb", "color": "Black"},
+        ])
+
+    def test_channel_post_is_idempotent_editable_draft(self):
+        first = self.inbox.record(update_id=10, chat_id="-1001", message_id=22,
+                                  text="Phones\nModel One\n256 GB | Black")
+        second = self.inbox.record(update_id=11, chat_id="-1001", message_id=22,
+                                   text="Phones\nModel Two\n512 GB | Silver")
+        self.assertEqual(first["draft_id"], second["draft_id"])
+        drafts = self.inbox.list()["drafts"]
+        self.assertEqual(len(drafts), 1)
+        self.assertEqual(drafts[0]["parsed"]["model_name"], "Model Two")
+        self.inbox.finish(first["draft_id"], status="applied")
+        locked = self.inbox.record(update_id=12, chat_id="-1001", message_id=22,
+                                   text="Phones\nChanged\n1 TB | Gold")
+        self.assertEqual(locked["status"], "applied")
+        self.assertEqual(self.inbox.list()["drafts"], [])
+
+    def test_one_group_message_creates_one_reviewable_draft_per_model(self):
+        result = self.inbox.record(
+            update_id=20, chat_id="-5581249831", message_id=30,
+            text="0. 3\n1. Model A\n2. 128Gb\n3. Black\n1. Model B\n3. Blue",
+        )
+        self.assertEqual(len(result["draft_ids"]), 2)
+        drafts = self.inbox.list()["drafts"]
+        self.assertEqual({item["parsed"]["model_name"] for item in drafts},
+                         {"Model A", "Model B"})
+
+    def test_invalid_post_is_visible_and_dismissible(self):
+        result = self.inbox.record(update_id=1, chat_id="-1001", message_id=1,
+                                   text="not enough")
+        self.assertEqual(result["status"], "invalid")
+        draft = self.inbox.list()["drafts"][0]
+        self.assertEqual(draft["parse_error"], "model_draft_headers_required")
+        self.assertEqual(self.inbox.finish(draft["draft_id"], status="dismissed")["status"],
+                         "dismissed")
 
 
 if __name__ == "__main__":

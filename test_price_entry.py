@@ -232,6 +232,10 @@ class EntryRouteTests(unittest.TestCase):
     def test_public_assets_whitelisted(self):
         self.assertEqual(self.client.get("/price/assets/price-entry.js").status_code, 200)
         self.assertEqual(self.client.get("/price/assets/price-entry.env").status_code, 404)
+        self.assertEqual(self.client.get("/price/models").status_code, 200)
+        self.assertEqual(self.client.get("/price/assets/price-models.js").status_code, 200)
+        self.assertEqual(self.client.get("/price/assets/price-models.css").status_code, 200)
+        self.assertEqual(self.client.get("/price/assets/price-models.env").status_code, 404)
 
     def test_every_data_route_requires_auth(self):
         self.admin.side_effect = HTTPException(401)

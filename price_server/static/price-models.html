@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <title>Модели · Texnikach</title>
+  <link rel="stylesheet" href="/price/assets/price-entry.css?v=3">
+  <link rel="stylesheet" href="/price/assets/price-models.css?v=1">
+  <script src="/price/assets/price-models.js?v=1" defer></script>
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="/monitoring"><span class="brand-mark">t.</span> texnikach<span class="brand-sub">РАБОЧЕЕ ПРОСТРАНСТВО</span></a>
+  <div class="nav-label">ПРАЙС И КАТАЛОГ</div>
+  <a class="nav-item" href="/price/entry"><span>▦</span> Ввод цен</a>
+  <a class="nav-item active" href="/price/models"><span>◇</span> Модели <span class="nav-dot"></span></a>
+  <a class="nav-item" href="/monitoring/prices/manage"><span>↗</span> Прайс и публикации</a>
+  <div class="sidebar-note"><span class="green-dot"></span> Самостоятельный каталог<strong>Модели на сервере</strong><p>Добавление и редактирование без Google Price.</p></div>
+  <a class="back-link" href="/monitoring">← Вернуться в портал</a>
+</aside>
+<main>
+  <header class="topline"><span>Каталог <span class="slash">/</span> <strong>Модели</strong></span><span class="private-label">Закрытый доступ</span></header>
+  <section class="page-heading"><div><div class="eyebrow">УПРАВЛЕНИЕ КАТАЛОГОМ</div><h1>Модели и варианты<span>.</span></h1><p>Добавляйте модели, исправляйте названия, категории, память и цвета.</p></div><div class="heading-actions"><button class="button primary" id="add-model" hidden>＋ Добавить модель</button></div></section>
+  <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+  <section id="login-panel" class="empty-state" hidden><h2>Войдите в рабочий кабинет</h2><p>Каталог доступен только сотрудникам с правом управления прайсом.</p><a class="button primary" href="/monitoring/login?next=%2Fprice%2Fmodels">Войти</a></section>
+  <div id="workspace" hidden>
+    <section class="summary-grid model-summary"><div class="summary-card"><span>МОДЕЛЕЙ</span><strong id="model-count">—</strong><small>Сгруппировано по названию</small></div><div class="summary-card"><span>ВАРИАНТОВ</span><strong id="variant-count">—</strong><small>Память и цвет</small></div><div class="summary-card"><span>КАТЕГОРИЙ</span><strong id="category-count">—</strong><small>Доступно для выбора</small></div><div class="summary-card"><span>ИСТОЧНИК</span><strong>Сервер</strong><small>Google Price не используется</small></div></section>
+    <section class="telegram-panel" id="telegram-panel">
+      <div><div class="eyebrow">MODEL YEGISH → ЧЕРНОВИК</div><h2>Новые модели из Telegram</h2><p>Привычный список из группы не меняет каталог сам. Бот разбирает каждую модель в отдельный черновик, который нужно проверить.</p><pre class="telegram-example">0. 3
+1. Samsung Galaxy A57 5G
+2. 8/128Gb, 8/256Gb
+3. Black, Gray, Blue</pre></div>
+      <div id="drafts" class="drafts"></div>
+    </section>
+    <section class="catalog-panel model-panel">
+      <div class="toolbar"><label class="search"><span>⌕</span><input id="search" type="search" placeholder="Название модели или ID…" autocomplete="off" aria-label="Поиск моделей"><kbd>/</kbd></label><select id="category" aria-label="Категория"><option value="">Все категории</option></select></div>
+      <div class="table-meta"><strong id="found-count">Загрузка…</strong><button class="text-button" id="refresh">↻ Обновить</button></div>
+      <div id="models" class="model-list"></div>
+      <div id="empty" class="empty-state" hidden><h3>Ничего не найдено</h3><p>Измените поиск или категорию.</p></div>
+    </section>
+    <div class="help-line"><span>ⓘ</span><p>Редактирование сохраняет ID товара, гарантий и все цены поставщиков. Удаление существующих вариантов намеренно недоступно: это защищает историю и ссылки. Новые варианты получают ID автоматически.</p></div>
+  </div>
+</main>
+<dialog id="dialog"><div class="dialog-header"><div><div class="eyebrow">КАТАЛОГ</div><h2 id="dialog-title"></h2></div><button class="close" id="close-dialog" aria-label="Закрыть">×</button></div><div id="dialog-body"></div><div id="dialog-actions" class="dialog-actions"></div></dialog>
+</body>
+</html>

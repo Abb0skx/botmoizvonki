@@ -44,6 +44,7 @@ DELIVERY_TEMPLATES = ROOT.parent / "app" / "templates"
 
 _PRICE_ADMIN_GET_PATHS = frozenset({
     "jobs", "sections", "entry/suppliers", "entry/history", "entry/categories",
+    "entry/models", "entry/model-inbox",
 })
 _PRICE_ADMIN_POST_PATHS = (
     re.compile(
@@ -58,6 +59,8 @@ _PRICE_ADMIN_POST_PATHS = (
     re.compile(r"posts/update-all"),
     re.compile(r"entry/save/[0-9]{1,12}"),
     re.compile(r"entry/products"),
+    re.compile(r"entry/models/[1-9][0-9]{0,18}"),
+    re.compile(r"entry/model-inbox/[1-9][0-9]{0,18}/(?:applied|dismissed)"),
 )
 
 router = APIRouter(tags=["manager-monitoring"])
@@ -189,7 +192,7 @@ def _price_manage_html(content: bytes) -> Response:
 
 def _price_admin_target(method: str, path: str) -> str:
     allowed = (path in _PRICE_ADMIN_GET_PATHS or bool(re.fullmatch(
-        r"entry/catalog/[0-9]{1,12}|entry/cell-history/[0-9]{1,12}/"
+        r"entry/catalog/[0-9]{1,12}|entry/models/[1-9][0-9]{0,18}|entry/cell-history/[0-9]{1,12}/"
         r"[1-9][0-9]{0,18}:[1-9][0-9]{0,18}:[1-9][0-9]{0,18}/"
         r"(?:price_1|price_12)/[0-9]{1,19}", path))) if method == "GET" else any(
         pattern.fullmatch(path) for pattern in _PRICE_ADMIN_POST_PATHS

@@ -17,6 +17,7 @@ from .quick_links import (
     QUICK_LINK_POST_SPECS,
 )
 from .post_formatting import format_price_sections
+from .model_inbox import ModelInbox
 from .sheets_registry import (
     BotSettingsRegistry,
     ProductSortCalendarRegistry,
@@ -1417,6 +1418,37 @@ class PricePublicationService:
         )
         return True
 
+    def _record_model_inbox_channel_post(
+        self,
+        update_id: int,
+        message: Mapping[str, Any],
+    ) -> bool:
+        chat_id = str(getattr(self.settings, "model_inbox_chat_id", "") or "")
+        if not chat_id:
+            return False
+        chat = message.get("chat")
+        if not isinstance(chat, Mapping) or str(chat.get("id")) != chat_id:
+            return False
+        sender = message.get("from")
+        if (isinstance(sender, Mapping) and bool(sender.get("is_bot"))) \
+                or message.get("via_bot") is not None \
+                or self._is_service_channel_post(message):
+            return False
+        text = message.get("text")
+        try:
+            message_id = int(message.get("message_id"))
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(text, str) or message_id <= 0:
+            return False
+        ModelInbox(self.settings.db_path).record(
+            update_id=int(update_id),
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+        )
+        return True
+
     @staticmethod
     def _external_error_is_permanent(exc: Exception) -> bool:
         retryable = getattr(exc, "retryable", None)
@@ -1602,10 +1634,14 @@ class PricePublicationService:
                     update_id,
                     channel_post,
                 )
-            for field in ("channel_post", "edited_channel_post"):
+            for field in (
+                "message", "edited_message", "channel_post", "edited_channel_post"
+            ):
                 message = update.get(field)
                 if not isinstance(message, Mapping):
                     continue
+                if update_id >= 0:
+                    self._record_model_inbox_channel_post(update_id, message)
                 chat = message.get("chat")
                 if (
                     isinstance(chat, Mapping)
