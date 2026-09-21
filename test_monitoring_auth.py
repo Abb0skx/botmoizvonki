@@ -731,7 +731,8 @@ class MonitoringRouteTests(unittest.TestCase):
         )
 
     def test_price_entry_proxy_is_authenticated_and_csrf_protected(self):
-        paths = ["entry/suppliers", "entry/history", "entry/categories", "entry/catalog/1027960070",
+        paths = ["entry/suppliers", "entry/history", "entry/categories", "entry/models",
+                 "entry/model-inbox", "entry/models/1", "entry/catalog/1027960070",
                  "entry/cell-history/1027960070/1:10:11/price_1/0",
                  "entry/cell-history/1027960070/1:10:11/price_12/123"]
         for path in paths:
@@ -762,7 +763,18 @@ class MonitoringRouteTests(unittest.TestCase):
                 "X-CSRF-Token": csrf, "Origin": "https://bot.texnikach.uz",
                 "Idempotency-Key": "123e4567-e89b-42d3-a456-426614174000"}).status_code, 200)
             self.assertEqual(upstream.await_args.args, ("POST", "/price/api/v1/entry/products"))
+            model_url = "/monitoring/api/prices/admin/entry/models/1"
+            self.assertEqual(self.client.post(model_url, json={}, headers={
+                "X-CSRF-Token": csrf, "Origin": "https://bot.texnikach.uz",
+                "Idempotency-Key": "123e4567-e89b-42d3-a456-426614174000"}).status_code, 200)
+            self.assertEqual(upstream.await_args.args, ("POST", "/price/api/v1/entry/models/1"))
+            inbox_url = "/monitoring/api/prices/admin/entry/model-inbox/1/dismissed"
+            self.assertEqual(self.client.post(inbox_url, json={}, headers={
+                "X-CSRF-Token": csrf, "Origin": "https://bot.texnikach.uz",
+                "Idempotency-Key": "123e4567-e89b-42d3-a456-426614174000"}).status_code, 200)
+            self.assertEqual(upstream.await_args.args, ("POST", "/price/api/v1/entry/model-inbox/1/dismissed"))
         self.assertEqual(_safe_next("/price/entry"), "/price/entry")
+        self.assertEqual(_safe_next("/price/models"), "/price/models")
 
     def test_price_admin_proxy_restores_manager_actions_with_csrf(self):
         self.assertEqual(self.client.get(
