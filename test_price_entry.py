@@ -231,6 +231,8 @@ class EntryRouteTests(unittest.TestCase):
         self.assertIn('<th class="product-col">МОДЕЛЬ</th>', response.text)
         self.assertIn('<th class="memory-col">ПАМЯТЬ</th>', response.text)
         self.assertIn('<th class="color-col">ЦВЕТ</th>', response.text)
+        self.assertIn('id="copy-ids"', response.text)
+        self.assertIn("Скопировать ID", response.text)
         self.assertNotIn("ПАМЯТЬ / ЦВЕТ", response.text)
 
     def test_public_assets_whitelisted(self):
@@ -241,6 +243,8 @@ class EntryRouteTests(unittest.TestCase):
         self.assertIn('"memory-cell"', entry_js.text)
         self.assertIn('"color-cell"', entry_js.text)
         self.assertIn('tr.classList.add("model-start")', entry_js.text)
+        self.assertIn('ids.join(", ")', entry_js.text)
+        self.assertIn('navigator.clipboard?.writeText', entry_js.text)
         self.assertNotIn('Object.keys(fields).forEach(field =>', entry_js.text)
         self.assertEqual(self.client.get("/price/assets/price-entry.env").status_code, 404)
         self.assertEqual(self.client.get("/price/models").status_code, 200)

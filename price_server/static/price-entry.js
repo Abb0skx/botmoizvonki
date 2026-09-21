@@ -82,6 +82,7 @@
     $("review").disabled = state.busy || state.uncertain || state.edits.size > 200 || [...state.edits.values()].some(e => !validPrice(e.raw));
     $("discard").disabled = state.busy;
     $("selected-count").textContent = state.selected.size ? `Выбрано: ${state.selected.size}` : "";
+    $("copy-ids").disabled = !state.selected.size;
     $("bulk").disabled = !state.selected.size || state.busy || state.uncertain;
     $("supplier").disabled = state.busy;
     $("refresh").disabled = state.busy;
@@ -359,6 +360,27 @@
       if (projected.size > 200) { warning.textContent = "Слишком много изменений. Выберите не более 200 цен за один раз."; return; }
       targets.forEach(r => edit(r, field.value, raw)); $("dialog").close(); filter();
     }, true)]);
+  });
+  $("copy-ids").addEventListener("click", async () => {
+    const ids = [...new Set(state.rows.filter(row => state.selected.has(row.key)).map(row => String(row.product_id).trim()).filter(Boolean))];
+    if (!ids.length) return;
+    const text = ids.join(", ");
+    try {
+      let copied = false;
+      if (navigator.clipboard?.writeText) {
+        try { await navigator.clipboard.writeText(text); copied = true; } catch { copied = false; }
+      }
+      if (!copied) {
+        const helper = node("textarea");
+        helper.value = text; helper.readOnly = true; helper.className = "clipboard-helper";
+        document.body.append(helper); helper.select();
+        copied = document.execCommand("copy"); helper.remove();
+      }
+      if (!copied) throw new Error("clipboard_unavailable");
+      notice(`ID скопированы: ${ids.length}. Формат: ${ids.slice(0, 3).join(", ")}${ids.length > 3 ? ", …" : ""}`);
+    } catch {
+      notice("Не удалось скопировать ID. Разрешите браузеру доступ к буферу обмена и повторите попытку.", true);
+    }
   });
   $("history").addEventListener("click", async () => {
     try {
