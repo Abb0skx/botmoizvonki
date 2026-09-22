@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="robots" content="noindex,nofollow">
   <title>Ввод цен · Texnikach</title>
-  <link rel="stylesheet" href="/price/assets/price-entry.css?v=9">
+  <link rel="stylesheet" href="/price/assets/price-entry.css?v=10">
   <script src="/price/assets/price-entry.js?v=10" defer></script>
 </head>
 <body class="price-entry-page">
@@ -31,7 +31,7 @@
       <div class="toolbar"><label class="search"><span>⌕</span><input id="search" type="search" placeholder="Модель, память, цвет или ID…" autocomplete="off" aria-label="Поиск товаров"><kbd>/</kbd></label><select id="category" aria-label="Категория"><option value="">Все категории</option></select><select id="availability" aria-label="Наличие цены"><option value="all">Все позиции</option><option value="priced">С ценой</option><option value="empty">Без цены</option><option value="changed">Только мои правки</option></select></div>
       <div class="table-meta"><div><strong id="found-count">Загрузка…</strong><span id="selected-count"></span></div><div class="table-actions"><button class="button small" id="copy-ids" disabled>⧉ Скопировать ID</button><button class="button small" id="bulk" disabled>Изменить выбранные</button></div></div>
       <div class="catalog-context"><span id="editing-supplier">Цены в долларах США ($)</span><span>◷ — история цены</span></div>
-      <div class="table-wrap" role="region" aria-label="Товары и цены поставщика" tabindex="0"><table><thead><tr><th class="check-col" scope="col"><input id="select-page" type="checkbox" aria-label="Выбрать текущую страницу"></th><th class="product-col" scope="col">Модель</th><th class="memory-col" scope="col">Память / размер</th><th class="color-col" scope="col">Цвет</th><th class="price-col" scope="col">Цена, $<small>Гарантия 1 мес.</small></th><th class="price-col" scope="col">Цена, $<small>Гарантия 12 мес.</small></th><th class="min-col" scope="col">Лучшая цена, $<small>Среди всех поставщиков</small></th></tr></thead><tbody id="rows"></tbody></table></div>
+      <div class="table-wrap" role="region" aria-label="Товары и цены поставщика"><table><thead><tr><th class="check-col" scope="col"><input id="select-page" type="checkbox" aria-label="Выбрать текущую страницу"></th><th class="product-col" scope="col">Модель</th><th class="memory-col" scope="col">Память / размер</th><th class="color-col" scope="col">Цвет</th><th class="price-col" scope="col">Цена, $<small>Гарантия 1 мес.</small></th><th class="price-col" scope="col">Цена, $<small>Гарантия 12 мес.</small></th><th class="min-col" scope="col">Лучшая цена, $<small>Среди всех поставщиков</small></th></tr></thead><tbody id="rows"></tbody></table></div>
       <div id="empty" class="empty-state" hidden><h3>Ничего не найдено</h3><p>Попробуйте другое название или измените фильтры.</p></div>
       <footer class="pagination"><span id="page-label">—</span><div id="page-actions"><button class="button small" id="previous" aria-label="Предыдущая страница">←</button><button class="button small" id="next" aria-label="Следующая страница">→</button></div></footer>
     </section>

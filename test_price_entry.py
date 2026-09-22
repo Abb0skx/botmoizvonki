@@ -381,13 +381,22 @@ class EntryRouteTests(unittest.TestCase):
         self.assertIn("Скопировать ID", response.text)
         self.assertIn('id="catalog-nav"', response.text)
         self.assertIn('aria-label="Фильтры каталога"', response.text)
+        self.assertIn('price-entry.css?v=10', response.text)
         self.assertIn('price-entry.js?v=10', response.text)
+        self.assertNotIn('aria-label="Товары и цены поставщика" tabindex="0"', response.text)
         self.assertIn('<div class="brand">', response.text)
         self.assertNotIn('href="/monitoring"', response.text)
         self.assertNotIn("Вернуться в портал", response.text)
         self.assertNotIn("ПАМЯТЬ / ЦВЕТ", response.text)
 
     def test_public_assets_whitelisted(self):
+        entry_css = self.client.get("/price/assets/price-entry.css")
+        self.assertEqual(entry_css.status_code, 200)
+        self.assertIn(
+            ".price-entry-page .table-wrap {max-height: none; overflow: visible;}",
+            entry_css.text,
+        )
+        self.assertNotIn("max-height: 68vh", entry_css.text)
         entry_js = self.client.get("/price/assets/price-entry.js")
         self.assertEqual(entry_js.status_code, 200)
         self.assertIn('const PRICE_FIELDS = ["price_1", "price_12"]', entry_js.text)

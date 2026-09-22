@@ -144,7 +144,7 @@
 .price-entry-page .summary-card small, .price-entry-page .summary-card .text-button {font-size: 11px; color: #6b7c71;}
 .price-entry-page .summary-card .text-button {color: var(--green); min-height: 24px;}
 .price-entry-page .summary-card select {font-size: 18px; letter-spacing: 0; border: 1px solid #cbded0; border-radius: 8px; padding: 7px 24px 7px 10px; margin: 0; background: #f7faf6;}
-.price-entry-page .catalog-panel {border-radius: 12px; box-shadow: 0 3px 14px #243d2e04;}
+.price-entry-page .catalog-panel {border-radius: 12px; box-shadow: 0 3px 14px #243d2e04; overflow: visible;}
 .price-entry-page .toolbar {padding: 18px 18px 12px; border-bottom: 0; gap: 12px;}
 .price-entry-page .search {height: 44px; background: #f9fbf8; border-color: #d6e1d8; border-radius: 9px;}
 .price-entry-page .search input {font-size: 13px; background: transparent;}
@@ -153,7 +153,7 @@
 .price-entry-page .table-meta {padding: 0 18px 12px; min-height: 44px; font-size: 12px; gap: 12px;}
 .price-entry-page .table-meta strong {font-weight: 600; color: #415d4b;}
 .price-entry-page .catalog-context {display: flex; justify-content: space-between; gap: 16px; padding: 10px 18px; border-top: 1px solid var(--line); font-size: 11px; color: #637a6b; background: #fafcf9;}
-.price-entry-page .table-wrap {max-height: 68vh; overflow: auto; scrollbar-width: thin; scrollbar-color: #c1d0c5 #f7f9f7;}
+.price-entry-page .table-wrap {max-height: none; overflow: visible;}
 .price-entry-page .table-wrap table {min-width: 990px; border-collapse: separate; border-spacing: 0;}
 .price-entry-page th {position: sticky; top: 0; z-index: 1; padding: 12px 12px; background: #f0f5ef; color: #466250; height: 60px; font-size: 12px; line-height: 1.4; letter-spacing: 0; font-weight: 650; vertical-align: middle;}
 .price-entry-page th small {display: block; font-size: 10px; font-weight: 400; color: #64796b; margin-top: 3px;}
@@ -216,6 +216,7 @@
   .price-entry-page .summary-card:nth-child(2) {border-right: 0;}
   .price-entry-page .summary-card {min-height: 88px;}
   .price-entry-page .page-heading {flex-direction: row; align-items: center;}
+  .price-entry-page .table-wrap {max-height: none; overflow-x: auto; overflow-y: visible;}
 }
 @media (max-width: 720px) {
   .price-entry-page .sidebar {width: auto; padding: 16px 20px; border-right: 0; border-bottom: 1px solid var(--line);}
