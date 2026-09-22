@@ -287,7 +287,7 @@
   function validPrice(raw) { return raw === "" || (/^[0-9]{1,6}$/.test(raw) && Number(raw) <= 100000); }
   function value(raw) { return raw === "" ? null : Number(raw); }
   function key(row, field) { return row.key + "/" + field; }
-  function categoryView() { return Boolean($("category").value); }
+  function categoryView() { return Boolean($("category").value) || state.catalogFilter !== "all"; }
   function shownRows() {
     if (categoryView()) return state.filtered;
     return state.filtered.slice(state.page * PAGE_SIZE, (state.page + 1) * PAGE_SIZE);
@@ -329,7 +329,11 @@
   function renderRows() {
     const slice = shownRows();
     const fullCategory = categoryView();
-    const categoryName = fullCategory ? $("category").selectedOptions[0]?.textContent : "";
+    const categoryName = $("category").value
+      ? $("category").selectedOptions[0]?.textContent
+      : CATALOG_FILTER_GROUPS.find(group => group.id === state.catalogFilter)?.label
+        || CATALOG_FILTER_RULES.find(rule => rule.id === state.catalogFilter)?.label
+        || CATALOG_OTHER_FILTER.label;
     const fragment = document.createDocumentFragment();
     slice.forEach((row, rowIndex) => {
       const tr = node("tr");

@@ -381,7 +381,7 @@ class EntryRouteTests(unittest.TestCase):
         self.assertIn("Скопировать ID", response.text)
         self.assertIn('id="catalog-nav"', response.text)
         self.assertIn('aria-label="Фильтры каталога"', response.text)
-        self.assertIn('price-entry.js?v=9', response.text)
+        self.assertIn('price-entry.js?v=10', response.text)
         self.assertIn('<div class="brand">', response.text)
         self.assertNotIn('href="/monitoring"', response.text)
         self.assertNotIn("Вернуться в портал", response.text)
