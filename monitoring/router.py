@@ -143,7 +143,7 @@ def _inject_price_admin_script(content: bytes) -> bytes:
             status_code=502, detail="price_catalog_invalid_encoding"
         ) from exc
     script = (
-        '<script src="/monitoring/assets/price-admin-bridge.js?v=2"></script>'
+        '<script src="/monitoring/assets/price-admin-bridge-v2.js"></script>'
         '<script src="/price/assets/admin.js" defer></script>'
     )
     legacy = '<script src="/price/assets/admin.js" defer></script>'
@@ -334,10 +334,15 @@ def auth_logout(request: Request):
 def monitoring_asset(filename: str):
     if filename not in {
         "monitoring.css", "monitoring.js", "price-admin-bridge.js",
+        "price-admin-bridge-v2.js",
         "go-stats.css", "go-stats.js", "login.js",
     }:
         raise HTTPException(status_code=404, detail="asset_not_found")
-    path = STATIC / filename
+    path = STATIC / (
+        "price-admin-bridge.js"
+        if filename == "price-admin-bridge-v2.js"
+        else filename
+    )
     media_type = "text/css" if filename.endswith(".css") else "application/javascript"
     response = Response(path.read_text(encoding="utf-8"), media_type=media_type)
     return monitoring_security_headers(response)

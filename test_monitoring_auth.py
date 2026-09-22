@@ -710,9 +710,11 @@ class MonitoringRouteTests(unittest.TestCase):
             )
         self.assertIn('/price/assets/admin.js', manage.text)
         self.assertIn(
-            '/monitoring/assets/price-admin-bridge.js?v=2', manage.text
+            '/monitoring/assets/price-admin-bridge-v2.js', manage.text
         )
-        bridge = self.client.get("/monitoring/assets/price-admin-bridge.js")
+        bridge = self.client.get(
+            "/monitoring/assets/price-admin-bridge-v2.js"
+        )
         self.assertIn('/monitoring/api/prices', bridge.text)
         self.assertIn(
             'window.setInterval(pollSnapshot, 10000)', bridge.text
