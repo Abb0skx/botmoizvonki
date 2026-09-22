@@ -55,3 +55,20 @@
 .clipboard-helper{position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0;pointer-events:none}
 @media(max-width:720px){.table-meta{align-items:flex-start;gap:10px}.table-actions{flex-direction:column;align-items:stretch}.table-actions .button{width:100%}}
 .pagination #page-label{font-weight:550;color:#52685d}
+
+/* Quick catalogue filters mirror the Telegram catalogue without loading thousands of rows at once. */
+.sidebar{overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-color:#3b6157 transparent}
+.catalog-nav{margin:16px 0 0;padding:15px 0 2px;border-top:1px solid #24473f;flex:0 0 auto}
+.catalog-nav-title{padding:0 13px 10px;color:#73958a;font-size:9px;font-weight:700;letter-spacing:1.35px}
+.catalog-nav button{display:block;width:100%;border:0;border-radius:7px;background:transparent;color:#9fb9ae;text-align:left;line-height:1.35}
+.catalog-nav button:hover{background:#193f36;color:#fff}
+.catalog-nav button.active{background:#285147;color:#fff;box-shadow:inset 3px 0 #b5e5ba}
+.catalog-filter-all,.catalog-filter-other,.catalog-filter-standalone{padding:9px 12px;font-size:11px;font-weight:650}
+.catalog-filter-parent{padding:10px 12px;font-size:11px;font-weight:650}
+.catalog-filter-group{margin:2px 0}
+.catalog-filter-children{padding:1px 0 5px 11px}
+.catalog-filter-child{padding:7px 8px;font-size:10px}
+.catalog-filter-other{margin-top:7px;border-top:1px solid #24473f!important;border-radius:0!important;padding-top:13px!important}
+.sidebar-note{margin:36px 8px 25px;padding-top:0}
+@media(max-width:1150px){.catalog-nav button{font-size:10px}.catalog-filter-child{font-size:9px;padding-left:6px;padding-right:5px}}
+@media(max-width:720px){.catalog-nav{display:none}.sidebar{overflow:visible}.sidebar-note{margin:auto 8px 25px;padding-top:40px}}

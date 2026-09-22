@@ -1,7 +1,7 @@
 (() => {
   "use strict";
   const $ = id => document.getElementById(id);
-  const state = {suppliers: [], categories: [], sheet: null, rows: [], filtered: [], edits: new Map(), selected: new Set(), page: 0, busy: false, uncertain: false};
+  const state = {suppliers: [], categories: [], sheet: null, rows: [], filtered: [], edits: new Map(), selected: new Set(), page: 0, busy: false, uncertain: false, catalogFilter: "all"};
   const PAGE_SIZE = 50;
   const number = value => Number(value).toLocaleString("ru-RU");
   const shownPrice = value => value === null || value === "" ? "нет" : number(value);
@@ -10,6 +10,98 @@
   const warranty = field => field === "price_1" ? "1 мес." : field === "price_12" ? "12 мес." : "";
   const minimumText = (value, supplier, field) => value === null || value === "" || Number(value) <= 0
     ? "нет" : `${number(value)} $ · ${supplier || "поставщик не указан"}${field ? ` · ${warranty(field)}` : ""}`;
+  const CATALOG_FILTER_GROUPS = [
+    {id: "smartphones", label: "Телефоны", items: [
+      {id: "smartphones-xiaomi-poco", label: "Xiaomi, Redmi, Poco", categories: ["Смартфоны бренда Xiaomi", "Смартфоны бренда Poco"], exclude: /^7Tech Connect U7(?:\s|$)/i},
+      {id: "smartphones-samsung", label: "Samsung", categories: ["Смартфоны бренда Samsung"]},
+      {id: "smartphones-iphone-18-duo", label: "iPhone 18 / Duo", categories: ["Смартфоны бренда Apple"], include: /^Apple iPhone (?:18(?:\s|$)|Duo(?:\s|$))/i},
+      {id: "smartphones-iphone-air-17", label: "iPhone Air / 17 Series", categories: ["Смартфоны бренда Apple"], include: /^Apple iPhone (?:Air(?:\s|$)|17(?:e)?(?:\s|$))/i},
+      {id: "smartphones-iphone-13-16", label: "iPhone 13–16 Series", categories: ["Смартфоны бренда Apple"], include: /^Apple iPhone (?:13|14|15|16)(?:e)?(?:\s|$)/i},
+      {id: "smartphones-honor-huawei", label: "Honor / Huawei", categories: ["Смартфоны бренда Honor", "Смартфоны бренда Huawei"]},
+      {id: "smartphones-google-pixel", label: "Google Pixel", categories: ["Смартфоны бренда Google Pixel"]},
+      {id: "smartphones-infinix", label: "Infinix", categories: ["Смартфоны бренда Infinix"]},
+      {id: "smartphones-tecno", label: "Tecno", categories: ["Смартфоны бренда Tecno"]},
+      {id: "smartphones-7tech-connect-u7", label: "7Tech Connect U7", categories: ["Смартфоны бренда 7TECH", "Смартфоны бренда 7Tech Connect U7", "7Tech Connect U7", "Смартфоны бренда Xiaomi"], include: /^7Tech Connect U7(?:\s|$)/i},
+      {id: "smartphones-keypad", label: "Кнопочные — Nokia / Samsung / Novey", categories: ["Кнопочные телефоны бренда Nokia", "Кнопочные телефоны бренда Samsung", "Кнопочные телефоны бренда Novey", "Кнопочные телефоны бренда Duoqin", "Кнопочные телефоны бренда LG"]},
+    ]},
+    {id: "tablets", label: "Планшеты", items: [
+      {id: "tablets-apple", label: "iPad", categories: ["Планшеты бренда Apple"]},
+      {id: "tablets-samsung", label: "Samsung", categories: ["Планшеты бренда Samsung"]},
+      {id: "tablets-xiaomi", label: "Xiaomi", categories: ["Планшеты бренда Xiaomi"]},
+      {id: "tablets-honor-huawei", label: "Honor / Huawei", categories: ["Планшеты бренда Honor", "Планшеты бренда Huawei"]},
+    ]},
+    {id: "audio", label: "Наушники, колонки", items: [
+      {id: "audio-apple", label: "AirPods, EarPods, HomePod", categories: ["Наушники бренда Apple", "Колонка бренда Apple"]},
+      {id: "audio-samsung", label: "Samsung Buds", categories: ["Наушники бренда Samsung"]},
+      {id: "audio-xiaomi", label: "Xiaomi Buds", categories: ["Наушники бренда Xiaomi"]},
+      {id: "audio-sony", label: "Sony", categories: ["Наушники бренда Sony"]},
+      {id: "audio-huawei-honor", label: "Huawei / Honor", categories: ["Наушники бренда Huawei", "Наушники бренда Honor"]},
+      {id: "audio-jbl", label: "JBL", categories: ["Наушники бренда JBL", "Колонка бренда JBL"]},
+      {id: "audio-nothing", label: "CMF (Nothing)", categories: ["Наушники бренда Nothing"]},
+      {id: "audio-marshall", label: "Marshall", categories: ["Наушники бренда Marshall"]},
+      {id: "audio-anker", label: "Anker", categories: ["Наушники бренда Anker"]},
+      {id: "audio-beats-dyson", label: "Beats / Dyson", categories: ["Наушники бренда Beats", "Наушники бренда Dyson"]},
+      {id: "audio-shokz", label: "Shokz", categories: ["Наушники бренда Shokz"]},
+      {id: "audio-yandex", label: "Яндекс", categories: ["Колонка бренда Яндекс"]},
+    ]},
+    {id: "wearables", label: "Часы, фитнес-браслеты, кольца", items: [
+      {id: "wearables-apple", label: "Apple Watch", categories: ["Часы бренда Apple"]},
+      {id: "wearables-samsung", label: "Samsung Watch", categories: ["Часы бренда Samsung"]},
+      {id: "wearables-xiaomi", label: "Xiaomi Watch", categories: ["Часы бренда Xiaomi"]},
+      {id: "wearables-amazfit-haylou-mibro", label: "Amazfit, Haylou, MiBro", categories: ["Часы бренда Amazfit", "Часы бренда Haylou", "Часы бренда Mibro"]},
+      {id: "wearables-huawei", label: "Huawei Watch", categories: ["Часы бренда Huawei"]},
+      {id: "wearables-nothing", label: "CMF Watch (Nothing)", categories: ["Часы бренда Nothing"]},
+      {id: "wearables-porodo", label: "Porodo — детские часы", categories: ["Часы бренда Porodo"]},
+      {id: "wearables-whoop-fitbit", label: "Whoop / Fitbit", categories: ["Часы бренда Whoop", "Фитнес-браслеты Fitbit"]},
+      {id: "wearables-iqibla", label: "iQibla", categories: ["Умное кольцо Бренда iQibla"]},
+    ]},
+    {id: "apple-computers", label: "MacBook, iMac, Mac mini", standalone: true, items: [
+      {id: "apple-computers-all", label: "MacBook, iMac, Mac mini", categories: ["Ноутбуки бренда Apple", "Комаютеры бренда Apple"]},
+    ]},
+    {id: "photo-video", label: "Фото, видео и блогинг", items: [
+      {id: "photo-dji", label: "Техника DJI", categories: ["Стабилизатор камеры Бренда Dji"]},
+      {id: "photo-hollyland", label: "Микрофоны Hollyland", categories: ["Диктофон бренда Hollyland"]},
+      {id: "photo-insta360", label: "Insta360", categories: ["Продукция Бренда Insta360"]},
+      {id: "photo-gopro", label: "GoPro", categories: ["Камеры Бренда GoPro"]},
+      {id: "photo-instax", label: "Instax", categories: ["Моментальные фотоаппараты"]},
+    ]},
+    {id: "smart-glasses-vr", label: "VR-очки / Умные очки", items: [
+      {id: "glasses-ray-ban-meta", label: "Ray-Ban Meta", categories: ["Очки бренда Ray-Ban Meta"]},
+      {id: "glasses-oakley-meta", label: "Oakley Meta", categories: ["Очки бренда Oakley Meta"]},
+      {id: "vr-meta-quest", label: "Meta Quest", categories: ["VR Очки Бренда Meta"]},
+    ]},
+    {id: "home-office", label: "Техника для дома и офиса", items: [
+      {id: "home-tv-boxes", label: "ТВ-приставки", categories: ["ТВ Бокс бренда Apple", "ТВ Бокс бренда Xiaomi", "ТВ Бокс Бренда Яндекс"]},
+      {id: "home-wifi", label: "Wi-Fi-оборудование", categories: ["Wifi бренда Tp - Link", "Wifi бренда Xiaomi", "Wifi бренда D-Link", "Wifi бренда D - Link"]},
+      {id: "home-cameras", label: "Камеры", categories: ["Камера Бренда Xiaomi"]},
+      {id: "home-yandex-sensors", label: "Датчики для Яндекс Станции", categories: ["Датчик умного дома Бренда Яндекс"]},
+      {id: "home-vacuums", label: "Пылесосы", categories: ["Пылесосы бренда Xiaomi", "Пылесосы Dyson", "Пылесосы бренда Deerma"]},
+      {id: "home-air", label: "Очистители / увлажнители воздуха", categories: ["Очиститель воздуха Dyson", "Очиститель/Увложнитель воздуха Xiaomi", "Увложнитель воздуха Xiaomi", "Увложнитель воздуха Deerma", "Увлажнитель воздуха бренда Deerma"]},
+    ]},
+    {id: "charging", label: "Зарядные устройства и Power Bank", items: [
+      {id: "charging-adapters-cables", label: "Адаптеры и USB-кабели", categories: ["Adapter и USB Бренда Apple", "Adapter и USB Бренда Samsung", "Adapter и USB Бренда Xiaomi"]},
+      {id: "charging-car", label: "Car Adapter", categories: ["Car Charger Бренда Samsung", "Car Charger Бренда Xiaomi"]},
+      {id: "charging-power-bank", label: "Power Bank", categories: ["Power Bank бренда Apple", "Power Bank бренда Belkin", "Power Bank бренда Samsung", "Power Bank бренда Xiaomi"]},
+      {id: "charging-stations", label: "Зарядные станции", categories: ["Belkin Зарядные станции"]},
+    ]},
+    {id: "gaming", label: "PlayStation / Xbox", standalone: true, items: [
+      {id: "gaming-playstation-xbox", label: "PlayStation / Xbox", categories: ["PlayStation Store", "Приставка Xbox"]},
+    ]},
+    {id: "dyson-beauty", label: "Dyson — фены и стайлеры", standalone: true, items: [
+      {id: "dyson-hair", label: "Dyson — фены и стайлеры", categories: ["Фен Dyson", "Стайлер (Airwrap) Dyson", "Стайлер-выпрямитель (Airstrait) Dyson", "Расческа", "Выпрямитель (Corrale) Dyson", "Утюжок (Corrale) Dyson"]},
+    ]},
+    {id: "voice-recorders", label: "Диктофоны Plaud", standalone: true, items: [
+      {id: "voice-recorders-plaud", label: "Диктофоны Plaud", categories: ["Диктофон бренда Plaud"]},
+    ]},
+    {id: "storage", label: "HDD, SSD, USB, MicroSD", standalone: true, items: [
+      {id: "storage-all", label: "HDD, SSD, USB, MicroSD", categories: ["Хард Бренда Seagate", "Хард Бренда Toshiba", "Хард БрендаTranscend", "SSD Бренда Lexar", "SSD Бренда SanDisk", "SSD бренда Ares", "MicroSD Бренда SanDisk", "USB Бренда SanDisk"]},
+    ]},
+    {id: "accessories", label: "AirTag, SmartTag, Pencil, Keyboard, Mouse", standalone: true, items: [
+      {id: "accessories-combined", label: "AirTag, SmartTag, Pencil, Keyboard, Mouse", categories: ["Tag Бренда Apple", "Tag Бренда Samsung", "Pencil бренда Apple", "Pencil бренда Xiaomi", "Мышь Бренда Apple", "Мышь Бренда Xiaomi", "Клавиатура бренда Apple", "Клавиатура бренда Samsung", "Клавиатура бренда Xiaomi"]},
+    ]},
+  ];
+  const CATALOG_FILTER_RULES = CATALOG_FILTER_GROUPS.flatMap(group => group.items);
+  const CATALOG_OTHER_FILTER = {id: "other", label: "Остальные"};
   const errors = {
     price_entry_unavailable: "Не удалось загрузить цены. Попробуйте ещё раз позже.",
     local_prices_not_initialized: "Серверный каталог ещё не подготовлен. Цены не изменены.",
@@ -38,6 +130,79 @@
     if (text !== undefined) n.textContent = text;
     if (className) n.className = className;
     return n;
+  }
+  function catalogRuleMatches(row, rule) {
+    if (!rule.categories.includes(row.category_name)) return false;
+    if (rule.include && !rule.include.test(row.model_name)) return false;
+    if (rule.exclude && rule.exclude.test(row.model_name)) return false;
+    return true;
+  }
+  function catalogFilterMatches(row) {
+    if (state.catalogFilter === "all") return true;
+    if (state.catalogFilter === CATALOG_OTHER_FILTER.id) {
+      return !CATALOG_FILTER_RULES.some(rule => catalogRuleMatches(row, rule));
+    }
+    const group = CATALOG_FILTER_GROUPS.find(item => item.id === state.catalogFilter);
+    if (group) return group.items.some(rule => catalogRuleMatches(row, rule));
+    const rule = CATALOG_FILTER_RULES.find(item => item.id === state.catalogFilter);
+    return rule ? catalogRuleMatches(row, rule) : true;
+  }
+  function updateCatalogNavigation() {
+    const nav = $("catalog-nav");
+    if (!nav) return;
+    nav.querySelectorAll("[data-catalog-filter]").forEach(button => {
+      const active = button.dataset.catalogFilter === state.catalogFilter;
+      button.classList.toggle("active", active);
+      button.setAttribute("aria-current", active ? "true" : "false");
+    });
+    const activeGroup = CATALOG_FILTER_GROUPS.find(group =>
+      !group.standalone && (group.id === state.catalogFilter || group.items.some(item => item.id === state.catalogFilter))
+    );
+    nav.querySelectorAll("[data-catalog-children]").forEach(list => {
+      const open = list.dataset.catalogChildren === activeGroup?.id;
+      list.hidden = !open;
+      const parent = nav.querySelector(`[data-catalog-parent="${list.dataset.catalogChildren}"]`);
+      if (parent) parent.setAttribute("aria-expanded", open ? "true" : "false");
+    });
+  }
+  function applyCatalogFilter(filterId) {
+    state.catalogFilter = filterId;
+    $("category").value = "";
+    $("search").value = "";
+    state.page = 0;
+    updateCatalogNavigation();
+    filter();
+  }
+  function catalogFilterButton(filterId, label, className) {
+    const button = node("button", label, className);
+    button.type = "button";
+    button.dataset.catalogFilter = filterId;
+    button.addEventListener("click", () => applyCatalogFilter(filterId));
+    return button;
+  }
+  function renderCatalogNavigation() {
+    const nav = $("catalog-nav");
+    const title = node("div", "БЫСТРЫЙ ФИЛЬТР", "catalog-nav-title");
+    const all = catalogFilterButton("all", "Все товары", "catalog-filter-all");
+    nav.append(title, all);
+    CATALOG_FILTER_GROUPS.forEach(group => {
+      if (group.standalone) {
+        nav.append(catalogFilterButton(group.id, group.label, "catalog-filter-standalone"));
+        return;
+      }
+      const wrapper = node("div", undefined, "catalog-filter-group");
+      const parent = catalogFilterButton(group.id, `▸ ${group.label}`, "catalog-filter-parent");
+      parent.dataset.catalogParent = group.id;
+      parent.setAttribute("aria-expanded", "false");
+      const children = node("div", undefined, "catalog-filter-children");
+      children.dataset.catalogChildren = group.id;
+      children.hidden = true;
+      group.items.forEach(item => children.append(catalogFilterButton(item.id, `• ${item.label}`, "catalog-filter-child")));
+      wrapper.append(parent, children);
+      nav.append(wrapper);
+    });
+    nav.append(catalogFilterButton(CATALOG_OTHER_FILTER.id, CATALOG_OTHER_FILTER.label, "catalog-filter-other"));
+    updateCatalogNavigation();
   }
   function notice(text, error = false) {
     $("notice").textContent = text;
@@ -96,6 +261,7 @@
     const words = $("search").value.toLowerCase().trim().split(/\s+/).filter(Boolean);
     const category = $("category").value, availability = $("availability").value;
     state.filtered = state.rows.filter(row => {
+      if (!catalogFilterMatches(row)) return false;
       if (category && row.category_name !== category) return false;
       const searchable = `${row.model_name} ${row.color} ${row.memory} ${row.product_id}`.toLowerCase();
       if (!words.every(w => searchable.includes(w))) return false;
@@ -414,7 +580,13 @@
   $("supplier").addEventListener("change", () => { if (mayDiscard()) load(Number($("supplier").value)); else $("supplier").value = String(state.sheet); });
   $("refresh").addEventListener("click", () => { if (state.sheet !== null && mayDiscard()) load(state.sheet); });
   $("discard").addEventListener("click", () => { if (mayDiscard()) { state.edits.clear(); filter(); } });
-  ["search", "category", "availability"].forEach(id => $(id).addEventListener(id === "search" ? "input" : "change", () => { state.page = 0; filter(); }));
+  ["search", "availability"].forEach(id => $(id).addEventListener(id === "search" ? "input" : "change", () => { state.page = 0; filter(); }));
+  $("category").addEventListener("change", () => {
+    state.catalogFilter = $("category").value ? "toolbar-category" : "all";
+    state.page = 0;
+    updateCatalogNavigation();
+    filter();
+  });
   $("previous").addEventListener("click", () => { state.page--; renderRows(); });
   $("next").addEventListener("click", () => { state.page++; renderRows(); });
   $("select-page").addEventListener("change", () => { shownRows().forEach(r => $("select-page").checked ? state.selected.add(r.key) : state.selected.delete(r.key)); renderRows(); });
@@ -442,5 +614,6 @@
       await load(data.suppliers[0].sheet_id);
     } catch (error) { notice(error.message, true); }
   }
+  renderCatalogNavigation();
   init();
 })();
