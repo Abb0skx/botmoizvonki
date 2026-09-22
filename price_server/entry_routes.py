@@ -14,6 +14,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from .price_entry import EntryError, PriceEntryService
 from .entry_catalog import EntryCatalogService
 from .entry_refresh import enqueue_price_refresh
+from .entry_schedule import publication_preview
 from .model_inbox import ModelInbox
 
 LOG = logging.getLogger(__name__)
@@ -91,8 +92,17 @@ def install_entry_routes(router, admin, enabled, settings):
     def suppliers(request: Request):
         enabled()
         admin(request, action=False)
-        return {"suppliers": call(service().source.suppliers),
-                "source": os.getenv("PRICE_ENTRY_SOURCE", "sqlite")}
+        result = {"suppliers": call(service().source.suppliers),
+                  "source": os.getenv("PRICE_ENTRY_SOURCE", "sqlite")}
+        try:
+            result["publication_schedule"] = publication_preview(
+                settings.db_path, getattr(settings, "timezone", "Asia/Tashkent"),
+            )
+        except Exception as exc:
+            # An unavailable calendar must not block price editing or show stale hints.
+            LOG.warning("price_entry_schedule_unavailable type=%s", type(exc).__name__)
+            result["publication_schedule"] = None
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
     @router.get("/price/api/v1/entry/categories")
     def categories(request: Request):

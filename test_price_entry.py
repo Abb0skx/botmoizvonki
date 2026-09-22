@@ -4,6 +4,7 @@ import sqlite3
 import tempfile
 import unittest
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -13,6 +14,8 @@ from fastapi.testclient import TestClient
 
 from price_server.entry_routes import install_entry_routes
 from price_server.entry_refresh import enqueue_price_refresh
+from price_server.entry_schedule import publication_preview
+from price_server.calendar_plan import CALENDAR_PLAN_ENTRIES
 from price_server.price_entry import (
     EntryError, HEADERS, PriceEntryService, SheetsPriceSource, identity, price, revision,
 )
@@ -292,6 +295,71 @@ class SheetsAdapterTests(unittest.TestCase):
         self.assertEqual(requests[1]["updateCells"]["rows"], [{"values": [{}]}])
 
 
+class EntryPublicationScheduleTests(unittest.TestCase):
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.addCleanup(self.folder.cleanup)
+        self.path = Path(self.folder.name) / "schedule.db"
+        with sqlite3.connect(self.path) as db:
+            db.execute("CREATE TABLE calendar_publication_plan (day_of_month, slot, subposition, section_key, enabled)")
+            db.executemany("INSERT INTO calendar_publication_plan VALUES (?, ?, ?, ?, 1)",
+                           [(e.day, e.slot, e.subposition, e.section_key) for e in CALENDAR_PLAN_ENTRIES])
+
+    def preview(self, stamp):
+        return publication_preview(self.path, "Asia/Tashkent", now=datetime.fromisoformat(stamp))
+
+    def test_tomorrow_and_day_after_follow_calendar(self):
+        result = self.preview("2026-09-22T08:00:00+00:00")
+        self.assertEqual(result["today"], "2026-09-22")
+        self.assertEqual(result["timezone"], "Asia/Tashkent")
+        self.assertEqual(result["days"][0], {"offset": 1, "date": "2026-09-23", "section_keys": [
+            "audio-nothing", "audio-apple", "charging-stations",
+        ]})
+        self.assertEqual(result["days"][1]["section_keys"], [
+            "audio-anker", "smartphones-iphone-air-17", "wearables-amazfit-haylou-mibro",
+        ])
+
+    def test_midnight_uses_tashkent_not_utc_date(self):
+        before = self.preview("2026-09-22T18:59:00+00:00")
+        after = self.preview("2026-09-22T19:00:00+00:00")
+        self.assertEqual(before["today"], "2026-09-22")
+        self.assertEqual(after["today"], "2026-09-23")
+        self.assertEqual(before["days"][1]["section_keys"], after["days"][0]["section_keys"])
+
+    def test_february_rollover_and_leap_year(self):
+        for stamp, plan_days in [("2027-02-28T10:00:00+00:00", {1, 29, 30}),
+                                 ("2028-02-29T10:00:00+00:00", {1, 30})]:
+            with self.subTest(stamp=stamp):
+                result = self.preview(stamp)
+                expected = {e.section_key for e in CALENDAR_PLAN_ENTRIES if e.day in plan_days}
+                self.assertEqual(set(result["days"][0]["section_keys"]), expected)
+                self.assertTrue(result["days"][0]["date"].endswith("03-01"))
+
+    def test_empty_day_31_and_new_year(self):
+        result = self.preview("2026-12-30T10:00:00+00:00")
+        self.assertEqual(result["days"][0]["section_keys"], [])
+        self.assertEqual(result["days"][1]["date"], "2027-01-01")
+        self.assertEqual(set(result["days"][1]["section_keys"]),
+                         {e.section_key for e in CALENDAR_PLAN_ENTRIES if e.day == 1})
+
+    def test_reads_live_changes_without_reseeding_or_duplicates(self):
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE calendar_publication_plan SET enabled=0 WHERE section_key='audio-apple'")
+            db.execute("INSERT INTO calendar_publication_plan VALUES (23, 4, 1, 'audio-nothing', 1)")
+            db.execute("INSERT INTO calendar_publication_plan VALUES (23, 5, 1, 'photo-gopro', 1)")
+        result = self.preview("2026-09-22T08:00:00+00:00")
+        self.assertEqual(result["days"][0]["section_keys"], ["audio-nothing", "charging-stations", "photo-gopro"])
+        with sqlite3.connect(self.path) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM calendar_publication_plan").fetchone()[0], len(CALENDAR_PLAN_ENTRIES) + 2)
+            self.assertEqual(db.execute("SELECT enabled FROM calendar_publication_plan WHERE section_key='audio-apple' LIMIT 1").fetchone()[0], 0)
+
+    def test_missing_database_is_not_created(self):
+        missing = self.path.parent / "missing.db"
+        with self.assertRaises(sqlite3.OperationalError):
+            publication_preview(missing, "Asia/Tashkent")
+        self.assertFalse(missing.exists())
+
+
 class EntryRouteTests(unittest.TestCase):
     def setUp(self):
         self.admin = Mock()
@@ -313,7 +381,7 @@ class EntryRouteTests(unittest.TestCase):
         self.assertIn("Скопировать ID", response.text)
         self.assertIn('id="catalog-nav"', response.text)
         self.assertIn('aria-label="Фильтры каталога"', response.text)
-        self.assertIn('price-entry.js?v=8', response.text)
+        self.assertIn('price-entry.js?v=9', response.text)
         self.assertIn('<div class="brand">', response.text)
         self.assertNotIn('href="/monitoring"', response.text)
         self.assertNotIn("Вернуться в портал", response.text)
@@ -351,6 +419,28 @@ class EntryRouteTests(unittest.TestCase):
             self.assertEqual(self.client.get("/price/api/v1/entry/" + route).status_code, 401)
         self.assertEqual(self.client.post("/price/api/v1/entry/save/99", json={}).status_code, 401)
         self.assertTrue(self.admin.call_args.kwargs["action"])
+
+    def test_suppliers_include_uncached_publication_preview(self):
+        preview = {"today": "2026-09-22", "timezone": "Asia/Tashkent", "days": []}
+        with patch("price_server.entry_routes.PriceEntryService") as service, patch(
+            "price_server.entry_routes.publication_preview", return_value=preview,
+        ):
+            service.return_value.source.suppliers.return_value = [{"name": "Test", "sheet_id": 99}]
+            response = self.client.get("/price/api/v1/entry/suppliers")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["publication_schedule"], preview)
+        self.assertEqual(response.headers["cache-control"], "no-store")
+
+    def test_unavailable_schedule_does_not_block_supplier_loading(self):
+        with patch("price_server.entry_routes.PriceEntryService") as service, patch(
+            "price_server.entry_routes.publication_preview", side_effect=RuntimeError("SECRET"),
+        ):
+            service.return_value.source.suppliers.return_value = [{"name": "Test", "sheet_id": 99}]
+            response = self.client.get("/price/api/v1/entry/suppliers")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()["suppliers"]), 1)
+        self.assertIsNone(response.json()["publication_schedule"])
+        self.assertNotIn("SECRET", response.text)
 
     def test_applied_save_queues_immediate_price_refresh(self):
         operation_id = str(uuid.uuid4())

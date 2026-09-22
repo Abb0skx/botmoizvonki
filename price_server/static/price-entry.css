@@ -74,6 +74,15 @@
 @media(max-width:720px){.catalog-nav{display:none}.sidebar{overflow:visible}.sidebar-note{margin:auto 8px 25px;padding-top:40px}}
 
 /* Price entry only: the model/category editors keep their existing layout. */
+.price-entry-page .catalog-nav button {display: flex; align-items: center; gap: 8px;}
+.catalog-filter-label {min-width: 0; flex: 1;}
+.catalog-schedule-markers {display: inline-flex; align-items: center; justify-content: flex-end; gap: 5px; margin-left: auto; flex-shrink: 0;}
+.schedule-dot {display: inline-block; width: 8px; height: 8px; border-radius: 50%; flex: 0 0 8px;}
+.schedule-tomorrow {background: #24d65a; box-shadow: 0 0 0 2px #24d65a20;}
+.schedule-later {background: #c99768;}
+.catalog-schedule-legend {display: grid; gap: 7px; padding: 0 12px 14px; font-size: 10px; color: #657b6c;}
+.schedule-legend-item {display: flex; align-items: center; gap: 8px; line-height: 1.4;}
+.schedule-unavailable {font-size: 10px; color: #7b877f;}
 .price-entry-page {
   --ink: #243730;
   --muted: #66776e;

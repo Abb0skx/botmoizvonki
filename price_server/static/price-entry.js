@@ -174,7 +174,8 @@
     filter();
   }
   function catalogFilterButton(filterId, label, className) {
-    const button = node("button", label, className);
+    const button = node("button", undefined, className);
+    button.append(node("span", label, "catalog-filter-label"));
     button.type = "button";
     button.dataset.catalogFilter = filterId;
     button.addEventListener("click", () => applyCatalogFilter(filterId));
@@ -184,7 +185,10 @@
     const nav = $("catalog-nav");
     const title = node("div", "БЫСТРЫЙ ФИЛЬТР", "catalog-nav-title");
     const all = catalogFilterButton("all", "Все товары", "catalog-filter-all");
-    nav.append(title, all);
+    const legend = node("div", undefined, "catalog-schedule-legend");
+    legend.id = "catalog-schedule-legend";
+    legend.setAttribute("aria-label", "План публикаций");
+    nav.append(title, legend, all);
     CATALOG_FILTER_GROUPS.forEach(group => {
       if (group.standalone) {
         nav.append(catalogFilterButton(group.id, group.label, "catalog-filter-standalone"));
@@ -203,6 +207,54 @@
     });
     nav.append(catalogFilterButton(CATALOG_OTHER_FILTER.id, CATALOG_OTHER_FILTER.label, "catalog-filter-other"));
     updateCatalogNavigation();
+  }
+  function updatePublicationMarkers(schedule) {
+    const nav = $("catalog-nav"), legend = $("catalog-schedule-legend");
+    nav.querySelectorAll(".catalog-schedule-markers").forEach(markers => markers.remove());
+    nav.querySelectorAll("[data-catalog-filter]").forEach(button => button.removeAttribute("title"));
+    legend.replaceChildren();
+    if (!schedule || !Array.isArray(schedule.days)) {
+      legend.append(node("span", "Расписание временно недоступно", "schedule-unavailable"));
+      return;
+    }
+    const days = schedule.days.filter(day => day.offset === 1 || day.offset === 2);
+    const description = day => `${day.offset === 1 ? "Завтра" : "Послезавтра"}, ${day.date.split("-").reverse().join(".")}`;
+    const dot = day => {
+      const mark = node("span", undefined, "schedule-dot " + (day.offset === 1 ? "schedule-tomorrow" : "schedule-later"));
+      mark.setAttribute("role", "img");
+      mark.setAttribute("aria-label", "По плану: " + description(day));
+      mark.title = "По плану: " + description(day);
+      return mark;
+    };
+    days.forEach(day => {
+      const item = node("span", undefined, "schedule-legend-item");
+      item.append(dot(day), node("span", description(day)));
+      legend.append(item);
+    });
+    nav.querySelectorAll("[data-catalog-filter]").forEach(button => {
+      const id = button.dataset.catalogFilter;
+      const group = CATALOG_FILTER_GROUPS.find(group => group.id === id);
+      const keys = group ? group.items.map(item => item.id) : [id];
+      const planned = days.filter(day => day.section_keys.some(key => keys.includes(key)));
+      if (!planned.length) return;
+      const markers = node("span", undefined, "catalog-schedule-markers");
+      planned.forEach(day => markers.append(dot(day)));
+      button.append(markers);
+      button.title = planned.map(day => "По плану: " + description(day)).join("; ");
+    });
+  }
+  let scheduleLoading = false;
+  async function refreshPublicationMarkers() {
+    if (document.hidden || !state.suppliers.length || scheduleLoading) return;
+    scheduleLoading = true;
+    try {
+      const response = await fetch("/monitoring/api/prices/admin/entry/suppliers", {
+        credentials: "same-origin", cache: "no-store", headers: {Accept: "application/json"},
+      });
+      if (!response.ok) throw new Error("schedule_unavailable");
+      updatePublicationMarkers((await response.json()).publication_schedule);
+    } catch { updatePublicationMarkers(null); }
+    finally { scheduleLoading = false; }
   }
   function notice(text, error = false) {
     $("notice").textContent = text;
@@ -612,6 +664,7 @@
     notice("Загружаем цены…");
     try {
       const data = await api("suppliers"); state.suppliers = data.suppliers;
+      updatePublicationMarkers(data.publication_schedule);
       state.source = data.source;
       $("source-mode").textContent = data.source === "sqlite" ? "Самостоятельный режим" : "Переходный режим";
       $("source-title").textContent = data.source === "sqlite" ? "Цены на сервере" : "Сайт + Google Sheets";
@@ -631,5 +684,7 @@
     } catch (error) { notice(error.message, true); }
   }
   renderCatalogNavigation();
+  window.setInterval(refreshPublicationMarkers, 60000);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshPublicationMarkers(); });
   init();
 })();
