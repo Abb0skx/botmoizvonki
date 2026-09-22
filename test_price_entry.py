@@ -235,6 +235,9 @@ class EntryRouteTests(unittest.TestCase):
         self.assertIn("Скопировать ID", response.text)
         self.assertIn('id="catalog-nav"', response.text)
         self.assertIn('aria-label="Фильтры каталога"', response.text)
+        self.assertIn('<div class="brand">', response.text)
+        self.assertNotIn('href="/monitoring"', response.text)
+        self.assertNotIn("Вернуться в портал", response.text)
         self.assertNotIn("ПАМЯТЬ / ЦВЕТ", response.text)
 
     def test_public_assets_whitelisted(self):
