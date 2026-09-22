@@ -1,7 +1,7 @@
 (() => {
   "use strict";
   const $ = id => document.getElementById(id);
-  const state = {suppliers: [], categories: [], sheet: null, rows: [], filtered: [], edits: new Map(), selected: new Set(), page: 0, busy: false, uncertain: false};
+  const state = {suppliers: [], categories: [], sheet: null, rows: [], filtered: [], edits: new Map(), selected: new Set(), page: 0, busy: false, uncertain: false, renderVersion: 0};
   const PAGE_SIZE = 50;
   const number = value => Number(value).toLocaleString("ru-RU");
   const shownPrice = value => value === null || value === "" ? "нет" : number(value);
@@ -105,21 +105,26 @@
     state.page = 0;
     renderRows();
   }
-  function renderRows() {
-    const slice = shownRows();
-    const fullCategory = categoryView();
-    const categoryName = fullCategory ? $("category").selectedOptions[0]?.textContent : "";
-    const fragment = document.createDocumentFragment();
-    slice.forEach((row, rowIndex) => {
+  function syncSelectionControls(rows) {
+    $("select-page").checked = !!rows.length && rows.every(row => state.selected.has(row.key));
+    $("select-page").indeterminate = rows.some(row => state.selected.has(row.key)) && !$("select-page").checked;
+    $("select-page").setAttribute("aria-label", categoryView() ? "Выбрать всю категорию" : "Выбрать все найденные товары");
+    updateSavebar();
+  }
+  function renderRow(row, rowIndex, rows) {
       const tr = node("tr");
-      const previous = slice[rowIndex - 1];
+      const previous = rows[rowIndex - 1];
       if (!previous || previous.model_name !== row.model_name || previous.category_name !== row.category_name) tr.classList.add("model-start");
       if (state.selected.has(row.key)) tr.classList.add("row-selected");
       if (PRICE_FIELDS.some(f => state.edits.has(key(row, f)))) tr.classList.add("row-dirty");
       const checkCell = node("td"), check = node("input");
       check.type = "checkbox"; check.checked = state.selected.has(row.key);
       check.setAttribute("aria-label", "Выбрать " + row.model_name + " " + row.memory + " " + row.color);
-      check.addEventListener("change", () => { check.checked ? state.selected.add(row.key) : state.selected.delete(row.key); renderRows(); });
+      check.addEventListener("change", () => {
+        check.checked ? state.selected.add(row.key) : state.selected.delete(row.key);
+        tr.classList.toggle("row-selected", check.checked);
+        syncSelectionControls(rows);
+      });
       checkCell.append(check); tr.append(checkCell);
       const product = node("td"); product.append(node("div", row.model_name, "product-name"), node("div", "ID " + row.product_id + " · " + row.category_name, "product-meta")); tr.append(product);
       const memory = node("td", undefined, "memory-cell");
@@ -184,21 +189,39 @@
       minimumHistory.title = "История изменения минимальной цены и поставщика";
       minimumHistory.addEventListener("click", () => showCellHistory(row, "min_price"));
       minimum.append(minimumHistory); tr.append(minimum);
-      fragment.append(tr);
-    });
-    $("rows").replaceChildren(fragment);
-    $("found-count").textContent = `${number(state.filtered.length)} позиций`;
-    $("empty").hidden = state.filtered.length !== 0;
-    $("page-label").textContent = fullCategory
+      return tr;
+  }
+  function renderRows() {
+    const slice = shownRows();
+    const fullCategory = categoryView();
+    const categoryName = fullCategory ? $("category").selectedOptions[0]?.textContent : "";
+    const finalLabel = fullCategory
       ? `${categoryName} · вся категория на одной странице · ${number(state.filtered.length)} позиций`
       : `Все модели на одной странице · ${number(state.filtered.length)} позиций`;
+    const renderVersion = ++state.renderVersion;
+    const body = $("rows");
+    body.replaceChildren();
+    $("found-count").textContent = `${number(state.filtered.length)} позиций`;
+    $("empty").hidden = state.filtered.length !== 0;
+    $("page-label").textContent = slice.length > 250 ? `Загружаем модели · 0 из ${number(slice.length)}` : finalLabel;
     $("page-actions").hidden = true;
     $("previous").disabled = true;
     $("next").disabled = true;
-    $("select-page").checked = !!slice.length && slice.every(r => state.selected.has(r.key));
-    $("select-page").indeterminate = slice.some(r => state.selected.has(r.key)) && !$("select-page").checked;
-    $("select-page").setAttribute("aria-label", fullCategory ? "Выбрать всю категорию" : "Выбрать все найденные товары");
-    updateSavebar();
+    syncSelectionControls(slice);
+    let cursor = 0;
+    const appendChunk = () => {
+      if (renderVersion !== state.renderVersion) return;
+      const end = Math.min(cursor + 250, slice.length);
+      const fragment = document.createDocumentFragment();
+      for (let index = cursor; index < end; index++) fragment.append(renderRow(slice[index], index, slice));
+      body.append(fragment);
+      cursor = end;
+      if (cursor < slice.length) {
+        $("page-label").textContent = `Загружаем модели · ${number(cursor)} из ${number(slice.length)}`;
+        setTimeout(appendChunk, 0);
+      } else $("page-label").textContent = finalLabel;
+    };
+    appendChunk();
   }
   async function load(sheetId) {
     state.busy = true; updateSavebar(); $("workspace").classList.add("loading"); notice("");

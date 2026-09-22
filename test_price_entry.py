@@ -249,6 +249,8 @@ class EntryRouteTests(unittest.TestCase):
         self.assertIn('function shownRows() { return state.filtered; }', entry_js.text)
         self.assertIn('вся категория на одной странице', entry_js.text)
         self.assertIn('Все модели на одной странице', entry_js.text)
+        self.assertIn('const end = Math.min(cursor + 250, slice.length);', entry_js.text)
+        self.assertIn('if (renderVersion !== state.renderVersion) return;', entry_js.text)
         self.assertNotIn('Object.keys(fields).forEach(field =>', entry_js.text)
         self.assertEqual(self.client.get("/price/assets/price-entry.env").status_code, 404)
         self.assertEqual(self.client.get("/price/models").status_code, 200)
