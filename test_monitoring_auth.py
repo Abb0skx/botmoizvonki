@@ -712,6 +712,11 @@ class MonitoringRouteTests(unittest.TestCase):
         self.assertIn(
             '/monitoring/assets/price-admin-bridge.js', manage.text
         )
+        bridge = self.client.get("/monitoring/assets/price-admin-bridge.js")
+        self.assertIn('/monitoring/api/prices', bridge.text)
+        self.assertIn(
+            'window.setInterval(pollSnapshot, 10000)', bridge.text
+        )
         self.assertEqual(manage.headers["x-frame-options"], "DENY")
         self.assertIn(
             "frame-ancestors 'none'",

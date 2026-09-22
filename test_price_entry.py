@@ -1,5 +1,6 @@
 import copy
 import json
+import sqlite3
 import tempfile
 import unittest
 import uuid
@@ -11,6 +12,7 @@ from fastapi import APIRouter, FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from price_server.entry_routes import install_entry_routes
+from price_server.entry_refresh import enqueue_price_refresh
 from price_server.price_entry import (
     EntryError, HEADERS, PriceEntryService, SheetsPriceSource, identity, price, revision,
 )
@@ -156,6 +158,82 @@ class EntryServiceTests(unittest.TestCase):
         self.assertEqual(self.source.calls, [])
 
 
+class EntryRefreshQueueTests(unittest.TestCase):
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.addCleanup(self.folder.cleanup)
+        self.path = Path(self.folder.name) / "worker-control.db"
+        with sqlite3.connect(self.path) as database:
+            database.execute("""CREATE TABLE control_queue (
+                request_id TEXT PRIMARY KEY,
+                update_id INTEGER NOT NULL UNIQUE,
+                task_name TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at TEXT,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                exit_code INTEGER,
+                worker_status TEXT,
+                error TEXT,
+                result_json TEXT,
+                notification_status TEXT NOT NULL DEFAULT 'pending',
+                notification_message_id INTEGER,
+                notification_error TEXT,
+                notified_at TEXT
+            )""")
+
+    def rows(self):
+        with sqlite3.connect(self.path) as database:
+            database.row_factory = sqlite3.Row
+            return [dict(row) for row in database.execute(
+                "SELECT * FROM control_queue ORDER BY created_at,request_id"
+            )]
+
+    def test_save_refresh_is_queued_without_telegram_notification(self):
+        result = enqueue_price_refresh(str(uuid.uuid4()), queue_path=self.path)
+        self.assertEqual(result, {"status": "queued", "coalesced": False})
+        row = self.rows()[0]
+        self.assertEqual(row["task_name"], "import-prices")
+        self.assertEqual(row["status"], "queued")
+        self.assertLess(row["update_id"], 0)
+        self.assertEqual(row["notification_status"], "sent")
+        self.assertIsNotNone(row["notified_at"])
+
+    def test_waiting_refreshes_are_coalesced(self):
+        enqueue_price_refresh(str(uuid.uuid4()), queue_path=self.path)
+        result = enqueue_price_refresh(str(uuid.uuid4()), queue_path=self.path)
+        self.assertEqual(result, {"status": "queued", "coalesced": True})
+        self.assertEqual(len(self.rows()), 1)
+
+    def test_edit_during_running_import_keeps_one_follow_up(self):
+        enqueue_price_refresh(str(uuid.uuid4()), queue_path=self.path)
+        with sqlite3.connect(self.path) as database:
+            database.execute("UPDATE control_queue SET status='running'")
+        enqueue_price_refresh(str(uuid.uuid4()), queue_path=self.path)
+        result = enqueue_price_refresh(str(uuid.uuid4()), queue_path=self.path)
+        self.assertTrue(result["coalesced"])
+        self.assertEqual(
+            sorted(row["status"] for row in self.rows()),
+            ["queued", "running"],
+        )
+
+    def test_missing_or_wrong_queue_never_makes_save_ambiguous(self):
+        self.assertEqual(
+            enqueue_price_refresh(str(uuid.uuid4()), queue_path=""),
+            {"status": "disabled"},
+        )
+        self.assertEqual(
+            enqueue_price_refresh(
+                str(uuid.uuid4()), queue_path=Path(self.folder.name) / "missing"
+            ),
+            {"status": "unavailable"},
+        )
+
+
 class SheetsAdapterTests(unittest.TestCase):
     def grid(self, field_formula=False, protected=False, invalid_ids=False):
         p = {"sheetId": 99, "title": "7-Jovoh", "gridProperties": {"rowCount": 5}}
@@ -235,6 +313,7 @@ class EntryRouteTests(unittest.TestCase):
         self.assertIn("Скопировать ID", response.text)
         self.assertIn('id="catalog-nav"', response.text)
         self.assertIn('aria-label="Фильтры каталога"', response.text)
+        self.assertIn('price-entry.js?v=7', response.text)
         self.assertIn('<div class="brand">', response.text)
         self.assertNotIn('href="/monitoring"', response.text)
         self.assertNotIn("Вернуться в портал", response.text)
@@ -258,6 +337,7 @@ class EntryRouteTests(unittest.TestCase):
         self.assertIn('function renderCatalogNavigation()', entry_js.text)
         self.assertIn('label: "iPhone 18 / Duo"', entry_js.text)
         self.assertIn('label: "Остальные"', entry_js.text)
+        self.assertIn('Обновление прайса запущено сразу', entry_js.text)
         self.assertNotIn('Object.keys(fields).forEach(field =>', entry_js.text)
         self.assertEqual(self.client.get("/price/assets/price-entry.env").status_code, 404)
         self.assertEqual(self.client.get("/price/models").status_code, 200)
@@ -271,6 +351,25 @@ class EntryRouteTests(unittest.TestCase):
             self.assertEqual(self.client.get("/price/api/v1/entry/" + route).status_code, 401)
         self.assertEqual(self.client.post("/price/api/v1/entry/save/99", json={}).status_code, 401)
         self.assertTrue(self.admin.call_args.kwargs["action"])
+
+    def test_applied_save_queues_immediate_price_refresh(self):
+        operation_id = str(uuid.uuid4())
+        with patch("price_server.entry_routes.PriceEntryService") as service, patch(
+            "price_server.entry_routes.enqueue_price_refresh",
+            return_value={"status": "queued", "coalesced": False},
+        ) as enqueue:
+            service.return_value.save.return_value = {
+                "status": "applied", "changed": 1,
+                "operation_id": operation_id,
+            }
+            response = self.client.post(
+                "/price/api/v1/entry/save/99",
+                json={"changes": [{}]},
+                headers={"Idempotency-Key": operation_id},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["refresh"]["status"], "queued")
+        enqueue.assert_called_once_with(operation_id)
 
     def test_no_google_error_details_exposed(self):
         with patch("price_server.entry_routes.PriceEntryService") as service:

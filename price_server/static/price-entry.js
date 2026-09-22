@@ -514,7 +514,11 @@
         const result = await api("save/" + state.sheet, {changes: edits.map(e => ({key: e.key, field: e.field, revision: e.revision, value: value(e.raw)}))}, operation);
         state.edits.clear(); state.busy = false;
         await load(state.sheet);
-        notice(`Сохранено цен: ${result.changed}. ${state.source === "sqlite" ? "Цены записаны на сервере, Google Price не используется." : "Google Sheets обновлена."} Прайс подхватит изменения при очередном плановом импорте.`);
+        const refreshQueued = ["queued"].includes(result.refresh?.status);
+        const refreshText = refreshQueued
+          ? "Обновление прайса запущено сразу и обычно завершается в течение 2 минут."
+          : "Прайс подхватит изменения при очередном плановом импорте.";
+        notice(`Сохранено цен: ${result.changed}. ${state.source === "sqlite" ? "Цены записаны на сервере, Google Price не используется." : "Google Sheets обновлена."} ${refreshText}`);
       } catch (error) {
         // A proxy timeout/network loss may follow a successful Sheets write.
         if (!error.status || error.status >= 500 || error.code === "save_outcome_unknown") {

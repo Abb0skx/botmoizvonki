@@ -12,6 +12,29 @@
   const upstreamPrefix = "/price/api/v1/";
   const portalPrefix = "/monitoring/api/prices/admin/";
   const originalFetch = window.fetch.bind(window);
+  let snapshotId = null;
+
+  const pollSnapshot = async () => {
+    if (document.hidden) return;
+    try {
+      const response = await originalFetch("/monitoring/api/prices", {
+        credentials: "same-origin",
+        cache: "no-store",
+        headers: {Accept: "application/json"},
+      });
+      if (!response.ok) return;
+      const payload = await response.json();
+      const current = String(payload?.data?.snapshot?.snapshot_id || "");
+      if (!current) return;
+      if (snapshotId === null) snapshotId = current;
+      else if (current !== snapshotId) window.location.reload();
+    } catch (_) {
+      // A temporary monitoring error must not interrupt price administration.
+    }
+  };
+
+  pollSnapshot();
+  window.setInterval(pollSnapshot, 10000);
 
   const csrfToken = () => {
     const prefix = "__Host-texnikach_monitoring_csrf=";

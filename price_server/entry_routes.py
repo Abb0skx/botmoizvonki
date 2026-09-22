@@ -13,6 +13,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from .price_entry import EntryError, PriceEntryService
 from .entry_catalog import EntryCatalogService
+from .entry_refresh import enqueue_price_refresh
 from .model_inbox import ModelInbox
 
 LOG = logging.getLogger(__name__)
@@ -199,8 +200,15 @@ def install_entry_routes(router, admin, enabled, settings):
             body = json.loads(raw)
         except (ValueError, UnicodeError):
             raise HTTPException(400, {"code": "invalid_json"}) from None
-        result = await run_in_threadpool(call, service().save, sheet_id, body,
-                                        request.headers.get("idempotency-key", ""))
+        operation_id = request.headers.get("idempotency-key", "")
+        result = await run_in_threadpool(
+            call, service().save, sheet_id, body, operation_id
+        )
+        if result.get("status") == "applied":
+            result = dict(result)
+            result["refresh"] = await run_in_threadpool(
+                enqueue_price_refresh, operation_id
+            )
         return JSONResponse(result)
 
     @router.post("/price/api/v1/entry/products")
