@@ -55,5 +55,3 @@
 .clipboard-helper{position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0;pointer-events:none}
 @media(max-width:720px){.table-meta{align-items:flex-start;gap:10px}.table-actions{flex-direction:column;align-items:stretch}.table-actions .button{width:100%}}
 .pagination #page-label{font-weight:550;color:#52685d}
-#rows tr{content-visibility:auto;contain-intrinsic-size:76px}
-@media(max-width:720px){#rows tr{contain-intrinsic-size:245px}}
