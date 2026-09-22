@@ -71,10 +71,7 @@
   function value(raw) { return raw === "" ? null : Number(raw); }
   function key(row, field) { return row.key + "/" + field; }
   function categoryView() { return Boolean($("category").value); }
-  function shownRows() {
-    if (categoryView()) return state.filtered;
-    return state.filtered.slice(state.page * PAGE_SIZE, (state.page + 1) * PAGE_SIZE);
-  }
+  function shownRows() { return state.filtered; }
   function edit(row, field, raw) {
     const k = key(row, field);
     if (validPrice(raw) && value(raw) === row[field]) state.edits.delete(k);
@@ -105,7 +102,7 @@
       if (availability === "changed" && !["price_1", "price_12"].some(f => state.edits.has(key(row, f)))) return false;
       return true;
     });
-    state.page = categoryView() ? 0 : Math.min(state.page, Math.max(0, Math.ceil(state.filtered.length / PAGE_SIZE) - 1));
+    state.page = 0;
     renderRows();
   }
   function renderRows() {
@@ -194,13 +191,13 @@
     $("empty").hidden = state.filtered.length !== 0;
     $("page-label").textContent = fullCategory
       ? `${categoryName} · вся категория на одной странице · ${number(state.filtered.length)} позиций`
-      : slice.length ? `${number(state.page * PAGE_SIZE + 1)}–${number(state.page * PAGE_SIZE + slice.length)} из ${number(state.filtered.length)}` : "0 позиций";
-    $("page-actions").hidden = fullCategory;
-    $("previous").disabled = state.page === 0;
-    $("next").disabled = fullCategory || (state.page + 1) * PAGE_SIZE >= state.filtered.length;
+      : `Все модели на одной странице · ${number(state.filtered.length)} позиций`;
+    $("page-actions").hidden = true;
+    $("previous").disabled = true;
+    $("next").disabled = true;
     $("select-page").checked = !!slice.length && slice.every(r => state.selected.has(r.key));
     $("select-page").indeterminate = slice.some(r => state.selected.has(r.key)) && !$("select-page").checked;
-    $("select-page").setAttribute("aria-label", fullCategory ? "Выбрать всю категорию" : "Выбрать текущую страницу");
+    $("select-page").setAttribute("aria-label", fullCategory ? "Выбрать всю категорию" : "Выбрать все найденные товары");
     updateSavebar();
   }
   async function load(sheetId) {
