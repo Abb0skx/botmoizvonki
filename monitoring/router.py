@@ -143,7 +143,7 @@ def _inject_price_admin_script(content: bytes) -> bytes:
             status_code=502, detail="price_catalog_invalid_encoding"
         ) from exc
     script = (
-        '<script src="/monitoring/assets/price-admin-bridge.js"></script>'
+        '<script src="/monitoring/assets/price-admin-bridge.js?v=2"></script>'
         '<script src="/price/assets/admin.js" defer></script>'
     )
     legacy = '<script src="/price/assets/admin.js" defer></script>'

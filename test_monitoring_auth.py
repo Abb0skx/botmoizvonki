@@ -710,7 +710,7 @@ class MonitoringRouteTests(unittest.TestCase):
             )
         self.assertIn('/price/assets/admin.js', manage.text)
         self.assertIn(
-            '/monitoring/assets/price-admin-bridge.js', manage.text
+            '/monitoring/assets/price-admin-bridge.js?v=2', manage.text
         )
         bridge = self.client.get("/monitoring/assets/price-admin-bridge.js")
         self.assertIn('/monitoring/api/prices', bridge.text)
