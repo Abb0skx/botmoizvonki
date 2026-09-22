@@ -290,15 +290,21 @@
       check.setAttribute("aria-label", "Выбрать " + row.model_name + " " + row.memory + " " + row.color);
       check.addEventListener("change", () => { check.checked ? state.selected.add(row.key) : state.selected.delete(row.key); renderRows(); });
       checkCell.append(check); tr.append(checkCell);
-      const product = node("td"); product.append(node("div", row.model_name, "product-name"), node("div", "ID " + row.product_id + " · " + row.category_name, "product-meta")); tr.append(product);
+      const product = node("td", undefined, "product-cell");
+      const productMeta = node("div", undefined, "product-meta");
+      productMeta.append(node("span", "ID " + row.product_id, "product-id"), node("span", row.category_name, "product-category"));
+      product.append(node("div", row.model_name, "product-name"), productMeta); tr.append(product);
       const memory = node("td", undefined, "memory-cell");
-      memory.append(node("span", row.memory || "—", "variant-memory"));
+      memory.append(node("span", row.memory || "Не указана", "variant-memory" + (row.memory ? "" : " variant-empty")));
       tr.append(memory);
       const color = node("td", undefined, "color-cell");
-      color.append(node("span", "", "color-marker"), node("span", row.color || "—", "variant-color"));
+      const colorContent = node("div", undefined, "color-content");
+      colorContent.append(node("span", row.color || "Не указан", "variant-color" + (row.color ? "" : " variant-empty")));
+      color.append(colorContent);
       tr.append(color);
       PRICE_FIELDS.forEach(field => {
-        const td = node("td"), input = node("input");
+        const td = node("td", undefined, "editable-price-cell"), input = node("input");
+        td.dataset.label = "Гарантия " + warranty(field) + " · $";
         input.type = "text"; input.inputMode = "numeric"; input.autocomplete = "off"; input.maxLength = 6; input.placeholder = "—";
         input.setAttribute("aria-label", `${row.model_name} ${row.memory} ${row.color}, ${fields[field]}`);
         input.value = state.edits.get(key(row, field))?.raw ?? (row[field] ?? "");
@@ -335,24 +341,29 @@
           pending.forEach(args => edit(...args)); renderRows();
           notice(`В черновик вставлено ячеек: ${pending.length}. Проверьте соответствие товарам перед сохранением.`);
         });
-        const history = node("button", "◷ История", "cell-history-button");
+        const history = node("button", "◷", "cell-history-button");
         history.type = "button";
         history.setAttribute("aria-label", `История цены: ${row.model_name} ${row.memory} ${row.color}, ${fields[field]}`);
         history.title = "История сохранённых изменений этой цены";
         history.addEventListener("click", () => showCellHistory(row, field));
-        td.append(input, history); tr.append(td);
+        const control = node("div", undefined, "price-control");
+        control.append(input, history);
+        td.append(control); tr.append(td);
       });
       const minimum = node("td", undefined, "minimum");
+      const minimumValue = node("div", undefined, "minimum-value");
       if (Number(row.min_price) > 0) {
-        minimum.append(node("strong", number(row.min_price)),
+        minimumValue.append(node("strong", number(row.min_price)),
           node("small", `${row.min_supplier_name || "Поставщик не указан"}${row.min_price_field ? ` · ${warranty(row.min_price_field)}` : ""}`));
-      } else minimum.append(node("span", "—"));
-      const minimumHistory = node("button", "◷ История", "cell-history-button");
+      } else minimumValue.append(node("span", "Нет предложений", "variant-empty"));
+      const minimumHistory = node("button", "◷", "cell-history-button");
       minimumHistory.type = "button";
       minimumHistory.setAttribute("aria-label", `История минимальной цены: ${row.model_name} ${row.memory} ${row.color}`);
       minimumHistory.title = "История изменения минимальной цены и поставщика";
       minimumHistory.addEventListener("click", () => showCellHistory(row, "min_price"));
-      minimum.append(minimumHistory); tr.append(minimum);
+      const minimumContent = node("div", undefined, "minimum-content");
+      minimumContent.append(minimumValue, minimumHistory);
+      minimum.append(minimumContent); tr.append(minimum);
       fragment.append(tr);
     });
     $("rows").replaceChildren(fragment);
@@ -375,6 +386,7 @@
       const data = await api("catalog/" + sheetId);
       state.sheet = data.sheet_id; state.rows = data.rows; state.edits.clear(); state.selected.clear(); state.uncertain = false; state.page = 0;
       $("supplier").value = String(sheetId);
+      $("editing-supplier").textContent = `Цены: ${$("supplier").selectedOptions[0]?.textContent || "поставщик"} · доллары США ($)`;
       $("total-count").textContent = number(data.rows.length);
       $("priced-count").textContent = number(data.rows.filter(r => Number(r.price_1) > 0 || Number(r.price_12) > 0).length);
       $("fetched-time").textContent = new Date(data.fetched_at).toLocaleTimeString("ru-RU", {hour: "2-digit", minute: "2-digit"});

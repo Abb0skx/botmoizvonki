@@ -5,10 +5,10 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="robots" content="noindex,nofollow">
   <title>Ввод цен · Texnikach</title>
-  <link rel="stylesheet" href="/price/assets/price-entry.css?v=6">
-  <script src="/price/assets/price-entry.js?v=7" defer></script>
+  <link rel="stylesheet" href="/price/assets/price-entry.css?v=8">
+  <script src="/price/assets/price-entry.js?v=8" defer></script>
 </head>
-<body>
+<body class="price-entry-page">
 <aside class="sidebar">
   <div class="brand"><span class="brand-mark">t.</span> texnikach<span class="brand-sub">РАБОЧЕЕ ПРОСТРАНСТВО</span></div>
   <div class="nav-label">ПРАЙС И КАТАЛОГ</div>
@@ -22,19 +22,20 @@
 </aside>
 <main>
   <header class="topline"><span>Каталог <span class="slash">/</span> <strong>Ввод цен</strong></span><button class="text-button mobile-only" id="history-mobile">История</button><span class="private-label">Закрытый доступ</span></header>
-  <section class="page-heading"><div><div class="eyebrow">УПРАВЛЕНИЕ ПРАЙСОМ</div><h1>Цены поставщиков<span>.</span></h1><p>Найдите товар, измените цену или добавьте новую модель.</p></div><div class="heading-actions"><button class="button primary" id="add-model" hidden>＋ Добавить модель</button></div></section>
+  <section class="page-heading"><div><div class="eyebrow">ВАШ РАБОЧИЙ КАТАЛОГ</div><h1>Цены поставщиков</h1><p>Выберите поставщика, найдите товар и укажите его цену.</p></div><div class="heading-actions"><button class="button primary" id="add-model" hidden>＋ Добавить модель</button></div></section>
   <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
   <section id="login-panel" class="empty-state" hidden><h2>Войдите в рабочий кабинет</h2><p>Цены доступны только сотрудникам с правом управления прайсом.</p><a class="button primary" href="/monitoring/login?next=%2Fprice%2Fentry">Войти</a></section>
   <div id="workspace" hidden>
-    <section class="summary-grid"><div class="summary-card"><span>ПОСТАВЩИК</span><select id="supplier" aria-label="Поставщик"></select><small>Цены в долларах США</small></div><div class="summary-card"><span>ПОЗИЦИЙ В КАТАЛОГЕ</span><strong id="total-count">—</strong><small>Модель, память и цвет</small></div><div class="summary-card"><span>С ЗАПОЛНЕННОЙ ЦЕНОЙ</span><strong id="priced-count">—</strong><small>У выбранного поставщика</small></div><div class="summary-card"><span>ДАННЫЕ ЗАГРУЖЕНЫ</span><strong id="fetched-time">—</strong><button class="text-button" id="refresh">↻ Обновить данные</button></div></section>
+    <section class="summary-grid"><div class="summary-card supplier-card"><label for="supplier">Чьи цены редактируем</label><select id="supplier" aria-label="Поставщик"></select><small>Выберите поставщика</small></div><div class="summary-card"><span>Всего вариантов</span><strong id="total-count">—</strong><small>Модель · память · цвет</small></div><div class="summary-card"><span>С ценой поставщика</span><strong id="priced-count">—</strong><small>Остальные можно заполнить</small></div><div class="summary-card"><span>Данные загружены в</span><strong id="fetched-time">—</strong><button class="text-button" id="refresh">↻ Обновить данные</button></div></section>
     <section class="catalog-panel">
       <div class="toolbar"><label class="search"><span>⌕</span><input id="search" type="search" placeholder="Модель, память, цвет или ID…" autocomplete="off" aria-label="Поиск товаров"><kbd>/</kbd></label><select id="category" aria-label="Категория"><option value="">Все категории</option></select><select id="availability" aria-label="Наличие цены"><option value="all">Все позиции</option><option value="priced">С ценой</option><option value="empty">Без цены</option><option value="changed">Только мои правки</option></select></div>
       <div class="table-meta"><div><strong id="found-count">Загрузка…</strong><span id="selected-count"></span></div><div class="table-actions"><button class="button small" id="copy-ids" disabled>⧉ Скопировать ID</button><button class="button small" id="bulk" disabled>Изменить выбранные</button></div></div>
-      <div class="table-wrap"><table><thead><tr><th class="check-col"><input id="select-page" type="checkbox" aria-label="Выбрать текущую страницу"></th><th class="product-col">МОДЕЛЬ</th><th class="memory-col">ПАМЯТЬ</th><th class="color-col">ЦВЕТ</th><th class="price-col">1 МЕС. <span>USD</span></th><th class="price-col">12 МЕС. <span>USD</span></th><th class="min-col">МИНИМУМ</th></tr></thead><tbody id="rows"></tbody></table></div>
+      <div class="catalog-context"><span id="editing-supplier">Цены в долларах США ($)</span><span>◷ — история цены</span></div>
+      <div class="table-wrap" role="region" aria-label="Товары и цены поставщика" tabindex="0"><table><thead><tr><th class="check-col" scope="col"><input id="select-page" type="checkbox" aria-label="Выбрать текущую страницу"></th><th class="product-col" scope="col">Модель</th><th class="memory-col" scope="col">Память / размер</th><th class="color-col" scope="col">Цвет</th><th class="price-col" scope="col">Цена, $<small>Гарантия 1 мес.</small></th><th class="price-col" scope="col">Цена, $<small>Гарантия 12 мес.</small></th><th class="min-col" scope="col">Лучшая цена, $<small>Среди всех поставщиков</small></th></tr></thead><tbody id="rows"></tbody></table></div>
       <div id="empty" class="empty-state" hidden><h3>Ничего не найдено</h3><p>Попробуйте другое название или измените фильтры.</p></div>
       <footer class="pagination"><span id="page-label">—</span><div id="page-actions"><button class="button small" id="previous" aria-label="Предыдущая страница">←</button><button class="button small" id="next" aria-label="Следующая страница">→</button></div></footer>
     </section>
-    <div class="help-line"><span>ⓘ</span><p>Пустая цена или 0 — нет предложения. Новая модель автоматически появляется у всех поставщиков с пустыми ценами. Товар и версии гарантии получают безопасные ID на сервере. Цены попадут в прайс при очередном импорте; эта страница не отправляет посты в Telegram.</p></div>
+    <div class="help-line"><span>ⓘ</span><p>Пустое поле или 0 — нет предложения. После правок нажмите «Проверить и сохранить». Прайс обновится автоматически, обычно в течение 1–2 минут.</p></div>
   </div>
   <footer class="savebar" id="savebar" hidden><div><span class="unsaved-dot"></span><strong id="change-count">Нет изменений</strong><small>Проверьте перед сохранением</small></div><div class="save-actions"><button class="button secondary" id="discard">Отменить правки</button><button class="button primary" id="review">Проверить и сохранить →</button></div></footer>
 </main>
