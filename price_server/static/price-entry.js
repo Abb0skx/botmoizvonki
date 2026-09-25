@@ -298,10 +298,46 @@
     else state.edits.set(k, {key: row.key, field, revision: row.revision, raw, row});
     updateSavebar();
   }
+  function invalidEdits() {
+    return [...state.edits.values()].filter(item => !validPrice(item.raw));
+  }
+  function editLabel(item) {
+    const variant = [item.row.memory, item.row.color].filter(Boolean).join(" · ");
+    return `${item.row.model_name}${variant ? ` · ${variant}` : ""} · ${fields[item.field]}`;
+  }
+  function focusEdit(item) {
+    const selector = `[data-edit-key="${CSS.escape(key(item.row, item.field))}"]`;
+    let input = document.querySelector(selector);
+    if (!input) {
+      state.catalogFilter = "all";
+      $("category").value = "";
+      $("availability").value = "all";
+      $("search").value = String(item.row.product_id || item.row.model_name);
+      state.page = 0;
+      updateCatalogNavigation();
+      filter();
+      input = document.querySelector(selector);
+    }
+    if (!input) return;
+    input.scrollIntoView({behavior: "smooth", block: "center"});
+    input.focus({preventScroll: true});
+    input.setCustomValidity(errors.invalid_price);
+    input.reportValidity();
+  }
   function updateSavebar() {
+    const invalid = invalidEdits();
     $("savebar").hidden = state.edits.size === 0;
-    $("change-count").textContent = `Изменено цен: ${state.edits.size}`;
-    $("review").disabled = state.busy || state.uncertain || state.edits.size > 200 || [...state.edits.values()].some(e => !validPrice(e.raw));
+    $("change-count").textContent = invalid.length
+      ? `Изменено цен: ${state.edits.size} · ошибок: ${invalid.length}`
+      : `Изменено цен: ${state.edits.size}`;
+    $("save-hint").textContent = invalid.length
+      ? "Нажмите кнопку — покажем ячейку, которую нужно исправить"
+      : state.uncertain
+        ? "Сначала обновите данные и проверьте историю сохранений"
+        : "Проверьте перед сохранением";
+    $("review").textContent = invalid.length ? `Исправить ${invalid.length === 1 ? "ошибку" : "ошибки"} →` : "Проверить и сохранить →";
+    $("review").disabled = state.busy || state.uncertain || state.edits.size > 200;
+    $("review").title = invalid.length ? "Есть цена вне диапазона от 0 до 100 000" : "";
     $("discard").disabled = state.busy;
     $("selected-count").textContent = state.selected.size ? `Выбрано: ${state.selected.size}` : "";
     $("copy-ids").disabled = !state.selected.size;
@@ -362,6 +398,7 @@
         const td = node("td", undefined, "editable-price-cell"), input = node("input");
         td.dataset.label = "Гарантия " + warranty(field) + " · $";
         input.type = "text"; input.inputMode = "numeric"; input.autocomplete = "off"; input.maxLength = 6; input.placeholder = "—";
+        input.dataset.editKey = key(row, field);
         input.setAttribute("aria-label", `${row.model_name} ${row.memory} ${row.color}, ${fields[field]}`);
         input.value = state.edits.get(key(row, field))?.raw ?? (row[field] ?? "");
         input.className = "price-input";
@@ -370,9 +407,11 @@
         input.disabled = row.locked.includes(field) || state.busy || state.uncertain;
         input.title = row.locked.includes(field) ? "Защищённая ячейка, формула или некорректные ID" : "Целая цена в USD. Пусто — нет предложения.";
         input.addEventListener("input", () => {
-          edit(row, field, input.value.trim());
+          const raw = input.value.trim();
+          input.setCustomValidity("");
+          edit(row, field, raw);
           input.classList.toggle("dirty", state.edits.has(key(row, field)));
-          input.classList.toggle("invalid", !validPrice(input.value.trim()));
+          input.classList.toggle("invalid", !validPrice(raw));
           tr.classList.toggle("row-dirty", PRICE_FIELDS.some(f => state.edits.has(key(row, f))));
         });
         input.addEventListener("keydown", event => { if (event.key === "Enter") { const all = [...document.querySelectorAll(".price-input:not(:disabled)")]; const next = all[all.indexOf(input) + 1]; if (next) next.focus(); } });
@@ -574,7 +613,14 @@
   }
   $("review").addEventListener("click", () => {
     const edits = [...state.edits.values()];
-    if (!edits.length || edits.length > 200 || edits.some(e => !validPrice(e.raw))) return;
+    if (!edits.length || edits.length > 200) return;
+    const invalid = invalidEdits();
+    if (invalid.length) {
+      const first = invalid[0];
+      notice(`Сохранение остановлено: «${editLabel(first)}» содержит «${first.raw}». Цена должна быть целым числом от 0 до 100 000.`, true);
+      focusEdit(first);
+      return;
+    }
     const operation = crypto.randomUUID();
     const save = button("Сохранить цены", async () => {
       save.disabled = true; state.busy = true; updateSavebar(); $("dialog").close(); renderRows();
