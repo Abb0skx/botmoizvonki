@@ -4536,28 +4536,8 @@ def get_effective_device_manager(
 
 
 def get_device_sms_sender(user_login: str | None, conn=None) -> str:
-    """Resolve one explicit device route, never a chain of routes.
-
-    Missing settings retain the original behaviour: the calling phone sends
-    its own SMS. Unknown calling devices are never redirected automatically.
-    """
-    source_login = normalize_user_login(user_login)
-    if source_login not in CALL_SOURCE_PROFILES:
-        return source_login
-    if conn is None:
-        with connect_db() as db:
-            return get_device_sms_sender(source_login, db)
-    row = conn.execute(
-        "SELECT sender_user_login FROM device_sms_senders WHERE user_login = ?",
-        (source_login,),
-    ).fetchone()
-    if row:
-        sender = normalize_user_login(row["sender_user_login"])
-        if sender not in CALL_SOURCE_PROFILES:
-            # Do not silently use another phone if a configured sender was removed.
-            raise ValueError("Телефон для SMS больше не настроен")
-        return sender
-    return source_login
+    """All outbound SMS use Poco, including legacy persisted sender routes."""
+    return "texnikach@gmail.com"
 
 
 def get_device_sms_settings(user_login: str | None, conn=None) -> dict:
@@ -4579,8 +4559,8 @@ def set_device_sms_sender(
     sender_login = normalize_user_login(sender_user_login)
     if source_login not in CALL_SOURCE_PROFILES:
         raise ValueError("Неизвестный телефон звонка")
-    if sender_login not in CALL_SOURCE_PROFILES:
-        raise ValueError("Выберите телефон для отправки SMS")
+    if sender_login != get_device_sms_sender(source_login):
+        raise ValueError("Все SMS отправляются только с Poco")
 
     with connect_db() as conn:
         conn.execute(
@@ -5351,10 +5331,9 @@ def send_client_sms(
             "MOIZVONKI_API_URL не указан"
         )
 
-    user_name = (
-        sender_user_login
-        or MOIZVONKI_USER_NAME
-    )
+    # Enforce at the transport boundary as well as in the dashboard: callers
+    # with a previously saved sender must never dispatch through another phone.
+    user_name = get_device_sms_sender(sender_user_login)
 
     if not user_name:
         raise RuntimeError(
@@ -19501,7 +19480,7 @@ tbody tr:last-child td {
                 «На сегодня» действует до 00:00.
                 «Постоянно» меняет менеджера для всех новых звонков.
                 История звонков не изменяется.
-                Телефон для SMS выбирается отдельно и сохраняется постоянно.
+                Все SMS отправляются только с Poco.
                 Оценка клиента относится к менеджеру исходного звонка.
             </div>
         </div>
@@ -20675,7 +20654,7 @@ function renderDeviceManagers(
             smsSection.className = "device-sms-section";
             const smsLabel = document.createElement("label");
             smsLabel.className = "device-sms-label";
-            smsLabel.textContent = "С какого телефона отправлять SMS";
+            smsLabel.textContent = "Отправитель всех SMS: Poco";
             const smsSelect = document.createElement("select");
             smsSelect.className = "device-manager-select";
             smsSelect.id = "sms_sender_" + device.user_login;
@@ -20699,7 +20678,8 @@ function renderDeviceManagers(
             const smsStatus = document.createElement("div");
             smsStatus.className = "device-sms-status";
             smsStatus.textContent = "Сейчас SMS отправляет: " + device.sms_sender_device_name;
-            smsSection.append(smsLabel, smsActions, smsStatus);
+            // Sender is fixed server-side. Do not offer an ineffective selector.
+            smsSection.append(smsLabel, smsStatus);
             [select, smsSelect].forEach(input => input.addEventListener("change", () => {
                 card.dataset.dirty = "true";
             }));
