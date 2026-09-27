@@ -4,6 +4,8 @@ import json
 from dataclasses import replace
 from html import escape
 
+import requests
+
 from .config import DEVICES, ROUTES, RouteConfig
 from .repository import utc_timestamp
 from .service import ForwardingService, dial_digit_signature, event_timestamp
@@ -22,6 +24,24 @@ class SMSForwardingService(ForwardingService):
 
     def __init__(self, *, send_sms, **kwargs):
         self.send_sms = send_sms
+        telegram_api = kwargs["telegram_api"]
+
+        def safe_telegram_api(*args, **options):
+            try:
+                return telegram_api(*args, **options)
+            except requests.RequestException as exc:
+                # HTTPError.__str__ contains Telegram's token-bearing URL.
+                # Preserve the API description for already-unpinned handling,
+                # but never persist the URL in logs or forwarding_control_posts.
+                description = "Telegram: " + type(exc).__name__
+                if exc.response is not None:
+                    try:
+                        description = str(exc.response.json().get("description") or description)
+                    except (ValueError, AttributeError):
+                        pass
+                raise RuntimeError(description[:500]) from None
+
+        kwargs["telegram_api"] = safe_telegram_api
         super().__init__(make_call=self._send_command, **kwargs)
         with self.repository.connect() as conn:
             conn.execute("""CREATE TABLE IF NOT EXISTS forwarding_sms_replies (
