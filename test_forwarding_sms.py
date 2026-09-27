@@ -97,6 +97,17 @@ class SMSControlsTests(unittest.TestCase):
             self.service._send_command("texnikach@gmail.com", "##21#")
         self.sender.assert_not_called()
 
+    def test_telegram_http_error_keeps_description_not_token_url(self):
+        response = requests.Response()
+        response.status_code = 400
+        response._content = b'{"description":"Bad Request: message to unpin not found"}'
+        api = Mock(side_effect=requests.HTTPError("secret-token-url", response=response))
+        service = SMSForwardingService(repository=self.repo, settings=self.service.settings,
+            chat_id=-100123, telegram_api=api, send_sms=self.sender)
+        with self.assertRaisesRegex(RuntimeError, "message to unpin not found") as error:
+            service.telegram_api("unpinChatMessage")
+        self.assertNotIn("secret", str(error.exception))
+
 
 if __name__ == "__main__":
     unittest.main()
