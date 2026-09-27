@@ -64,6 +64,8 @@ from forwarding import (
     load_forwarding_settings,
 )
 from forwarding.service import canonical_dial_string
+from dataclasses import replace as dataclass_replace
+from forwarding.sms_service import SMSForwardingService, SMS_DEVICES, SMS_ROUTES
 
 
 class _RedactAccessQueryFilter(logging.Filter):
@@ -308,7 +310,10 @@ MISSED_CALL_ALERT_USERNAMES_BY_DEVICE = {
     ).strip(),
 }
 
-FORWARDING_SETTINGS = load_forwarding_settings()
+FORWARDING_SETTINGS = dataclass_replace(
+    load_forwarding_settings(), command_cooldown_seconds=300,
+    correlation_window_seconds=300,
+)
 
 
 def forwarding_security_error() -> str:
@@ -1382,8 +1387,8 @@ def init_db():
         ForwardingRepository(
             connect_db,
             FORWARDING_OPERATOR,
-            FORWARDING_DEVICES,
-            FORWARDING_ROUTES,
+            SMS_DEVICES,
+            SMS_ROUTES,
         ).init_schema(conn)
 
         conn.execute(
@@ -10956,16 +10961,16 @@ def get_forwarding_service():
         repository = ForwardingRepository(
             connect_db,
             FORWARDING_OPERATOR,
-            FORWARDING_DEVICES,
-            FORWARDING_ROUTES,
+            SMS_DEVICES,
+            SMS_ROUTES,
         )
         repository.init_schema()
-        _forwarding_service = ForwardingService(
+        _forwarding_service = SMSForwardingService(
             repository=repository,
             settings=FORWARDING_SETTINGS,
             chat_id=TELEGRAM_CHAT_ID,
             telegram_api=telegram_api,
-            make_call=moizvonki_make_call,
+            send_sms=send_client_sms,
             local_timezone=UZ_TZ,
         )
 
@@ -18507,6 +18512,7 @@ def admin_device_managers(
 ):
 
     return {
+        "forwarding": get_forwarding_service().states(),
         "devices": (
             list_device_manager_assignments()
         ),
@@ -18552,6 +18558,23 @@ async def update_admin_device_manager(
         payload.get("action")
         or "assign"
     ).strip().casefold()
+
+    if action == "forwarding":
+        principal = get_monitoring_auth().principal(request, admin=True)
+        get_monitoring_auth().verify_csrf(request, principal)
+        if forwarding_security_error():
+            raise HTTPException(status_code=503, detail="Не настроена защита webhook")
+        request_id = str(payload.get("request_id") or "")
+        if not re.fullmatch(r"[a-zA-Z0-9-]{16,80}", request_id):
+            raise HTTPException(status_code=400, detail="Неверный ID запроса")
+        try:
+            result = await asyncio.to_thread(
+                get_forwarding_service().queue_web,
+                payload.get("source"), payload.get("target"), request_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"ok": True, "forwarding": result}
 
     try:
         if action in {
@@ -20772,6 +20795,48 @@ function renderDeviceManagers(
             card.appendChild(status);
             card.appendChild(actions);
             card.appendChild(smsSection);
+            const forwarding = (data.forwarding || []).find(item => item.moizvonki_user === device.user_login);
+            if (forwarding) {
+                const section = document.createElement("div");
+                section.className = "device-sms-section";
+                const label = document.createElement("p");
+                label.textContent = "Переадресация · команды SMS с Poco";
+                const state = document.createElement("p");
+                state.textContent = forwarding.status_label;
+                const reply = document.createElement("pre");
+                reply.style.whiteSpace = "pre-wrap";
+                reply.textContent = forwarding.reply || "";
+                const buttons = document.createElement("div");
+                buttons.className = "device-manager-actions";
+                [...data.forwarding.filter(item => item.code !== forwarding.code), {code: "off", name: "Отменить"}].forEach(target => {
+                    const button = document.createElement("button");
+                    button.type = "button";
+                    button.className = "admin-action";
+                    button.textContent = target.code === "off" ? "Отменить" : "→ " + target.name;
+                    button.onclick = async () => {
+                        if (!confirm(forwarding.name + ": " + button.textContent + "? Отправить команду по SMS с Poco?")) return;
+                        buttons.querySelectorAll("button").forEach(item => item.disabled = true);
+                        card.dataset.busy = "true";
+                        try {
+                            const answer = await deviceManagerRequest("POST", {
+                                action: "forwarding", source: forwarding.code, target: target.code,
+                                request_id: crypto.randomUUID()
+                            });
+                            const result = answer.forwarding;
+                            state.textContent = result.queued ? "SMS в очереди. Ожидайте ответ телефона." :
+                                "Команда не отправлена: " + result.reason + (result.retry_after ? " · ждать " + result.retry_after + " сек." : "");
+                        } catch (error) {
+                            state.textContent = error.message + ". Не повторяйте сразу: запрос мог быть принят.";
+                        } finally {
+                            card.dataset.busy = "false";
+                            buttons.querySelectorAll("button").forEach(item => item.disabled = false);
+                        }
+                    };
+                    buttons.appendChild(button);
+                });
+                section.append(label, state, reply, buttons);
+                card.appendChild(section);
+            }
             grid.appendChild(card);
         }
     );
@@ -22670,6 +22735,11 @@ async def moizvonki_webhook(
     )
 
     if action == "sms.message":
+        if MOIZVONKI_WEBHOOK_SECRET and await asyncio.to_thread(
+            get_forwarding_service().handle_sms_reply,
+            webhook, event, webhook_received_at,
+        ):
+            return {"ok": True, "event": action, "forwarding_reply": True}
         sms_result = process_inbound_sms_event(
             webhook,
             event,

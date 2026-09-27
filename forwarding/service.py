@@ -90,6 +90,8 @@ def event_timestamp(event: dict, fallback: int) -> int:
 
 
 class ForwardingService:
+    devices = DEVICES
+
     def __init__(
         self,
         *,
@@ -321,7 +323,7 @@ class ForwardingService:
             }
 
         source_code, target_code = parts[1], parts[2]
-        employee = DEVICES.get(source_code)
+        employee = self.devices.get(source_code)
         if not employee or not employee.controls_enabled:
             return {
                 "queued": False,
@@ -450,12 +452,12 @@ class ForwardingService:
             raise RuntimeError("Telegram не вернул message_id")
         return int(message["message_id"])
 
-    def ensure_daily_post(self, now_ts: int | None = None) -> dict:
+    def ensure_daily_post(self, now_ts: int | None = None, *, force=False) -> dict:
         now_ts = int(now_ts or utc_timestamp())
         if not self.settings.enabled:
             return {"created": False, "reason": "disabled"}
         local_now = datetime.fromtimestamp(now_ts, self.local_timezone)
-        if (local_now.hour, local_now.minute) < (
+        if not force and (local_now.hour, local_now.minute) < (
             self.settings.post_hour,
             self.settings.post_minute,
         ):
