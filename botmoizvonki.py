@@ -18538,7 +18538,7 @@ async def update_admin_device_manager(
         or "assign"
     ).strip().casefold()
 
-    if action == "forwarding":
+    if action in {"forwarding", "device_control"}:
         principal = get_monitoring_auth().principal(request, admin=True)
         get_monitoring_auth().verify_csrf(request, principal)
         if forwarding_security_error():
@@ -18547,10 +18547,17 @@ async def update_admin_device_manager(
         if not re.fullmatch(r"[a-zA-Z0-9-]{16,80}", request_id):
             raise HTTPException(status_code=400, detail="Неверный ID запроса")
         try:
-            result = await asyncio.to_thread(
-                get_forwarding_service().queue_web,
-                payload.get("source"), payload.get("target"), request_id,
-            )
+            if action == "device_control":
+                result = await asyncio.to_thread(
+                    get_forwarding_service().device_controls.queue,
+                    payload.get("source"), payload.get("command"), request_id,
+                    int(datetime.now(timezone.utc).timestamp()),
+                )
+            else:
+                result = await asyncio.to_thread(
+                    get_forwarding_service().queue_web,
+                    payload.get("source"), payload.get("target"), request_id,
+                )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"ok": True, "forwarding": result}
@@ -20816,6 +20823,59 @@ function renderDeviceManagers(
                 });
                 section.append(label, state, reply, buttons);
                 card.appendChild(section);
+
+                const controlSection = document.createElement("div");
+                controlSection.className = "device-sms-section";
+                const controlTitle = document.createElement("p");
+                controlTitle.textContent = "Настройки телефона · SMS с Poco на " + forwarding.name + " " + forwarding.sim_number;
+                const controlNote = document.createElement("p");
+                controlNote.textContent = "Wi-Fi и мобильные данные требуют привилегированной службы Automate. Звук — доступа к «Не беспокоить». Отключение сети может лишить телефон интернета." +
+                    (forwarding.code === "poco" ? " Точка доступа: установка _Hotspot.flo пока не подтверждена. SMS на собственный номер должно доставляться оператором." : "");
+                const controlState = document.createElement("p");
+                const currentControl = forwarding.control_state || {};
+                controlState.textContent = (currentControl.command ? currentControl.command + ": " : "") + (currentControl.status_label || "Команд ещё не было");
+                const controlReply = document.createElement("pre");
+                controlReply.style.whiteSpace = "pre-wrap";
+                controlReply.textContent = currentControl.reply || "";
+                const controlButtons = document.createElement("div");
+                controlButtons.className = "device-manager-actions";
+                (forwarding.controls || []).forEach(control => {
+                    const button = document.createElement("button");
+                    button.type = "button";
+                    button.className = "admin-action";
+                    button.textContent = control.label;
+                    button.onclick = async () => {
+                        const warning = control.key.startsWith("hotspot_") ? " Требуется импорт _Hotspot.flo; установка пока не подтверждена." :
+                            (["wifi_off", "internet_off"].includes(control.key) ? " Телефон может потерять интернет." : "");
+                        if (!confirm("Отправить «" + control.command + "» с Poco на " + forwarding.name + " (" + forwarding.sim_number + ")?" + warning)) return;
+                        controlButtons.querySelectorAll("button").forEach(item => item.disabled = true);
+                        card.dataset.busy = "true";
+                        try {
+                            const answer = await deviceManagerRequest("POST", {
+                                action: "device_control", source: forwarding.code, command: control.key,
+                                request_id: crypto.randomUUID()
+                            });
+                            const result = answer.forwarding;
+                            controlState.textContent = result.queued ? control.command + ": SMS в очереди." :
+                                "Не отправлено: " + result.reason + (result.retry_after ? " · ждать " + result.retry_after + " сек." : "");
+                        } catch (error) {
+                            controlState.textContent = error.message + ". Не повторяйте сразу: команда могла быть принята.";
+                        } finally {
+                            card.dataset.busy = "false";
+                            controlButtons.querySelectorAll("button").forEach(item => item.disabled = false);
+                        }
+                    };
+                    controlButtons.appendChild(button);
+                });
+                const tableLink = document.createElement("a");
+                tableLink.href = "https://docs.google.com/spreadsheets/d/1jq5ibSFF19zpww51a4AtYgMgg7Y7_HxM2hvPwXvcRjA/edit";
+                tableLink.target = "_blank";
+                tableLink.rel = "noopener noreferrer";
+                tableLink.textContent = "Координаты и ответы в таблице";
+                const locationNote = document.createElement("p");
+                locationNote.textContent = "Запрос координат: ожидание до 30 минут. При интернете ответного SMS нет; если координаты не определятся, записи не будет. Без интернета телефон отвечает «Нет интернета».";
+                controlSection.append(controlTitle, controlNote, controlState, controlReply, controlButtons, locationNote, tableLink);
+                card.appendChild(controlSection);
             }
             grid.appendChild(card);
         }

@@ -46,6 +46,71 @@ class SMSControlsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.service.service_number("poco", "poco")
 
+    def test_device_controls_allowed_commands_and_poco_only_hotspot(self):
+        for device in ("redmi", "tecno", "poco"):
+            states = next(s for s in self.service.states() if s["code"] == device)
+            self.assertEqual(len(states["controls"]), 9 if device == "poco" else 7)
+        with self.assertRaises(ValueError):
+            self.service.device_controls.queue("tecno", "hotspot_on", "bad", self.now)
+        with self.assertRaises(ValueError):
+            self.service.device_controls.queue("tecno", "WIFI on", "bad2", self.now)
+
+    def test_device_control_exact_sms_and_shared_cooldown(self):
+        controls = self.service.device_controls
+        self.assertTrue(controls.queue("tecno", "wifi_on", "wifi1", self.now)["queued"])
+        self.assertEqual(controls.queue("tecno", "sound_on", "sound1", self.now)["reason"], "busy")
+        self.assertEqual(self.queue("tecno", key="forward")["reason"], "busy")
+        controls.dispatch_one(self.now)
+        self.sender.assert_called_once_with("+998908456162", "texnikach@gmail.com", "WIFI ON")
+        controls.dispatch_one(self.now + 1)
+        self.assertEqual(self.sender.call_count, 1)
+        self.assertEqual(self.repo.get_device("tecno")["forwarding_status"], "unknown")
+
+    def test_settings_reply_and_location_no_expected_sms(self):
+        controls = self.service.device_controls
+        controls.queue("redmi", "sound_off", "sound1", self.now)
+        controls.dispatch_one(self.now)
+        event = {"event_type": 32, "direction": 0, "client_number": "+998908534466",
+                 "start_time": self.now + 10, "text": "SOUND OFF\nБатарея: 80%\nРежим звонка: Silent"}
+        self.assertTrue(self.service.handle_sms_reply({"user_login": "texnikach@gmail.com"}, event, self.now+10))
+        self.assertEqual(controls.state("redmi")["reply"], event["text"])
+        self.assertEqual(self.repo.get_device("redmi")["forwarding_status"], "unknown")
+        controls.queue("poco", "location", "location1", self.now)
+        controls.dispatch_one(self.now)
+        self.assertIn("30 минут", controls.state("poco")["status_label"])
+        event.update(client_number="+998901313999", text="Нет интернета")
+        self.assertTrue(self.service.handle_sms_reply({"user_login":"texnikach@gmail.com"}, event, self.now+10))
+        self.assertEqual(controls.state("poco")["reply"], "Нет интернета")
+
+    def test_settings_timeout_restart_does_not_retry(self):
+        controls = self.service.device_controls
+        controls.queue("poco", "hotspot_on", "hotspot1", self.now)
+        self.sender.side_effect = requests.Timeout()
+        controls.dispatch_one(self.now)
+        controls.dispatch_one(self.now+61)
+        self.assertEqual(self.sender.call_count, 1)
+        self.assertEqual(controls.state("poco")["status_label"], "Подтверждения нет; автоповтор отключён")
+
+    def test_forwarding_blocks_device_settings(self):
+        self.queue()
+        self.assertEqual(self.service.device_controls.queue("redmi", "wifi_off", "off1", self.now)["reason"], "busy")
+
+    def test_interrupted_settings_dispatch_is_not_repeated(self):
+        controls = self.service.device_controls
+        controls.queue("tecno", "internet_on", "restart1", self.now)
+        with self.repo.connect() as conn:
+            conn.execute("UPDATE device_sms_commands SET status='sending',dispatched_at=?", (self.now,))
+        controls.dispatch_one(self.now+61)
+        self.sender.assert_not_called()
+        self.assertEqual(controls.state("tecno")["status_label"], "Подтверждения нет; автоповтор отключён")
+
+    def test_concurrent_settings_clicks_queue_exactly_one(self):
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(lambda i: self.service.device_controls.queue(
+                "redmi", "wifi_on", "parallel"+str(i), self.now), range(4)))
+        self.assertEqual(sum(result["queued"] for result in results), 1)
+
     def test_sms_always_from_poco(self):
         self.assertTrue(self.queue()["queued"])
         self.service.dispatch_one(self.now)

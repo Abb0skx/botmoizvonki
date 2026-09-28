@@ -635,6 +635,12 @@ class ForwardingRepository:
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
 
+            control_guard = getattr(self, "control_guard", None)
+            if control_guard:
+                blocked = control_guard(conn, employee.code, now_ts)
+                if blocked:
+                    return blocked
+
             replay = conn.execute(
                 """
                 SELECT * FROM forwarding_operations
