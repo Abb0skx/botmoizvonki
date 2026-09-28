@@ -9,6 +9,7 @@ import requests
 from .config import DEVICES, ROUTES, RouteConfig
 from .repository import utc_timestamp
 from .service import ForwardingService, dial_digit_signature, event_timestamp
+from .device_controls import DeviceSMSControls, COMMANDS
 
 
 SMS_DEVICES = {key: replace(value, controls_enabled=True) for key, value in DEVICES.items()}
@@ -48,6 +49,8 @@ class SMSForwardingService(ForwardingService):
                 event_key TEXT PRIMARY KEY, operation_id INTEGER,
                 received_at INTEGER NOT NULL, sender TEXT NOT NULL, text TEXT NOT NULL
             )""")
+        self.device_controls = DeviceSMSControls(self)
+        self.repository.control_guard = self.device_controls.guard
 
     @staticmethod
     def service_number(source_code, target_code):
@@ -104,6 +107,17 @@ class SMSForwardingService(ForwardingService):
         for device in result:
             device["status_label"] = self._status_text(device)
             device["reply"] = device.get("operation_result") if device.get("operation_status") == "sms_reply_received" else None
+            device["controls"] = [{"key": key, "label": value[1], "command": value[0]}
+                                  for key, value in COMMANDS.items()
+                                  if device["code"] == "poco" or not key.startswith("hotspot_")]
+            device["control_state"] = self.device_controls.state(device["code"])
+        return result
+
+    def run_once(self, now_ts=None):
+        now_ts = int(now_ts or utc_timestamp())
+        result = super().run_once(now_ts)
+        if self.settings.enabled:
+            result["device_control"] = self.device_controls.dispatch_one(now_ts)
         return result
 
     def build_post_text(self):
@@ -149,11 +163,15 @@ class SMSForwardingService(ForwardingService):
         source = next((d for d in self.devices.values() if dial_digit_signature(d.sim_number) == sender), None)
         text = str(event.get("text") or "").strip()[:10000]
         # Do not mistake ordinary employee SMS or commands for an Automate reply.
-        if not source or not text or "Батарея:" not in text or "Режим звонка:" not in text:
+        if not source or not text:
             return False
         timestamp = event_timestamp(event, now_ts)
         key = hashlib.sha256(json.dumps([webhook.get("user_login"), event.get("db_call_id"), sender,
                                         event.get("start_time"), text], ensure_ascii=False).encode()).hexdigest()
+        if self.device_controls.handle_reply(source.code, text, timestamp, now_ts, key):
+            return True
+        if "Батарея:" not in text or "Режим звонка:" not in text:
+            return False
         with self.repository.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             if conn.execute("SELECT 1 FROM forwarding_sms_replies WHERE event_key=?", (key,)).fetchone():
@@ -166,6 +184,10 @@ class SMSForwardingService(ForwardingService):
                 AND request_time <= ? AND request_time >= ?
                 ORDER BY id DESC""", (source.code, timestamp, timestamp - self.settings.correlation_window_seconds)).fetchall()
             row = rows[0] if len(rows) == 1 else None
+            first_line = text.splitlines()[0].strip()
+            known_commands = {value[0] for value in COMMANDS.values()} | {"OFF", "ON Poco", "ON Redmi", "ON Tecno"}
+            if row and first_line in known_commands and first_line != row["service_number"]:
+                row = None
             conn.execute("INSERT INTO forwarding_sms_replies VALUES (?,?,?,?,?)",
                          (key, row["id"] if row else None, now_ts, sender, text))
             if row and row["status"] in {"sending", "api_accepted", "unconfirmed"}:
