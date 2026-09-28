@@ -2155,7 +2155,7 @@ def normalize_model_text(
         normalized,
     )
 
-    return normalized.strip()
+    return re.sub(r"\bwi\s+fi\b", "wifi", normalized).strip()
 
 
 def model_family_name(

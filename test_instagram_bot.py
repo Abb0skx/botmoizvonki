@@ -43,6 +43,11 @@ SETTINGS_CSV = '''setting,value,updated_at
 kurs,11900,2026-08-20
 '''
 
+WIFI_PRODUCTS_CSV = '''product_id,model_name,memory,color,price,warranty_period
+1,Xiaomi Redmi Pad 2 (Wifi),8/256Gb,Graphite Gray,210,1
+2,Xiaomi Redmi Pad 2 4G (Sim),8/256Gb,Gray,275,1
+'''
+
 POST_MODELS_CSV = '''enabled,media_id,permalink,models,caption,published_at,updated_at
 TRUE,media-one,https://instagram.com/reel/one,"Samsung Galaxy S25, Samsung Galaxy S25 Ultra",Post one,2026-08-20,2026-08-20
 FALSE,media-disabled,https://instagram.com/reel/two,Samsung Galaxy S25,Post two,2026-08-20,2026-08-20
@@ -304,6 +309,77 @@ class TriggerDetectionTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "ambiguous")
         self.assertIsNone(result["family"])
+
+    def test_wifi_spellings_select_wifi_prices_instead_of_sim(self):
+        catalog = instagram_bot.parse_product_catalog(
+            WIFI_PRODUCTS_CSV,
+            SETTINGS_CSV,
+        )
+        spellings = (
+            "Wifi", "Wi-Fi", "Wi\u2010Fi", "Wi\u2011Fi",
+            "Wi\u2013Fi", "Wi\u2014Fi", "Wi\u2212Fi", "Wi Fi", "WI - FI",
+        )
+
+        for spelling in spellings:
+            with self.subTest(spelling=spelling):
+                result = instagram_bot.find_price_model_in_text(
+                    f"Redmi Pad 2 {spelling} narxi",
+                    catalog=catalog,
+                )
+                self.assertEqual(result["status"], "found")
+                self.assertEqual(
+                    result["family"]["name"],
+                    "Xiaomi Redmi Pad 2 (Wifi)",
+                )
+                message = instagram_bot.build_direct_product_message(
+                    result["family"],
+                    result["kurs"],
+                    self.direct_config["settings"],
+                )
+                self.assertIn("2 499 000 So'm", message)
+                self.assertNotIn("3 273 000 So'm", message)
+
+    def test_wifi_spelling_in_catalog_and_post_mapping_is_equivalent(self):
+        catalog = instagram_bot.parse_product_catalog(
+            WIFI_PRODUCTS_CSV.replace("(Wifi)", "(Wi-Fi)"),
+            SETTINGS_CSV,
+        )
+
+        for model_name in ("Redmi Pad 2 Wifi", "Redmi Pad 2 Wi\u2011Fi"):
+            with self.subTest(model_name=model_name):
+                result = instagram_bot.resolve_post_model_families(
+                    "wifi-post",
+                    catalog=catalog,
+                    mappings={"wifi-post": [model_name]},
+                )
+                self.assertEqual(result["invalid_models"], [])
+                self.assertEqual(
+                    [family["name"] for family in result["families"]],
+                    ["Xiaomi Redmi Pad 2 (Wi-Fi)"],
+                )
+
+    def test_sim_request_keeps_sim_prices(self):
+        catalog = instagram_bot.parse_product_catalog(
+            WIFI_PRODUCTS_CSV,
+            SETTINGS_CSV,
+        )
+        result = instagram_bot.find_price_model_in_text(
+            "Redmi Pad 2 4G Sim",
+            catalog=catalog,
+        )
+
+        self.assertEqual(result["status"], "found")
+        self.assertEqual(
+            {row["model_name"] for row in result["family"]["rows"]},
+            {"Xiaomi Redmi Pad 2 4G (Sim)"},
+        )
+        message = instagram_bot.build_direct_product_message(
+            result["family"],
+            result["kurs"],
+            self.direct_config["settings"],
+        )
+        self.assertIn("3 273 000 So'm", message)
+        self.assertNotIn("2 499 000 So'm", message)
 
     def test_product_message_uses_live_price_and_course(self):
         result = instagram_bot.find_price_model_in_text(
