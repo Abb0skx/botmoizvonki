@@ -383,6 +383,13 @@ python -m telegram_market_stats.cli models --days 7
 python -m telegram_market_stats.cli competitors --days 30
 ```
 
+Защищённый веб-отчёт доступен по `https://bot.texnikach.uz/finance` после
+входа в общую панель мониторинга. Он читает отдельную SQLite-базу в режиме
+read-only и показывает периоды «сегодня», «вчера», 7/30 дней и произвольный
+диапазон: популярные модели, уникальных участников, предложения, активность
+конкурентов, их модели и дневную динамику. Страница не показывает текст
+сообщений группы и не влияет на MTProto-сборщик.
+
 All client-authored text and captions are sanitized before SQLite/outbox storage:
 long payment/account numbers, IBAN, expiry dates, and CVV values are redacted.
 Structured Telegram IDs are preserved for idempotency. Tokens and service-account
