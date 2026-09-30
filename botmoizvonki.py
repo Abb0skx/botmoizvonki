@@ -59,6 +59,7 @@ from telegram_folder_manager.service import (
     TelegramFolderScheduler,
     TelegramFolderService,
 )
+from telegram_market_stats import MarketStatsCollector, MarketStatsSettings
 from forwarding import (
     DEVICES as FORWARDING_DEVICES,
     OPERATOR as FORWARDING_OPERATOR,
@@ -209,12 +210,25 @@ async def start_telegram_business():
         await _telegram_business_scheduler.start()
 
     folder_settings = FolderSettings.load()
+    market_settings = MarketStatsSettings.load()
+    if market_settings.enabled and not folder_settings.enabled:
+        raise RuntimeError(
+            "TELEGRAM_MARKET_STATS_ENABLED requires TELEGRAM_FOLDER_SYNC_ENABLED=true "
+            "so both readers share one authorized MTProto client"
+        )
     if folder_settings.enabled:
-        # This optional task shares only the durable Business SQLite. It uses a
-        # Telegram user session solely for dialog-filter tags; it never sends or
-        # reads messages. Run one application replica while it is enabled.
+        # One authorized MTProto client owns the SQLite session.  Folder tags
+        # never inspect chat text; the optional market collector only reads the
+        # explicitly configured supplier group into its separate statistics DB.
+        # Run one application replica while either feature is enabled.
         _telegram_folder_scheduler = TelegramFolderScheduler(
-            TelegramFolderService(folder_settings)
+            TelegramFolderService(
+                folder_settings,
+                market_collector=(
+                    MarketStatsCollector(market_settings)
+                    if market_settings.enabled else None
+                ),
+            )
         )
         await _telegram_folder_scheduler.start()
 

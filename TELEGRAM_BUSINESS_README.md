@@ -341,6 +341,48 @@ python -m telegram_folder_manager.cli list
 `telegram_folder_assignments`, `telegram_folder_jobs` и
 `telegram_folder_state`. Файл сессии не входит в резервные копии репозитория.
 
+## Отдельная статистика группы поставщиков
+
+Опциональный `telegram_market_stats` использует уже подключённый MTProto-клиент,
+но хранит данные отдельно от Business-бота в
+`/app/data/telegram_market_stats.db`. Он читает `Malika bozor N1` без отправки
+сообщений и без отметки их прочитанными, определяет спрос/предложение, модели,
+память и цвет, а также отмечает заданных конкурентов по устойчивому Telegram ID.
+
+```dotenv
+TELEGRAM_MARKET_STATS_ENABLED=false
+TELEGRAM_MARKET_GROUP_ID=-1002188560435
+TELEGRAM_MARKET_GROUP_TITLE=Malika bozor N1
+TELEGRAM_MARKET_STATS_DB_PATH=/app/data/telegram_market_stats.db
+TELEGRAM_MARKET_CATALOG_PATH=/app/data/Bot_URLS.xlsx
+TELEGRAM_MARKET_POLL_SECONDS=30
+TELEGRAM_MARKET_BACKFILL_DAYS=30
+TELEGRAM_MARKET_BACKFILL_LIMIT=100000
+TELEGRAM_MARKET_BATCH_SIZE=1000
+TELEGRAM_MARKET_EDIT_RESCAN_MESSAGES=500
+TELEGRAM_MARKET_COMPETITORS_JSON={"213962560":"Mobilon","6243942320":"MixMobiles_1","1780333654":"MixMobiles_2"}
+```
+
+`TELEGRAM_FOLDER_SYNC_ENABLED=true` остаётся обязательным: оба модуля используют
+один Telegram client и один session-файл, чтобы исключить параллельную запись в
+Telethon SQLite session. Первичный backfill выполняется небольшими устойчивыми
+порциями и ограничен одновременно числом дней и максимальным количеством
+сообщений. Повторные циклы идемпотентны; последние
+сообщения перечитываются для учёта редактирования.
+
+Таблицы отдельной базы: `market_sources`, `market_competitors`,
+`market_messages`, `market_model_mentions`, `market_checkpoints` и
+`market_collector_runs`. Текст нерелевантных сообщений не сохраняется; для
+релевантных остаётся только защищённый фрагмент до 500 символов. Карточные и
+платёжные данные редактируются перед записью.
+
+Проверка агрегатов без доступа к переписке:
+
+```bash
+python -m telegram_market_stats.cli models --days 7
+python -m telegram_market_stats.cli competitors --days 30
+```
+
 All client-authored text and captions are sanitized before SQLite/outbox storage:
 long payment/account numbers, IBAN, expiry dates, and CVV values are redacted.
 Structured Telegram IDs are preserved for idempotency. Tokens and service-account
