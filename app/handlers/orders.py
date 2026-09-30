@@ -21,7 +21,7 @@ from telegram.ext import (
 
 from app.bot.keyboards import (
     CONFIRM_DUPLICATE_TEXT, CREATION_BACK_TEXT, CREATION_CANCEL_TEXT,
-    all_locations_keyboard, completed_keyboard, courier_cancelled_keyboard,
+    all_locations_keyboard, amount_input_keyboard, completed_keyboard, courier_cancelled_keyboard,
     courier_keyboard, courier_reassignment_confirmation_keyboard,
     courier_selection_keyboard,
     delivery_pending_keyboard, delivery_time_keyboard, edit_input_keyboard,
@@ -58,6 +58,9 @@ from app.utils.parsers import display_phone, extract_http_urls
 
 logger = logging.getLogger(__name__)
 SELLER, PRODUCT, PRODUCT_PHOTO, DETAILS, SECOND_LOCATION, PAYMENT, DELIVERY_TIME, COMMENT, EDIT_VALUE = range(9)
+# Keep the existing numeric state IDs stable: unfinished conversations may
+# still contain them in Telegram/SQLite when a new release starts.
+AMOUNT = 9
 MANAGER_EDITABLE_STATUSES = {"draft", "pending", "picked_up", "on_way"}
 DELIVERY_ACTIVE_STATUSES = {"pending", "picked_up", "on_way", "awaiting_photo", "awaiting_amount"}
 LOCATION_SEPARATOR = "\n".join(["📍" * 11] * 3)
@@ -369,38 +372,42 @@ def _delete_creation_draft(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def _prompt_creation_state(message, state: int, draft: dict, *, resumed: bool = False) -> None:
     prefix = "♻️ Черновик восстановлен.\n\n" if resumed else ""
     if state == SELLER:
-        text, keyboard = "1/7. Выберите, кому принадлежит заказ:", seller_keyboard()
+        text, keyboard = "1/8. Выберите, кому принадлежит заказ:", seller_keyboard()
     elif state == PRODUCT:
-        text, keyboard = "2/7. Введите модель товара:", product_input_keyboard()
+        text, keyboard = "2/8. Введите модель товара:", product_input_keyboard()
     elif state == PRODUCT_PHOTO:
         saved = "\nТекущее фото уже сохранено." if draft.get("product_photo_file_id") else ""
-        text = f"3/7. 📸 Фото товара?{saved}\n\nОтправьте фотографию или нажмите «Пропустить»."
+        text = f"3/8. 📸 Фото товара?{saved}\n\nОтправьте фотографию или нажмите «Пропустить»."
         keyboard = product_photo_keyboard()
     elif state == DETAILS:
         saved = []
         if draft.get("client_phone"):
             saved.append("номер")
-        if draft.get("amount_usd") is not None or draft.get("amount_uzs") is not None:
-            saved.append("цена")
         if draft.get("latitude") is not None or draft.get("address_text"):
             saved.append("локация")
         suffix = f"\n✅ Уже сохранено: {', '.join(saved)}" if saved else ""
-        text = "4/7. Отправьте:\n📍 Локацию\n📱 Номер\n💰 Общую сумму" + suffix
+        text = "4/8. Отправьте:\n📍 Локацию\n📱 Номер" + suffix
         keyboard = text_location_keyboard()
+    elif state == AMOUNT:
+        text = (
+            "5/8. Введите общую сумму:\n"
+            "Например: 100$ или 1 920 000 сум или 100$ 1 920 000 сум"
+        )
+        keyboard = amount_input_keyboard()
     elif state == PAYMENT:
-        text, keyboard = "5/7. Выберите вариант оплаты:", payment_keyboard()
+        text, keyboard = "6/8. Выберите вариант оплаты:", payment_keyboard()
     elif state == DELIVERY_TIME:
-        text = "6/7. Выберите время доставки или напишите свой вариант текстом:"
+        text = "7/8. Выберите время доставки или напишите свой вариант текстом:"
         keyboard = delivery_time_keyboard()
     else:
-        text, keyboard = "7/7. Добавьте комментарий или пропустите:", skip_keyboard()
+        text, keyboard = "8/8. Добавьте комментарий или пропустите:", skip_keyboard()
     await message.reply_text(prefix + text, reply_markup=keyboard)
 
 
 def _infer_creation_state(draft: dict) -> int:
     stored = draft.get("_state")
     if isinstance(stored, int) and stored in {
-        SELLER, PRODUCT, PRODUCT_PHOTO, DETAILS, PAYMENT, DELIVERY_TIME, COMMENT,
+        SELLER, PRODUCT, PRODUCT_PHOTO, DETAILS, AMOUNT, PAYMENT, DELIVERY_TIME, COMMENT,
     }:
         return stored
     if not draft.get("seller_name"):
@@ -409,8 +416,10 @@ def _infer_creation_state(draft: dict) -> int:
         return PRODUCT
     if "product_photo_file_id" not in draft:
         return PRODUCT_PHOTO
-    if _missing_details(draft):
+    if _missing_contact_location(draft):
         return DETAILS
+    if draft.get("amount_usd") is None and draft.get("amount_uzs") is None:
+        return AMOUNT
     if not draft.get("payment_status"):
         return PAYMENT
     if "delivery_time" not in draft:
@@ -2976,6 +2985,10 @@ async def back_to_details(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return await _back_to_state(update, context, DETAILS)
 
 
+async def back_to_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _back_to_state(update, context, AMOUNT)
+
+
 async def back_to_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return await _back_to_state(update, context, PAYMENT)
 
@@ -3061,12 +3074,10 @@ async def product_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return state
 
 
-def _missing_details(draft: dict) -> list[str]:
+def _missing_contact_location(draft: dict) -> list[str]:
     missing = []
     if not draft.get("client_phone"):
         missing.append("номер клиента")
-    if draft.get("amount_usd") is None and draft.get("amount_uzs") is None:
-        missing.append("цена")
     if (
         (draft.get("latitude") is None or draft.get("longitude") is None)
         and not draft.get("address_text")
@@ -3131,10 +3142,6 @@ async def _capture_order_details(message, draft: dict) -> list[str]:
     if phones:
         count = _merge_phones(draft, phones)
         recognized.append("два номера" if count > 1 else "номер")
-    if "amount_usd" in parsed or "amount_uzs" in parsed:
-        draft["amount_usd"] = parsed.get("amount_usd")
-        draft["amount_uzs"] = parsed.get("amount_uzs")
-        recognized.append("цена")
     for latitude, longitude in parsed.get("location_coordinates") or []:
         url = (
             "https://yandex.uz/maps/?"
@@ -3222,10 +3229,11 @@ async def details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             await update.message.reply_text(f"Не удалось сохранить данные: {error}")
             return DETAILS
 
-    missing = _missing_details(draft)
+    missing = _missing_contact_location(draft)
     if not recognized:
         await update.message.reply_text(
-            "Не распознал данные. Отправьте номер клиента, цену или ссылку на карту."
+            "Не распознал данные. Отправьте номер клиента, координаты, Telegram Location или ссылку на карту.",
+            reply_markup=text_location_keyboard(),
         )
         return DETAILS
     if missing:
@@ -3235,7 +3243,7 @@ async def details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return _persist_creation_draft(update, context, DETAILS)
 
-    state = _persist_creation_draft(update, context, PAYMENT)
+    state = _persist_creation_draft(update, context, AMOUNT)
     await _prompt_creation_state(update.message, state, draft)
     return state
 
@@ -3254,11 +3262,10 @@ async def second_location(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return ConversationHandler.END
     text = (update.message.text or "").strip().casefold()
     if text == "продолжить без второй локации":
-        await update.message.reply_text(
-            "5/7. Выберите вариант оплаты:",
-            reply_markup=payment_keyboard(),
-        )
-        return PAYMENT
+        state = AMOUNT if draft.get("amount_usd") is None and draft.get("amount_uzs") is None else PAYMENT
+        state = _persist_creation_draft(update, context, state)
+        await _prompt_creation_state(update.message, state, draft)
+        return state
     try:
         recognized = await _capture_order_details(update.message, draft)
     except ValueError as error:
@@ -3267,11 +3274,48 @@ async def second_location(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             reply_markup=payment_keyboard(),
         )
         return SECOND_LOCATION
-    await update.message.reply_text(
-        f"✅ Сохранено: {', '.join(recognized)}.\n\n5/7. Выберите вариант оплаты:",
-        reply_markup=payment_keyboard(),
-    )
-    return _persist_creation_draft(update, context, PAYMENT)
+    state = AMOUNT if draft.get("amount_usd") is None and draft.get("amount_uzs") is None else PAYMENT
+    state = _persist_creation_draft(update, context, state)
+    await update.message.reply_text(f"✅ Сохранено: {', '.join(recognized)}.")
+    await _prompt_creation_state(update.message, state, draft)
+    return state
+
+
+async def amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await _require_manager_flow(update, context):
+        return ConversationHandler.END
+    draft = context.user_data.get("draft")
+    if draft is None:
+        await update.message.reply_text("Начните новый заказ заново.", reply_markup=main_keyboard())
+        return ConversationHandler.END
+    # Telegram may deliver a second phone/location after the bot has already
+    # advanced to the amount prompt. Capture it first so a nine-digit phone is
+    # never mistaken for a large UZS amount.
+    try:
+        recognized = await _capture_order_details(update.message, draft)
+    except ValueError as error:
+        await update.message.reply_text(
+            f"Не удалось сохранить данные: {error}",
+            reply_markup=amount_input_keyboard(),
+        )
+        return AMOUNT
+    if recognized:
+        _persist_creation_draft(update, context, AMOUNT)
+        await update.message.reply_text(
+            f"✅ Сохранено: {', '.join(recognized)}. Теперь введите общую сумму.",
+            reply_markup=amount_input_keyboard(),
+        )
+        return AMOUNT
+    try:
+        amount_usd, amount_uzs = parse_amount(update.message.text or "")
+    except ValueError as error:
+        await update.message.reply_text(str(error), reply_markup=amount_input_keyboard())
+        return AMOUNT
+    draft["amount_usd"] = amount_usd
+    draft["amount_uzs"] = amount_uzs
+    state = _persist_creation_draft(update, context, PAYMENT)
+    await _prompt_creation_state(update.message, state, draft)
+    return state
 
 
 async def payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -5381,11 +5425,18 @@ def register_handlers(application: Application) -> None:
                 MessageHandler(filters.Regex(f"^{re.escape(CREATION_BACK_TEXT)}$"), back_to_details),
                 MessageHandler(LOCATION_INPUT_FILTER & ~filters.COMMAND, second_location),
             ],
-            PAYMENT: [
+            AMOUNT: [
                 creation_menu,
                 creation_stats,
                 MessageHandler(filters.Regex(f"^{re.escape(CREATION_CANCEL_TEXT)}$"), cancel_conversation),
                 MessageHandler(filters.Regex(f"^{re.escape(CREATION_BACK_TEXT)}$"), back_to_details),
+                MessageHandler(LOCATION_INPUT_FILTER & ~filters.COMMAND, amount),
+            ],
+            PAYMENT: [
+                creation_menu,
+                creation_stats,
+                MessageHandler(filters.Regex(f"^{re.escape(CREATION_CANCEL_TEXT)}$"), cancel_conversation),
+                MessageHandler(filters.Regex(f"^{re.escape(CREATION_BACK_TEXT)}$"), back_to_amount),
                 MessageHandler(LOCATION_INPUT_FILTER & ~filters.COMMAND, payment),
             ],
             DELIVERY_TIME: [

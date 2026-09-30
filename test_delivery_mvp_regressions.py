@@ -8,12 +8,14 @@ from telegram.ext import ConversationHandler
 
 from app.database import OrderRepository
 from app.handlers.orders import (
+    AMOUNT,
     DETAILS,
     EDIT_VALUE,
     PAYMENT,
     _merge_location,
     _send_location_messages,
     begin_edit,
+    amount,
     details,
     payment,
     save_edit,
@@ -75,11 +77,16 @@ class MultiValueCreationTests(unittest.IsolatedAsyncioTestCase):
             state = await details(update, context)
 
         draft = context.user_data["draft"]
-        self.assertEqual(state, PAYMENT)
+        self.assertEqual(state, AMOUNT)
         self.assertEqual(draft["client_phone"], "+998901333999")
         self.assertEqual(draft["client_phone_2"], "+998912223344")
         self.assertEqual((draft["latitude"], draft["longitude"]), (41.31, 69.24))
         self.assertEqual((draft["second_latitude"], draft["second_longitude"]), (41.32, 69.25))
+        self.assertNotIn("amount_usd", draft)
+        self.assertNotIn("amount_uzs", draft)
+
+        price_message = self.message("375$")
+        self.assertEqual(await amount(self.update(price_message), context), PAYMENT)
         self.assertEqual((draft["amount_usd"], draft["amount_uzs"]), (375, None))
 
     async def test_second_native_location_is_accepted_after_payment_prompt(self):
@@ -108,6 +115,46 @@ class MultiValueCreationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(context.user_data["draft"]["second_latitude"], 41.32)
         self.assertIn("Сохранено", message.reply_text.await_args.args[0])
 
+    async def test_second_native_location_is_accepted_after_amount_prompt(self):
+        context = self.context({
+            "seller_name": "Ali",
+            "product": "A56",
+            "client_phone": "+998901333999",
+            "latitude": 41.31,
+            "longitude": 69.24,
+        })
+        message = self.message(location=SimpleNamespace(latitude=41.32, longitude=69.25))
+        second = {
+            "location_url": "https://yandex.uz/maps/?ll=69.250000%2C41.320000",
+            "latitude": 41.32,
+            "longitude": 69.25,
+            "address_text": "Вторая",
+            "district": None,
+            "mahalla": None,
+        }
+        with patch("app.handlers.orders._location_values", AsyncMock(return_value=second)):
+            state = await amount(self.update(message), context)
+
+        self.assertEqual(state, AMOUNT)
+        self.assertEqual(context.user_data["draft"]["second_latitude"], 41.32)
+        self.assertNotIn("amount_uzs", context.user_data["draft"])
+
+    async def test_second_phone_at_amount_prompt_is_not_mistaken_for_uzs(self):
+        context = self.context({
+            "seller_name": "Ali",
+            "product": "A56",
+            "client_phone": "+998901333999",
+            "latitude": 41.31,
+            "longitude": 69.24,
+        })
+        message = self.message("91 222 33 44")
+
+        state = await amount(self.update(message), context)
+
+        self.assertEqual(state, AMOUNT)
+        self.assertEqual(context.user_data["draft"]["client_phone_2"], "+998912223344")
+        self.assertNotIn("amount_uzs", context.user_data["draft"])
+
     async def test_map_link_outside_uzbekistan_is_rejected(self):
         message = self.message("https://maps.google.com/?q=40.7128,-74.0060")
         update = self.update(message)
@@ -134,7 +181,7 @@ class MultiValueCreationTests(unittest.IsolatedAsyncioTestCase):
             "product": "A56",
             "client_phone": "+998901333999",
         })
-        price_message = self.message("375$")
+        price_message = self.message("не локация")
 
         state = await details(self.update(price_message), context)
 
@@ -159,7 +206,7 @@ class MultiValueCreationTests(unittest.IsolatedAsyncioTestCase):
         )
         state = await details(self.update(address_message), context)
 
-        self.assertEqual(state, PAYMENT)
+        self.assertEqual(state, AMOUNT)
         draft = context.user_data["draft"]
         self.assertEqual(
             draft["address_text"],
@@ -188,7 +235,7 @@ class MultiValueCreationTests(unittest.IsolatedAsyncioTestCase):
         )
         response = address_message.reply_text.await_args.args[0]
         self.assertIn("номер клиента", response)
-        self.assertIn("цена", response)
+        self.assertNotIn("цена", response)
 
     def test_coordinate_after_text_address_uses_second_location_slot(self):
         draft = {"address_text": "Чиланзар, ориентир магазин"}

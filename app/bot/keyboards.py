@@ -93,6 +93,14 @@ def product_input_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+def amount_input_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(CREATION_BACK_TEXT), KeyboardButton(CREATION_CANCEL_TEXT)]],
+        resize_keyboard=True,
+        input_field_placeholder="Например: 100$ 1 920 000 сум",
+    )
+
+
 def payment_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [[KeyboardButton(label)] for label in PAYMENT_LABELS.values()] + [

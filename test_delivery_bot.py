@@ -16,10 +16,10 @@ from app.bot.keyboards import (
 from app.database import OrderRepository
 from app.database.repository import MIGRATION_COLUMNS, SCHEMA
 from app.handlers.orders import (
-    DETAILS, PAYMENT, PRODUCT_PHOTO, SECOND_LOCATION, _courier_waiting_pickup_text,
+    AMOUNT, DETAILS, PAYMENT, PRODUCT_PHOTO, SECOND_LOCATION, _courier_waiting_pickup_text,
     _location_values, _message_location_urls, _publish_location,
     _send_post_delivery_prompt, _waiting_pickup_reminder_messages,
-    courier_action, delivery_input, details,
+    amount, courier_action, delivery_input, details,
     location_label_action, product, product_photo, save_edit, second_location,
 )
 from app.models import Order
@@ -806,9 +806,10 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
         }
         with patch("app.handlers.orders.enrich_location", AsyncMock(return_value=location)):
             state = await details(update, context)
-        self.assertEqual(state, PAYMENT)
+        self.assertEqual(state, AMOUNT)
         self.assertEqual(context.user_data["draft"]["client_phone"], "+998901333999")
-        self.assertEqual(context.user_data["draft"]["amount_uzs"], 1920000)
+        self.assertNotIn("amount_usd", context.user_data["draft"])
+        self.assertNotIn("amount_uzs", context.user_data["draft"])
 
     async def test_combined_details_accept_plain_coordinates(self):
         update = self.update(
@@ -831,9 +832,9 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
         with patch("app.handlers.orders.enrich_location", AsyncMock(side_effect=location)):
             state = await details(update, context)
 
-        self.assertEqual(state, PAYMENT)
+        self.assertEqual(state, AMOUNT)
         self.assertEqual(context.user_data["draft"]["client_phone"], "+998901333999")
-        self.assertEqual(context.user_data["draft"]["amount_usd"], 125)
+        self.assertNotIn("amount_usd", context.user_data["draft"])
         self.assertEqual(
             (
                 context.user_data["draft"]["latitude"],
@@ -864,7 +865,7 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
         with patch("app.handlers.orders.enrich_location", AsyncMock(side_effect=location)):
             state = await details(update, context)
 
-        self.assertEqual(state, PAYMENT)
+        self.assertEqual(state, AMOUNT)
         self.assertEqual(
             (
                 context.user_data["draft"]["latitude"],
@@ -884,6 +885,7 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
         context = self.context()
         price_update = self.update("100$ 1920000")
         self.assertEqual(await details(price_update, context), DETAILS)
+        self.assertNotIn("amount_usd", context.user_data["draft"])
         phone_update = self.update("901333999")
         self.assertEqual(await details(phone_update, context), DETAILS)
 
@@ -898,7 +900,22 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
         }
         with patch("app.handlers.orders.enrich_location", AsyncMock(return_value=location)):
             state = await details(map_update, context)
-        self.assertEqual(state, PAYMENT)
+        self.assertEqual(state, AMOUNT)
+
+        amount_update = self.update("100$ 1920000")
+        self.assertEqual(await amount(amount_update, context), PAYMENT)
+        self.assertEqual(context.user_data["draft"]["amount_usd"], 100)
+        self.assertEqual(context.user_data["draft"]["amount_uzs"], 1920000)
+
+    async def test_amount_step_rejects_invalid_value_without_losing_state(self):
+        context = self.context()
+        update = self.update("не сумма")
+
+        state = await amount(update, context)
+
+        self.assertEqual(state, AMOUNT)
+        self.assertNotIn("amount_usd", context.user_data["draft"])
+        self.assertIn("Введите положительную сумму", update.message.reply_text.await_args.args[0])
 
     async def test_optional_second_location_is_saved(self):
         context = self.context()
