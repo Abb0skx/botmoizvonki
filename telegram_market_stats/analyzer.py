@@ -74,7 +74,8 @@ def _aliases(model_name: str) -> set[str]:
 
 def _canonical_model(value: str) -> str:
     """Collapse catalogue transport/radio variants into the searched family."""
-    cleaned = re.sub(r"\s+(?:4g|5g)(?:\s+\d+)?\s*$", "", str(value), flags=re.I)
+    cleaned = re.sub(r"^\s*zzztex[.\s]+", "", str(value), flags=re.I)
+    cleaned = re.sub(r"\s+(?:4g|5g)(?:\s+\d+)?\s*$", "", cleaned, flags=re.I)
     family = str(_family_name(cleaned) or cleaned).strip()
     return family or str(value).strip()
 
@@ -87,6 +88,78 @@ def _message_forms(text: str) -> str:
     return " ".join(normalized.split())
 
 
+def _special_aliases(model_name: str) -> set[str]:
+    """Safe shop shorthand aliases used in the supplier group."""
+    value = normalize_model(model_name)
+    aliases: set[str] = set()
+    iphone = re.fullmatch(
+        r"(?:apple\s+)?iphone\s+(\d{1,2})(?:\s+(pro max|pro|plus|e))?",
+        value,
+    )
+    if iphone:
+        generation, variant = iphone.groups()
+        if variant:
+            aliases.add(f"{generation} {variant}")
+        if variant == "pro max":
+            aliases.update({f"{generation} max", f"{generation} pm"})
+        return aliases
+    samsung = re.fullmatch(
+        r"samsung\s+galaxy\s+(?:tab\s+)?([asz]\d+(?:\s+(?:ultra|plus|fe))?)",
+        value,
+    )
+    if samsung:
+        aliases.add(samsung.group(1))
+    macbook = re.fullmatch(
+        r"(?:apple\s+)?(macbook\s+(?:air|pro)\s+\d+\s+m\d+)\s+\d+\s+core",
+        value,
+    )
+    if macbook:
+        aliases.add(macbook.group(1))
+    return aliases
+
+
+def _observed_mentions(text: str) -> tuple[ModelMention, ...]:
+    """Capture explicit market models that are newer than the price catalogue."""
+    value = _message_forms(text)
+    _query, memory, color = extract_product_query(text)
+    matches: list[tuple[str, str]] = []
+    iphone = re.search(
+        r"\b(?:iphone\s+)?(1[2-9]|2\d)\s*(pro\s+max|pro|max|plus|e)?\b",
+        value,
+    )
+    phone_context = bool(re.search(r"\b(?:iphone|sim|esim)\b", value))
+    if iphone and phone_context:
+        generation, variant = iphone.groups()
+        suffix = "Pro Max" if variant in {"pro max", "max"} else (
+            variant.title() if variant else ""
+        )
+        name = f"Apple iPhone {generation}" + (f" {suffix}" if suffix else "")
+        matches.append((normalize_model(name), name))
+    airpods = re.search(r"\bairpods\s+(\d+)\b", value)
+    if airpods:
+        name = f"Apple AirPods {airpods.group(1)}"
+        matches.append((normalize_model(name), name))
+    ipad = re.search(r"\bipad\s+(air|pro|mini)?\s*(m\d+|\d+)\b", value)
+    if ipad:
+        family, generation = ipad.groups()
+        name = "Apple iPad" + (f" {family.title()}" if family else "")
+        name += f" {generation.upper()}"
+        matches.append((normalize_model(name), name))
+    samsung = re.search(r"\b([az]\d{2})(?:\s+(ultra|plus|fe))?\b", value)
+    if samsung:
+        code, variant = samsung.groups()
+        name = f"Samsung Galaxy {code.upper()}" + (
+            f" {variant.upper() if variant == 'fe' else variant.title()}"
+            if variant else ""
+        )
+        matches.append((normalize_model(name), name))
+    unique = dict(matches)
+    return tuple(
+        ModelMention(key, name, memory, color, 0.8)
+        for key, name in unique.items()
+    )
+
+
 class ProductModelIndex:
     def __init__(self, models: Iterable[str]):
         canonical: dict[str, str] = {}
@@ -97,7 +170,7 @@ class ProductModelIndex:
             if not key or key in {"model", "model name"}:
                 continue
             canonical.setdefault(key, model)
-            for alias in _aliases(model):
+            for alias in _aliases(model) | _special_aliases(model):
                 alias_map.setdefault(alias, set()).add(key)
         self.models = canonical
         self.aliases = tuple(sorted(
@@ -185,7 +258,11 @@ class MarketMessageAnalyzer:
         self.index = index
 
     def analyze(self, text: str) -> MessageAnalysis:
+        intent = classify_intent(text)
+        mentions = self.index.find(text)
+        if intent == "demand" and not mentions:
+            mentions = _observed_mentions(text)
         return MessageAnalysis(
-            intent=classify_intent(text),
-            mentions=self.index.find(text),
+            intent=intent,
+            mentions=mentions,
         )

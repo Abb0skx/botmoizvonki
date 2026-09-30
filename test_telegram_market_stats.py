@@ -77,6 +77,31 @@ def test_analyzer_understands_short_uzbek_request():
     assert result.mentions[0].color == "black"
 
 
+def test_analyzer_understands_supplier_group_shorthand_and_new_models():
+    index = ProductModelIndex([
+        "Apple iPhone 17",
+        "Apple iPhone 17 Pro Max",
+        "ZZZTex. Apple iPhone 17 Pro Max",
+        "Samsung Galaxy A57",
+        "Samsung Galaxy Tab S11 Ultra",
+        "Apple MacBook Pro 14 (M5 10-core)",
+    ])
+    current = MarketMessageAnalyzer(index)
+    cases = {
+        "17 max 512 sim silver kere": "Apple iPhone 17 Pro Max",
+        "A57 256 navy kere": "Samsung Galaxy A57",
+        "S11 ultra 256 sim kere": "Samsung Galaxy Tab S11 Ultra",
+        "Macbook pro 14 M5 16/512 kere": "Apple MacBook Pro 14 (M5 10-core)",
+        "18 pro 256 esim blue kere": "Apple iPhone 18 Pro",
+        "Airpods 5 ozi kere": "Apple AirPods 5",
+        "iPad Air M3 128/256 Blue Wifi Kere": "Apple iPad Air M3",
+    }
+    for message_text, expected in cases.items():
+        result = current.analyze(message_text)
+        assert result.intent == "demand"
+        assert [mention.model_name for mention in result.mentions] == [expected]
+
+
 def test_catalog_is_loaded_from_approved_xlsx(tmp_path):
     path = tmp_path / "Bot_URLS.xlsx"
     make_catalog(path)
