@@ -1666,7 +1666,12 @@ def _known_delivery_groups(settings: Settings) -> frozenset[int]:
     return frozenset(configured_groups) | frozenset({settings.delivery_group_id})
 
 
-async def _sync_order(context: ContextTypes.DEFAULT_TYPE, order_id: int) -> tuple[object | None, bool]:
+async def _sync_order(
+    context: ContextTypes.DEFAULT_TYPE,
+    order_id: int,
+    *,
+    refresh_existing_locations: bool = True,
+) -> tuple[object | None, bool]:
     async with _order_sync_lock(context.application, order_id):
         # Recheck after acquiring the per-order lock. Another request may have
         # received a newer Telegram RetryAfter while this worker was queued;
@@ -1675,7 +1680,11 @@ async def _sync_order(context: ContextTypes.DEFAULT_TYPE, order_id: int) -> tupl
         if _sync_retry_remaining(context.application, order_id) > 0:
             repo = context.application.bot_data.get("repo")
             return (repo.get(order_id) if repo is not None else None), False
-        return await _sync_order_locked(context, order_id)
+        return await _sync_order_locked(
+            context,
+            order_id,
+            refresh_existing_locations=refresh_existing_locations,
+        )
 
 
 async def _sync_order_foreground(
@@ -1768,7 +1777,12 @@ def _reset_mismatched_publications(
     )
 
 
-async def _sync_order_locked(context: ContextTypes.DEFAULT_TYPE, order_id: int) -> tuple[object | None, bool]:
+async def _sync_order_locked(
+    context: ContextTypes.DEFAULT_TYPE,
+    order_id: int,
+    *,
+    refresh_existing_locations: bool = True,
+) -> tuple[object | None, bool]:
     """Bring Telegram group/channel/private cards in line with SQLite state."""
     repo: OrderRepository = context.application.bot_data["repo"]
     settings: Settings = context.application.bot_data["settings"]
@@ -1909,13 +1923,14 @@ async def _sync_order_locked(context: ContextTypes.DEFAULT_TYPE, order_id: int) 
     order, same_generation = reload_generation()
     if not same_generation:
         return order, False
-    locations_ok = await _set_location_marker(
-        context,
-        order,
-        publication_expectations=expected_publications,
-    )
-    if not locations_ok:
-        success = False
+    if refresh_existing_locations:
+        locations_ok = await _set_location_marker(
+            context,
+            order,
+            publication_expectations=expected_publications,
+        )
+        if not locations_ok:
+            success = False
     order, same_generation = reload_generation()
     if not same_generation:
         return order, False
@@ -2367,7 +2382,9 @@ async def reconcile_orders_on_start(application: Application) -> None:
     await validate_delivery_configuration(application)
 
     repo: OrderRepository = application.bot_data["repo"]
-    candidates = {order.id: order for order in repo.list_needing_sync(limit=100)}
+    needing_sync = repo.list_needing_sync(limit=100)
+    candidates = {order.id: order for order in needing_sync}
+    location_refresh_ids = set(candidates)
     # Existing installations did not have sync_needed. Validate every open
     # order, including drafts whose manager card disappeared or whose first
     # send failed after the SQLite insert.
@@ -2383,7 +2400,11 @@ async def reconcile_orders_on_start(application: Application) -> None:
         if _sync_retry_remaining(application, order_id) > 0:
             continue
         try:
-            await _sync_order(context, order_id)
+            await _sync_order(
+                context,
+                order_id,
+                refresh_existing_locations=order_id in location_refresh_ids,
+            )
         except RetryAfter:
             raise
         except Exception:

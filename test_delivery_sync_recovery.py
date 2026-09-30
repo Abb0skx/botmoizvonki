@@ -980,7 +980,7 @@ class ConcurrentPublicationTests(unittest.IsolatedAsyncioTestCase):
         concurrent = 0
         maximum = 0
 
-        async def fake_locked(_context, order_id):
+        async def fake_locked(_context, order_id, **_kwargs):
             nonlocal concurrent, maximum
             concurrent += 1
             maximum = max(maximum, concurrent)
@@ -1294,6 +1294,7 @@ class StartupLegacyRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
         sync.assert_awaited_once()
         self.assertEqual(sync.await_args.args[1], 4)
+        self.assertFalse(sync.await_args.kwargs["refresh_existing_locations"])
 
     async def test_changed_chat_ids_clear_old_references_and_queue_cleanup(self):
         with tempfile.TemporaryDirectory() as directory:
