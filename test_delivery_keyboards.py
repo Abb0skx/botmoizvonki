@@ -49,8 +49,9 @@ class EditInputKeyboardTests(unittest.TestCase):
         labels = self._labels(keyboard)
 
         self.assertEqual(labels[:3], list(DELIVERY_TIME_QUICK_CHOICES))
-        self.assertEqual(labels[3:-1], list(DELIVERY_TIME_SLOTS))
-        self.assertEqual(labels[-1], "Пропустить")
+        slot_end = 3 + len(DELIVERY_TIME_SLOTS)
+        self.assertEqual(labels[3:slot_end], list(DELIVERY_TIME_SLOTS))
+        self.assertEqual(labels[slot_end:], ["Пропустить", "⬅️ Назад", "❌ Отменить создание"])
         self.assertEqual(keyboard.input_field_placeholder, "Или напишите время текстом")
         self.assertTrue(keyboard.one_time_keyboard)
 
@@ -192,6 +193,26 @@ class DeliveryTimeCreationFlowTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual(state, COMMENT)
                 self.assertEqual(context.user_data["draft"]["delivery_time"], value)
+
+    async def test_time_step_rejects_impossible_clock(self):
+        message = SimpleNamespace(text="25:90", reply_text=AsyncMock())
+        update = SimpleNamespace(
+            message=message,
+            effective_chat=SimpleNamespace(type="private"),
+            effective_user=SimpleNamespace(id=1),
+        )
+        context = SimpleNamespace(
+            user_data={"draft": {}},
+            application=SimpleNamespace(bot_data={
+                "settings": SimpleNamespace(manager_ids=frozenset({1})),
+            }),
+        )
+
+        state = await delivery_time(update, context)
+
+        self.assertEqual(state, DELIVERY_TIME)
+        self.assertNotIn("delivery_time", context.user_data["draft"])
+        self.assertIn("Некорректное время", message.reply_text.await_args.args[0])
 
 
 class OrdersPageKeyboardTests(unittest.TestCase):

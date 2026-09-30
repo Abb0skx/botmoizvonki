@@ -28,6 +28,8 @@ _EXPLICIT_UZS_RE = re.compile(
     re.I,
 )
 MAX_STORED_AMOUNT = (1 << 63) - 1
+MAX_ORDER_USD = 100_000
+MAX_ORDER_UZS = 2_000_000_000
 
 
 def extract_text_coordinates(value: str) -> list[tuple[float, float]]:
@@ -318,10 +320,14 @@ def parse_amount(value: str) -> tuple[int | None, int | None]:
         raise ValueError("Сумма в долларах должна быть больше нуля")
     if uzs is not None and uzs <= 0:
         raise ValueError("Сумма в сумах должна быть больше нуля")
-    if usd is not None and usd > MAX_STORED_AMOUNT:
-        raise ValueError("Сумма в долларах слишком большая")
-    if uzs is not None and uzs > MAX_STORED_AMOUNT:
-        raise ValueError("Сумма в сумах слишком большая")
+    if usd is not None and usd > min(MAX_STORED_AMOUNT, MAX_ORDER_USD):
+        raise ValueError(
+            f"Сумма в долларах слишком большая. Максимум: {MAX_ORDER_USD:,}$".replace(",", " ")
+        )
+    if uzs is not None and uzs > min(MAX_STORED_AMOUNT, MAX_ORDER_UZS):
+        raise ValueError(
+            f"Сумма в сумах слишком большая. Максимум: {MAX_ORDER_UZS:,} сум".replace(",", " ")
+        )
     return usd, uzs
 
 
@@ -337,7 +343,10 @@ def parse_order_details(
     if not value.strip() or len(value) > 4096:
         raise ValueError("Сообщение пустое или слишком длинное")
 
-    result: dict[str, str | int | None | list[str]] = {}
+    result: dict[
+        str,
+        str | int | None | list[str] | list[tuple[float, float]],
+    ] = {}
     remaining = value
 
     location_urls: list[str] = []
@@ -399,8 +408,6 @@ def parse_order_details(
         for phone_match in _PHONE_RE.finditer(labelled.group(1)):
             remember_phone(phone_match, labelled.start(1))
             labelled_phone_spans.add(phone_span(phone_match, labelled.start(1)))
-    phones = phones[:2]
-
     # A full 998 number is unambiguously a phone. Bare nine-digit values are
     # ambiguous because they may also be an unmarked UZS amount. The order
     # supports at most two phones: when a labelled/full phone already exists,
@@ -420,22 +427,59 @@ def parse_order_details(
         if not has_country_code:
             deferred_bare_phones.append(phone_match)
             continue
-        if len(phones) < 2:
-            remember_phone(phone_match)
-            definite_phone_ends.append(span[1])
+        remember_phone(phone_match)
+        definite_phone_ends.append(span[1])
 
-    phone_slots = max(0, 2 - len(phones))
     has_explicit_amount = bool(
         re.search(rf"{_USD_MARKER}|{_UZS_MARKER}", remaining, flags=re.I)
     )
     if has_explicit_amount:
-        bare_phone_count = min(phone_slots, len(deferred_bare_phones))
+        bare_phone_count = len(deferred_bare_phones)
     elif definite_phone_ends:
-        bare_phone_count = min(phone_slots, max(0, len(deferred_bare_phones) - 1))
+        # A seven/eight-digit amount cannot be mistaken for an Uzbek phone.
+        # If such a separate number is present, all remaining nine-digit
+        # candidates are phones. Otherwise reserve the last ambiguous
+        # nine-digit value for an unmarked UZS amount.
+        non_ambiguous_source = list(phone_search)
+        for start, end in phone_spans:
+            for index in range(start, end):
+                if non_ambiguous_source[index] not in "\r\n":
+                    non_ambiguous_source[index] = " "
+        for phone_match in deferred_bare_phones:
+            start, end = phone_span(phone_match)
+            for index in range(start, end):
+                if non_ambiguous_source[index] not in "\r\n":
+                    non_ambiguous_source[index] = " "
+        has_other_amount = bool(
+            re.search(
+                rf"(?<!\w){_AMOUNT_PATTERN}(?!\w)",
+                "".join(non_ambiguous_source),
+            )
+        )
+        available = (
+            len(deferred_bare_phones)
+            if has_other_amount
+            else max(0, len(deferred_bare_phones) - 1)
+        )
+        bare_phone_count = available
     else:
-        bare_phone_count = min(phone_slots, 2, len(deferred_bare_phones))
+        bare_phone_count = min(max(0, 2 - len(phones)), 2, len(deferred_bare_phones))
     for phone_match in deferred_bare_phones[:bare_phone_count]:
         remember_phone(phone_match)
+
+    if not labelled_phone_spans:
+        ordered_phones: list[str] = []
+        for start, end in sorted(phone_spans):
+            try:
+                phone = normalize_phone(phone_search[start:end])
+            except ValueError:
+                continue
+            if phone not in ordered_phones:
+                ordered_phones.append(phone)
+        phones = ordered_phones
+
+    if len(phones) > 2:
+        raise ValueError("Укажите не больше двух номеров клиента")
 
     if phones:
         result["client_phone"] = phones[0]
@@ -447,7 +491,12 @@ def parse_order_details(
         try:
             usd, uzs = parse_amount(remaining)
         except ValueError:
-            pass
+            if re.search(
+                rf"{_USD_MARKER}|{_UZS_MARKER}|(?<!\w){_AMOUNT_PATTERN}(?!\w)",
+                remaining,
+                flags=re.I,
+            ):
+                raise
         else:
             result["amount_usd"] = usd
             result["amount_uzs"] = uzs

@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import logging
+import re
 from pathlib import Path
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -19,6 +20,7 @@ from telegram.ext import (
 )
 
 from app.bot.keyboards import (
+    CONFIRM_DUPLICATE_TEXT, CREATION_BACK_TEXT, CREATION_CANCEL_TEXT,
     all_locations_keyboard, completed_keyboard, courier_cancelled_keyboard,
     courier_keyboard, courier_reassignment_confirmation_keyboard,
     courier_selection_keyboard,
@@ -27,7 +29,8 @@ from app.bot.keyboards import (
     main_keyboard,
     manager_cancelled_keyboard, manager_sent_keyboard, on_way_keyboard,
     orders_channel_keyboard, orders_page_keyboard, payment_keyboard, review_keyboard, seller_keyboard,
-    product_photo_keyboard, readonly_order_keyboard, sales_card_confirmation_keyboard,
+    duplicate_order_keyboard, product_input_keyboard, product_photo_keyboard,
+    readonly_order_keyboard, sales_card_confirmation_keyboard,
     sales_card_result_keyboard, skip_keyboard, statistics_keyboard, text_location_keyboard,
 )
 from app.config import Settings
@@ -63,6 +66,7 @@ EDIT_CANCEL_TEXT = "❌ Отменить изменение"
 TEXT_LOCATION_BUTTON = "📝 Локация текстом"
 DELETE_SECOND_LOCATION_TEXT = "🗑 Удалить доп. локацию"
 TELEGRAM_SAFE_TEXT_LIMIT = 3800
+CREATION_DRAFT_MAX_AGE = timedelta(hours=24)
 MAIN_MENU_TEXTS = {
     "➕ Новый заказ",
     "📋 Активные заказы",
@@ -296,6 +300,25 @@ async def _require_manager_flow(
     chat = getattr(update, "effective_chat", None)
     user = getattr(update, "effective_user", None)
     if getattr(chat, "type", None) == "private" and user and user.id in settings.manager_ids:
+        draft = getattr(context, "user_data", {}).get("draft") or {}
+        updated_at = draft.get("_updated_at")
+        if updated_at:
+            try:
+                touched = datetime.fromisoformat(str(updated_at))
+                if touched.tzinfo is None:
+                    touched = touched.replace(tzinfo=ZoneInfo("Asia/Tashkent"))
+                age = datetime.now().astimezone() - touched.astimezone()
+            except (TypeError, ValueError):
+                age = timedelta(0)
+            if age > CREATION_DRAFT_MAX_AGE:
+                context.user_data.pop("draft", None)
+                message = getattr(update, "effective_message", None) or getattr(update, "message", None)
+                if message:
+                    await message.reply_text(
+                        "Старая сессия закрыта. Черновик сохранён — нажмите «➕ Новый заказ», чтобы продолжить.",
+                        reply_markup=main_keyboard(),
+                    )
+                return False
         return True
     user_data = getattr(context, "user_data", None)
     if isinstance(user_data, dict):
@@ -308,6 +331,91 @@ async def _require_manager_flow(
             reply_markup=ReplyKeyboardRemove(),
         )
     return False
+
+
+def _draft_payload(draft: dict) -> dict:
+    """Strip conversation-only metadata before inserting the final order."""
+    return {
+        key: value
+        for key, value in draft.items()
+        if not key.startswith("_") and key != "awaiting_text_location"
+    }
+
+
+def _persist_creation_draft(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    state: int,
+) -> int:
+    draft = context.user_data.get("draft")
+    user = getattr(update, "effective_user", None)
+    if draft is None or user is None:
+        return state
+    draft["_state"] = int(state)
+    draft["_updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+    repo: OrderRepository | None = context.application.bot_data.get("repo")
+    if repo:
+        repo.save_creation_draft(user.id, draft, state)
+    return state
+
+
+def _delete_creation_draft(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = getattr(update, "effective_user", None)
+    repo: OrderRepository | None = context.application.bot_data.get("repo")
+    if user and repo:
+        repo.delete_creation_draft(user.id)
+
+
+async def _prompt_creation_state(message, state: int, draft: dict, *, resumed: bool = False) -> None:
+    prefix = "♻️ Черновик восстановлен.\n\n" if resumed else ""
+    if state == SELLER:
+        text, keyboard = "1/7. Выберите, кому принадлежит заказ:", seller_keyboard()
+    elif state == PRODUCT:
+        text, keyboard = "2/7. Введите модель товара:", product_input_keyboard()
+    elif state == PRODUCT_PHOTO:
+        saved = "\nТекущее фото уже сохранено." if draft.get("product_photo_file_id") else ""
+        text = f"3/7. 📸 Фото товара?{saved}\n\nОтправьте фотографию или нажмите «Пропустить»."
+        keyboard = product_photo_keyboard()
+    elif state == DETAILS:
+        saved = []
+        if draft.get("client_phone"):
+            saved.append("номер")
+        if draft.get("amount_usd") is not None or draft.get("amount_uzs") is not None:
+            saved.append("цена")
+        if draft.get("latitude") is not None or draft.get("address_text"):
+            saved.append("локация")
+        suffix = f"\n✅ Уже сохранено: {', '.join(saved)}" if saved else ""
+        text = "4/7. Отправьте:\n📍 Локацию\n📱 Номер\n💰 Общую сумму" + suffix
+        keyboard = text_location_keyboard()
+    elif state == PAYMENT:
+        text, keyboard = "5/7. Выберите вариант оплаты:", payment_keyboard()
+    elif state == DELIVERY_TIME:
+        text = "6/7. Выберите время доставки или напишите свой вариант текстом:"
+        keyboard = delivery_time_keyboard()
+    else:
+        text, keyboard = "7/7. Добавьте комментарий или пропустите:", skip_keyboard()
+    await message.reply_text(prefix + text, reply_markup=keyboard)
+
+
+def _infer_creation_state(draft: dict) -> int:
+    stored = draft.get("_state")
+    if isinstance(stored, int) and stored in {
+        SELLER, PRODUCT, PRODUCT_PHOTO, DETAILS, PAYMENT, DELIVERY_TIME, COMMENT,
+    }:
+        return stored
+    if not draft.get("seller_name"):
+        return SELLER
+    if not draft.get("product"):
+        return PRODUCT
+    if "product_photo_file_id" not in draft:
+        return PRODUCT_PHOTO
+    if _missing_details(draft):
+        return DETAILS
+    if not draft.get("payment_status"):
+        return PAYMENT
+    if "delivery_time" not in draft:
+        return DELIVERY_TIME
+    return COMMENT
 
 
 async def _notify_log(
@@ -2431,10 +2539,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     # This callback is also a ConversationHandler fallback. Clear both kinds
     # of persisted input before returning END, including for users whose
     # permissions changed while a conversation was stored.
-    draft = context.user_data.get("draft") or {}
     repo: OrderRepository | None = context.application.bot_data.get("repo")
+    draft = context.user_data.get("draft") or {}
+    if not draft and repo and update.effective_user:
+        stored = repo.get_creation_draft(update.effective_user.id)
+        if stored:
+            draft, state = stored
+            draft["_state"] = state
+            context.user_data["draft"] = draft
     committed = repo.get_by_creation_token(draft.get("creation_token")) if repo else None
-    context.user_data.pop("draft", None)
     context.user_data.pop("edit", None)
     if update.effective_chat.type != "private":
         return ConversationHandler.END
@@ -2443,10 +2556,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
     prefix = ""
     if committed and committed.status == "draft":
+        context.user_data.pop("draft", None)
+        _delete_creation_draft(update, context)
         _, recovered = await _sync_order_foreground(context, committed.id)
         if not recovered:
             _schedule_sync_retry(context, committed.id)
         prefix = f"Заказ №{committed.order_number} уже сохранён. Его карточка будет восстановлена автоматически.\n\n"
+    elif draft:
+        prefix = "У вас есть незавершённый заказ. Нажмите «➕ Новый заказ», чтобы продолжить.\n\n"
     await update.message.reply_text(prefix + "Бот доставки TEXNIKACH готов.", reply_markup=main_keyboard())
     return ConversationHandler.END
 
@@ -2470,8 +2587,9 @@ async def _end_creation_with_order_list(
     draft = context.user_data.get("draft") or {}
     repo: OrderRepository = context.application.bot_data["repo"]
     committed = repo.get_by_creation_token(draft.get("creation_token"))
-    context.user_data.pop("draft", None)
     if committed and committed.status == "draft":
+        context.user_data.pop("draft", None)
+        _delete_creation_draft(update, context)
         _, recovered = await _sync_order_foreground(context, committed.id)
         if not recovered:
             _schedule_sync_retry(context, committed.id)
@@ -2493,8 +2611,9 @@ async def _end_creation_with_map(
     draft = context.user_data.get("draft") or {}
     repo: OrderRepository = context.application.bot_data["repo"]
     committed = repo.get_by_creation_token(draft.get("creation_token"))
-    context.user_data.pop("draft", None)
     if committed and committed.status == "draft":
+        context.user_data.pop("draft", None)
+        _delete_creation_draft(update, context)
         _, recovered = await _sync_order_foreground(context, committed.id)
         if not recovered:
             _schedule_sync_retry(context, committed.id)
@@ -2511,8 +2630,9 @@ async def _end_creation_with_statistics(
     draft = context.user_data.get("draft") or {}
     repo: OrderRepository = context.application.bot_data["repo"]
     committed = repo.get_by_creation_token(draft.get("creation_token"))
-    context.user_data.pop("draft", None)
     if committed and committed.status == "draft":
+        context.user_data.pop("draft", None)
+        _delete_creation_draft(update, context)
         _, recovered = await _sync_order_foreground(context, committed.id)
         if not recovered:
             _schedule_sync_retry(context, committed.id)
@@ -2772,6 +2892,12 @@ async def new_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.pop("edit", None)
     previous_draft = context.user_data.get("draft") or {}
     repo: OrderRepository = context.application.bot_data["repo"]
+    if not previous_draft:
+        stored = repo.get_creation_draft(update.effective_user.id)
+        if stored:
+            previous_draft, stored_state = stored
+            previous_draft["_state"] = stored_state
+            context.user_data["draft"] = previous_draft
     committed = repo.get_by_creation_token(previous_draft.get("creation_token"))
     if committed and committed.status == "draft":
         # The final creation step commits SQLite before sending the manager
@@ -2784,6 +2910,7 @@ async def new_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         if not recovered:
             _schedule_sync_retry(context, committed.id)
         context.user_data.pop("draft", None)
+        _delete_creation_draft(update, context)
         recovery_text = (
             "Его карточка восстановлена."
             if recovered
@@ -2796,9 +2923,65 @@ async def new_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             reply_markup=main_keyboard(),
         )
         return ConversationHandler.END
+    if previous_draft:
+        state = _infer_creation_state(previous_draft)
+        _persist_creation_draft(update, context, state)
+        await _prompt_creation_state(update.message, state, previous_draft, resumed=True)
+        return state
     context.user_data["draft"] = {"creation_token": uuid4().hex}
-    await update.message.reply_text("1/7. Выберите, кому принадлежит заказ:", reply_markup=seller_keyboard())
+    _persist_creation_draft(update, context, SELLER)
+    await _prompt_creation_state(update.message, SELLER, context.user_data["draft"])
     return SELLER
+
+
+async def _back_to_state(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    state: int,
+) -> int:
+    if not await _require_manager_flow(update, context):
+        return ConversationHandler.END
+    draft = context.user_data.get("draft")
+    if draft is None:
+        await update.message.reply_text("Черновик не найден.", reply_markup=main_keyboard())
+        return ConversationHandler.END
+    draft.pop("awaiting_text_location", None)
+    draft.pop("_duplicate_order_id", None)
+    if state == DETAILS:
+        for field in (
+            "client_phone", "client_phone_2", "amount_usd", "amount_uzs",
+            "location_url", "latitude", "longitude", "address_text", "district", "mahalla",
+            "second_location_url", "second_latitude", "second_longitude",
+            "second_address_text", "second_district", "second_mahalla",
+        ):
+            draft.pop(field, None)
+    _persist_creation_draft(update, context, state)
+    await _prompt_creation_state(update.message, state, draft)
+    return state
+
+
+async def back_to_seller(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _back_to_state(update, context, SELLER)
+
+
+async def back_to_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _back_to_state(update, context, PRODUCT)
+
+
+async def back_to_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _back_to_state(update, context, PRODUCT_PHOTO)
+
+
+async def back_to_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _back_to_state(update, context, DETAILS)
+
+
+async def back_to_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _back_to_state(update, context, PAYMENT)
+
+
+async def back_to_delivery_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _back_to_state(update, context, DELIVERY_TIME)
 
 
 async def seller(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2814,8 +2997,9 @@ async def seller(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text(str(error), reply_markup=seller_keyboard())
         return SELLER
     draft["seller_name"] = value
-    await update.message.reply_text("2/7. Введите модель товара:", reply_markup=ReplyKeyboardRemove())
-    return PRODUCT
+    state = _persist_creation_draft(update, context, PRODUCT)
+    await _prompt_creation_state(update.message, state, draft)
+    return state
 
 
 async def product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2830,13 +3014,10 @@ async def product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     except ValueError as error:
         await update.message.reply_text(str(error))
         return PRODUCT
-    draft["product"] = value
-    await update.message.reply_text(
-        "3/7. 📸 Фото товара?\n\n"
-        "Отправьте фотографию или нажмите «Пропустить».",
-        reply_markup=product_photo_keyboard(),
-    )
-    return PRODUCT_PHOTO
+    draft["product"] = " ".join(value.split())
+    state = _persist_creation_draft(update, context, PRODUCT_PHOTO)
+    await _prompt_creation_state(update.message, state, draft)
+    return state
 
 
 async def product_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2847,6 +3028,7 @@ async def product_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await update.message.reply_text("Начните новый заказ заново.", reply_markup=main_keyboard())
         return ConversationHandler.END
     photos = tuple(update.message.photo or ())
+    document = getattr(update.message, "document", None)
     text = (update.message.text or "").strip().casefold()
     if photos:
         photo = max(
@@ -2860,6 +3042,11 @@ async def product_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         draft["product_photo_unique_id"] = str(
             getattr(photo, "file_unique_id", "") or photo.file_id
         )
+    elif document and str(getattr(document, "mime_type", "") or "").casefold().startswith("image/"):
+        draft["product_photo_file_id"] = str(document.file_id)
+        draft["product_photo_unique_id"] = str(
+            getattr(document, "file_unique_id", "") or document.file_id
+        )
     elif text in {"пропустить", "⏭ пропустить"}:
         draft["product_photo_file_id"] = None
         draft["product_photo_unique_id"] = None
@@ -2869,14 +3056,9 @@ async def product_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             reply_markup=product_photo_keyboard(),
         )
         return PRODUCT_PHOTO
-    await update.message.reply_text(
-        "4/7. Отправьте:\n"
-        "📍 Локацию\n"
-        "📱 Номер\n"
-        "💰 Общую сумму",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    return DETAILS
+    state = _persist_creation_draft(update, context, DETAILS)
+    await _prompt_creation_state(update.message, state, draft)
+    return state
 
 
 def _missing_details(draft: dict) -> list[str]:
@@ -3007,21 +3189,27 @@ async def details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             except ValueError as error:
                 await update.message.reply_text(str(error), reply_markup=ReplyKeyboardRemove())
                 return DETAILS
-            draft.update(
-                **extract_text_address(address),
-                location_url=None,
-                latitude=None,
-                longitude=None,
-            )
+            try:
+                location_number = _merge_location(
+                    draft,
+                    {
+                        **extract_text_address(address),
+                        "location_url": None,
+                        "latitude": None,
+                        "longitude": None,
+                    },
+                )
+            except ValueError as error:
+                await update.message.reply_text(
+                    f"Не удалось сохранить данные: {error}",
+                    reply_markup=text_location_keyboard(),
+                )
+                return DETAILS
             draft.pop("awaiting_text_location", None)
-            recognized = ["локация текстом"]
+            recognized = [f"локация {location_number} текстом"]
     elif incoming_text == TEXT_LOCATION_BUTTON:
-        if _missing_details(draft) != ["локация"]:
-            await update.message.reply_text(
-                "Сначала отправьте номер клиента и цену. После этого можно будет ввести локацию текстом."
-            )
-            return DETAILS
         draft["awaiting_text_location"] = True
+        _persist_creation_draft(update, context, DETAILS)
         await update.message.reply_text(
             "Напишите адрес клиента текстом. Например: Яшнабадский район, махалля Алимкент, улица Кустанай, дом 15.",
             reply_markup=ReplyKeyboardRemove(),
@@ -3041,15 +3229,15 @@ async def details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return DETAILS
     if missing:
-        reply_markup = text_location_keyboard() if missing == ["локация"] else ReplyKeyboardRemove()
         await update.message.reply_text(
             f"✅ Сохранено: {', '.join(recognized)}. Осталось отправить: {', '.join(missing)}.",
-            reply_markup=reply_markup,
+            reply_markup=text_location_keyboard(),
         )
-        return DETAILS
+        return _persist_creation_draft(update, context, DETAILS)
 
-    await update.message.reply_text("5/7. Выберите вариант оплаты:", reply_markup=payment_keyboard())
-    return PAYMENT
+    state = _persist_creation_draft(update, context, PAYMENT)
+    await _prompt_creation_state(update.message, state, draft)
+    return state
 
 
 def _as_second_location(values: dict) -> dict:
@@ -3083,7 +3271,7 @@ async def second_location(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         f"✅ Сохранено: {', '.join(recognized)}.\n\n5/7. Выберите вариант оплаты:",
         reply_markup=payment_keyboard(),
     )
-    return PAYMENT
+    return _persist_creation_draft(update, context, PAYMENT)
 
 
 async def payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -3108,15 +3296,37 @@ async def payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 f"✅ Сохранено: {', '.join(recognized)}. Теперь выберите вариант оплаты:",
                 reply_markup=payment_keyboard(),
             )
-            return PAYMENT
+            return _persist_creation_draft(update, context, PAYMENT)
         await update.message.reply_text(str(error), reply_markup=payment_keyboard())
         return PAYMENT
     draft["payment_status"] = value
-    await update.message.reply_text(
-        "6/7. Выберите время доставки или напишите свой вариант текстом:",
-        reply_markup=delivery_time_keyboard(),
-    )
-    return DELIVERY_TIME
+    state = _persist_creation_draft(update, context, DELIVERY_TIME)
+    await _prompt_creation_state(update.message, state, draft)
+    return state
+
+
+def _normalize_delivery_time_value(value: str | None) -> tuple[str | None, bool]:
+    if not value:
+        return value, False
+    clock = re.search(r"(?<!\d)(\d{1,2}):(\d{2})(?!\d)", value)
+    if clock and (int(clock.group(1)) > 23 or int(clock.group(2)) > 59):
+        raise ValueError("Некорректное время. Используйте формат, например: 17:30.")
+    normalized = value.strip()
+    if clock and "завтра" not in normalized.casefold():
+        exact_or_deadline = bool(
+            re.fullmatch(r"\d{1,2}:\d{2}", normalized)
+            or re.match(r"(?i)^до\s+\d{1,2}:\d{2}$", normalized)
+        )
+        now_local = datetime.now(ZoneInfo("Asia/Tashkent"))
+        promised = now_local.replace(
+            hour=int(clock.group(1)),
+            minute=int(clock.group(2)),
+            second=0,
+            microsecond=0,
+        )
+        if exact_or_deadline and promised <= now_local:
+            return f"Завтра {normalized}", True
+    return normalized, False
 
 
 async def delivery_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -3131,9 +3341,19 @@ async def delivery_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     except ValueError as error:
         await update.message.reply_text(str(error), reply_markup=delivery_time_keyboard())
         return DELIVERY_TIME
+    try:
+        value, moved_to_tomorrow = _normalize_delivery_time_value(value)
+    except ValueError as error:
+        await update.message.reply_text(str(error), reply_markup=delivery_time_keyboard())
+        return DELIVERY_TIME
+    if moved_to_tomorrow:
+        await update.message.reply_text(
+            f"ℹ️ Время сегодня уже прошло. Сохраняю как: {value}."
+        )
     draft["delivery_time"] = value
-    await update.message.reply_text("7/7. Добавьте комментарий или пропустите:", reply_markup=skip_keyboard())
-    return COMMENT
+    state = _persist_creation_draft(update, context, COMMENT)
+    await _prompt_creation_state(update.message, state, draft)
+    return state
 
 
 async def comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -3146,23 +3366,44 @@ async def comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             reply_markup=main_keyboard(),
         )
         return ConversationHandler.END
-    try:
-        value = _text(update.message, maximum=1000, required=False)
-    except ValueError as error:
-        await update.message.reply_text(str(error))
-        return COMMENT
-    draft["comment"] = value
+    incoming = (update.message.text or "").strip()
+    duplicate_confirmation = (
+        incoming == CONFIRM_DUPLICATE_TEXT and draft.get("_duplicate_order_id")
+    )
+    if not duplicate_confirmation:
+        try:
+            value = _text(update.message, maximum=1000, required=False)
+        except ValueError as error:
+            await update.message.reply_text(str(error), reply_markup=skip_keyboard())
+            return COMMENT
+        draft["comment"] = value
+        draft.pop("_duplicate_order_id", None)
     # Drafts restored from the release that predates creation_token still get
     # the same duplicate protection on their first final-step attempt.
     draft.setdefault("creation_token", uuid4().hex)
     repo: OrderRepository = context.application.bot_data["repo"]
+    committed = repo.get_by_creation_token(draft.get("creation_token"))
+    if not committed and not duplicate_confirmation:
+        duplicate = repo.find_possible_duplicate(_draft_payload(draft))
+        if duplicate:
+            draft["_duplicate_order_id"] = duplicate.id
+            _persist_creation_draft(update, context, COMMENT)
+            await update.message.reply_text(
+                "⚠️ Возможно, это повтор заказа.\n\n"
+                f"Уже существует заказ №{duplicate.order_number}:\n"
+                f"📦 {duplicate.product}\n"
+                f"📱 {display_phone(duplicate.client_phone)}\n\n"
+                "Проверьте данные перед созданием ещё одного заказа.",
+                reply_markup=duplicate_order_keyboard(),
+            )
+            return COMMENT
     # The creation token is stored both in persistent user_data and SQLite.
     # Retrying this step after a Telegram timeout therefore returns the same
     # order instead of consuming a second order number.
     order = repo.create(
         manager_id=update.effective_user.id,
         manager_name=_name(update.effective_user),
-        data=draft,
+        data=_draft_payload(draft),
     )
     async with _order_sync_lock(context.application, order.id):
         order = repo.get(order.id)
@@ -3220,30 +3461,12 @@ async def comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         order, synchronized = await _sync_order_foreground(context, order.id)
         if not synchronized:
             _schedule_sync_retry(context, order.id)
-    sales_queued = False
-    if order and order.product_photo_file_id:
-        try:
-            order, sales_queued = await _queue_product_photo_sales_card(
-                context,
-                order,
-                actor_id=update.effective_user.id,
-                actor_name=_name(update.effective_user),
-            )
-        except Exception:
-            logger.exception(
-                "Could not automatically queue sales card for order %s",
-                order.id,
-            )
-        else:
-            if sales_queued:
-                _, synchronized = await _sync_order_foreground(context, order.id)
-                if not synchronized:
-                    _schedule_sync_retry(context, order.id)
     confirmation = "Проверьте данные заказа."
-    if sales_queued:
-        confirmation += "\n📸 Фото нового товара отправляется в канал продаж."
+    if order and order.product_photo_file_id:
+        confirmation += "\n📸 Фото сохранено. Публикация в «Проданные» запускается отдельной кнопкой."
     await update.message.reply_text(confirmation, reply_markup=main_keyboard())
     context.user_data.pop("draft", None)
+    _delete_creation_draft(update, context)
     return ConversationHandler.END
 
 
@@ -3519,14 +3742,18 @@ async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
         if field == "seller": values["seller_name"] = normalize_seller(update.message.text or "")
         elif field == "product_photo":
-            if update.message.photo:
+            image_document = getattr(update.message, "document", None)
+            if update.message.photo or (
+                image_document
+                and str(getattr(image_document, "mime_type", "") or "").casefold().startswith("image/")
+            ):
                 photo = max(
                     update.message.photo,
                     key=lambda item: (
                         int(getattr(item, "file_size", 0) or 0),
                         int(getattr(item, "width", 0) or 0) * int(getattr(item, "height", 0) or 0),
                     ),
-                )
+                ) if update.message.photo else image_document
                 values.update(
                     product_photo_file_id=str(photo.file_id),
                     product_photo_unique_id=str(
@@ -3597,6 +3824,10 @@ async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         else:
             limits = {"product": 200, "delivery_time": 100, "comment": 1000}
             values[field] = _text(update.message, maximum=limits[field], required=field == "product")
+            if field == "product":
+                values[field] = " ".join(values[field].split())
+            elif field == "delivery_time":
+                values[field], _ = _normalize_delivery_time_value(values[field])
     except ValueError as error:
         await update.message.reply_text(str(error), reply_markup=edit_input_keyboard(field))
         return EDIT_VALUE
@@ -3754,23 +3985,6 @@ async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 order.id,
             )
 
-    sales_queued = False
-    sales_queue_failed = False
-    if field == "product_photo" and order.product_photo_file_id:
-        try:
-            order, sales_queued = await _queue_product_photo_sales_card(
-                context,
-                order,
-                actor_id=actor.id if actor else previous.manager_id,
-                actor_name=_name(actor) if actor else previous.manager_name,
-            )
-        except Exception:
-            sales_queue_failed = True
-            logger.exception(
-                "Could not automatically queue edited product photo for order %s",
-                order.id,
-            )
-
     keyboard = manager_sent_keyboard(order) if sent else review_keyboard(order.id)
     manager_refreshed = True
     try:
@@ -3814,13 +4028,8 @@ async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         result = "⚠️ Данные сохранены в базе, но карточку менеджера обновить не удалось."
     elif not refreshed:
         result = "⚠️ Данные сохранены, но карточку в группе обновить не удалось."
-    elif sales_queue_failed:
-        result = (
-            "⚠️ Фото товара сохранено, но пока не отправлено в «Проданные». "
-            "Фоновая проверка повторит отправку автоматически."
-        )
-    elif sales_queued:
-        result = "✅ Фото товара сохранено и отправляется в канал продаж."
+    elif field == "product_photo":
+        result = "✅ Фото товара сохранено. Публикация в «Проданные» запускается отдельной кнопкой."
     elif field == "amount":
         result = f"✅ Новая цена сохранена:\n{money(order.amount_usd, order.amount_uzs)}"
     else:
@@ -5067,6 +5276,7 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
             return ConversationHandler.END
         if cancelled:
             context.user_data.pop("draft", None)
+            _delete_creation_draft(update, context)
             result = f"Заказ №{cancelled.order_number} отменён."
             if cancelled.manager_message_id:
                 _, success = await _sync_order_foreground(context, cancelled.id)
@@ -5081,6 +5291,7 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
             result = f"Заказ №{committed.order_number} уже обработан."
     else:
         context.user_data.pop("draft", None)
+        _delete_creation_draft(update, context)
     await update.message.reply_text(result, reply_markup=main_keyboard())
     return ConversationHandler.END
 
@@ -5133,18 +5344,64 @@ def register_handlers(application: Application) -> None:
     conversation = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^➕ Новый заказ$") & filters.ChatType.PRIVATE, new_order)],
         states={
-            SELLER: [creation_menu, creation_stats, MessageHandler(filters.TEXT & ~filters.COMMAND, seller)],
-            PRODUCT: [creation_menu, creation_stats, MessageHandler(filters.TEXT & ~filters.COMMAND, product)],
+            SELLER: [
+                creation_menu,
+                creation_stats,
+                MessageHandler(filters.Regex(f"^{re.escape(CREATION_CANCEL_TEXT)}$"), cancel_conversation),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, seller),
+            ],
+            PRODUCT: [
+                creation_menu,
+                creation_stats,
+                MessageHandler(filters.Regex(f"^{re.escape(CREATION_CANCEL_TEXT)}$"), cancel_conversation),
+                MessageHandler(filters.Regex(f"^{re.escape(CREATION_BACK_TEXT)}$"), back_to_seller),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, product),
+            ],
             PRODUCT_PHOTO: [
                 creation_menu,
                 creation_stats,
-                MessageHandler((filters.PHOTO | filters.TEXT) & ~filters.COMMAND, product_photo),
+                MessageHandler(filters.Regex(f"^{re.escape(CREATION_CANCEL_TEXT)}$"), cancel_conversation),
+                MessageHandler(filters.Regex(f"^{re.escape(CREATION_BACK_TEXT)}$"), back_to_product),
+                MessageHandler(
+                    (filters.PHOTO | filters.Document.IMAGE | filters.TEXT) & ~filters.COMMAND,
+                    product_photo,
+                ),
             ],
-            DETAILS: [creation_menu, creation_stats, MessageHandler(LOCATION_INPUT_FILTER & ~filters.COMMAND, details)],
-            SECOND_LOCATION: [creation_menu, creation_stats, MessageHandler(LOCATION_INPUT_FILTER & ~filters.COMMAND, second_location)],
-            PAYMENT: [creation_menu, creation_stats, MessageHandler(LOCATION_INPUT_FILTER & ~filters.COMMAND, payment)],
-            DELIVERY_TIME: [creation_menu, creation_stats, MessageHandler(filters.TEXT & ~filters.COMMAND, delivery_time)],
-            COMMENT: [creation_menu, creation_stats, MessageHandler(filters.TEXT & ~filters.COMMAND, comment)],
+            DETAILS: [
+                creation_menu,
+                creation_stats,
+                MessageHandler(filters.Regex(f"^{re.escape(CREATION_CANCEL_TEXT)}$"), cancel_conversation),
+                MessageHandler(filters.Regex(f"^{re.escape(CREATION_BACK_TEXT)}$"), back_to_photo),
+                MessageHandler(LOCATION_INPUT_FILTER & ~filters.COMMAND, details),
+            ],
+            SECOND_LOCATION: [
+                creation_menu,
+                creation_stats,
+                MessageHandler(filters.Regex(f"^{re.escape(CREATION_CANCEL_TEXT)}$"), cancel_conversation),
+                MessageHandler(filters.Regex(f"^{re.escape(CREATION_BACK_TEXT)}$"), back_to_details),
+                MessageHandler(LOCATION_INPUT_FILTER & ~filters.COMMAND, second_location),
+            ],
+            PAYMENT: [
+                creation_menu,
+                creation_stats,
+                MessageHandler(filters.Regex(f"^{re.escape(CREATION_CANCEL_TEXT)}$"), cancel_conversation),
+                MessageHandler(filters.Regex(f"^{re.escape(CREATION_BACK_TEXT)}$"), back_to_details),
+                MessageHandler(LOCATION_INPUT_FILTER & ~filters.COMMAND, payment),
+            ],
+            DELIVERY_TIME: [
+                creation_menu,
+                creation_stats,
+                MessageHandler(filters.Regex(f"^{re.escape(CREATION_CANCEL_TEXT)}$"), cancel_conversation),
+                MessageHandler(filters.Regex(f"^{re.escape(CREATION_BACK_TEXT)}$"), back_to_payment),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, delivery_time),
+            ],
+            COMMENT: [
+                creation_menu,
+                creation_stats,
+                MessageHandler(filters.Regex(f"^{re.escape(CREATION_CANCEL_TEXT)}$"), cancel_conversation),
+                MessageHandler(filters.Regex(f"^{re.escape(CREATION_BACK_TEXT)}$"), back_to_delivery_time),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, comment),
+            ],
         },
         fallbacks=[
             CommandHandler("start", start),
@@ -5159,7 +5416,11 @@ def register_handlers(application: Application) -> None:
         entry_points=[CallbackQueryHandler(begin_edit, pattern=r"^edit:\d+:")],
         states={
             EDIT_VALUE: [
-                MessageHandler((LOCATION_INPUT_FILTER | filters.PHOTO) & ~filters.COMMAND, save_edit)
+                MessageHandler(
+                    (LOCATION_INPUT_FILTER | filters.PHOTO | filters.Document.IMAGE)
+                    & ~filters.COMMAND,
+                    save_edit,
+                )
             ],
         },
         fallbacks=[

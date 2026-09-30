@@ -35,6 +35,7 @@ from app.utils.geocoding import (
 from app.utils.parsers import normalize_phone, parse_amount, parse_location_url, parse_order_details
 from app.utils.payments import PAID_AT_ASSEMBLY, normalize_payment
 from app.utils.sellers import normalize_seller
+from sales_photo_bot.delivery import DeliverySalesBridge
 
 
 class _FakeResponseContext:
@@ -700,6 +701,31 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(await product_photo(skip_update, skip_context), DETAILS)
         self.assertIsNone(skip_context.user_data["draft"]["product_photo_file_id"])
+
+    async def test_product_photo_accepts_image_document(self):
+        context = self.context()
+        document = SimpleNamespace(
+            file_id="document-photo",
+            file_unique_id="document-photo-unique",
+            mime_type="image/png",
+        )
+        message = SimpleNamespace(
+            text=None,
+            photo=[],
+            document=document,
+            reply_text=AsyncMock(),
+        )
+        update = SimpleNamespace(
+            message=message,
+            effective_message=message,
+            effective_chat=SimpleNamespace(id=1, type="private"),
+            effective_user=SimpleNamespace(id=1, full_name="Manager", username=None),
+        )
+
+        state = await product_photo(update, context)
+
+        self.assertEqual(state, DETAILS)
+        self.assertEqual(context.user_data["draft"]["product_photo_file_id"], "document-photo")
 
     async def test_waiting_pickup_log_lists_only_pending_products_for_courier(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1625,7 +1651,7 @@ class RepositoryTests(unittest.TestCase):
         updated = self.repo.transition(order.id, {"draft"}, payment_status="collect_on_delivery")
         self.assertEqual(updated.payment_status, "collect_on_delivery")
 
-    def test_sales_card_recovery_selects_only_unqueued_non_cancelled_photos(self):
+    def test_sales_card_recovery_selects_only_failed_requested_non_cancelled_photos(self):
         missing = self.repo.create(
             manager_id=1,
             manager_name="A",
@@ -1635,6 +1661,12 @@ class RepositoryTests(unittest.TestCase):
             manager_id=1,
             manager_name="A",
             data={**self.data, "product_photo_file_id": "photo-failed"},
+        )
+        self.repo.request_sales_card(
+            failed.id,
+            actor_id=1,
+            actor_name="A",
+            product_photo_path="product_photos/failed.jpg",
         )
         self.repo.update(failed.id, sales_card_status="failed")
         pending = self.repo.create(
@@ -1658,7 +1690,25 @@ class RepositoryTests(unittest.TestCase):
 
         selected = self.repo.list_sales_cards_needing_queue()
 
-        self.assertEqual({order.id for order in selected}, {missing.id, failed.id})
+        self.assertEqual({order.id for order in selected}, {failed.id})
+
+    def test_cancelled_order_is_not_claimed_by_sales_bridge(self):
+        order = self.repo.create(
+            manager_id=1,
+            manager_name="A",
+            data={**self.data, "product_photo_file_id": "photo"},
+        )
+        self.repo.request_sales_card(
+            order.id,
+            actor_id=1,
+            actor_name="A",
+            product_photo_path="product_photos/order.jpg",
+        )
+        self.repo.update(order.id, status="cancelled")
+        bridge = DeliverySalesBridge(self.repo.path)
+
+        self.assertEqual(bridge.pending_sales_requests(), ())
+        self.assertIsNone(bridge.claim_sales_request(order.id))
 
     def test_atomic_courier_claim(self):
         order = self.repo.create(manager_id=1, manager_name="A", data=self.data)

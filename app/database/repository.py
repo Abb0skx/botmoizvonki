@@ -174,6 +174,12 @@ CREATE TABLE IF NOT EXISTS counters (
     value INTEGER NOT NULL
 );
 INSERT OR IGNORE INTO counters(name, value) VALUES ('order_number', 0);
+CREATE TABLE IF NOT EXISTS creation_drafts (
+    manager_id INTEGER PRIMARY KEY,
+    payload TEXT NOT NULL,
+    state INTEGER NOT NULL,
+    updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS order_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     order_id INTEGER NOT NULL,
@@ -1046,6 +1052,102 @@ class OrderRepository:
             )
         return Order.from_row(row)
 
+    def save_creation_draft(
+        self,
+        manager_id: int,
+        payload: dict[str, Any],
+        state: int,
+    ) -> None:
+        """Persist an unfinished manager order independently of Telegram state."""
+        serialized = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        if len(serialized.encode("utf-8")) > 100_000:
+            raise ValueError("creation draft is too large")
+        with self.connect() as db:
+            db.execute(
+                """INSERT INTO creation_drafts(manager_id,payload,state,updated_at)
+                   VALUES(?,?,?,?)
+                   ON CONFLICT(manager_id) DO UPDATE SET
+                     payload=excluded.payload,
+                     state=excluded.state,
+                     updated_at=excluded.updated_at""",
+                (int(manager_id), serialized, int(state), now()),
+            )
+
+    def get_creation_draft(self, manager_id: int) -> tuple[dict[str, Any], int] | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT payload,state FROM creation_drafts WHERE manager_id=?",
+                (int(manager_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row["payload"])
+        except (TypeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return payload, int(row["state"])
+
+    def delete_creation_draft(self, manager_id: int) -> bool:
+        with self.connect() as db:
+            cursor = db.execute(
+                "DELETE FROM creation_drafts WHERE manager_id=?",
+                (int(manager_id),),
+            )
+        return cursor.rowcount == 1
+
+    def find_possible_duplicate(
+        self,
+        data: dict[str, Any],
+        *,
+        within_minutes: int = 30,
+    ) -> Order | None:
+        """Find a recent operationally identical order created by a manager."""
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=max(1, within_minutes))
+        phones = {
+            str(value)
+            for value in (data.get("client_phone"), data.get("client_phone_2"))
+            if value
+        }
+        if not phones:
+            return None
+        with self.connect() as db:
+            rows = db.execute(
+                """SELECT * FROM orders
+                   WHERE status!='cancelled' AND created_at>=?
+                   ORDER BY order_number DESC""",
+                (cutoff.isoformat(timespec="microseconds"),),
+            ).fetchall()
+        product = " ".join(str(data.get("product") or "").split()).casefold()
+        for row in rows:
+            row_phones = {value for value in (row["client_phone"], row["client_phone_2"]) if value}
+            if not phones.intersection(row_phones):
+                continue
+            if " ".join(str(row["product"] or "").split()).casefold() != product:
+                continue
+            if row["amount_usd"] != data.get("amount_usd") or row["amount_uzs"] != data.get("amount_uzs"):
+                continue
+            latitude, longitude = data.get("latitude"), data.get("longitude")
+            if latitude is not None and longitude is not None:
+                if row["latitude"] is None or row["longitude"] is None:
+                    continue
+                if abs(float(row["latitude"]) - float(latitude)) > 0.001:
+                    continue
+                if abs(float(row["longitude"]) - float(longitude)) > 0.001:
+                    continue
+            else:
+                draft_address = " ".join(str(data.get("address_text") or "").split()).casefold()
+                row_address = " ".join(str(row["address_text"] or "").split()).casefold()
+                if draft_address != row_address:
+                    continue
+            return Order.from_row(row)
+        return None
+
     def request_sales_card(
         self,
         order_id: int,
@@ -1098,13 +1200,14 @@ class OrderRepository:
         return Order.from_row(row)
 
     def list_sales_cards_needing_queue(self, *, limit: int = 20) -> list[Order]:
-        """Return photo orders whose idempotent sales request was never completed."""
+        """Retry only failed sales cards that a manager explicitly requested."""
         limit, _ = self._page_bounds(limit, 0)
         with self.connect() as db:
             rows = db.execute(
                 """SELECT * FROM orders
                    WHERE product_photo_file_id IS NOT NULL
-                     AND sales_card_status IN ('none','failed')
+                     AND sales_card_status='failed'
+                     AND sales_card_requested_at IS NOT NULL
                      AND status != 'cancelled'
                    ORDER BY updated_at,id
                    LIMIT ?""",

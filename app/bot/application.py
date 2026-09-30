@@ -208,7 +208,7 @@ async def reconcile_sales_card_requests(
     *,
     slot: int,
 ) -> int:
-    """Recover product photos that never acquired a sales-card queue entry."""
+    """Recover failed manager-requested sales cards without auto-publishing drafts."""
     repo: OrderRepository = application.bot_data["repo"]
     if not repo.claim_periodic_job("sales_card_autoqueue", slot):
         return 0

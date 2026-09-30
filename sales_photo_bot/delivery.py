@@ -270,7 +270,7 @@ class DeliverySalesBridge(DeliveryReader):
                           manager_name,seller_name,assigned_courier_name,courier_name,
                           status,created_at,updated_at,delivered_at
                    FROM orders
-                   WHERE sales_card_status='pending'
+                   WHERE sales_card_status='pending' AND status!='cancelled'
                    ORDER BY sales_card_requested_at,id LIMIT ?""",
                 (max(1, min(int(limit), 100)),),
             ).fetchall()
@@ -290,7 +290,7 @@ class DeliverySalesBridge(DeliveryReader):
             db.execute("BEGIN IMMEDIATE")
             cursor = db.execute(
                 """UPDATE orders SET sales_card_status='processing',sales_card_error=NULL
-                   WHERE id=? AND sales_card_status='pending'""",
+                   WHERE id=? AND sales_card_status='pending' AND status!='cancelled'""",
                 (int(order_id),),
             )
             if cursor.rowcount != 1:

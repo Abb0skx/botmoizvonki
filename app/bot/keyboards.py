@@ -16,6 +16,11 @@ from app.utils.payments import PAYMENT_LABELS
 from app.utils.sellers import SELLERS
 
 
+CREATION_BACK_TEXT = "⬅️ Назад"
+CREATION_CANCEL_TEXT = "❌ Отменить создание"
+CONFIRM_DUPLICATE_TEXT = "✅ Всё равно создать"
+
+
 DELIVERY_TIME_QUICK_CHOICES = (
     "Срочно 🚨🚨🚨",
     "2 часа",
@@ -51,7 +56,9 @@ def _delivery_time_rows(*, include_skip: bool) -> list[list[KeyboardButton]]:
 def delivery_time_keyboard() -> ReplyKeyboardMarkup:
     """Quick delivery-time presets while keeping free text available."""
     return ReplyKeyboardMarkup(
-        _delivery_time_rows(include_skip=True),
+        _delivery_time_rows(include_skip=True) + [
+            [KeyboardButton(CREATION_BACK_TEXT), KeyboardButton(CREATION_CANCEL_TEXT)],
+        ],
         resize_keyboard=True,
         one_time_keyboard=True,
         input_field_placeholder="Или напишите время текстом",
@@ -71,15 +78,26 @@ def main_keyboard() -> ReplyKeyboardMarkup:
 def seller_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [[KeyboardButton(SELLERS[0]), KeyboardButton(SELLERS[1])],
-         [KeyboardButton(SELLERS[2]), KeyboardButton(SELLERS[3])]],
+         [KeyboardButton(SELLERS[2]), KeyboardButton(SELLERS[3])],
+         [KeyboardButton(CREATION_CANCEL_TEXT)]],
         resize_keyboard=True,
         one_time_keyboard=True,
     )
 
 
+def product_input_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(CREATION_BACK_TEXT), KeyboardButton(CREATION_CANCEL_TEXT)]],
+        resize_keyboard=True,
+        input_field_placeholder="Введите модель товара",
+    )
+
+
 def payment_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [[KeyboardButton(label)] for label in PAYMENT_LABELS.values()],
+        [[KeyboardButton(label)] for label in PAYMENT_LABELS.values()] + [
+            [KeyboardButton(CREATION_BACK_TEXT), KeyboardButton(CREATION_CANCEL_TEXT)],
+        ],
         resize_keyboard=True,
         one_time_keyboard=True,
     )
@@ -87,7 +105,10 @@ def payment_keyboard() -> ReplyKeyboardMarkup:
 
 def product_photo_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [[KeyboardButton("⏭ Пропустить")]],
+        [
+            [KeyboardButton("⏭ Пропустить")],
+            [KeyboardButton(CREATION_BACK_TEXT), KeyboardButton(CREATION_CANCEL_TEXT)],
+        ],
         resize_keyboard=True,
         one_time_keyboard=True,
     )
@@ -95,7 +116,10 @@ def product_photo_keyboard() -> ReplyKeyboardMarkup:
 
 def text_location_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [[KeyboardButton("📝 Локация текстом")]],
+        [
+            [KeyboardButton("📝 Локация текстом")],
+            [KeyboardButton(CREATION_BACK_TEXT), KeyboardButton(CREATION_CANCEL_TEXT)],
+        ],
         resize_keyboard=True,
         one_time_keyboard=True,
     )
@@ -530,7 +554,25 @@ def orders_page_keyboard(
 
 
 def skip_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup([[KeyboardButton("Пропустить")]], resize_keyboard=True, one_time_keyboard=True)
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("Пропустить")],
+            [KeyboardButton(CREATION_BACK_TEXT), KeyboardButton(CREATION_CANCEL_TEXT)],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
+def duplicate_order_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton(CONFIRM_DUPLICATE_TEXT)],
+            [KeyboardButton(CREATION_BACK_TEXT), KeyboardButton(CREATION_CANCEL_TEXT)],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
 
 
 def second_location_keyboard() -> ReplyKeyboardMarkup:

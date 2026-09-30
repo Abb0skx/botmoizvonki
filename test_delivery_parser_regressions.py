@@ -118,9 +118,33 @@ class DeliveryParserRegressionTests(unittest.TestCase):
         self.assertEqual(parsed["amount_uzs"], 900_000_000)
 
     def test_amounts_outside_sqlite_integer_range_are_rejected(self):
-        self.assertEqual(parse_amount("9223372036854775807 сум"), (None, 9223372036854775807))
-        with self.assertRaisesRegex(ValueError, "слишком большая"):
-            parse_amount("9223372036854775808 сум")
+        self.assertEqual(parse_amount("100000$ 2000000000 сум"), (100_000, 2_000_000_000))
+        for value in ("100001$", "2000000001 сум", "9223372036854775808 сум"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "слишком большая"):
+                parse_amount(value)
+
+    def test_full_and_local_phone_with_short_unmarked_uzs_keeps_all_fields(self):
+        parsed = parse_order_details(
+            "901333999\n"
+            "998901234567\n"
+            "1920000"
+        )
+
+        self.assertEqual(
+            parsed["client_phones"],
+            ["+998901333999", "+998901234567"],
+        )
+        self.assertEqual(parsed["amount_uzs"], 1_920_000)
+
+    def test_invalid_explicit_price_error_is_not_hidden(self):
+        with self.assertRaisesRegex(ValueError, "Копейки не поддерживаются"):
+            parse_order_details("+998901333999\n125.50$")
+
+    def test_more_than_two_explicit_phones_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "не больше двух"):
+            parse_order_details(
+                "901333999\n998901234567\n998907777777\n100$"
+            )
 
     def test_decimal_duplicate_and_unicode_negative_amounts_are_rejected(self):
         for value in ("125.50$", "125,50$", "100$ 200$", "−100$"):

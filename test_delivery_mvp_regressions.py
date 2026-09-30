@@ -169,6 +169,27 @@ class MultiValueCreationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(draft["longitude"])
         self.assertNotIn("awaiting_text_location", draft)
 
+    async def test_manager_can_enter_text_location_before_phone_and_price(self):
+        context = self.context({"seller_name": "Ali", "product": "A56"})
+
+        state = await details(
+            self.update(self.message("📝 Локация текстом")),
+            context,
+        )
+        self.assertEqual(state, DETAILS)
+
+        address_message = self.message("Яшнабадский район, махалля Алимкент")
+        state = await details(self.update(address_message), context)
+
+        self.assertEqual(state, DETAILS)
+        self.assertEqual(
+            context.user_data["draft"]["address_text"],
+            "Яшнабадский район, махалля Алимкент",
+        )
+        response = address_message.reply_text.await_args.args[0]
+        self.assertIn("номер клиента", response)
+        self.assertIn("цена", response)
+
     def test_coordinate_after_text_address_uses_second_location_slot(self):
         draft = {"address_text": "Чиланзар, ориентир магазин"}
 

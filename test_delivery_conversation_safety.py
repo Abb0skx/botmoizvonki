@@ -9,7 +9,11 @@ from telegram.ext import CallbackQueryHandler, CommandHandler, ConversationHandl
 
 from app.database import OrderRepository
 from app.handlers.orders import (
+    COMMENT,
+    DETAILS,
+    PRODUCT,
     _end_creation_with_order_list,
+    back_to_details,
     cancel_conversation,
     comment,
     new_order,
@@ -35,6 +39,24 @@ def complete_draft(token: str = "stable-creation-token") -> dict:
 
 
 class RepositoryCreationIdempotencyTests(unittest.TestCase):
+    def test_unfinished_creation_draft_survives_repository_recreation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "delivery.db"
+            repo = OrderRepository(path)
+            repo.initialize()
+            payload = {
+                "creation_token": "draft-token",
+                "seller_name": "Ali",
+                "product": "A56",
+            }
+
+            repo.save_creation_draft(101, payload, PRODUCT)
+            restored = OrderRepository(path).get_creation_draft(101)
+
+            self.assertEqual(restored, (payload, PRODUCT))
+            self.assertTrue(repo.delete_creation_draft(101))
+            self.assertIsNone(repo.get_creation_draft(101))
+
     def test_same_creation_token_reuses_order_number_and_event(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = OrderRepository(Path(directory) / "delivery.db")
@@ -128,7 +150,72 @@ class FinalCreationStepSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Заказ №1", message.reply_text.await_args_list[0].args[0])
         self.assertEqual(message.reply_text.await_args_list[2].args[0], "Проверьте данные заказа.")
 
-    async def test_new_order_photo_is_queued_for_sales_without_backfill(self):
+    async def test_recent_duplicate_requires_explicit_confirmation(self):
+        existing = self.repo.create(
+            manager_id=self.user.id,
+            manager_name=self.user.full_name,
+            data=complete_draft("existing-token"),
+        )
+        context = self.make_context()
+        context.user_data["draft"]["creation_token"] = "new-token"
+        warning_message = SimpleNamespace(text="Пропустить", reply_text=AsyncMock())
+
+        state = await comment(self.private_update(warning_message), context)
+
+        self.assertEqual(state, COMMENT)
+        self.assertEqual(self.repo.count_all(), 1)
+        self.assertEqual(context.user_data["draft"]["_duplicate_order_id"], existing.id)
+        self.assertIn("Возможно, это повтор", warning_message.reply_text.await_args.args[0])
+
+        card = SimpleNamespace(chat_id=101, message_id=601)
+        confirm_message = SimpleNamespace(
+            text="✅ Всё равно создать",
+            reply_text=AsyncMock(side_effect=[card, None]),
+        )
+        state = await comment(self.private_update(confirm_message), context)
+
+        self.assertEqual(state, ConversationHandler.END)
+        self.assertEqual(self.repo.count_all(), 2)
+        self.assertNotIn("draft", context.user_data)
+
+    async def test_new_order_restores_sqlite_creation_draft(self):
+        payload = {
+            "creation_token": "resume-token",
+            "seller_name": "Ali",
+        }
+        self.repo.save_creation_draft(self.user.id, payload, PRODUCT)
+        message = SimpleNamespace(text="➕ Новый заказ", reply_text=AsyncMock())
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={
+                "repo": self.repo,
+                "settings": SimpleNamespace(manager_ids=frozenset({self.user.id})),
+            }),
+            user_data={},
+        )
+
+        state = await new_order(self.private_update(message), context)
+
+        self.assertEqual(state, PRODUCT)
+        self.assertEqual(context.user_data["draft"]["seller_name"], "Ali")
+        self.assertIn("Черновик восстановлен", message.reply_text.await_args.args[0])
+
+    async def test_back_to_details_clears_old_contact_price_and_locations(self):
+        context = self.make_context()
+        message = SimpleNamespace(text="⬅️ Назад", reply_text=AsyncMock())
+
+        state = await back_to_details(self.private_update(message), context)
+
+        self.assertEqual(state, DETAILS)
+        draft = context.user_data["draft"]
+        for field in (
+            "client_phone", "amount_usd", "latitude", "longitude",
+        ):
+            self.assertNotIn(field, draft)
+        restored, restored_state = self.repo.get_creation_draft(self.user.id)
+        self.assertEqual(restored_state, DETAILS)
+        self.assertNotIn("client_phone", restored)
+
+    async def test_new_order_photo_waits_for_explicit_sales_confirmation(self):
         card_message = SimpleNamespace(chat_id=101, message_id=503)
         message = SimpleNamespace(
             text="Пропустить",
@@ -143,10 +230,6 @@ class FinalCreationStepSafetyTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch(
-                "app.handlers.orders._persist_product_photo",
-                new=AsyncMock(return_value="product_photos/order-1-photo.jpg"),
-            ) as persist_photo,
-            patch(
                 "app.handlers.orders._sync_order",
                 new=AsyncMock(return_value=(None, True)),
             ) as sync_order,
@@ -155,19 +238,15 @@ class FinalCreationStepSafetyTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(state, ConversationHandler.END)
         order = self.repo.list_all()[0]
-        self.assertEqual(order.sales_card_status, "pending")
-        self.assertEqual(
-            order.product_photo_path,
-            "product_photos/order-1-photo.jpg",
-        )
-        persist_photo.assert_awaited_once()
-        sync_order.assert_awaited_once_with(context, order.id)
+        self.assertEqual(order.sales_card_status, "none")
+        self.assertIsNone(order.product_photo_path)
+        sync_order.assert_not_awaited()
         self.assertIn(
-            "Фото нового товара отправляется",
+            "Публикация в «Проданные» запускается отдельной кнопкой",
             message.reply_text.await_args_list[-1].args[0],
         )
 
-    async def test_edited_product_photo_is_queued_for_sales(self):
+    async def test_edited_product_photo_waits_for_explicit_sales_confirmation(self):
         order = self.repo.create(
             manager_id=self.user.id,
             manager_name=self.user.full_name,
@@ -200,22 +279,14 @@ class FinalCreationStepSafetyTests(unittest.IsolatedAsyncioTestCase):
         }
         context.bot = SimpleNamespace(edit_message_text=AsyncMock())
 
-        with patch(
-            "app.handlers.orders._persist_product_photo",
-            new=AsyncMock(return_value="product_photos/order-1-edited.jpg"),
-        ) as persist_photo:
-            state = await save_edit(update, context)
+        state = await save_edit(update, context)
 
         self.assertEqual(state, ConversationHandler.END)
         updated = self.repo.get(order.id)
-        self.assertEqual(updated.sales_card_status, "pending")
-        self.assertEqual(
-            updated.product_photo_path,
-            "product_photos/order-1-edited.jpg",
-        )
-        persist_photo.assert_awaited_once()
+        self.assertEqual(updated.sales_card_status, "none")
+        self.assertIsNone(updated.product_photo_path)
         self.assertIn(
-            "отправляется в канал продаж",
+            "Публикация в «Проданные» запускается отдельной кнопкой",
             message.reply_text.await_args.args[0],
         )
 
@@ -368,7 +439,7 @@ class FinalCreationStepSafetyTests(unittest.IsolatedAsyncioTestCase):
         sync.assert_awaited_once_with(context, committed.id)
         self.assertIn("уже сохранён", reentry_message.reply_text.await_args.args[0])
 
-    async def test_order_list_menu_ends_incomplete_creation(self):
+    async def test_order_list_menu_preserves_incomplete_creation(self):
         message = SimpleNamespace(text="📋 Активные заказы", reply_text=AsyncMock())
         update = SimpleNamespace(
             message=message,
@@ -388,12 +459,12 @@ class FinalCreationStepSafetyTests(unittest.IsolatedAsyncioTestCase):
         state = await _end_creation_with_order_list(update, context)
 
         self.assertEqual(state, ConversationHandler.END)
-        self.assertNotIn("draft", context.user_data)
+        self.assertEqual(context.user_data["draft"]["product"], "A56")
         message.reply_text.assert_awaited_once()
 
 
 class StartConversationResetTests(unittest.IsolatedAsyncioTestCase):
-    async def test_start_clears_both_persisted_payloads_and_returns_end(self):
+    async def test_start_preserves_draft_but_clears_edit_and_returns_end(self):
         message = SimpleNamespace(reply_text=AsyncMock())
         update = SimpleNamespace(
             message=message,
@@ -410,7 +481,9 @@ class StartConversationResetTests(unittest.IsolatedAsyncioTestCase):
         state = await start(update, context)
 
         self.assertEqual(state, ConversationHandler.END)
-        self.assertEqual(context.user_data, {})
+        self.assertIn("draft", context.user_data)
+        self.assertNotIn("edit", context.user_data)
+        self.assertIn("незавершённый заказ", message.reply_text.await_args.args[0])
         message.reply_text.assert_awaited_once()
 
     def test_start_is_fallback_for_both_persistent_conversations(self):
