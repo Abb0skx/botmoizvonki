@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import secrets
 import time
@@ -33,6 +34,10 @@ from .auth import (
 from .config import MonitoringSettings
 from .database import MonitoringStore
 from .manager_registry import public_registry
+from telegram_market_stats.reporting import (
+    MarketStatsUnavailable,
+    build_market_report,
+)
 
 
 LOG = logging.getLogger("monitoring")
@@ -350,6 +355,9 @@ def monitoring_asset(filename: str):
 
 @router.get("/monitoring", response_class=HTMLResponse)
 @router.get("/monitoring/prices", response_class=HTMLResponse)
+@router.get("/monitoring/finance", response_class=HTMLResponse)
+@router.get("/finance", response_class=HTMLResponse)
+@router.get("/finance/", response_class=HTMLResponse, include_in_schema=False)
 def monitoring_page(request: Request):
     try:
         principal = _principal(request)
@@ -365,6 +373,8 @@ def monitoring_page(request: Request):
             "/monitoring/prices/manage", status_code=303
         ))
     section = request.url.path.removeprefix("/monitoring/").strip("/")
+    if request.url.path.rstrip("/") == "/finance":
+        section = "finance"
     if request.url.path == "/monitoring":
         section = ""
     template = TEMPLATES.joinpath("monitoring.html").read_text(encoding="utf-8")
@@ -453,6 +463,42 @@ def api_me(request: Request):
         "role": principal.role,
         "expires_at": principal.session.absolute_expires_at.isoformat(),
     })
+
+
+@router.get("/monitoring/api/finance")
+async def api_finance(
+    request: Request,
+    period: str = Query("today"),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
+):
+    _principal(request)
+    try:
+        group_id = int(os.getenv("TELEGRAM_MARKET_GROUP_ID", "-1002188560435"))
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail="market_group_not_configured") from exc
+    database_path = Path(os.getenv(
+        "TELEGRAM_MARKET_STATS_DB_PATH", "/app/data/telegram_market_stats.db"
+    ))
+    try:
+        data = await run_in_threadpool(
+            build_market_report,
+            database_path,
+            group_id=group_id,
+            period=period,
+            date_from=date_from,
+            date_to=date_to,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except MarketStatsUnavailable as exc:
+        return _json(
+            {"data": None, "meta": _meta(
+                "market_stats", "unavailable", error_code=str(exc)
+            )},
+            status_code=503,
+        )
+    return _json({"data": data, "meta": _meta("market_stats")})
 
 
 @router.get("/monitoring/api/calls")

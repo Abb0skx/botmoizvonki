@@ -297,6 +297,37 @@ class MonitoringRouteTests(unittest.TestCase):
         self.assertEqual(response.headers["x-frame-options"], "DENY")
         self.assertEqual(response.headers["referrer-policy"], "no-referrer")
 
+    def test_finance_page_is_protected_and_uses_market_api(self):
+        anonymous = self.client.get("/finance", follow_redirects=False)
+        self.assertEqual(anonymous.status_code, 303)
+        self.assertIn("%2Ffinance", anonymous.headers["location"])
+
+        self.login()
+        page = self.client.get("/finance")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn('"section": "finance"', page.text)
+        self.assertIn('href="/finance"', page.text)
+        script = self.client.get("/monitoring/assets/monitoring.js")
+        self.assertIn("/monitoring/api/finance", script.text)
+        self.assertIn("Что искали конкуренты", script.text)
+
+    def test_finance_api_requires_session_and_reports_missing_database(self):
+        self.assertEqual(
+            self.client.get("/monitoring/api/finance").status_code, 401
+        )
+        self.login()
+        missing = Path(self.temp.name) / "missing-market.db"
+        with patch.dict(
+            os.environ,
+            {"TELEGRAM_MARKET_STATS_DB_PATH": str(missing)},
+        ):
+            response = self.client.get("/monitoring/api/finance")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(
+            response.json()["meta"]["error_code"],
+            "market_stats_database_not_found",
+        )
+
     def test_reduced_portal_sections_return_to_complete_legacy_pages(self):
         anonymous = self.client.get(
             "/monitoring/calls?period=30d", follow_redirects=False
