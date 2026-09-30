@@ -555,6 +555,20 @@ class OrderRepository:
             )
         return cursor.rowcount == 1
 
+    def release_periodic_job(self, job_name: str, slot: int) -> bool:
+        """Release a claim only when its work was not published at all."""
+        clean_name = job_name.strip() if isinstance(job_name, str) else ""
+        if not clean_name:
+            raise ValueError("job_name cannot be empty")
+        if isinstance(slot, bool) or not isinstance(slot, int) or slot < 0:
+            raise ValueError("slot must be a non-negative integer")
+        with self.connect() as db:
+            cursor = db.execute(
+                "DELETE FROM periodic_job_claims WHERE job_name=? AND slot=?",
+                (clean_name, slot),
+            )
+        return cursor.rowcount == 1
+
     @staticmethod
     def _validate_cash_value(value: Any, *, positive_only: bool = False) -> int:
         if isinstance(value, bool) or not isinstance(value, int):

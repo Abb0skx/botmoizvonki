@@ -89,11 +89,12 @@ class RoutingServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(movement["kind"], "delivery")
         self.assertEqual(movement["distance_km"], 4.2)
-        self.assertEqual(movement["duration_minutes"], 10)
-        self.assertGreater(movement["progress"], 0.45)
-        self.assertLess(movement["progress"], 0.55)
+        self.assertEqual(movement["duration_minutes"], 19)
+        self.assertGreater(movement["progress"], 0.25)
+        self.assertLess(movement["progress"], 0.30)
         self.assertIsNotNone(movement["eta_at"])
-        self.assertGreater(result["summary"]["distance_today_km"], 2)
+        self.assertGreater(result["summary"]["distance_today_km"], 1)
+        self.assertLess(result["summary"]["distance_today_km"], 1.3)
 
     async def test_stats_enrichment_counts_completed_return_and_planned_roads(self):
         routing = Mock()
@@ -116,7 +117,7 @@ class RoutingServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["couriers"][0]["distance_km"], 4.2)
         self.assertEqual(result["couriers"][0]["route_minutes"], 10)
         self.assertEqual(result["routes"][0]["completed_road_segments"][0]["duration_minutes"], 10)
-        self.assertEqual(result["routes"][0]["estimated_minutes"], 10)
+        self.assertEqual(result["routes"][0]["estimated_minutes"], 19)
 
 
 class DeliveryAnalyticsTests(unittest.TestCase):

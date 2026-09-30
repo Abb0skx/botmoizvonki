@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from app.database import OrderRepository
-from app.monitor_service import TASHKENT, build_delivery_monitor
+from app.monitor_service import TASHKENT, _delivery_deadline, build_delivery_monitor
 
 
 ABBOS_ID = 202134293
@@ -168,6 +168,17 @@ class DeliveryMonitorRegressionTests(unittest.TestCase):
         self.assertEqual(route["return_path"], [])
         self.assertEqual(route["planned_path"][0], [41.31, 69.27])
         self.assertIn([41.36, 69.31], route["planned_path"])
+
+    def test_start_window_is_not_overdue_and_tomorrow_uses_next_day(self):
+        order = self._pending("Окно")
+        order = self.repo.update(order.id, delivery_time="После 18:00")
+        self.assertEqual(_delivery_deadline(order), (None, False))
+
+        order = self.repo.update(order.id, delivery_time="Завтра 11:00")
+        deadline, _urgent = _delivery_deadline(order)
+        created = datetime.fromisoformat(order.created_at).astimezone(TASHKENT)
+        self.assertEqual(deadline.date(), (created + timedelta(days=1)).date())
+        self.assertEqual((deadline.hour, deadline.minute), (11, 0))
 
 
 if __name__ == "__main__":

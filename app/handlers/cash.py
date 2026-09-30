@@ -13,11 +13,16 @@ from app.config import Settings
 from app.database import OrderRepository
 from app.models import CourierCashEntry
 from app.utils.couriers import courier_option
-from app.utils.parsers import contains_cash_keyword, parse_courier_cash
+from app.utils.parsers import (
+    contains_cash_keyword,
+    has_courier_cash_context,
+    looks_like_phone,
+    parse_courier_cash,
+)
 
 logger = logging.getLogger(__name__)
 TASHKENT = ZoneInfo("Asia/Tashkent")
-CASH_REVIEWER_ID = 5619452809
+CASH_REVIEWER_IDS = frozenset({5619452809, 202134293})
 
 
 def _name(user) -> str:
@@ -179,6 +184,17 @@ async def courier_cash_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     raw = (message.text or message.caption or "").strip()
     if not raw:
         return
+    reply = getattr(message, "reply_to_message", None)
+    has_photo = bool(getattr(message, "photo", None))
+    if (
+        not contains_cash_keyword(raw)
+        and not has_courier_cash_context(raw)
+        and not reply
+        and not has_photo
+    ):
+        return
+    if looks_like_phone(raw) and not contains_cash_keyword(raw):
+        return
     try:
         parsed = parse_courier_cash(raw)
     except ValueError as error:
@@ -187,7 +203,6 @@ async def courier_cash_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     repo: OrderRepository = context.application.bot_data["repo"]
-    reply = getattr(message, "reply_to_message", None)
     entry, created = repo.create_cash_entry(
         courier_id=courier.user_id,
         courier_name=courier.name,
@@ -206,6 +221,12 @@ async def courier_cash_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             raise
         except Exception:
             logger.exception("Could not publish cash entry %s", entry.id)
+    elif entry.raw_text.strip() != raw:
+        await message.reply_text(
+            "⚠️ Это сообщение уже было учтено с прежней суммой. "
+            "Для исправления отправьте отдельным сообщением минус прежнюю сумму, "
+            "затем правильную сумму."
+        )
 
 
 async def _refresh_cash_notification(
@@ -248,7 +269,7 @@ async def _refresh_cash_notification(
 async def cash_review_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     user = query.from_user
-    if user.id != CASH_REVIEWER_ID:
+    if user.id not in CASH_REVIEWER_IDS:
         await query.answer("Эти кнопки доступны только ответственному за кассу", show_alert=True)
         return
     action, raw_id, raw_revision = query.data.split(":")
@@ -323,7 +344,7 @@ async def cash_correction_input(update: Update, context: ContextTypes.DEFAULT_TY
     message = update.effective_message
     if not user or not chat or not message:
         return
-    if user.id != CASH_REVIEWER_ID:
+    if user.id not in CASH_REVIEWER_IDS:
         context.user_data.pop("cash_correction", None)
         raise ApplicationHandlerStop
     if chat.id != int(pending.get("chat_id") or 0):

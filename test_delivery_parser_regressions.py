@@ -104,6 +104,24 @@ class DeliveryParserRegressionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "слишком большая"):
             parse_amount("9223372036854775808 сум")
 
+    def test_decimal_duplicate_and_unicode_negative_amounts_are_rejected(self):
+        for value in ("125.50$", "125,50$", "100$ 200$", "−100$"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                parse_amount(value)
+
+    def test_two_bare_phones_are_kept_when_price_has_currency_marker(self):
+        parsed = parse_order_details(
+            "+998901333999\n"
+            "99 876 54 32\n"
+            "125$"
+        )
+
+        self.assertEqual(
+            parsed["client_phones"],
+            ["+998901333999", "+998998765432"],
+        )
+        self.assertEqual((parsed["amount_usd"], parsed["amount_uzs"]), (125, None))
+
 
 if __name__ == "__main__":
     unittest.main()

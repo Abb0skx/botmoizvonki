@@ -318,7 +318,31 @@ class CourierCashHandlerTests(unittest.IsolatedAsyncioTestCase):
             self.context(),
         )
         self.assertEqual(self.repo.cash_balance(1799690992), (0, 0))
+
+    async def test_plain_number_and_phone_are_not_recorded_as_cash(self):
+        await courier_cash_input(self.update("7", message_id=60), self.context())
+        await courier_cash_input(
+            self.update("998901333999", message_id=61),
+            self.context(),
+        )
+
+        self.assertEqual(self.repo.cash_balance(1799690992), (0, 0))
         self.bot.send_message.assert_not_awaited()
+
+    async def test_edited_source_message_warns_without_changing_ledger(self):
+        original = self.update("40$", message_id=62)
+        await courier_cash_input(original, self.context())
+        edited = self.update("50$", message_id=62)
+
+        await courier_cash_input(edited, self.context())
+
+        self.assertEqual(self.repo.cash_balance(1799690992), (40, 0))
+        edited.effective_message.reply_text.assert_awaited_once()
+        self.assertIn(
+            "уже было учтено",
+            edited.effective_message.reply_text.await_args.args[0],
+        )
+        self.assertEqual(self.bot.send_message.await_count, 1)
 
     async def test_responsible_user_confirmation_updates_balance_once(self):
         await courier_cash_input(self.update("40$ касса"), self.context())

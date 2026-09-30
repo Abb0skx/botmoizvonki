@@ -41,6 +41,35 @@ def contains_cash_keyword(value: str) -> bool:
     return bool(_CASH_KEYWORD_RE.search(value or ""))
 
 
+def has_courier_cash_context(value: str) -> bool:
+    """Return whether a group message is intentionally about courier cash.
+
+    Plain numbers are common in delivery groups (phones, order numbers and
+    model names), so they must not become ledger entries by accident.  A cash
+    message needs a keyword, a currency marker, or an explicit signed change
+    amount such as ``40 -25000``.
+    """
+    clean = (value or "").replace("−", "-").replace("–", "-").replace("—", "-")
+    if contains_cash_keyword(clean):
+        return True
+    if re.search(rf"{_USD_MARKER}|{_UZS_MARKER}", clean, flags=re.I):
+        return True
+    amounts = re.findall(rf"(?<!\w){_SIGNED_AMOUNT_PATTERN}(?!\w)", clean)
+    return len(amounts) >= 2 and any(item.lstrip().startswith(("-", "+")) for item in amounts)
+
+
+def looks_like_phone(value: str) -> bool:
+    """Recognize a message whose entire useful content is one Uzbek phone."""
+    clean = (value or "").strip()
+    if not clean or re.search(r"[^\d+\s()\-]", clean):
+        return False
+    try:
+        normalize_phone(clean)
+    except ValueError:
+        return False
+    return True
+
+
 def parse_courier_cash(value: str) -> CourierCashAmounts:
     """Parse a courier cash delta without weakening normal order-price rules.
 
@@ -189,11 +218,20 @@ def display_phone(value: str) -> str:
 
 
 def parse_amount(value: str) -> tuple[int | None, int | None]:
-    clean = value.strip().lower()
+    clean = value.strip().lower().replace("−", "-").replace("–", "-").replace("—", "-")
+    # Telegram keycap emoji (for example ``7️⃣`` used as a list number) are
+    # presentation, not money.
+    clean = re.sub(r"\d\ufe0f?\u20e3", " ", clean)
     if not clean or len(clean) > 100:
         raise ValueError("Введите сумму, например: 100$ 1920000")
     if re.search(r"-\s*\d", clean):
         raise ValueError("Сумма не может быть отрицательной")
+    decimal_amount = (
+        rf"(?:\d+[.,]\d{{1,2}}[ \t]*(?:{_USD_MARKER}|{_UZS_MARKER}))"
+        rf"|(?:(?:{_USD_MARKER}|{_UZS_MARKER})[ \t:]*\d+[.,]\d{{1,2}})"
+    )
+    if re.search(decimal_amount, clean, flags=re.I):
+        raise ValueError("Копейки не поддерживаются. Введите целую сумму")
     usd_values: list[int] = []
     uzs_values: list[int] = []
 
@@ -218,17 +256,23 @@ def parse_amount(value: str) -> tuple[int | None, int | None]:
     for pattern, callback in explicit_patterns:
         clean = re.sub(pattern, callback, clean, flags=re.I)
 
+    if len(usd_values) > 1 or len(uzs_values) > 1:
+        raise ValueError("Укажите не больше одной суммы в долларах и одной в сумах")
+
     candidates: list[int] = []
     for match in re.finditer(rf"(?<!\w){_AMOUNT_PATTERN}(?!\w)", clean):
         candidates.append(int(re.sub(r"\D", "", match.group(0))))
 
-    usd = usd_values[-1] if usd_values else None
-    uzs = uzs_values[-1] if uzs_values else None
+    usd = usd_values[0] if usd_values else None
+    uzs = uzs_values[0] if uzs_values else None
     for number in candidates:
         if number > 9_000:
-            if not uzs_values:
-                uzs = number
-        elif not usd_values:
+            if uzs is not None:
+                raise ValueError("Укажите не больше одной суммы в сумах")
+            uzs = number
+        else:
+            if usd is not None:
+                raise ValueError("Укажите не больше одной суммы в долларах")
             usd = number
     if (usd is None or usd <= 0) and (uzs is None or uzs <= 0):
         raise ValueError("Введите положительную сумму, например: 100$ 1920000")
@@ -334,7 +378,12 @@ def parse_order_details(value: str) -> dict[str, str | int | None | list[str]]:
             definite_phone_ends.append(span[1])
 
     phone_slots = max(0, 2 - len(phones))
-    if definite_phone_ends:
+    has_explicit_amount = bool(
+        re.search(rf"{_USD_MARKER}|{_UZS_MARKER}", remaining, flags=re.I)
+    )
+    if has_explicit_amount:
+        bare_phone_count = min(phone_slots, len(deferred_bare_phones))
+    elif definite_phone_ends:
         bare_phone_count = min(phone_slots, max(0, len(deferred_bare_phones) - 1))
     else:
         bare_phone_count = min(phone_slots, 2, len(deferred_bare_phones))

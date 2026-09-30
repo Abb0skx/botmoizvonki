@@ -308,6 +308,32 @@ class DeliveryRuntimeTests(unittest.IsolatedAsyncioTestCase):
         formatter.assert_not_called()
         notify.assert_not_awaited()
 
+    async def test_failed_first_pickup_reminder_releases_slot_for_retry(self):
+        repo = SimpleNamespace(
+            claim_periodic_job=Mock(return_value=True),
+            release_periodic_job=Mock(return_value=True),
+        )
+        settings = SimpleNamespace(orders_channel_id=-1004459657817)
+        application = self.application(repo=repo, settings=settings)
+
+        with (
+            patch(
+                "app.bot.application._waiting_pickup_reminder_messages",
+                return_value=["напоминание"],
+            ),
+            patch(
+                "app.bot.application._notify_log",
+                new=AsyncMock(return_value=False),
+            ),
+        ):
+            sent = await send_waiting_pickup_reminders(application, slot=42)
+
+        self.assertEqual(sent, 0)
+        repo.release_periodic_job.assert_called_once_with(
+            "waiting_pickup:-1004459657817",
+            42,
+        )
+
     async def test_pickup_reminder_is_singleton_and_shutdown_cancels_it(self):
         application = self.application()
 

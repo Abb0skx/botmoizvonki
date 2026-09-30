@@ -38,7 +38,9 @@ logger = logging.getLogger(__name__)
 CONVERSATION_PERSISTENCE_NAME = "delivery_order_creation"
 PERSISTENCE_UPDATE_INTERVAL = 5
 SYNC_RECONCILIATION_INTERVAL = 30
-FULL_RECONCILIATION_EVERY = 10
+# A full pass validates every open Telegram publication and is intentionally
+# infrequent. Business changes still use the incremental sync queue at once.
+FULL_RECONCILIATION_EVERY = 120
 SYNC_RECONCILIATION_BATCH_SIZE = 100
 SYNC_WORKER_TASK_KEY = "delivery_sync_worker_task"
 PICKUP_REMINDER_INTERVAL = 30 * 60
@@ -432,9 +434,14 @@ async def send_waiting_pickup_reminders(
         return 0
     context = SimpleNamespace(application=application, bot=application.bot)
     messages = _waiting_pickup_reminder_messages(repo)
+    published = 0
     for message in messages:
-        await _notify_log(context, message)
-    return len(messages)
+        if not await _notify_log(context, message):
+            if published == 0:
+                repo.release_periodic_job(job_name, slot)
+            return published
+        published += 1
+    return published
 
 
 async def _pickup_reminder_worker(application: Application) -> None:

@@ -27,7 +27,14 @@ FAILURE_COOLDOWN_SECONDS = 60
 MIN_REQUEST_INTERVAL_SECONDS = 1.05
 MAX_ROUTING_POINTS = 20
 ROUTE_SPECIFIC_HTTP_ERRORS = frozenset({400, 404, 422})
+DELIVERY_TIME_FACTOR = 1.20
+DELIVERY_TIME_RESERVE_SECONDS = 7 * 60
 logger = logging.getLogger(__name__)
+
+
+def delivery_duration_seconds(road_seconds: int | float) -> int:
+    """Apply the customer-facing road-time reserve consistently."""
+    return round(max(60, int(road_seconds or 0)) * DELIVERY_TIME_FACTOR) + DELIVERY_TIME_RESERVE_SECONDS
 
 
 def _haversine_m(start: list[float], finish: list[float]) -> float:
@@ -359,8 +366,13 @@ async def enrich_monitor_routes(
 
         movement_path = route.get("current_path") or route.get("return_path") or []
         movement = await routing.route(movement_path) if len(movement_path) >= 2 else None
+        movement_duration = (
+            delivery_duration_seconds(movement["duration_s"])
+            if movement and route.get("movement_kind") == "delivery"
+            else (movement["duration_s"] if movement else 0)
+        )
         movement_progress = (
-            _progress(route.get("movement_started_at"), movement["duration_s"])
+            _progress(route.get("movement_started_at"), movement_duration)
             if movement
             else 0.0
         )
@@ -389,9 +401,9 @@ async def enrich_monitor_routes(
             {
                 "kind": route.get("movement_kind"),
                 "started_at": route.get("movement_started_at"),
-                "eta_at": _eta(route.get("movement_started_at"), movement["duration_s"]),
-                "duration_seconds": movement["duration_s"],
-                "duration_minutes": max(1, round(movement["duration_s"] / 60)),
+                "eta_at": _eta(route.get("movement_started_at"), movement_duration),
+                "duration_seconds": movement_duration,
+                "duration_minutes": max(1, round(movement_duration / 60)),
                 "distance_km": round(movement["distance_m"] / 1_000, 1),
                 "progress": round(movement_progress, 4),
                 "geometry": movement["geometry"],
@@ -459,8 +471,9 @@ async def enrich_stats_routes(
         completed_distance = sum(item["distance_m"] for item in completed_results)
         current_distance = current["distance_m"] if current else 0
         return_distance = returning["distance_m"] if returning else 0
+        current_duration = delivery_duration_seconds(current["duration_s"]) if current else 0
         current_progress = (
-            _progress(route.get("current_started_at"), current["duration_s"])
+            _progress(route.get("current_started_at"), current_duration)
             if current
             else 0.0
         )
@@ -507,13 +520,13 @@ async def enrich_stats_routes(
             sum(item["duration_s"] for item in completed_results) / 60
         )
         route["current_driven_minutes"] = round(
-            (current["duration_s"] * current_progress) / 60
+            (current_duration * current_progress) / 60
         ) if current else 0
         route["return_minutes"] = round(
             (returning["duration_s"] * return_progress) / 60
         ) if returning else 0
         route["estimated_minutes"] = (
-            max(1, round(current["duration_s"] / 60)) if current else None
+            max(1, round(current_duration / 60)) if current else None
         )
         total_distance += completed_distance + current_driven + return_driven
         total_planned += current_remaining + return_remaining + planned_distance

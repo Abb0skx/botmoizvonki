@@ -237,12 +237,45 @@ def monitor_page(request: Request):
 async def internal_monitoring_live(request: Request):
     require_internal_monitoring_auth(request)
     repository = _repository()
+    return await run_in_threadpool(build_delivery_monitor, repository)
+
+
+@app.get("/internal/monitoring/v1/delivery/live/detailed")
+async def internal_monitoring_live_detailed(request: Request):
+    require_internal_monitoring_auth(request)
+    repository = _repository()
     state = await run_in_threadpool(build_delivery_monitor, repository)
     return await enrich_monitor_routes(state, _routing_service())
 
 
+@app.get("/internal/monitoring/v1/delivery/status-events")
+async def internal_delivery_status_events(
+    request: Request,
+    after_event_id: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+):
+    """Expose a cursor-safe delivery feed to the Business service."""
+    require_internal_monitoring_auth(request)
+    repository = _repository()
+    return await run_in_threadpool(
+        repository.delivery_status_event_feed,
+        after_event_id=after_event_id,
+        limit=limit,
+    )
+
+
 @app.get("/internal/monitoring/v1/delivery/report")
 async def internal_monitoring_report(
+    request: Request,
+    day: str = Query("today", max_length=20),
+    courier_id: int | None = Query(None),
+):
+    require_internal_monitoring_auth(request)
+    return await run_in_threadpool(_report, day, courier_id)
+
+
+@app.get("/internal/monitoring/v1/delivery/report/detailed")
+async def internal_monitoring_report_detailed(
     request: Request,
     day: str = Query("today", max_length=20),
     courier_id: int | None = Query(None),

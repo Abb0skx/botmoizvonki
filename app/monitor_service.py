@@ -79,7 +79,13 @@ def _delivery_deadline(order: Order) -> tuple[datetime | None, bool]:
         return None, False
     clock = _CLOCK_RE.search(raw)
     if clock:
+        # "После 18:00" and "с 18:00" are the beginning of a window, not a
+        # promised deadline. Treating them as a deadline creates false alarms.
+        if re.search(r"(?:^|\s)(?:после|с)\s*\d", raw):
+            return None, urgent
         base = created or datetime.now(TASHKENT)
+        if "завтра" in raw:
+            base += timedelta(days=1)
         return base.replace(
             hour=int(clock.group(1)),
             minute=int(clock.group(2)),
@@ -217,6 +223,7 @@ def _order_payload(order: Order) -> dict[str, Any]:
         "read_at": order.courier_read_at,
         "picked_up_time": _time(order.picked_up_at),
         "started_time": _time(order.time_started),
+        "estimated_delivery_at": order.estimated_delivery_at,
         "completed_time": _time(order.delivered_at),
         "attention": _attention(order),
     }

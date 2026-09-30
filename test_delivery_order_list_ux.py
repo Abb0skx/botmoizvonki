@@ -711,6 +711,53 @@ class CallbackAcknowledgementTests(unittest.IsolatedAsyncioTestCase):
             message_id=101,
         )
 
+    async def test_undo_completed_cannot_create_second_on_way_order(self):
+        active = self.repo.create(manager_id=11, manager_name="Manager", data=_order_data())
+        self.repo.update(
+            active.id,
+            status="on_way",
+            assigned_courier_id=22,
+            assigned_courier_name="Courier",
+            courier_id=22,
+            courier_name="Courier",
+            time_started="2026-09-15T11:00:00+05:00",
+        )
+        completed = self.repo.create(manager_id=11, manager_name="Manager", data=_order_data())
+        completed = self.repo.update(
+            completed.id,
+            status="completed",
+            assigned_courier_id=22,
+            assigned_courier_name="Courier",
+            courier_id=22,
+            courier_name="Courier",
+            time_started="2026-09-15T10:00:00+05:00",
+            delivered_at="2026-09-15T10:30:00+05:00",
+            delivery_chat_id=-1004404461980,
+            delivery_message_id=100,
+        )
+        query = SimpleNamespace(
+            data=f"undo_complete:{completed.id}",
+            from_user=SimpleNamespace(id=22, full_name="Courier", username=None),
+            message=SimpleNamespace(chat_id=-1004404461980, message_id=100),
+            answer=AsyncMock(),
+        )
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={
+                "settings": SimpleNamespace(
+                    delivery_group_id=-1004404461980,
+                    courier_ids=frozenset({22}),
+                ),
+                "repo": self.repo,
+            }),
+            bot=SimpleNamespace(delete_message=AsyncMock()),
+        )
+
+        await courier_action(SimpleNamespace(callback_query=query), context)
+
+        self.assertEqual(self.repo.get(completed.id).status, "completed")
+        self.assertEqual(self.repo.get(active.id).status, "on_way")
+        self.assertIn("Сначала завершите заказ", query.answer.await_args.args[0])
+
     async def test_undo_refreshes_main_card_before_rate_limited_prompt_cleanup(self):
         order = self.repo.create(manager_id=11, manager_name="Manager", data=_order_data())
         order = self.repo.update(

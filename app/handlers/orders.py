@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 
 from telegram import ReplyKeyboardRemove, ReplyParameters, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, ChatMigrated, Forbidden, RetryAfter
+from telegram.error import BadRequest, ChatMigrated, Forbidden, NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     Application, ApplicationHandlerStop, CallbackQueryHandler, CommandHandler, ContextTypes,
     ConversationHandler, MessageHandler, TypeHandler, filters,
@@ -36,6 +36,7 @@ from app.handlers.cash import (
     cash_correction_input, cash_review_action, courier_cash_input,
 )
 from app.monitor_service import build_delivery_monitor
+from app.routing_service import delivery_duration_seconds
 from app.utils import (
     completed_card, contains_cash_keyword, courier_card, enrich_location, extract_text_address, manager_card,
     map_url_provider, normalize_payment, normalize_seller, parse_amount,
@@ -313,31 +314,41 @@ async def _notify_log(
     text: str,
     *,
     reply_markup=None,
-) -> None:
+) -> bool:
     """Publish a lifecycle notification to the shared delivery Log channel."""
     settings: Settings = context.application.bot_data["settings"]
     channel_id = getattr(settings, "orders_channel_id", None)
     if not channel_id:
-        return
+        return True
     send_message = getattr(context.bot, "send_message", None)
     if not callable(send_message):
-        return
-    try:
-        kwargs = {
-            "chat_id": channel_id,
-            "text": text,
-            "parse_mode": ParseMode.HTML,
-            "disable_web_page_preview": True,
-        }
-        if reply_markup is not None:
-            kwargs["reply_markup"] = reply_markup
-        await send_message(
-            **kwargs,
-        )
-    except Exception:
-        # A notification is secondary to the durable order/event update. The
-        # canonical Log card is still synchronized by _sync_order.
-        logger.exception("Could not publish delivery notification to Log channel")
+        return False
+    kwargs = {
+        "chat_id": channel_id,
+        "text": text,
+        "parse_mode": ParseMode.HTML,
+        "disable_web_page_preview": True,
+    }
+    if reply_markup is not None:
+        kwargs["reply_markup"] = reply_markup
+    for attempt in range(3):
+        try:
+            await send_message(**kwargs)
+            return True
+        except RetryAfter as error:
+            if attempt == 2:
+                logger.exception("Could not publish delivery notification to Log channel")
+                return False
+            await asyncio.sleep(min(5.0, _retry_after_seconds(error)))
+        except (TimedOut, NetworkError):
+            if attempt == 2:
+                logger.exception("Could not publish delivery notification to Log channel")
+                return False
+            await asyncio.sleep(0.4 * (attempt + 1))
+        except Exception:
+            logger.exception("Could not publish delivery notification to Log channel")
+            return False
+    return False
 
 
 _EDIT_FIELD_LABELS = {
@@ -446,8 +457,7 @@ async def _estimated_delivery_time(
         if len(points) < 2:
             return None
         road_route = await routing.route(points)
-        route_seconds = max(60, int(road_route.get("duration_s") or 0))
-        duration_seconds = round(route_seconds * 1.20) + 7 * 60
+        duration_seconds = delivery_duration_seconds(road_route.get("duration_s") or 0)
         started = datetime.fromisoformat(order.time_started)
         if started.tzinfo is None:
             started = started.replace(tzinfo=ZoneInfo("Asia/Tashkent"))
@@ -4151,6 +4161,7 @@ async def manager_sync_action(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.answer("Заказ не найден", show_alert=True)
         return
     await query.answer("Синхронизация запущена…")
+    repo.mark_needs_sync(current.id, expected_updated_at=current.updated_at)
     order, success = await _sync_order_foreground(context, int(raw_id))
     if not success:
         _schedule_sync_retry(context, current.id)
@@ -4596,6 +4607,21 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     time_started=None,
                     estimated_delivery_at=None,
                 )
+            elif target_status == "on_way":
+                blocking = repo.get_on_way_for_courier(
+                    query.from_user.id,
+                    exclude_order_id=order.id,
+                )
+                if blocking:
+                    await query.answer(
+                        f"Сначала завершите заказ №{blocking.order_number}",
+                        show_alert=True,
+                    )
+                    return
+                reset.update(
+                    courier_id=query.from_user.id,
+                    courier_name=_name(query.from_user),
+                )
             prompt_cleanup = [
                 (
                     order.post_delivery_prompt_chat_id,
@@ -4610,6 +4636,7 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 {"awaiting_photo", "awaiting_amount", "completed"},
                 guard_courier_id=query.from_user.id,
                 require_unassigned_or_same=True,
+                require_no_other_on_way_for_courier=(target_status == "on_way"),
                 expected_updated_at=order.updated_at,
                 expected_publications={
                     "post_delivery_prompt_chat_id": order.post_delivery_prompt_chat_id,
@@ -4626,6 +4653,16 @@ async def courier_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             order = latest
         order = transitioned
         if not order:
+            blocking = repo.get_on_way_for_courier(
+                query.from_user.id,
+                exclude_order_id=int(raw_id),
+            )
+            if blocking:
+                await query.answer(
+                    f"Сначала завершите заказ №{blocking.order_number}",
+                    show_alert=True,
+                )
+                return
             await query.answer("Подтверждение уже нельзя отменить", show_alert=True); return
         state = "↩️ <b>Подтверждение доставки отменено</b>"
         keyboard = on_way_keyboard(order) if target_status == "on_way" else courier_keyboard(order)
