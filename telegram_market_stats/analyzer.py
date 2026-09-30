@@ -82,6 +82,7 @@ def _canonical_model(value: str) -> str:
 
 def _message_forms(text: str) -> str:
     normalized = normalize_model(text)
+    normalized = re.sub(r"\b(air|pro)\s*(1[3456])\b", r"\1 \2", normalized)
     normalized = re.sub(r"\b(\d{1,2})\s*pm\b", r"\1 pro max", normalized)
     normalized = re.sub(r"\b(\d{1,2})\s*p\b", r"\1 pro", normalized)
     normalized = re.sub(r"\bs\s*(\d{1,2})\s*u\b", r"s\1 ultra", normalized)
@@ -127,7 +128,9 @@ def _observed_mentions(text: str) -> tuple[ModelMention, ...]:
         r"\b(?:iphone\s+)?(1[2-9]|2\d)\s*(pro\s+max|pro|max|plus|e)?\b",
         value,
     )
-    phone_context = bool(re.search(r"\b(?:iphone|sim|esim)\b", value))
+    phone_context = bool(
+        re.search(r"\b(?:iphone|sim|esim)\b", value) or iphone and iphone.group(2)
+    )
     if iphone and phone_context:
         generation, variant = iphone.groups()
         suffix = "Pro Max" if variant in {"pro max", "max"} else (
@@ -145,6 +148,27 @@ def _observed_mentions(text: str) -> tuple[ModelMention, ...]:
         name = "Apple iPad" + (f" {family.title()}" if family else "")
         name += f" {generation.upper()}"
         matches.append((normalize_model(name), name))
+    if re.search(r"\b(?:redmi|mi)\s+pad\s+se\b", value):
+        name = "Xiaomi Redmi Pad SE"
+        matches.append((normalize_model(name), name))
+    macbook = re.search(
+        r"\bmacbook\s+(air|pro)\s+(1[3456])(?:\s+(1[3456]))?\s+(m\d+)\b",
+        value,
+    )
+    if macbook:
+        family, first_size, second_size, chip = macbook.groups()
+        for size in (first_size, second_size):
+            if size:
+                name = f"Apple MacBook {family.title()} {size} {chip.upper()}"
+                matches.append((normalize_model(name), name))
+    if re.search(r"\boakley(?:\s+meta)?\s+hstn\b", value):
+        name = "Oakley Meta HSTN"
+        matches.append((normalize_model(name), name))
+    watch = re.search(r"^\s*(\d{1,2})\s+(4[0-9])\b", value)
+    if watch:
+        series, size = watch.groups()
+        name = f"Apple Watch Series {series}"
+        matches.append((normalize_model(name), name))
     samsung = re.search(r"\b([az]\d{2})(?:\s+(ultra|plus|fe))?\b", value)
     if samsung:
         code, variant = samsung.groups()
@@ -155,7 +179,13 @@ def _observed_mentions(text: str) -> tuple[ModelMention, ...]:
         matches.append((normalize_model(name), name))
     unique = dict(matches)
     return tuple(
-        ModelMention(key, name, memory, color, 0.8)
+        ModelMention(
+            key,
+            name,
+            f"{watch.group(2)}mm" if watch and name.startswith("Apple Watch") else memory,
+            color,
+            0.8,
+        )
         for key, name in unique.items()
     )
 

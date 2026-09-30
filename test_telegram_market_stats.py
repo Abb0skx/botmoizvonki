@@ -95,11 +95,24 @@ def test_analyzer_understands_supplier_group_shorthand_and_new_models():
         "18 pro 256 esim blue kere": "Apple iPhone 18 Pro",
         "Airpods 5 ozi kere": "Apple AirPods 5",
         "iPad Air M3 128/256 Blue Wifi Kere": "Apple iPad Air M3",
+        "18 max 512 dual glacier kere": "Apple iPhone 18 Pro Max",
+        "Mi pad se 256 wifi kere": "Xiaomi Redmi Pad SE",
+        "Macbook air15 m4 16/512 silver kere": "Apple MacBook Air 15 M4",
+        "Oakley hstn black/clear kere": "Oakley Meta HSTN",
     }
     for message_text, expected in cases.items():
         result = current.analyze(message_text)
         assert result.intent == "demand"
         assert [mention.model_name for mention in result.mentions] == [expected]
+
+    two_sizes = current.analyze("Macbook air 13/15 m4 256 mdn kere")
+    assert [mention.model_name for mention in two_sizes.mentions] == [
+        "Apple MacBook Air 13 M4",
+        "Apple MacBook Air 15 M4",
+    ]
+    watch = current.analyze("12/46 light gold kere")
+    assert watch.mentions[0].model_name == "Apple Watch Series 12"
+    assert watch.mentions[0].memory == "46mm"
 
 
 def test_catalog_is_loaded_from_approved_xlsx(tmp_path):
