@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 
 from app.database import OrderRepository
 from app.handlers.cash import (
+    cash_notification_text,
     cash_correction_input,
     cash_review_action,
     courier_cash_input,
@@ -171,6 +172,22 @@ class CourierCashRepositoryTests(unittest.TestCase):
 
         self.assertEqual(sum(result is not None for result in results), 1)
         self.assertEqual(self.repo.cash_balance(handover.courier_id), (-40, 0))
+
+    def test_rejected_receipt_card_explains_that_bad_entry_was_cancelled(self):
+        entry, _created = self.create(message_id=99, usd=0, uzs=5_614_681_201_793_266)
+        with self.repo.connect() as db:
+            db.execute(
+                """UPDATE courier_cash_entries
+                   SET status='rejected',reviewed_by_name='Abbos',reviewed_at=created_at
+                   WHERE id=?""",
+                (entry.id,),
+            )
+        entry = self.repo.get_cash_entry(entry.id)
+
+        text = cash_notification_text(entry)
+
+        self.assertIn("Ошибочная запись кассы отменена", text)
+        self.assertIn("Abbos", text)
 
 
 class CourierCashHandlerTests(unittest.IsolatedAsyncioTestCase):

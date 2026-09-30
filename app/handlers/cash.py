@@ -77,8 +77,17 @@ def cash_notification_text(
     courier = escape(entry.courier_name)
     if entry.entry_type == "receipt":
         delta_lines = "\n".join(_amount_lines(entry.delta_usd, entry.delta_uzs, signed=True))
-        created = _local_time(entry.created_at)
-        time_line = f"\n🕒 Записано: {created}" if created else ""
+        action_time = _local_time(entry.reviewed_at or entry.created_at)
+        if entry.status == "rejected":
+            reviewer = escape(entry.reviewed_by_name or "Администратор")
+            return (
+                "❌ <b>Ошибочная запись кассы отменена</b>\n"
+                f"🚚 Курьер: <b>{courier}</b>\n\n"
+                f"Отменённое изменение:\n{delta_lines}\n"
+                f"👤 Исправил: <b>{reviewer}</b>"
+                + (f"\n🕒 {action_time}" if action_time else "")
+            )
+        time_line = f"\n🕒 Записано: {action_time}" if action_time else ""
         return (
             "🧾 <b>Сумма учтена</b>\n"
             f"🚚 Курьер: <b>{courier}</b>\n\n"
