@@ -16,5 +16,10 @@ data/delivery-state.pickle*
 **/*service-account*.json
 **/*service_account*.json
 **/google-credentials*.json
+# A Telegram user session is equivalent to a logged-in Telegram device.
+*.session
+*.session-journal
+*.session-shm
+*.session-wal
 venv/
 .venv/

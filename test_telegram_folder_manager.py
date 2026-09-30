@@ -1,0 +1,270 @@
+import asyncio
+import inspect
+from types import SimpleNamespace
+from datetime import datetime, timezone
+from pathlib import Path
+
+from telegram_business.migrations import connect
+from telegram_folder_manager.auth import credentials_from_page
+from telegram_folder_manager.config import DEFAULT_COLORS, FOLDER_CODES, FolderSettings, FolderSpec
+from telegram_folder_manager.gateway import TelegramFolderGateway
+from telegram_folder_manager.repository import FolderRepository
+from telegram_folder_manager.service import TelegramFolderService
+
+
+NOW = datetime(2026, 9, 30, 7, 0, tzinfo=timezone.utc)
+
+
+def settings(db_path: Path) -> FolderSettings:
+    return FolderSettings(
+        enabled=True,
+        api_id=12345,
+        api_hash="a" * 32,
+        session_path=db_path.with_suffix(".session"),
+        db_path=db_path,
+        poll_seconds=5,
+        reconcile_seconds=30,
+        lease_seconds=120,
+        max_attempts=4,
+        backfill_existing=False,
+        reopen_done=True,
+        folders=tuple(
+            FolderSpec(code, code, DEFAULT_COLORS[code]) for code in FOLDER_CODES
+        ),
+    )
+
+
+def add_client_message(repo: FolderRepository, chat_id: str, message_id: int) -> None:
+    stamp = NOW.isoformat()
+    with connect(repo.path) as db:
+        db.execute(
+            """INSERT INTO business_messages(
+                 business_connection_id,chat_id,message_id,direction,sender_type,
+                 message_type,created_at)
+               VALUES('connection',?,?,'incoming','client','text',?)""",
+            (chat_id, message_id, stamp),
+        )
+
+
+def test_credentials_page_is_parsed_without_environment_format(tmp_path):
+    page = tmp_path / "app.txt"
+    page.write_text(
+        "App api_id\n12345678\nApp api_hash\n0123456789abcdef0123456789abcdef\n",
+        encoding="utf-8",
+    )
+    assert credentials_from_page(page) == (
+        12345678,
+        "0123456789abcdef0123456789abcdef",
+    )
+
+
+def test_first_start_does_not_backfill_old_chats(tmp_path):
+    repo = FolderRepository(tmp_path / "business.db")
+    add_client_message(repo, "1001", 1)
+
+    assert repo.seed_new_clients(NOW, backfill_existing=False) == 0
+    assert repo.assignments() == []
+
+    add_client_message(repo, "1002", 2)
+    assert repo.seed_new_clients(NOW, backfill_existing=False) == 1
+    row = repo.assignment("1002")
+    assert row["folder_code"] == "NEW"
+    jobs = repo.jobs()
+    assert len(jobs) == 1
+    assert jobs[0]["state"] == "pending"
+
+
+def test_backfill_is_explicit_and_idempotent(tmp_path):
+    repo = FolderRepository(tmp_path / "business.db")
+    add_client_message(repo, "1001", 1)
+    add_client_message(repo, "1001", 2)
+    add_client_message(repo, "1002", 3)
+
+    assert repo.seed_new_clients(NOW, backfill_existing=True) == 2
+    assert repo.seed_new_clients(NOW, backfill_existing=True) == 0
+    assert {row["chat_id"] for row in repo.assignments()} == {"1001", "1002"}
+    assert len(repo.jobs()) == 2
+
+
+def test_new_message_reopens_done_but_keeps_active_manager(tmp_path):
+    repo = FolderRepository(tmp_path / "business.db")
+    repo.seed_new_clients(NOW)
+    repo.assign("1001", "DONE", NOW)
+    repo.assign("1002", "OLMAS", NOW)
+    add_client_message(repo, "1001", 1)
+    add_client_message(repo, "1002", 2)
+
+    assert repo.seed_new_clients(NOW, reopen_done=True) == 1
+    assert repo.assignment("1001")["folder_code"] == "NEW"
+    assert repo.assignment("1002")["folder_code"] == "OLMAS"
+
+
+def test_newer_assignment_supersedes_old_job(tmp_path):
+    repo = FolderRepository(tmp_path / "business.db")
+    first = repo.assign("1001", "NEW", NOW)
+    second = repo.assign("1001", "ABBOS", NOW)
+
+    assert second["revision"] == first["revision"] + 1
+    jobs = repo.jobs()
+    assert [row["state"] for row in jobs] == ["superseded", "pending"]
+    claimed = repo.claim_due(NOW)
+    assert len(claimed) == 1
+    assert claimed[0]["folder_code"] == "ABBOS"
+    assert repo.is_current(claimed[0])
+
+
+def test_retry_is_durable_and_redacts_long_secrets(tmp_path):
+    repo = FolderRepository(tmp_path / "business.db")
+    repo.assign("1001", "NEW", NOW)
+    row = repo.claim_due(NOW)[0]
+    error = RuntimeError("failed " + "a" * 32)
+    assert repo.retry(row["job_id"], row["lease_token"], error, NOW)
+    saved = repo.jobs()[0]
+    assert saved["state"] == "retry"
+    assert "a" * 32 not in saved["last_error"]
+    assert "[redacted]" in saved["last_error"]
+
+
+class FakeGateway:
+    def __init__(self, memberships=None, *, fail=False):
+        self.memberships = memberships or {}
+        self.fail = fail
+        self.moved = []
+
+    async def connect(self):
+        return None
+
+    async def ensure_folders(self):
+        return None
+
+    async def disconnect(self):
+        return None
+
+    async def move(self, chat_id, folder_code):
+        if self.fail:
+            raise TimeoutError("temporary")
+        self.moved.append((chat_id, folder_code))
+
+    async def snapshot(self):
+        return self.memberships
+
+
+class FakeMTProtoClient:
+    def __init__(self):
+        self.filters = []
+        self.tags_enabled = False
+        self.connected = False
+
+    async def connect(self):
+        self.connected = True
+
+    async def disconnect(self):
+        self.connected = False
+
+    async def is_user_authorized(self):
+        return True
+
+    async def get_me(self):
+        return SimpleNamespace(id=999)
+
+    async def get_input_entity(self, value):
+        from telethon.tl import types
+
+        if value == "me":
+            return types.InputPeerUser(999, 999)
+        return types.InputPeerUser(int(value), int(value) * 10)
+
+    async def __call__(self, request):
+        name = type(request).__name__
+        if name == "GetDialogFiltersRequest":
+            return SimpleNamespace(
+                filters=list(self.filters), tags_enabled=self.tags_enabled
+            )
+        if name == "ToggleDialogFilterTagsRequest":
+            self.tags_enabled = bool(request.enabled)
+            return True
+        if name == "UpdateDialogFilterRequest":
+            self.filters = [
+                folder for folder in self.filters if int(folder.id) != int(request.id)
+            ]
+            if request.filter is not None:
+                self.filters.append(request.filter)
+            return True
+        raise AssertionError(name)
+
+    async def iter_dialogs(self):
+        if False:
+            yield None
+
+
+def test_service_finishes_successful_job(tmp_path):
+    config = settings(tmp_path / "business.db")
+    repo = FolderRepository(config.db_path)
+    repo.assign("1001", "OLMAS", NOW)
+    gateway = FakeGateway()
+    service = TelegramFolderService(
+        config, repository=repo, gateway=gateway, clock=lambda: NOW
+    )
+
+    assert asyncio.run(service.process_jobs()) == 1
+    assert gateway.moved == [("1001", "OLMAS")]
+    assert repo.jobs()[0]["state"] == "done"
+
+
+def test_manual_manager_folder_wins_over_new_and_is_normalized(tmp_path):
+    config = settings(tmp_path / "business.db")
+    repo = FolderRepository(config.db_path)
+    repo.assign("1001", "NEW", NOW)
+    # Apply and finish the initial NEW job so reconciliation creates exactly
+    # one fresh normalization job.
+    initial = repo.claim_due(NOW)[0]
+    repo.finish(initial["job_id"], initial["lease_token"], NOW)
+    gateway = FakeGateway({"1001": {"NEW", "OTABEK"}})
+    service = TelegramFolderService(
+        config, repository=repo, gateway=gateway, clock=lambda: NOW
+    )
+
+    assert asyncio.run(service.reconcile_manual_moves()) == 1
+    assert repo.assignment("1001")["folder_code"] == "OTABEK"
+    assert repo.jobs()[-1]["state"] == "pending"
+
+
+def test_multiple_manager_folders_are_not_guessed(tmp_path):
+    config = settings(tmp_path / "business.db")
+    repo = FolderRepository(config.db_path)
+    gateway = FakeGateway({"1001": {"OLMAS", "ABBOS"}})
+    service = TelegramFolderService(
+        config, repository=repo, gateway=gateway, clock=lambda: NOW
+    )
+
+    assert asyncio.run(service.reconcile_manual_moves()) == 0
+    assert repo.assignment("1001") is None
+
+
+def test_gateway_has_no_message_send_or_read_history_code_path():
+    source = inspect.getsource(TelegramFolderGateway)
+    assert "send_message" not in source
+    assert "ReadHistoryRequest" not in source
+    assert "read_history" not in source
+
+
+def test_gateway_creates_colored_folders_and_moves_one_private_chat(tmp_path):
+    config = settings(tmp_path / "business.db")
+    client = FakeMTProtoClient()
+    gateway = TelegramFolderGateway(config, client=client)
+
+    async def scenario():
+        await gateway.connect()
+        await gateway.ensure_folders()
+        await gateway.move("1001", "NEW")
+        assert await gateway.snapshot() == {"1001": {"NEW"}}
+        await gateway.move("1001", "OLMAS")
+        return await gateway.snapshot()
+
+    snapshot = asyncio.run(scenario())
+    assert client.tags_enabled is True
+    assert len(client.filters) == len(FOLDER_CODES)
+    assert {folder.title.text: folder.color for folder in client.filters} == {
+        code: DEFAULT_COLORS[code] for code in FOLDER_CODES
+    }
+    assert snapshot == {"1001": {"OLMAS"}}

@@ -18,3 +18,9 @@ data/delivery.db-shm
 data/delivery.db-wal
 data/delivery-state.pickle*
 data/delivery-heartbeat
+# MTProto sessions grant full access to the Telegram user account and must
+# never be committed, copied into an image, or attached to diagnostics.
+*.session
+*.session-journal
+*.session-shm
+*.session-wal

@@ -277,6 +277,70 @@ volume. The SQLite sync lease coordinates processes sharing that file; it cannot
 coordinate Coolify replicas with separate local volumes. Use one application
 replica unless all workers truly share the configured database file.
 
+## Цветные папки менеджеров (MTProto)
+
+Bot API не умеет добавлять личные чаты в папки. Опциональный модуль
+`telegram_folder_manager` подключается как отдельное Telegram-устройство через
+MTProto и использует только методы `messages.getDialogFilters`,
+`messages.updateDialogFilter` и `messages.toggleDialogFilterTags`. Он не вызывает
+`messages.readHistory`, не отправляет сообщения и не сохраняет их текст.
+
+По умолчанию модуль выключен. Добавьте в Coolify:
+
+```dotenv
+TELEGRAM_FOLDER_SYNC_ENABLED=false
+TELEGRAM_USER_API_ID=
+TELEGRAM_USER_API_HASH=
+TELEGRAM_USER_SESSION_PATH=/app/data/texnikach-user.session
+TELEGRAM_FOLDER_POLL_SECONDS=5
+TELEGRAM_FOLDER_RECONCILE_SECONDS=30
+TELEGRAM_FOLDER_BACKFILL_EXISTING=false
+TELEGRAM_FOLDER_REOPEN_DONE=true
+TELEGRAM_FOLDER_NEW=NEW
+TELEGRAM_FOLDER_OLMAS=OLMAS
+TELEGRAM_FOLDER_OTABEK=OTABEK
+TELEGRAM_FOLDER_ALI=ALI
+TELEGRAM_FOLDER_ABBOS=ABBOS
+TELEGRAM_FOLDER_DONE=DONE
+```
+
+`api_id` и `api_hash` берутся на `my.telegram.org` и задаются как скрытые runtime
+переменные. Они, файл `*.session`, QR-ссылка и пароль 2FA никогда не должны
+попадать в Git, логи или сообщения. `/app/data` обязан быть постоянным диском.
+
+Одноразовая авторизация выполняется в Terminal контейнера, пока синхронизация
+ещё выключена:
+
+```bash
+python -m telegram_folder_manager.auth
+```
+
+Откройте Telegram → Настройки → Устройства → Подключить устройство и считайте
+QR-код. После строки `AUTHORIZED` включите `TELEGRAM_FOLDER_SYNC_ENABLED=true`
+и перезапустите один экземпляр приложения. При необходимости 2FA-пароль
+вводится интерактивно и нигде не сохраняется. Скомпрометированный `.session`
+даёт полный доступ к аккаунту; такое устройство нужно немедленно завершить в
+Telegram → Настройки → Устройства.
+
+При первом безопасном запуске текущая история не размечается. Только новые
+входящие Business-чаты получают `NEW`. Если нужен осознанный разовый backfill,
+на один запуск задайте `TELEGRAM_FOLDER_BACKFILL_EXISTING=true`, затем верните
+`false`. Папки создаются с цветами и включаются как теги. Чтобы взять клиента,
+добавьте его в папку менеджера в обычном Telegram; worker увидит изменение,
+уберёт `NEW` и оставит один тег. `DONE` означает завершённый диалог; новое
+сообщение клиента снова переводит его в `NEW`.
+
+Назначение также можно поставить без текста переписки командой:
+
+```bash
+python -m telegram_folder_manager.cli assign CHAT_ID OLMAS
+python -m telegram_folder_manager.cli list
+```
+
+Состояние и устойчивые retry хранятся в таблицах
+`telegram_folder_assignments`, `telegram_folder_jobs` и
+`telegram_folder_state`. Файл сессии не входит в резервные копии репозитория.
+
 All client-authored text and captions are sanitized before SQLite/outbox storage:
 long payment/account numbers, IBAN, expiry dates, and CVV values are redacted.
 Structured Telegram IDs are preserved for idempotency. Tokens and service-account

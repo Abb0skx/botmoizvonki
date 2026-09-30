@@ -180,6 +180,26 @@ CREATE TABLE IF NOT EXISTS business_model_choices (
  session_id TEXT NOT NULL, choice_number INTEGER NOT NULL, model_name TEXT NOT NULL,
  model_url TEXT, created_at TEXT NOT NULL,
  PRIMARY KEY(session_id, choice_number));
+CREATE TABLE IF NOT EXISTS telegram_folder_assignments (
+ chat_id TEXT PRIMARY KEY, folder_code TEXT NOT NULL,
+ revision INTEGER NOT NULL DEFAULT 1, source TEXT NOT NULL,
+ assigned_by_id TEXT, assigned_by_name TEXT,
+ assigned_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ CHECK(folder_code IN ('NEW','OLMAS','OTABEK','ALI','ABBOS','DONE')));
+CREATE TABLE IF NOT EXISTS telegram_folder_jobs (
+ job_id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL,
+ folder_code TEXT NOT NULL, revision INTEGER NOT NULL,
+ state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+ next_attempt_at TEXT NOT NULL, lease_token TEXT, lease_expires_at TEXT,
+ last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ completed_at TEXT,
+ UNIQUE(chat_id,revision),
+ CHECK(folder_code IN ('NEW','OLMAS','OTABEK','ALI','ABBOS','DONE')),
+ CHECK(state IN ('pending','running','retry','done','failed','superseded')));
+CREATE INDEX IF NOT EXISTS idx_telegram_folder_jobs_due
+ ON telegram_folder_jobs(state,next_attempt_at,job_id);
+CREATE TABLE IF NOT EXISTS telegram_folder_state (
+ key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
 """
 
 
