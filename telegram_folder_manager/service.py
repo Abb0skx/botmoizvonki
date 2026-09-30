@@ -30,17 +30,21 @@ class TelegramFolderService:
         *,
         repository: FolderRepository | None = None,
         gateway: TelegramFolderGateway | None = None,
+        market_collector=None,
         clock=None,
     ):
         self.settings = settings
         self.repo = repository or FolderRepository(settings.db_path)
         self.gateway = gateway or TelegramFolderGateway(settings)
+        self.market_collector = market_collector
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self._last_reconcile = 0.0
 
     async def start(self) -> None:
         await self.gateway.connect()
         await self.gateway.ensure_folders()
+        if self.market_collector is not None:
+            await self.market_collector.start(self.gateway.client)
         self.repo.seed_new_clients(
             self.clock(),
             backfill_existing=self.settings.backfill_existing,
@@ -48,6 +52,8 @@ class TelegramFolderService:
         )
 
     async def stop(self) -> None:
+        if self.market_collector is not None:
+            await self.market_collector.stop()
         await self.gateway.disconnect()
 
     async def process_jobs(self) -> int:
@@ -116,6 +122,8 @@ class TelegramFolderService:
             reopen_done=self.settings.reopen_done,
         )
         processed = await self.process_jobs()
+        if self.market_collector is not None:
+            await self.market_collector.run_if_due()
         monotonic = time.monotonic()
         if monotonic - self._last_reconcile >= self.settings.reconcile_seconds:
             await self.reconcile_manual_moves()
