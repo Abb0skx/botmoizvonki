@@ -614,6 +614,29 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual((values["latitude"], values["longitude"]), (41.311081, 69.240562))
 
+    async def test_plain_coordinates_become_a_native_location(self):
+        message = SimpleNamespace(
+            text="41.338586, 69.272757",
+            caption=None,
+            location=None,
+            venue=None,
+            entities=(),
+            caption_entities=(),
+        )
+        address = {"address_text": "Малика", "district": None, "mahalla": None}
+
+        with patch("app.utils.geocoding.reverse_geocode", AsyncMock(return_value=address)):
+            values = await _location_values(message)
+
+        self.assertEqual(
+            (values["latitude"], values["longitude"]),
+            (41.338586, 69.272757),
+        )
+        self.assertEqual(
+            values["location_url"],
+            "https://yandex.uz/maps/?ll=69.272757%2C41.338586&z=17",
+        )
+
     async def test_venue_replaces_text_location_prompt(self):
         context = self.context()
         context.user_data["draft"]["awaiting_text_location"] = True
@@ -760,6 +783,76 @@ class HandlerFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state, PAYMENT)
         self.assertEqual(context.user_data["draft"]["client_phone"], "+998901333999")
         self.assertEqual(context.user_data["draft"]["amount_uzs"], 1920000)
+
+    async def test_combined_details_accept_plain_coordinates(self):
+        update = self.update(
+            "Телефон: 90 133 39 99\n"
+            "Цена: 125$\n"
+            "41.338586, 69.272757"
+        )
+        context = self.context()
+
+        async def location(latitude, longitude, url):
+            return {
+                "location_url": url,
+                "latitude": latitude,
+                "longitude": longitude,
+                "address_text": "Малика",
+                "district": None,
+                "mahalla": None,
+            }
+
+        with patch("app.handlers.orders.enrich_location", AsyncMock(side_effect=location)):
+            state = await details(update, context)
+
+        self.assertEqual(state, PAYMENT)
+        self.assertEqual(context.user_data["draft"]["client_phone"], "+998901333999")
+        self.assertEqual(context.user_data["draft"]["amount_usd"], 125)
+        self.assertEqual(
+            (
+                context.user_data["draft"]["latitude"],
+                context.user_data["draft"]["longitude"],
+            ),
+            (41.338586, 69.272757),
+        )
+
+    async def test_two_plain_coordinate_pairs_create_two_locations(self):
+        update = self.update(
+            "Телефон: 90 133 39 99\n"
+            "Цена: 125$\n"
+            "41.338586, 69.272757\n"
+            "41.311081, 69.240562"
+        )
+        context = self.context()
+
+        async def location(latitude, longitude, url):
+            return {
+                "location_url": url,
+                "latitude": latitude,
+                "longitude": longitude,
+                "address_text": None,
+                "district": None,
+                "mahalla": None,
+            }
+
+        with patch("app.handlers.orders.enrich_location", AsyncMock(side_effect=location)):
+            state = await details(update, context)
+
+        self.assertEqual(state, PAYMENT)
+        self.assertEqual(
+            (
+                context.user_data["draft"]["latitude"],
+                context.user_data["draft"]["longitude"],
+            ),
+            (41.338586, 69.272757),
+        )
+        self.assertEqual(
+            (
+                context.user_data["draft"]["second_latitude"],
+                context.user_data["draft"]["second_longitude"],
+            ),
+            (41.311081, 69.240562),
+        )
 
     async def test_details_accumulate_in_any_order(self):
         context = self.context()

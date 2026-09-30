@@ -38,7 +38,8 @@ from app.handlers.cash import (
 from app.monitor_service import build_delivery_monitor
 from app.routing_service import delivery_duration_seconds
 from app.utils import (
-    completed_card, contains_cash_keyword, courier_card, enrich_location, extract_text_address, manager_card,
+    completed_card, contains_cash_keyword, courier_card, enrich_location, extract_text_address,
+    extract_text_coordinates, manager_card,
     map_url_provider, normalize_payment, normalize_seller, parse_amount,
     parse_order_details,
 )
@@ -803,6 +804,11 @@ def _message_location_urls(message) -> list[str]:
     return result[:2]
 
 
+def _message_text_coordinates(message) -> list[tuple[float, float]]:
+    value = getattr(message, "text", None) or getattr(message, "caption", None) or ""
+    return extract_text_coordinates(value)
+
+
 async def _location_values(message) -> dict:
     native_location = getattr(message, "location", None)
     venue = getattr(message, "venue", None)
@@ -813,13 +819,21 @@ async def _location_values(message) -> dict:
         url = f"https://yandex.uz/maps/?ll={longitude:.6f}%2C{latitude:.6f}&z=17"
     else:
         urls = _message_location_urls(message)
-        if not urls:
-            raise ValueError(
-                "Отправьте Telegram Location или ссылку Google, Яндекс, 2GIS, Apple Maps, "
-                "OpenStreetMap или Waze."
+        coordinates = _message_text_coordinates(message)
+        if coordinates:
+            latitude, longitude = coordinates[0]
+            url = (
+                "https://yandex.uz/maps/?"
+                f"ll={longitude:.6f}%2C{latitude:.6f}&z=17"
             )
-        url = urls[0]
-        latitude = longitude = None
+        elif urls:
+            url = urls[0]
+            latitude = longitude = None
+        else:
+            raise ValueError(
+                "Отправьте Telegram Location, координаты или ссылку Google, Яндекс, 2GIS, "
+                "Apple Maps, OpenStreetMap или Waze."
+            )
     values = await enrich_location(latitude, longitude, url)
     return _validated_location(values)
 
@@ -2939,6 +2953,16 @@ async def _capture_order_details(message, draft: dict) -> list[str]:
         draft["amount_usd"] = parsed.get("amount_usd")
         draft["amount_uzs"] = parsed.get("amount_uzs")
         recognized.append("цена")
+    for latitude, longitude in parsed.get("location_coordinates") or []:
+        url = (
+            "https://yandex.uz/maps/?"
+            f"ll={longitude:.6f}%2C{latitude:.6f}&z=17"
+        )
+        values = _validated_location(await enrich_location(latitude, longitude, url))
+        location_number = _merge_location(draft, values)
+        label = f"локация {location_number}"
+        if label not in recognized:
+            recognized.append(label)
     for raw_url in _message_location_urls(message):
         values = _validated_location(await enrich_location(None, None, str(raw_url)))
         location_number = _merge_location(draft, values)
@@ -2962,6 +2986,7 @@ async def details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             getattr(update.message, "location", None)
             or getattr(update.message, "venue", None)
             or _message_location_urls(update.message)
+            or _message_text_coordinates(update.message)
         )
         if has_location_input:
             draft.pop("awaiting_text_location", None)
@@ -3531,6 +3556,7 @@ async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 getattr(update.message, "location", None)
                 or getattr(update.message, "venue", None)
                 or _message_location_urls(update.message)
+                or _message_text_coordinates(update.message)
             )
             if incoming_text == DELETE_SECOND_LOCATION_TEXT:
                 if field != "second_location":

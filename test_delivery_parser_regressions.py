@@ -1,9 +1,27 @@
 import unittest
 
-from app.utils.parsers import parse_amount, parse_order_details
+from app.utils.parsers import extract_text_coordinates, parse_amount, parse_order_details
 
 
 class DeliveryParserRegressionTests(unittest.TestCase):
+    def test_plain_coordinates_are_extracted_without_becoming_an_amount(self):
+        parsed = parse_order_details(
+            "+998901333999\n125$\n41.338586, 69.272757"
+        )
+
+        self.assertEqual(
+            parsed["location_coordinates"],
+            [(41.338586, 69.272757)],
+        )
+        self.assertEqual(parsed["client_phone"], "+998901333999")
+        self.assertEqual((parsed["amount_usd"], parsed["amount_uzs"]), (125, None))
+
+    def test_reversed_plain_coordinates_are_normalized(self):
+        self.assertEqual(
+            extract_text_coordinates("69.272757, 41.338586"),
+            [(41.338586, 69.272757)],
+        )
+
     def test_model_digits_do_not_join_explicit_usd_price(self):
         self.assertEqual(parse_amount("A56 375$"), (375, None))
         parsed = parse_order_details("A56 375$")

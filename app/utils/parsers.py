@@ -5,6 +5,10 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 
 _URL_RE = re.compile(r"https?://[^\s<>]+", re.I)
+_COORDINATE_PAIR_RE = re.compile(
+    r"(?<![\d.])([+\-]?\d{1,3}(?:\.\d{3,8}))\s*[,;]\s*"
+    r"([+\-]?\d{1,3}(?:\.\d{3,8}))(?![\d.])"
+)
 _PHONE_LABEL_RE = re.compile(
     r"(?im)^(?:телефон|номер(?:\s+клиента)?|phone|tel)\s*[:\-]?\s*(.+)$"
 )
@@ -24,6 +28,40 @@ _EXPLICIT_UZS_RE = re.compile(
     re.I,
 )
 MAX_STORED_AMOUNT = (1 << 63) - 1
+
+
+def extract_text_coordinates(value: str) -> list[tuple[float, float]]:
+    """Extract up to two decimal coordinate pairs outside HTTP links.
+
+    Managers normally paste ``latitude, longitude``. A reversed
+    ``longitude, latitude`` pair is also normalized when its ordering is
+    unambiguous. Geographic bounds are checked by the order handler so it can
+    return the existing Uzbekistan-specific error to the manager.
+    """
+    without_urls = _URL_RE.sub(" ", value or "")
+    result: list[tuple[float, float]] = []
+    for match in _COORDINATE_PAIR_RE.finditer(without_urls):
+        first, second = float(match.group(1)), float(match.group(2))
+        first_is_uzbek_longitude = 55 <= first <= 74
+        second_is_uzbek_latitude = 37 <= second <= 46
+        first_is_uzbek_latitude = 37 <= first <= 46
+        second_is_uzbek_longitude = 55 <= second <= 74
+        if (
+            first_is_uzbek_longitude
+            and second_is_uzbek_latitude
+            and not (first_is_uzbek_latitude and second_is_uzbek_longitude)
+        ) or (abs(first) > 90 and abs(second) <= 90):
+            latitude, longitude = second, first
+        else:
+            latitude, longitude = first, second
+        if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+            continue
+        coordinates = (latitude, longitude)
+        if coordinates not in result:
+            result.append(coordinates)
+        if len(result) == 2:
+            break
+    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -287,7 +325,9 @@ def parse_amount(value: str) -> tuple[int | None, int | None]:
     return usd, uzs
 
 
-def parse_order_details(value: str) -> dict[str, str | int | None | list[str]]:
+def parse_order_details(
+    value: str,
+) -> dict[str, str | int | None | list[str] | list[tuple[float, float]]]:
     """Extract phones, amount and up to two map URLs from free-form text.
 
     ``client_phone`` remains the primary phone for backwards compatibility;
@@ -312,6 +352,13 @@ def parse_order_details(value: str) -> dict[str, str | int | None | list[str]]:
         result["location_urls"] = location_urls[:2]
         for start, end in reversed(url_spans):
             remaining = remaining[:start] + " " + remaining[end:]
+
+    coordinate_matches = list(_COORDINATE_PAIR_RE.finditer(remaining))
+    coordinates = extract_text_coordinates(remaining)
+    if coordinates:
+        result["location_coordinates"] = coordinates
+        for match in reversed(coordinate_matches):
+            remaining = remaining[:match.start()] + " " + remaining[match.end():]
 
     # An explicitly marked amount always wins over the visually ambiguous
     # nine-digit Uzbek phone form. Keep character offsets intact so phone spans
