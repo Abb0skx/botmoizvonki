@@ -1,0 +1,396 @@
+from __future__ import annotations
+
+import re
+import secrets
+import sqlite3
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from telegram_business.migrations import connect, migrate
+
+from .config import FOLDER_CODES
+
+
+CURSOR_KEY = "incoming_client_message_cursor"
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def iso(value: datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat()
+
+
+def _chat_id(value: object) -> str:
+    text = str(value or "").strip()
+    if not re.fullmatch(r"[1-9][0-9]{0,19}", text):
+        raise ValueError("chat_id must be a positive Telegram user ID")
+    return text
+
+
+def _folder_code(value: object) -> str:
+    code = str(value or "").strip().upper()
+    if code not in FOLDER_CODES:
+        raise ValueError(f"folder_code must be one of {', '.join(FOLDER_CODES)}")
+    return code
+
+
+def safe_error(error: BaseException | str) -> str:
+    if isinstance(error, BaseException):
+        value = f"{type(error).__name__}: {error}"
+    else:
+        value = str(error)
+    value = re.sub(r"\b[0-9a-fA-F]{32,}\b", "[redacted]", value)
+    value = re.sub(r"\b\d{7,}:[A-Za-z0-9_-]{20,}\b", "[redacted]", value)
+    return " ".join(value.replace("\x00", "").split())[:500]
+
+
+class FolderRepository:
+    def __init__(self, path: Path | str):
+        self.path = Path(path)
+        migrate(self.path)
+
+    def _assign_in_db(
+        self,
+        db: sqlite3.Connection,
+        chat_id: str,
+        folder_code: str,
+        now: datetime,
+        *,
+        source: str,
+        assigned_by_id: str | None = None,
+        assigned_by_name: str | None = None,
+        queue: bool = True,
+    ) -> tuple[int, bool]:
+        row = db.execute(
+            "SELECT folder_code,revision FROM telegram_folder_assignments WHERE chat_id=?",
+            (chat_id,),
+        ).fetchone()
+        changed = row is None or row["folder_code"] != folder_code
+        revision = 1 if row is None else int(row["revision"]) + (1 if changed else 0)
+        stamp = iso(now)
+        if row is None:
+            db.execute(
+                """INSERT INTO telegram_folder_assignments(
+                     chat_id,folder_code,revision,source,assigned_by_id,
+                     assigned_by_name,assigned_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (
+                    chat_id, folder_code, revision, source, assigned_by_id,
+                    assigned_by_name, stamp, stamp,
+                ),
+            )
+        elif changed:
+            db.execute(
+                """UPDATE telegram_folder_assignments
+                      SET folder_code=?,revision=?,source=?,assigned_by_id=?,
+                          assigned_by_name=?,assigned_at=?,updated_at=?
+                    WHERE chat_id=?""",
+                (
+                    folder_code, revision, source, assigned_by_id,
+                    assigned_by_name, stamp, stamp, chat_id,
+                ),
+            )
+            db.execute(
+                """UPDATE telegram_folder_jobs
+                      SET state='superseded',updated_at=?,lease_token=NULL,
+                          lease_expires_at=NULL
+                    WHERE chat_id=? AND state IN ('pending','retry','running')""",
+                (stamp, chat_id),
+            )
+        elif source == "telegram_manual":
+            db.execute(
+                """UPDATE telegram_folder_assignments
+                      SET source=?,updated_at=? WHERE chat_id=?""",
+                (source, stamp, chat_id),
+            )
+
+        if queue and (changed or not self._has_live_job(db, chat_id, revision)):
+            db.execute(
+                """INSERT OR IGNORE INTO telegram_folder_jobs(
+                     chat_id,folder_code,revision,state,attempts,next_attempt_at,
+                     created_at,updated_at)
+                   VALUES(?,?,?,'pending',0,?,?,?)""",
+                (chat_id, folder_code, revision, stamp, stamp, stamp),
+            )
+        return revision, changed
+
+    @staticmethod
+    def _has_live_job(db: sqlite3.Connection, chat_id: str, revision: int) -> bool:
+        return db.execute(
+            """SELECT 1 FROM telegram_folder_jobs
+                WHERE chat_id=? AND revision=?
+                  AND state IN ('pending','retry','running','done')""",
+            (chat_id, revision),
+        ).fetchone() is not None
+
+    def assign(
+        self,
+        chat_id: object,
+        folder_code: object,
+        now: datetime | None = None,
+        *,
+        source: str = "operator",
+        assigned_by_id: str | None = None,
+        assigned_by_name: str | None = None,
+        force_sync: bool = False,
+    ):
+        chat = _chat_id(chat_id)
+        code = _folder_code(folder_code)
+        when = now or utcnow()
+        with connect(self.path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            revision, changed = self._assign_in_db(
+                db, chat, code, when,
+                source=str(source or "operator")[:40],
+                assigned_by_id=(str(assigned_by_id)[:32] if assigned_by_id else None),
+                assigned_by_name=(str(assigned_by_name)[:80] if assigned_by_name else None),
+                queue=True,
+            )
+            if force_sync and not changed:
+                stamp = iso(when)
+                db.execute(
+                    """UPDATE telegram_folder_jobs
+                          SET state='superseded',updated_at=?
+                        WHERE chat_id=? AND revision=?
+                          AND state IN ('failed','done')""",
+                    (stamp, chat, revision),
+                )
+                revision += 1
+                db.execute(
+                    """UPDATE telegram_folder_assignments
+                          SET revision=?,updated_at=? WHERE chat_id=?""",
+                    (revision, stamp, chat),
+                )
+                db.execute(
+                    """INSERT INTO telegram_folder_jobs(
+                         chat_id,folder_code,revision,state,attempts,next_attempt_at,
+                         created_at,updated_at)
+                       VALUES(?,?,?,'pending',0,?,?,?)""",
+                    (chat, code, revision, stamp, stamp, stamp),
+                )
+            return db.execute(
+                "SELECT * FROM telegram_folder_assignments WHERE chat_id=?",
+                (chat,),
+            ).fetchone()
+
+    def accept_remote(
+        self, chat_id: object, folder_code: object,
+        now: datetime | None = None,
+    ):
+        chat = _chat_id(chat_id)
+        code = _folder_code(folder_code)
+        when = now or utcnow()
+        with connect(self.path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._assign_in_db(
+                db, chat, code, when,
+                source="telegram_manual", queue=False,
+            )
+            return db.execute(
+                "SELECT * FROM telegram_folder_assignments WHERE chat_id=?",
+                (chat,),
+            ).fetchone()
+
+    def assignment(self, chat_id: object):
+        chat = _chat_id(chat_id)
+        with connect(self.path) as db:
+            return db.execute(
+                "SELECT * FROM telegram_folder_assignments WHERE chat_id=?",
+                (chat,),
+            ).fetchone()
+
+    def assignments(self):
+        with connect(self.path) as db:
+            return db.execute(
+                "SELECT * FROM telegram_folder_assignments ORDER BY updated_at DESC"
+            ).fetchall()
+
+    def seed_new_clients(
+        self,
+        now: datetime | None = None,
+        *,
+        backfill_existing: bool = False,
+        reopen_done: bool = True,
+        limit: int = 500,
+    ) -> int:
+        """Queue NEW only for messages arriving after the durable cursor.
+
+        The first production run establishes a boundary instead of unexpectedly
+        tagging every historical chat.  Explicit backfill remains available.
+        """
+        when = now or utcnow()
+        stamp = iso(when)
+        created = 0
+        with connect(self.path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            state = db.execute(
+                "SELECT value FROM telegram_folder_state WHERE key=?", (CURSOR_KEY,)
+            ).fetchone()
+            maximum = int(
+                db.execute(
+                    "SELECT COALESCE(MAX(id),0) FROM business_messages"
+                ).fetchone()[0]
+            )
+            if state is None:
+                cursor = 0 if backfill_existing else maximum
+                db.execute(
+                    """INSERT INTO telegram_folder_state(key,value,updated_at)
+                       VALUES(?,?,?)""",
+                    (CURSOR_KEY, str(cursor), stamp),
+                )
+                if not backfill_existing:
+                    return 0
+            else:
+                try:
+                    cursor = max(0, int(state["value"]))
+                except (TypeError, ValueError):
+                    cursor = maximum
+
+            rows = db.execute(
+                """SELECT id,chat_id FROM business_messages
+                    WHERE id>? AND sender_type='client' AND deleted_at IS NULL
+                    ORDER BY id LIMIT ?""",
+                (cursor, max(1, min(int(limit), 5000))),
+            ).fetchall()
+            for row in rows:
+                chat = str(row["chat_id"] or "")
+                if not re.fullmatch(r"[1-9][0-9]{0,19}", chat):
+                    continue
+                current = db.execute(
+                    """SELECT folder_code FROM telegram_folder_assignments
+                       WHERE chat_id=?""",
+                    (chat,),
+                ).fetchone()
+                if current is None or (reopen_done and current["folder_code"] == "DONE"):
+                    _, changed = self._assign_in_db(
+                        db, chat, "NEW", when,
+                        source="new_client_message", queue=True,
+                    )
+                    created += int(changed)
+            if rows:
+                cursor = int(rows[-1]["id"])
+            db.execute(
+                """UPDATE telegram_folder_state SET value=?,updated_at=?
+                   WHERE key=?""",
+                (str(cursor), stamp, CURSOR_KEY),
+            )
+        return created
+
+    def claim_due(
+        self, now: datetime | None = None, *, limit: int = 20,
+        lease_seconds: int = 120,
+    ):
+        when = now or utcnow()
+        stamp = iso(when)
+        expires = iso(when + timedelta(seconds=max(30, lease_seconds)))
+        with connect(self.path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                """UPDATE telegram_folder_jobs
+                      SET state='retry',lease_token=NULL,lease_expires_at=NULL,
+                          next_attempt_at=?,updated_at=?
+                    WHERE state='running' AND lease_expires_at<=?""",
+                (stamp, stamp, stamp),
+            )
+            rows = db.execute(
+                """SELECT job_id FROM telegram_folder_jobs
+                    WHERE state IN ('pending','retry') AND next_attempt_at<=?
+                    ORDER BY job_id LIMIT ?""",
+                (stamp, max(1, min(int(limit), 100))),
+            ).fetchall()
+            claimed = []
+            for row in rows:
+                token = secrets.token_urlsafe(24)
+                changed = db.execute(
+                    """UPDATE telegram_folder_jobs
+                          SET state='running',attempts=attempts+1,
+                              lease_token=?,lease_expires_at=?,updated_at=?
+                        WHERE job_id=? AND state IN ('pending','retry')""",
+                    (token, expires, stamp, row["job_id"]),
+                ).rowcount
+                if changed:
+                    claimed.append(
+                        db.execute(
+                            "SELECT * FROM telegram_folder_jobs WHERE job_id=?",
+                            (row["job_id"],),
+                        ).fetchone()
+                    )
+            return claimed
+
+    def is_current(self, job) -> bool:
+        with connect(self.path) as db:
+            row = db.execute(
+                """SELECT folder_code,revision FROM telegram_folder_assignments
+                   WHERE chat_id=?""",
+                (job["chat_id"],),
+            ).fetchone()
+            return bool(
+                row
+                and row["folder_code"] == job["folder_code"]
+                and int(row["revision"]) == int(job["revision"])
+            )
+
+    def finish(self, job_id: int, lease_token: str, now: datetime | None = None) -> bool:
+        stamp = iso(now or utcnow())
+        with connect(self.path) as db:
+            return bool(db.execute(
+                """UPDATE telegram_folder_jobs
+                      SET state='done',completed_at=?,updated_at=?,
+                          lease_token=NULL,lease_expires_at=NULL,last_error=NULL
+                    WHERE job_id=? AND state='running' AND lease_token=?""",
+                (stamp, stamp, int(job_id), lease_token),
+            ).rowcount)
+
+    def supersede(self, job_id: int, lease_token: str, now: datetime | None = None) -> bool:
+        stamp = iso(now or utcnow())
+        with connect(self.path) as db:
+            return bool(db.execute(
+                """UPDATE telegram_folder_jobs
+                      SET state='superseded',updated_at=?,lease_token=NULL,
+                          lease_expires_at=NULL
+                    WHERE job_id=? AND state='running' AND lease_token=?""",
+                (stamp, int(job_id), lease_token),
+            ).rowcount)
+
+    def retry(
+        self, job_id: int, lease_token: str, error: BaseException | str,
+        now: datetime | None = None, *, max_attempts: int = 12,
+        retry_after: float | None = None,
+    ) -> bool:
+        when = now or utcnow()
+        with connect(self.path) as db:
+            row = db.execute(
+                """SELECT attempts FROM telegram_folder_jobs
+                   WHERE job_id=? AND state='running' AND lease_token=?""",
+                (int(job_id), lease_token),
+            ).fetchone()
+            if row is None:
+                return False
+            attempts = int(row["attempts"])
+            terminal = attempts >= max(1, int(max_attempts))
+            delay = (
+                max(1.0, float(retry_after))
+                if retry_after is not None
+                else min(3600.0, float(2 ** min(attempts, 11)))
+            )
+            return bool(db.execute(
+                """UPDATE telegram_folder_jobs
+                      SET state=?,next_attempt_at=?,last_error=?,updated_at=?,
+                          lease_token=NULL,lease_expires_at=NULL
+                    WHERE job_id=? AND state='running' AND lease_token=?""",
+                (
+                    "failed" if terminal else "retry",
+                    iso(when + timedelta(seconds=delay)),
+                    safe_error(error), iso(when), int(job_id), lease_token,
+                ),
+            ).rowcount)
+
+    def jobs(self):
+        with connect(self.path) as db:
+            return db.execute(
+                "SELECT * FROM telegram_folder_jobs ORDER BY job_id"
+            ).fetchall()

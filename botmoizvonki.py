@@ -54,6 +54,11 @@ from telegram_business.router import router as telegram_business_router
 from telegram_business.router import get_service as get_telegram_business_service
 from telegram_business.router import settings as telegram_business_settings
 from telegram_business.scheduler import DurableScheduler
+from telegram_folder_manager.config import FolderSettings
+from telegram_folder_manager.service import (
+    TelegramFolderScheduler,
+    TelegramFolderService,
+)
 from forwarding import (
     DEVICES as FORWARDING_DEVICES,
     OPERATOR as FORWARDING_OPERATOR,
@@ -114,6 +119,7 @@ app.include_router(
 )
 
 _telegram_business_scheduler = None
+_telegram_folder_scheduler = None
 _transcription_worker = None
 _forwarding_scheduler = None
 _forwarding_service = None
@@ -191,6 +197,7 @@ async def protect_legacy_manager_routes(request: Request, call_next):
 @app.on_event("startup")
 async def start_telegram_business():
     global _telegram_business_scheduler
+    global _telegram_folder_scheduler
     global _transcription_worker
     global _forwarding_scheduler
 
@@ -200,6 +207,16 @@ async def start_telegram_business():
         service = get_telegram_business_service()
         _telegram_business_scheduler = DurableScheduler(service)
         await _telegram_business_scheduler.start()
+
+    folder_settings = FolderSettings.load()
+    if folder_settings.enabled:
+        # This optional task shares only the durable Business SQLite. It uses a
+        # Telegram user session solely for dialog-filter tags; it never sends or
+        # reads messages. Run one application replica while it is enabled.
+        _telegram_folder_scheduler = TelegramFolderScheduler(
+            TelegramFolderService(folder_settings)
+        )
+        await _telegram_folder_scheduler.start()
 
     if TRANSCRIPTION_ENABLED:
         transcription_config_error = (
@@ -233,6 +250,9 @@ async def stop_telegram_business():
 
     if _telegram_business_scheduler:
         await _telegram_business_scheduler.stop()
+
+    if _telegram_folder_scheduler:
+        await _telegram_folder_scheduler.stop()
 
     if _transcription_worker:
         await _transcription_worker.stop()
