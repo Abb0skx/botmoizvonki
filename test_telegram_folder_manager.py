@@ -268,3 +268,37 @@ def test_gateway_creates_colored_folders_and_moves_one_private_chat(tmp_path):
         code: DEFAULT_COLORS[code] for code in FOLDER_CODES
     }
     assert snapshot == {"1001": {"OLMAS"}}
+
+
+def test_gateway_preserves_case_distinct_personal_folder_and_ignores_channels(tmp_path):
+    from telethon.tl import types
+
+    config = settings(tmp_path / "business.db")
+    client = FakeMTProtoClient()
+    personal_channel = types.InputPeerChannel(123, 456)
+    personal_folder = types.DialogFilter(
+        id=102,
+        title=types.TextWithEntities("Ali", []),
+        pinned_peers=[],
+        include_peers=[personal_channel],
+        exclude_peers=[],
+        color=2,
+    )
+    client.filters = [personal_folder]
+    gateway = TelegramFolderGateway(config, client=client)
+
+    async def scenario():
+        await gateway.connect()
+        await gateway.ensure_folders()
+        managed_ali = next(
+            folder for folder in client.filters if gateway._title(folder) == "ALI"
+        )
+        managed_ali.include_peers.append(types.InputPeerChannel(789, 987))
+        return await gateway.snapshot()
+
+    snapshot = asyncio.run(scenario())
+    titles = [gateway._title(folder) for folder in client.filters]
+    assert titles.count("Ali") == 1
+    assert titles.count("ALI") == 1
+    assert personal_folder.include_peers == [personal_channel]
+    assert snapshot == {}

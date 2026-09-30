@@ -75,14 +75,14 @@ class TelegramFolderGateway:
 
     def _managed(self, filters: Iterable[Any]) -> dict[str, Any]:
         by_title = {
-            self._title(folder).casefold(): folder
+            self._title(folder): folder
             for folder in filters
             if hasattr(folder, "id") and hasattr(folder, "exclude_peers")
         }
         return {
-            spec.code: by_title[spec.title.casefold()]
+            spec.code: by_title[spec.title]
             for spec in self.settings.folders
-            if spec.title.casefold() in by_title
+            if spec.title in by_title
         }
 
     @staticmethod
@@ -158,13 +158,11 @@ class TelegramFolderGateway:
             result, filters = await self._filters()
             if not bool(getattr(result, "tags_enabled", False)):
                 await self.client(ToggleDialogFilterTagsRequest(enabled=True))
-            managed_titles = {
-                spec.title.casefold() for spec in self.settings.folders
-            }
+            managed_titles = {spec.title for spec in self.settings.folders}
             incompatible = [
                 self._title(folder)
                 for folder in filters
-                if self._title(folder).casefold() in managed_titles
+                if self._title(folder) in managed_titles
                 and not hasattr(folder, "exclude_peers")
             ]
             if incompatible:
@@ -297,7 +295,10 @@ class TelegramFolderGateway:
                 )
                 for peer in peers:
                     peer_id = self._peer_id(peer)
-                    if peer_id is None or peer_id == self._self_id:
+                    # Bot clients are private user dialogs. Telegram represents
+                    # groups/channels with negative peer IDs; a user may add
+                    # those to a folder manually, so ignore them safely.
+                    if peer_id is None or peer_id <= 0 or peer_id == self._self_id:
                         continue
                     memberships.setdefault(str(peer_id), set()).add(code)
             return memberships
