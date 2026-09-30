@@ -288,11 +288,12 @@ class MonitoringRouteTests(unittest.TestCase):
             "/dashboard",
             "/admin/reviews",
             "/rating",
-            "/delivery/monitor",
-            "/delivery/stats",
             "/price",
+            "/finance",
         ):
             self.assertIn(f'href="{legacy_url}"', response.text)
+        self.assertNotIn('href="/delivery/monitor"', response.text)
+        self.assertNotIn('href="/delivery/stats"', response.text)
         self.assertEqual(response.headers["cache-control"], "no-store, private")
         self.assertEqual(response.headers["x-frame-options"], "DENY")
         self.assertEqual(response.headers["referrer-policy"], "no-referrer")
@@ -310,6 +311,8 @@ class MonitoringRouteTests(unittest.TestCase):
         script = self.client.get("/monitoring/assets/monitoring.js")
         self.assertIn("/monitoring/api/finance", script.text)
         self.assertIn("Что искали конкуренты", script.text)
+        self.assertIn("/finance/delivery/live", script.text)
+        self.assertIn("/finance/delivery/stats", script.text)
 
     def test_finance_api_requires_session_and_reports_missing_database(self):
         self.assertEqual(
@@ -494,6 +497,8 @@ class MonitoringRouteTests(unittest.TestCase):
         self.login()
         stats = self.client.get("/monitoring/delivery/stats?period=today")
         live = self.client.get("/monitoring/delivery/live")
+        finance_stats = self.client.get("/finance/delivery/stats?period=today")
+        finance_live = self.client.get("/finance/delivery/live")
 
         self.assertEqual(stats.status_code, 200)
         self.assertIn("Карта очередности", stats.text)
@@ -532,6 +537,13 @@ class MonitoringRouteTests(unittest.TestCase):
             live.headers["referrer-policy"], "strict-origin-when-cross-origin"
         )
 
+        self.assertEqual(finance_stats.status_code, 200)
+        self.assertIn("/finance/delivery/stats", finance_stats.text)
+        self.assertIn('href="/finance"', finance_stats.text)
+        self.assertEqual(finance_live.status_code, 200)
+        self.assertIn("/finance/delivery/live/api/state", finance_live.text)
+        self.assertIn('href="/finance"', finance_live.text)
+
         direct_stats = self.client.get(
             "/delivery/stats?period=today", follow_redirects=False
         )
@@ -557,14 +569,14 @@ class MonitoringRouteTests(unittest.TestCase):
             new=upstream,
         ):
             report = self.client.get(
-                "/monitoring/delivery/stats/api/report",
+                "/finance/delivery/stats/api/report",
                 params={"day": "today", "delivery_courier_id": "42"},
             )
             live = self.client.get(
-                "/monitoring/delivery/live/api/state"
+                "/finance/delivery/live/api/state"
             )
             analytics = self.client.get(
-                "/monitoring/delivery/stats/api/analytics",
+                "/finance/delivery/stats/api/analytics",
                 params={"month": "2026-09"},
             )
 
@@ -669,6 +681,10 @@ class MonitoringRouteTests(unittest.TestCase):
             self.client.get("/monitoring/delivery/stats/map.png").status_code,
             401,
         )
+        self.assertEqual(
+            self.client.get("/finance/delivery/stats/map.png").status_code,
+            401,
+        )
         self.login()
         get_bytes = AsyncMock(return_value=(b"png-data", "image/png"))
         with patch.object(
@@ -677,7 +693,7 @@ class MonitoringRouteTests(unittest.TestCase):
             new=get_bytes,
         ):
             response = self.client.get(
-                "/monitoring/delivery/stats/map.png",
+                "/finance/delivery/stats/map.png",
                 params={"day": "yesterday", "delivery_courier_id": "42"},
             )
         self.assertEqual(response.status_code, 200)
@@ -956,9 +972,6 @@ class MonitoringRouteTests(unittest.TestCase):
         reviews = {"summary": {"total": 4, "attention": 1}}
         prices = {"status": "enabled", "sections": []}
 
-        async def delivery_or_go(path=None, params=None):
-            return {"summary": {"active": 2}}
-
         with patch.object(
             monitoring_router.calls_adapter, "calls_summary", return_value=calls
         ), patch.object(
@@ -970,8 +983,6 @@ class MonitoringRouteTests(unittest.TestCase):
             "summary",
             new=AsyncMock(return_value=prices),
         ), patch.object(
-            monitoring_router.DeliveryAdapter, "get", new=AsyncMock(return_value={"summary": {"active": 2}})
-        ), patch.object(
             monitoring_router.GoSiteAdapter,
             "stats",
             new=AsyncMock(side_effect=RuntimeError("go_source_not_configured")),
@@ -981,7 +992,7 @@ class MonitoringRouteTests(unittest.TestCase):
         sources = response.json()["sources"]
         self.assertEqual(sources["calls"]["meta"]["status"], "ok")
         self.assertEqual(sources["go_site"]["meta"]["status"], "unavailable")
-        self.assertEqual(sources["delivery"]["data"]["summary"]["active"], 2)
+        self.assertNotIn("delivery", sources)
 
 
 class SafeNextTests(unittest.TestCase):
@@ -991,6 +1002,10 @@ class SafeNextTests(unittest.TestCase):
             "/monitoring/site",
             "/monitoring/prices/manage#smartphones-7tech-connect-u7",
             "/monitoring/delivery/stats?period=today",
+            "/finance",
+            "/finance/",
+            "/finance/delivery/live",
+            "/finance/delivery/stats?period=today",
             "/dashboard?period=30d",
             "/dashboard/",
             "/admin/reviews?period=7d",

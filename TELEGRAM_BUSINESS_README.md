@@ -390,6 +390,11 @@ read-only и показывает периоды «сегодня», «вчер�
 конкурентов, их модели и дневную динамику. Страница не показывает текст
 сообщений группы и не влияет на MTProto-сборщик.
 
+В этом же разделе доступны отдельные страницы доставки:
+`/finance/delivery/live` для текущего мониторинга и
+`/finance/delivery/stats` для отчётов. С главной панели Monitoring ссылки и
+сводка доставки убраны; старые адреса сохранены как совместимые входы.
+
 All client-authored text and captions are sanitized before SQLite/outbox storage:
 long payment/account numbers, IBAN, expiry dates, and CVV values are redacted.
 Structured Telegram IDs are preserved for idempotency. Tokens and service-account
