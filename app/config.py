@@ -97,8 +97,8 @@ class Settings:
             stats_url=(
                 os.getenv(
                     "DELIVERY_STATS_URL",
-                    "https://bot.texnikach.uz/monitoring",
+                    "https://bot.texnikach.uz/finance",
                 ).strip().rstrip("/")
-                or "https://bot.texnikach.uz/monitoring"
+                or "https://bot.texnikach.uz/finance"
             ),
         )
