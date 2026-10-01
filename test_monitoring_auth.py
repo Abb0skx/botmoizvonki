@@ -817,6 +817,12 @@ class MonitoringRouteTests(unittest.TestCase):
                 "X-CSRF-Token": csrf, "Origin": "https://bot.texnikach.uz",
                 "Idempotency-Key": "123e4567-e89b-42d3-a456-426614174000"}).status_code, 200)
             self.assertEqual(upstream.await_args.args, ("POST", "/price/api/v1/entry/models/1"))
+            delete_model_url = "/monitoring/api/prices/admin/entry/models/1/delete"
+            self.assertEqual(self.client.post(delete_model_url, json={}, headers={
+                "X-CSRF-Token": csrf, "Origin": "https://bot.texnikach.uz",
+                "Idempotency-Key": "123e4567-e89b-42d3-a456-426614174000"}).status_code, 200)
+            self.assertEqual(upstream.await_args.args,
+                             ("POST", "/price/api/v1/entry/models/1/delete"))
             preview_url = "/monitoring/api/prices/admin/entry/model-import/preview"
             self.assertEqual(self.client.post(preview_url, json={}, headers={
                 "X-CSRF-Token": csrf, "Origin": "https://bot.texnikach.uz",

@@ -67,7 +67,7 @@ _PRICE_ADMIN_POST_PATHS = (
     re.compile(r"entry/categories"),
     re.compile(r"entry/categories/[1-9][0-9]{0,18}"),
     re.compile(r"entry/model-import/(?:preview|apply)"),
-    re.compile(r"entry/models/[1-9][0-9]{0,18}"),
+    re.compile(r"entry/models/[1-9][0-9]{0,18}(?:/delete)?"),
     re.compile(r"entry/model-inbox/[1-9][0-9]{0,18}/(?:applied|dismissed)"),
 )
 

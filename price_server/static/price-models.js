@@ -10,6 +10,7 @@
     duplicate_catalog_variant: "Память и цвет не должны повторяться.",
     invalid_catalog_variants: "Добавьте от 1 до 100 вариантов.",
     invalid_catalog_request: "Проверьте категорию, название и варианты.",
+    catalog_model_delete_confirmation_required: "Подтвердите удаление модели.",
     catalog_category_exists: "Такая категория уже есть — выберите её из списка.",
     catalog_model_exists: "Одна или несколько моделей уже есть в выбранной категории. Отредактируйте существующую модель отдельно.",
     duplicate_catalog_model: "Название модели повторяется в списке.",
@@ -44,7 +45,7 @@
     return data;
   }
   const button = (text, action, primary = false) => { const value = node("button", text, "button " + (primary ? "primary" : "secondary")); value.type = "button"; value.addEventListener("click", action); return value; };
-  function modal(title, content, actions) { $("dialog-title").textContent = title; $("dialog-body").replaceChildren(...content); $("dialog-actions").replaceChildren(...actions); $("dialog").showModal(); }
+  function modal(title, content, actions) { $("dialog-title").textContent = title; $("dialog-body").replaceChildren(...content); $("dialog-actions").replaceChildren(...actions); if (!$("dialog").open) $("dialog").showModal(); }
   function renderModels() {
     const words = $("search").value.toLowerCase().trim().split(/\s+/).filter(Boolean);
     const category = Number($("category").value || 0);
@@ -125,7 +126,40 @@
         $("dialog").close(); await load(); $("search").value = model.value.trim(); renderModels(); notice(editing ? `Модель сохранена. Обновлено вариантов: ${result.updated_count}, добавлено: ${result.created_count}.` : `Модель создана. Добавлено вариантов: ${result.created_count}.`);
       } catch (error) { status.textContent = error.message; status.classList.add("danger"); save.disabled = false; }
     }, true);
-    modal(editing ? "Редактировать модель" : "Добавить новую модель", [wrap], [button("Отмена", () => $("dialog").close()), save]); model.focus();
+    const actions = [button("Отмена", () => $("dialog").close())];
+    if (editing) {
+      const remove = button("Удалить модель", () => confirmDeleteModel(initial));
+      remove.classList.add("danger"); actions.push(remove);
+    }
+    actions.push(save);
+    modal(editing ? "Редактировать модель" : "Добавить новую модель", [wrap], actions); model.focus();
+  }
+  function confirmDeleteModel(model) {
+    const wrap = node("div", undefined, "delete-confirm");
+    const warning = node("div", undefined, "delete-warning");
+    warning.append(node("strong", "Это удалит модель из действующего каталога"), node("p", "Все варианты модели и введённые для них текущие цены поставщиков будут удалены. История прошлых изменений и использованные ID сохранятся."));
+    const summary = node("div", undefined, "delete-model-summary");
+    const modelCell = node("div"), variantsCell = node("div");
+    modelCell.append(node("span", "Модель"), node("strong", model.model_name));
+    variantsCell.append(node("span", "Будет удалено"), node("strong", `${number(model.variants.length)} вариантов`));
+    summary.append(modelCell, variantsCell);
+    const acknowledge = node("label", undefined, "delete-acknowledge"), checkbox = node("input"), acknowledgement = node("span", "Я понимаю, что модель исчезнет из каталога вместе с текущими ценами её вариантов.");
+    checkbox.type = "checkbox"; acknowledge.append(checkbox, acknowledgement);
+    const status = node("p", "После удаления каталог будет обновлён при следующем запуске импорта.", "form-note");
+    wrap.append(warning, summary, acknowledge, status);
+    const remove = button("Удалить безвозвратно", async () => {
+      remove.disabled = true; checkbox.disabled = true; status.textContent = "Удаляем модель…"; status.classList.remove("danger");
+      try {
+        const result = await api(`models/${model.anchor_product_id}/delete`, {expected_revision: model.revision, confirm: true});
+        $("dialog").close(); await load();
+        notice(`Модель «${result.model_name}» удалена. Удалено вариантов: ${number(result.deleted_variant_count)}, текущих цен: ${number(result.deleted_price_count)}.`);
+      } catch (error) {
+        status.textContent = error.message; status.classList.add("danger"); checkbox.disabled = false; remove.disabled = !checkbox.checked;
+      }
+    });
+    remove.classList.add("danger-solid"); remove.disabled = true;
+    checkbox.addEventListener("change", () => { remove.disabled = !checkbox.checked; });
+    modal("Удалить модель?", [wrap], [button("Вернуться к редактированию", () => openEditor(model)), remove]);
   }
   async function editModel(productId) { try { notice("Загружаем модель…"); const detail = await api("models/" + productId); notice(""); openEditor(detail); } catch (error) { notice(error.message, true); } }
   function invalidateImport() {

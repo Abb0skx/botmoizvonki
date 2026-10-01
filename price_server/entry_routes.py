@@ -293,6 +293,23 @@ def install_entry_routes(router, admin, enabled, settings):
         )
         return JSONResponse(result)
 
+    @router.post("/price/api/v1/entry/models/{product_id}/delete")
+    async def delete_model(request: Request, product_id: int):
+        enabled()
+        admin(request, action=True)
+        raw = await request.body()
+        if len(raw) > 16 * 1024:
+            raise HTTPException(413)
+        try:
+            body = json.loads(raw)
+        except (ValueError, UnicodeError):
+            raise HTTPException(400, {"code": "invalid_json"}) from None
+        result = await run_in_threadpool(
+            call, catalog_service().delete, product_id, body,
+            request.headers.get("idempotency-key", ""),
+        )
+        return JSONResponse(result)
+
     @router.post("/price/api/v1/entry/model-inbox/{draft_id}/{action}")
     async def finish_model_draft(request: Request, draft_id: int, action: str):
         enabled()

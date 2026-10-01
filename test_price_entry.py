@@ -424,8 +424,13 @@ class EntryRouteTests(unittest.TestCase):
         self.assertNotIn('Object.keys(fields).forEach(field =>', entry_js.text)
         self.assertEqual(self.client.get("/price/assets/price-entry.env").status_code, 404)
         self.assertEqual(self.client.get("/price/models").status_code, 200)
-        self.assertEqual(self.client.get("/price/assets/price-models.js").status_code, 200)
-        self.assertEqual(self.client.get("/price/assets/price-models.css").status_code, 200)
+        models_js = self.client.get("/price/assets/price-models.js")
+        self.assertEqual(models_js.status_code, 200)
+        self.assertIn("Удалить модель", models_js.text)
+        self.assertIn("models/${model.anchor_product_id}/delete", models_js.text)
+        models_css = self.client.get("/price/assets/price-models.css")
+        self.assertEqual(models_css.status_code, 200)
+        self.assertIn(".delete-confirm", models_css.text)
         self.assertEqual(self.client.get("/price/assets/price-models.env").status_code, 404)
 
     def test_every_data_route_requires_auth(self):

@@ -202,6 +202,67 @@ class EntryCatalogTests(unittest.TestCase):
             self.service.update(1, request, str(uuid.uuid4()))
         self.assertEqual(caught.exception.code, "catalog_model_changed")
 
+    def test_model_delete_removes_group_prices_and_never_reuses_ids(self):
+        created_model = self.service.create(self.request(), str(uuid.uuid4()))
+        with sqlite3.connect(self.path) as db:
+            db.executemany(
+                "INSERT INTO entry_prices(sheet_id,product_key,price_1,price_12) "
+                "VALUES (?,?,?,?)",
+                [(sheet_id, item["key"], 100 + sheet_id, 110 + sheet_id)
+                 for sheet_id in (1, 2) for item in created_model["created"]],
+            )
+        detail = self.service.model(1001)
+        operation = str(uuid.uuid4())
+        result = self.service.delete(1001, {
+            "expected_revision": detail["revision"], "confirm": True,
+        }, operation)
+        self.assertEqual(result["status"], "deleted")
+        self.assertEqual(result["model_name"], detail["model_name"])
+        self.assertEqual(result["deleted_variant_count"], 2)
+        self.assertEqual(result["deleted_price_count"], 4)
+        self.assertEqual(result["product_ids"], [1001, 1002])
+        self.assertEqual(result["version_ids"], [2001, 2002, 2003, 2004])
+        self.assertEqual(self.service.delete(1001, {
+            "expected_revision": detail["revision"], "confirm": True,
+        }, operation), result)
+
+        for sheet_id in (1, 2):
+            rows = SQLitePriceSource(self.path).read(sheet_id)["rows"]
+            self.assertEqual([row["product_id"] for row in rows], [1, 2])
+        exported = SQLitePriceSource(self.path).export()
+        self.assertEqual([row["product_id"] for row in exported["products"]], [1, 2])
+        deleted_keys = {item["key"] for item in created_model["created"]}
+        self.assertTrue(all(price_row[1] not in deleted_keys
+                            for price_row in exported["prices"]))
+        with sqlite3.connect(self.path) as db:
+            self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
+            state = db.execute(
+                "SELECT next_product_id,next_version_id FROM entry_catalog_state WHERE id=1"
+            ).fetchone()
+            self.assertEqual(state, (1003, 2005))
+
+        created = self.service.create(self.request(
+            model_name="Replacement", variants=[{"memory": "", "color": ""}]
+        ), str(uuid.uuid4()))
+        self.assertEqual(created["created"][0]["product_id"], 1003)
+        self.assertEqual(created["created"][0]["version_id_1"], 2005)
+
+    def test_model_delete_requires_confirmation_and_current_revision(self):
+        detail = self.service.model(1)
+        with self.assertRaises(EntryError) as caught:
+            self.service.delete(1, {
+                "expected_revision": detail["revision"], "confirm": False,
+            }, str(uuid.uuid4()))
+        self.assertEqual(
+            caught.exception.code, "catalog_model_delete_confirmation_required"
+        )
+        with self.assertRaises(EntryError) as caught:
+            self.service.delete(1, {
+                "expected_revision": "0" * 64, "confirm": True,
+            }, str(uuid.uuid4()))
+        self.assertEqual(caught.exception.code, "catalog_model_changed")
+        self.assertEqual(self.service.model(1)["model_name"], detail["model_name"])
+
     def test_large_existing_model_remains_editable(self):
         variants = [{"memory": f"{index} GB", "color": "Black"}
                     for index in range(101)]
@@ -403,6 +464,8 @@ class EntryCatalogRouteTests(unittest.TestCase):
         self.admin.side_effect = HTTPException(401)
         self.assertEqual(self.client.get("/price/api/v1/entry/categories").status_code, 401)
         self.assertEqual(self.client.post("/price/api/v1/entry/products", json={}).status_code, 401)
+        self.assertEqual(self.client.post(
+            "/price/api/v1/entry/models/1/delete", json={}).status_code, 401)
         self.admin.side_effect = None
         with patch("price_server.entry_routes.EntryCatalogService") as service:
             service.return_value.categories.return_value = {"categories": []}
@@ -429,6 +492,13 @@ class EntryCatalogRouteTests(unittest.TestCase):
             service.return_value.update.return_value = {"status": "updated"}
             self.assertEqual(self.client.post(
                 "/price/api/v1/entry/models/1", json={}, headers={
+                    "Idempotency-Key": "123e4567-e89b-42d3-a456-426614174000"
+                }).status_code, 200)
+            service.return_value.delete.return_value = {"status": "deleted"}
+            self.assertEqual(self.client.post(
+                "/price/api/v1/entry/models/1/delete", json={
+                    "expected_revision": "a" * 64, "confirm": True,
+                }, headers={
                     "Idempotency-Key": "123e4567-e89b-42d3-a456-426614174000"
                 }).status_code, 200)
             service.return_value.preview_import.return_value = {"models": []}

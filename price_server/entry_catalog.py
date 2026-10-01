@@ -833,3 +833,95 @@ class EntryCatalogService:
             if db.execute("PRAGMA foreign_key_check").fetchone():
                 raise EntryError("catalog_update_integrity_failed")
             return result
+
+    def delete(self, anchor_product_id: int, body: dict, operation_id: str) -> dict:
+        """Delete one complete model group and its current supplier prices.
+
+        Product/version high-water marks and immutable operation/history rows are
+        deliberately retained.  This prevents ID reuse and keeps the audit trail
+        readable after the active catalogue rows have gone.
+        """
+        anchor_product_id = _positive(anchor_product_id)
+        if not isinstance(body, dict) or set(body) != {"expected_revision", "confirm"}:
+            raise EntryError("invalid_catalog_request")
+        expected_revision = body["expected_revision"]
+        if not isinstance(expected_revision, str) or not re.fullmatch(
+                r"[0-9a-f]{64}", expected_revision):
+            raise EntryError("invalid_catalog_revision")
+        if body["confirm"] is not True:
+            raise EntryError("catalog_model_delete_confirmation_required")
+        canonical = {
+            "action": "delete_model",
+            "anchor_product_id": anchor_product_id,
+            "expected_revision": expected_revision,
+            "confirm": True,
+        }
+        request_hash = _digest(canonical)
+
+        with sqlite3.connect(self.db_path, timeout=30) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys=ON")
+            db.execute("BEGIN IMMEDIATE")
+            _tables(db)
+            previous = _operation(db, operation_id, request_hash)
+            if previous is not None:
+                return previous
+            if not db.execute(
+                    "SELECT 1 FROM entry_catalog_state WHERE id=1").fetchone():
+                raise EntryError("catalog_management_not_initialized", 503)
+
+            rows = _metadata_rows(db)
+            anchor = next((metadata for _, metadata in rows
+                           if int(metadata["product_id"]) == anchor_product_id), None)
+            if anchor is None:
+                raise EntryError("catalog_model_not_found", 404)
+            marker = (
+                int(anchor["category_id"]), str(anchor["model_name"]).casefold()
+            )
+            group = [(row, metadata) for row, metadata in rows if (
+                int(metadata["category_id"]), str(metadata["model_name"]).casefold()
+            ) == marker]
+            products = [metadata for _, metadata in group]
+            if not secrets.compare_digest(
+                    _model_revision(products), expected_revision):
+                raise EntryError("catalog_model_changed", 409)
+
+            product_keys = [str(row["product_key"]) for row, _ in group]
+            product_ids = sorted(int(item["product_id"]) for item in products)
+            version_ids = sorted(
+                int(item[field])
+                for item in products
+                for field in ("version_id_1", "version_id_12")
+            )
+            placeholders = ",".join("?" for _ in product_keys)
+            deleted_price_count = int(db.execute(
+                f"SELECT count(*) FROM entry_prices WHERE product_key IN ({placeholders})",
+                product_keys,
+            ).fetchone()[0])
+            db.execute(
+                f"DELETE FROM entry_prices WHERE product_key IN ({placeholders})",
+                product_keys,
+            )
+            db.execute(
+                f"DELETE FROM entry_products WHERE product_key IN ({placeholders})",
+                product_keys,
+            )
+            db.execute(
+                "UPDATE entry_input_state SET revision=revision+1,updated_at=? WHERE id=1",
+                (now(),),
+            )
+            result = {
+                "status": "deleted",
+                "model_name": str(anchor["model_name"]),
+                "category_id": int(anchor["category_id"]),
+                "category_name": str(anchor["category_name"]),
+                "deleted_variant_count": len(group),
+                "deleted_price_count": deleted_price_count,
+                "product_ids": product_ids,
+                "version_ids": version_ids,
+                "import": "next_scheduled_import",
+            }
+            _store_operation(db, operation_id, request_hash, canonical, result)
+            if db.execute("PRAGMA foreign_key_check").fetchone():
+                raise EntryError("catalog_delete_integrity_failed")
+            return result
