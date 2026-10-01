@@ -75,6 +75,9 @@ def _aliases(model_name: str) -> set[str]:
 def _canonical_model(value: str) -> str:
     """Collapse catalogue transport/radio variants into the searched family."""
     cleaned = re.sub(r"^\s*zzztex[.\s]+", "", str(value), flags=re.I)
+    # Supplier exports may append ``(2)`` to duplicate rows.  It is not part of
+    # the product name and otherwise makes a perfectly valid lookup ambiguous.
+    cleaned = re.sub(r"\s+\(\d+\)\s*$", "", cleaned)
     cleaned = re.sub(r"\s+(?:4g|5g)(?:\s+\d+)?\s*$", "", cleaned, flags=re.I)
     family = str(_family_name(cleaned) or cleaned).strip()
     return family or str(value).strip()
@@ -82,6 +85,8 @@ def _canonical_model(value: str) -> str:
 
 def _message_forms(text: str) -> str:
     normalized = normalize_model(text)
+    normalized = re.sub(r"\bgoogel\b", "google", normalized)
+    normalized = re.sub(r"\b(whoop\s+5\s+0)\s+peek\b", r"\1 peak", normalized)
     normalized = re.sub(r"\b(air|pro)\s*(1[3456])\b", r"\1 \2", normalized)
     normalized = re.sub(r"\b(\d{1,2})\s*pm\b", r"\1 pro max", normalized)
     normalized = re.sub(r"\b(\d{1,2})\s*p\b", r"\1 pro", normalized)
@@ -164,7 +169,7 @@ def _observed_mentions(text: str) -> tuple[ModelMention, ...]:
     if re.search(r"\boakley(?:\s+meta)?\s+hstn\b", value):
         name = "Oakley Meta HSTN"
         matches.append((normalize_model(name), name))
-    watch = re.search(r"^\s*(\d{1,2})\s+(4[0-9])\b", value)
+    watch = re.search(r"^\s*(\d{1,2})\s+(4[0-9])(?:\s*mm)?\b", value)
     if watch:
         series, size = watch.groups()
         name = f"Apple Watch Series {series}"

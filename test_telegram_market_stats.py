@@ -85,6 +85,9 @@ def test_analyzer_understands_supplier_group_shorthand_and_new_models():
         "Samsung Galaxy A57",
         "Samsung Galaxy Tab S11 Ultra",
         "Apple MacBook Pro 14 (M5 10-core)",
+        "Whoop 5.0 Peak",
+        "Whoop 5.0 Peak (2)",
+        "Google Fitbit Air",
     ])
     current = MarketMessageAnalyzer(index)
     cases = {
@@ -110,9 +113,15 @@ def test_analyzer_understands_supplier_group_shorthand_and_new_models():
         "Apple MacBook Air 13 M4",
         "Apple MacBook Air 15 M4",
     ]
-    watch = current.analyze("12/46 light gold kere")
+    watch = current.analyze("12/46mm light gold/burgundy kere????")
     assert watch.mentions[0].model_name == "Apple Watch Series 12"
     assert watch.mentions[0].memory == "46mm"
+
+    whoop = current.analyze("Whoop 5.0 Peek kere yilli???")
+    assert [mention.model_name for mention in whoop.mentions] == ["Whoop 5.0 Peak"]
+
+    fitbit = current.analyze("Googel Fitbit Air Black kere????")
+    assert [mention.model_name for mention in fitbit.mentions] == ["Google Fitbit Air"]
 
 
 def test_catalog_is_loaded_from_approved_xlsx(tmp_path):
