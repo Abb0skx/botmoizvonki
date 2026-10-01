@@ -159,7 +159,7 @@
   <main class="shell">
     <header class="topbar">
       <div class="brand"><div class="logo">🚚</div><div><h1>Статистика доставки</h1><div class="subtitle">TEXNIKACH · фактическая очередь и маршрут курьеров</div></div></div>
-      <div class="top-actions"><a class="nav-link" id="monitorLink" href="/delivery/monitor">🚦 Мониторинг</a><div class="secure">🔒 Защищённый раздел</div></div>
+      <div class="top-actions"><a class="nav-link" href="/finance">← Finance</a><a class="nav-link" id="monitorLink" href="/delivery/monitor">🚦 Мониторинг</a><div class="secure">🔒 Защищённый раздел</div></div>
     </header>
 
     <div class="error" id="error"></div>
@@ -229,8 +229,9 @@
           integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
           crossorigin="anonymous"></script>
   <script>
+    const IS_FINANCE_PORTAL = location.pathname.startsWith("/finance/");
     const IS_MONITORING_PORTAL = location.pathname.startsWith("/monitoring/");
-    const BASE = IS_MONITORING_PORTAL ? "/monitoring/delivery/stats" : "/delivery/stats";
+    const BASE = IS_FINANCE_PORTAL ? "/finance/delivery/stats" : IS_MONITORING_PORTAL ? "/monitoring/delivery/stats" : "/delivery/stats";
     const params = new URLSearchParams(location.search);
     const periodDay = params.get("period");
     let requestedDay = params.get("day") || (["today", "yesterday"].includes(periodDay) ? periodDay : "today");
@@ -503,7 +504,8 @@
     $("weekNext").onclick = () => { requestedWeek=$("weekNext").dataset.value; loadAnalytics().catch(error => showError(error.message)); };
     $("interactiveBtn").onclick = () => { $("map").style.display="block"; $("mapPhoto").style.display="none"; $("interactiveBtn").classList.add("active"); $("photoBtn").classList.remove("active"); setTimeout(()=>map.invalidateSize(),50); };
     $("photoBtn").onclick = () => { $("map").style.display="none"; $("mapPhoto").style.display="block"; $("photoBtn").classList.add("active"); $("interactiveBtn").classList.remove("active"); loadMapPhoto(); };
-    if (IS_MONITORING_PORTAL) $("monitorLink").href = "/monitoring/delivery/live";
+    if (IS_FINANCE_PORTAL) $("monitorLink").href = "/finance/delivery/live";
+    else if (IS_MONITORING_PORTAL) $("monitorLink").href = "/monitoring/delivery/live";
     initMap(); load();
   </script>
 </body>

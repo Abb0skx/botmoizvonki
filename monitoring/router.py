@@ -429,6 +429,7 @@ def monitoring_go_legacy_page(request: Request):
 
 
 @router.get("/monitoring/delivery/live", response_class=HTMLResponse)
+@router.get("/finance/delivery/live", response_class=HTMLResponse)
 @router.get("/delivery/monitor", response_class=HTMLResponse)
 @router.get("/delivery/monitor/", response_class=HTMLResponse, include_in_schema=False)
 def monitoring_delivery_live_page(request: Request):
@@ -442,6 +443,7 @@ def monitoring_delivery_live_page(request: Request):
 
 
 @router.get("/monitoring/delivery/stats", response_class=HTMLResponse)
+@router.get("/finance/delivery/stats", response_class=HTMLResponse)
 @router.get("/delivery/stats", response_class=HTMLResponse)
 @router.get("/delivery/stats/", response_class=HTMLResponse, include_in_schema=False)
 def monitoring_delivery_stats_page(request: Request):
@@ -729,6 +731,7 @@ def api_revoke_user_sessions(request: Request, telegram_user_id: int):
 
 
 @router.get("/monitoring/delivery/live/api/state")
+@router.get("/finance/delivery/live/api/state")
 @router.get("/delivery/monitor/api/state")
 async def monitoring_delivery_live_state(request: Request):
     _principal(request)
@@ -746,6 +749,7 @@ async def monitoring_delivery_live_state(request: Request):
 
 
 @router.get("/monitoring/delivery/stats/api/report")
+@router.get("/finance/delivery/stats/api/report")
 @router.get("/delivery/stats/api/report")
 async def monitoring_delivery_stats_report(request: Request):
     _principal(request)
@@ -765,6 +769,7 @@ async def monitoring_delivery_stats_report(request: Request):
 
 
 @router.get("/monitoring/delivery/stats/api/analytics")
+@router.get("/finance/delivery/stats/api/analytics")
 @router.get("/delivery/stats/api/analytics")
 async def monitoring_delivery_stats_analytics(request: Request):
     _principal(request)
@@ -821,6 +826,7 @@ async def api_delivery_analytics(request: Request):
 
 
 @router.get("/monitoring/delivery/stats/map.png")
+@router.get("/finance/delivery/stats/map.png")
 @router.get("/delivery/stats/map.png")
 @router.get("/monitoring/api/delivery/map.png")
 async def api_delivery_map(request: Request):
@@ -1007,20 +1013,15 @@ async def api_overview(
     async def prices_source():
         return await prices_adapter.PriceAdapter(settings).summary()
 
-    async def delivery_source():
-        return await DeliveryAdapter(settings).get(
-            "/internal/monitoring/v1/delivery/live"
-        )
-
     async def go_source():
         return await GoSiteAdapter(settings).stats(
             {key: value for key, value in filters.items() if value is not None}
         )
 
-    names = ("calls", "reviews", "delivery", "prices", "go_site")
+    names = ("calls", "reviews", "prices", "go_site")
     results = await asyncio.gather(
-        calls_source(), reviews_source(), delivery_source(),
-        prices_source(), go_source(), return_exceptions=True,
+        calls_source(), reviews_source(), prices_source(), go_source(),
+        return_exceptions=True,
     )
     sources: dict[str, Any] = {}
     for name, result in zip(names, results):

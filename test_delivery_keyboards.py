@@ -300,6 +300,23 @@ class StatisticsKeyboardTests(unittest.TestCase):
         )
         self.assertIn("https://bot.texnikach.uz/monitoring", urls)
 
+    def test_finance_portal_links_keep_delivery_filters(self):
+        keyboard = statistics_keyboard("https://bot.texnikach.uz/finance")
+        urls = [
+            button.url
+            for row in keyboard.inline_keyboard
+            for button in row
+        ]
+        self.assertIn(
+            "https://bot.texnikach.uz/finance/delivery/stats?day=today",
+            urls,
+        )
+        self.assertIn(
+            "https://bot.texnikach.uz/finance/delivery/live",
+            urls,
+        )
+        self.assertIn("https://bot.texnikach.uz/finance", urls)
+
 
 if __name__ == "__main__":
     unittest.main()
