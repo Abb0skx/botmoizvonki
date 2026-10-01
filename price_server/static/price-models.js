@@ -150,7 +150,7 @@
     const remove = button("Удалить безвозвратно", async () => {
       remove.disabled = true; checkbox.disabled = true; status.textContent = "Удаляем модель…"; status.classList.remove("danger");
       try {
-        const result = await api(`models/${model.anchor_product_id}/delete`, {expected_revision: model.revision, confirm: true});
+        const result = await api(`models/${model.anchor_product_id}`, {action: "delete", expected_revision: model.revision, confirm: true});
         $("dialog").close(); await load();
         notice(`Модель «${result.model_name}» удалена. Удалено вариантов: ${number(result.deleted_variant_count)}, текущих цен: ${number(result.deleted_price_count)}.`);
       } catch (error) {

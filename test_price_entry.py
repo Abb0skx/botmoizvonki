@@ -427,7 +427,7 @@ class EntryRouteTests(unittest.TestCase):
         models_js = self.client.get("/price/assets/price-models.js")
         self.assertEqual(models_js.status_code, 200)
         self.assertIn("Удалить модель", models_js.text)
-        self.assertIn("models/${model.anchor_product_id}/delete", models_js.text)
+        self.assertIn('action: "delete"', models_js.text)
         models_css = self.client.get("/price/assets/price-models.css")
         self.assertEqual(models_css.status_code, 200)
         self.assertIn(".delete-confirm", models_css.text)

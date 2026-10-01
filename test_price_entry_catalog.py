@@ -496,6 +496,17 @@ class EntryCatalogRouteTests(unittest.TestCase):
                 }).status_code, 200)
             service.return_value.delete.return_value = {"status": "deleted"}
             self.assertEqual(self.client.post(
+                "/price/api/v1/entry/models/1", json={
+                    "action": "delete", "expected_revision": "a" * 64,
+                    "confirm": True,
+                }, headers={
+                    "Idempotency-Key": "123e4567-e89b-42d3-a456-426614174000"
+                }).status_code, 200)
+            service.return_value.delete.assert_called_with(
+                1, {"expected_revision": "a" * 64, "confirm": True},
+                "123e4567-e89b-42d3-a456-426614174000",
+            )
+            self.assertEqual(self.client.post(
                 "/price/api/v1/entry/models/1/delete", json={
                     "expected_revision": "a" * 64, "confirm": True,
                 }, headers={

@@ -287,10 +287,21 @@ def install_entry_routes(router, admin, enabled, settings):
             body = json.loads(raw)
         except (ValueError, UnicodeError):
             raise HTTPException(400, {"code": "invalid_json"}) from None
-        result = await run_in_threadpool(
-            call, catalog_service().update, product_id, body,
-            request.headers.get("idempotency-key", ""),
-        )
+        operation_id = request.headers.get("idempotency-key", "")
+        if (isinstance(body, dict)
+                and set(body) == {"action", "expected_revision", "confirm"}
+                and body.get("action") == "delete"):
+            delete_body = {
+                "expected_revision": body["expected_revision"],
+                "confirm": body["confirm"],
+            }
+            result = await run_in_threadpool(
+                call, catalog_service().delete, product_id, delete_body, operation_id,
+            )
+        else:
+            result = await run_in_threadpool(
+                call, catalog_service().update, product_id, body, operation_id,
+            )
         return JSONResponse(result)
 
     @router.post("/price/api/v1/entry/models/{product_id}/delete")
