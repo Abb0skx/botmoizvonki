@@ -357,6 +357,53 @@ class TelegramBusinessAPI:
         self._message_result(response, "sendMessage")
         return response
 
+    def get_chat(self, chat_id: str) -> dict:
+        result = self._call("getChat", {"chat_id": str(chat_id)}).get("result")
+        if not isinstance(result, dict):
+            raise TelegramAPIError("Telegram returned an invalid getChat result")
+        return result
+
+    def get_chat_member(self, chat_id: str, user_id: int) -> dict:
+        result = self._call(
+            "getChatMember", {"chat_id": str(chat_id), "user_id": int(user_id)}
+        ).get("result")
+        if not isinstance(result, dict):
+            raise TelegramAPIError("Telegram returned an invalid getChatMember result")
+        return result
+
+    def send_manager_card(self, chat_id: str, text: str, reply_markup: dict) -> dict:
+        """Send an internal card as the bot, never on behalf of a Business chat."""
+        response = self._call(
+            "sendMessage",
+            {
+                "chat_id": str(chat_id), "text": text,
+                "reply_markup": reply_markup,
+                "protect_content": True,
+                "link_preview_options": {"is_disabled": True},
+            },
+        )
+        self._message_result(response, "sendMessage")
+        return response
+
+    def edit_manager_card(
+        self, chat_id: str, message_id: int, text: str, reply_markup: dict,
+    ) -> dict:
+        try:
+            response = self._call(
+                "editMessageText",
+                {
+                    "chat_id": str(chat_id), "message_id": int(message_id),
+                    "text": text, "reply_markup": reply_markup,
+                    "link_preview_options": {"is_disabled": True},
+                },
+            )
+        except TelegramAPIError as exc:
+            if exc.status == 400 and "message is not modified" in str(exc).lower():
+                return {"ok": True, "result": {"message_id": message_id}}
+            raise
+        self._message_result(response, "editMessageText")
+        return response
+
     def edit_message_text(
         self,
         connection_id: str,

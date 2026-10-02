@@ -89,6 +89,8 @@ class FolderSettings:
     supplier_group_ids: tuple[int, ...] = DEFAULT_SUPPLIER_GROUP_IDS
     supplier_scan_seconds: int = 21600
     supplier_folder_capacity: int = 199
+    manager_cards_chat_id: str = ""
+    manager_cards_bot_token: str = ""
 
     @classmethod
     def load(cls) -> "FolderSettings":
@@ -157,11 +159,19 @@ class FolderSettings:
             supplier_group_ids=group_ids,
             supplier_scan_seconds=_int("TELEGRAM_SUPPLIER_SCAN_SECONDS", 21600, minimum=300, maximum=86400),
             supplier_folder_capacity=_int("TELEGRAM_SUPPLIER_FOLDER_CAPACITY", 199, minimum=1, maximum=199),
+            manager_cards_chat_id=os.getenv("TELEGRAM_MANAGER_ASSIGNMENTS_CHAT_ID", "").strip(),
+            manager_cards_bot_token=os.getenv("TELEGRAM_BUSINESS_BOT_TOKEN", "").strip(),
         )
         settings.validate()
         return settings
 
     def validate(self) -> None:
+        if self.manager_cards_chat_id and not re.fullmatch(r"-[1-9][0-9]{4,19}", self.manager_cards_chat_id):
+            raise ValueError("TELEGRAM_MANAGER_ASSIGNMENTS_CHAT_ID must be a group chat ID")
+        if self.manager_cards_chat_id and not self.manager_cards_bot_token:
+            raise ValueError("TELEGRAM_BUSINESS_BOT_TOKEN is required for manager cards")
+        if self.manager_cards_chat_id and not self.enabled:
+            raise ValueError("TELEGRAM_FOLDER_SYNC_ENABLED is required for manager cards")
         for folder in self.folders:
             folder.validate()
         titles = [folder.title.casefold() for folder in self.folders]

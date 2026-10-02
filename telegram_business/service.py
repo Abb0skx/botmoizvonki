@@ -51,6 +51,8 @@ from .sheets import BusinessSheets
 from .telegram_api import TelegramAPIError, TelegramBusinessAPI
 from .templates import REVIEW_URL, TEMPLATES, normalize_template_code, render
 from .timeutils import is_night, manager_phrases, next_night_end, telegram_datetime
+from telegram_folder_manager.cards import ManagerCards
+from telegram_folder_manager.repository import FolderRepository
 
 LOG = logging.getLogger("telegram_business")
 HANDOFF = {
@@ -308,6 +310,15 @@ class BusinessService:
                 type(exc).__name__,
             )
         self.api = api or TelegramBusinessAPI(settings.bot_token)
+        self.manager_cards = (
+            ManagerCards(
+                FolderRepository(settings.db_path),
+                getattr(settings, "manager_assignments_chat_id", ""),
+                settings.bot_token,
+                api=self.api,
+            )
+            if getattr(settings, "manager_assignments_chat_id", "") else None
+        )
         self.products = products or ExistingGoogleProductRepository(
             settings.product_price_max_age_minutes,
             getattr(settings, "product_urls_path", None),
@@ -1805,7 +1816,11 @@ class BusinessService:
         )
         try:
             if "callback_query" in update:
-                self.requests.handle_callback(update, now)
+                if not (
+                    self.manager_cards is not None
+                    and self.manager_cards.handle_callback(update, now)
+                ):
+                    self.requests.handle_callback(update, now)
                 self.repo.mark_update(update_id, "processed", now)
                 return
 

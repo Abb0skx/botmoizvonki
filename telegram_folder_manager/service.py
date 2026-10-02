@@ -10,6 +10,7 @@ from .gateway import TelegramFolderGateway
 from .repository import FolderRepository
 from .config import SUPPLIER_CODES
 from .suppliers import scan_supplier_groups
+from .cards import ManagerCards
 
 
 LOG = logging.getLogger("telegram_folder_manager")
@@ -42,6 +43,13 @@ class TelegramFolderService:
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self._last_reconcile = 0.0
         self._supplier_task: asyncio.Task | None = None
+        self.manager_cards = (
+            ManagerCards(
+                self.repo, settings.manager_cards_chat_id,
+                settings.manager_cards_bot_token,
+            )
+            if settings.manager_cards_chat_id else None
+        )
 
     async def start(self) -> None:
         await self.gateway.connect()
@@ -53,6 +61,7 @@ class TelegramFolderService:
             backfill_existing=self.settings.backfill_existing,
             reopen_done=self.settings.reopen_done,
             supplier_folder_capacity=self.settings.supplier_folder_capacity,
+            manager_cards_chat_id=self.settings.manager_cards_chat_id,
         )
         if self.settings.supplier_sync_enabled:
             self._supplier_task = asyncio.create_task(
@@ -153,8 +162,15 @@ class TelegramFolderService:
             backfill_existing=self.settings.backfill_existing,
             reopen_done=self.settings.reopen_done,
             supplier_folder_capacity=self.settings.supplier_folder_capacity,
+            manager_cards_chat_id=self.settings.manager_cards_chat_id,
         )
         processed = await self.process_jobs()
+        if self.manager_cards is not None:
+            try:
+                await asyncio.to_thread(self.manager_cards.dispatch_due, self.clock())
+            except Exception as exc:
+                # Internal card delivery must not stop folder reconciliation.
+                LOG.error("manager_card_cycle_failed type=%s", type(exc).__name__)
         if self.market_collector is not None:
             await self.market_collector.run_if_due()
         monotonic = time.monotonic()

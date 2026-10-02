@@ -354,6 +354,7 @@ class FolderRepository:
         backfill_existing: bool = False,
         reopen_done: bool = True,
         supplier_folder_capacity: int = 199,
+        manager_cards_chat_id: str = "",
         limit: int = 500,
     ) -> int:
         """Queue NEW only for messages arriving after the durable cursor.
@@ -419,11 +420,19 @@ class FolderRepository:
                         created += 1
                     continue
                 if current is None or (reopen_done and current["folder_code"] == "DONE"):
-                    _, changed = self._assign_in_db(
+                    revision, changed = self._assign_in_db(
                         db, chat, "NEW", when,
                         source="new_client_message", queue=True,
                     )
                     created += int(changed)
+                    if changed and manager_cards_chat_id:
+                        db.execute(
+                            """INSERT OR IGNORE INTO telegram_manager_cards(
+                                 chat_id,assignment_revision,group_chat_id,
+                                 next_attempt_at,created_at,updated_at)
+                               VALUES(?,?,?,?,?,?)""",
+                            (chat, revision, manager_cards_chat_id, stamp, stamp, stamp),
+                        )
             if rows:
                 cursor = int(rows[-1]["id"])
             db.execute(

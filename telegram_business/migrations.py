@@ -200,6 +200,21 @@ CREATE INDEX IF NOT EXISTS idx_telegram_folder_jobs_due
  ON telegram_folder_jobs(state,next_attempt_at,job_id);
 CREATE TABLE IF NOT EXISTS telegram_folder_state (
  key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS telegram_manager_cards (
+ card_id INTEGER PRIMARY KEY AUTOINCREMENT,
+ chat_id TEXT NOT NULL, assignment_revision INTEGER NOT NULL,
+ group_chat_id TEXT NOT NULL, group_message_id INTEGER,
+ status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+ next_attempt_at TEXT NOT NULL, lease_token TEXT, lease_expires_at TEXT,
+ last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ UNIQUE(chat_id,assignment_revision),
+ CHECK(status IN ('pending','sending','sent','retry','unknown','failed','cancelled')));
+CREATE INDEX IF NOT EXISTS idx_telegram_manager_cards_due
+ ON telegram_manager_cards(status,next_attempt_at,card_id);
+CREATE TABLE IF NOT EXISTS telegram_manager_card_callbacks (
+ callback_query_id TEXT PRIMARY KEY, card_id INTEGER NOT NULL,
+ manager_code TEXT NOT NULL, outcome TEXT NOT NULL,
+ created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS telegram_supplier_group_members (
  user_id TEXT PRIMARY KEY, group_id TEXT NOT NULL, updated_at TEXT NOT NULL);
 """
@@ -347,7 +362,7 @@ def migrate(path: Path | str) -> None:
         # customer from starting a new draft in a later night session.
         db.execute("DROP INDEX IF EXISTS idx_business_requests_one_active_chat")
         db.execute(
-            "CREATE UNIQUE INDEX idx_business_requests_one_active_chat "
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_business_requests_one_active_chat "
             "ON business_requests(chat_id) "
             "WHERE status IN ('collecting','ready')"
         )

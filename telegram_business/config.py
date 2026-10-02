@@ -80,6 +80,7 @@ class BusinessSettings:
     delivery_notifications_token: str = ""
     delivery_notifications_poll_seconds: int = 30
     delivery_notifications_max_event_age_hours: int = 24
+    manager_assignments_chat_id: str = ""
 
     @classmethod
     def load(cls) -> "BusinessSettings":
@@ -117,6 +118,7 @@ class BusinessSettings:
             webhook_secret=os.getenv("TELEGRAM_BUSINESS_WEBHOOK_SECRET", "").strip(),
             allowed_connection_id=os.getenv("TELEGRAM_BUSINESS_ALLOWED_CONNECTION_ID", "").strip(),
             admin_chat_id=os.getenv("TELEGRAM_BUSINESS_ADMIN_CHAT_ID", "").strip(),
+            manager_assignments_chat_id=os.getenv("TELEGRAM_MANAGER_ASSIGNMENTS_CHAT_ID", "").strip(),
             timezone=os.getenv("APP_TIMEZONE", "Asia/Tashkent").strip(),
             night_start=configured(lambda: _time("BUSINESS_NIGHT_START", "20:00"), time(20)),
             night_end=configured(lambda: _time("BUSINESS_NIGHT_END", "09:30"), time(9, 30)),
@@ -174,6 +176,12 @@ class BusinessSettings:
         )
 
     def validate_enabled(self) -> None:
+        if self.manager_assignments_chat_id and not re.fullmatch(
+            r"-[1-9][0-9]{4,19}", self.manager_assignments_chat_id
+        ):
+            raise RuntimeError(
+                "TELEGRAM_MANAGER_ASSIGNMENTS_CHAT_ID must be a group chat ID"
+            )
         try:
             ZoneInfo(self.timezone)
         except (KeyError, ValueError) as exc:
