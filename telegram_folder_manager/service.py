@@ -178,6 +178,7 @@ class TelegramFolderService:
                         scan.members, self.clock(),
                         complete=scan.complete,
                         folder_capacity=self.settings.supplier_folder_capacity,
+                        private_dialog_ids=set(scan.private_dialog_ids),
                     )
                 )
                 for chat_id in to_pause:

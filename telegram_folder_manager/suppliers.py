@@ -9,6 +9,7 @@ from typing import Any
 @dataclass(frozen=True)
 class SupplierScan:
     members: dict[str, str]
+    private_dialog_ids: frozenset[str]
     complete: bool
     groups_found: int
     groups_expected: int
@@ -16,19 +17,24 @@ class SupplierScan:
 
 
 async def scan_supplier_groups(
-    client: Any, group_ids: tuple[int, ...], *, dialog_limit: int = 12000
+    client: Any, group_ids: tuple[int, ...], *, dialog_limit: int = 25000
 ) -> SupplierScan:
     """Collect current user IDs without reading or marking group messages."""
     wanted = set(group_ids)
     groups: dict[int, Any] = {}
+    private_dialog_ids: set[str] = set()
+    dialog_count = 0
     async for dialog in client.iter_dialogs(limit=dialog_limit):
+        dialog_count += 1
+        if bool(getattr(dialog, "is_user", False)) and int(dialog.id) > 0:
+            private_dialog_ids.add(str(dialog.id))
         if bool(getattr(dialog, "is_group", False)) and int(dialog.id) in wanted:
             groups[int(dialog.id)] = dialog
-            if len(groups) == len(wanted):
-                break
 
     members: dict[str, str] = {}
     unavailable = [str(group_id) for group_id in group_ids if group_id not in groups]
+    if dialog_count >= dialog_limit:
+        unavailable.append("dialog_scan_limit")
     for group_id in group_ids:
         dialog = groups.get(group_id)
         if dialog is None:
@@ -48,6 +54,7 @@ async def scan_supplier_groups(
             unavailable.append(f"{group_id}:partial_{count}_of_{expected}")
     return SupplierScan(
         members=members,
+        private_dialog_ids=frozenset(private_dialog_ids),
         complete=not unavailable,
         groups_found=len(groups),
         groups_expected=len(group_ids),

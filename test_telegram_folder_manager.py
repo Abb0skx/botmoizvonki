@@ -113,24 +113,24 @@ def test_new_message_reopens_done_but_keeps_active_manager(tmp_path):
 
 def test_supplier_group_members_are_split_and_pause_business_bot(tmp_path):
     repo = FolderRepository(tmp_path / "business.db")
-    for chat_id in ("1001", "1002", "1003"):
+    for chat_id in ("1001", "1002", "1003", "1004", "1005"):
         add_business_client(repo, chat_id)
-    members = {chat_id: "-1001" for chat_id in ("1001", "1002", "1003")}
+    members = {chat_id: "-1001" for chat_id in ("1001", "1002", "1003", "1004", "1005")}
 
     assigned, released, overflow, to_pause, matched = repo.sync_supplier_members(
         members, NOW, complete=True, folder_capacity=1,
     )
-    assert matched == 3
-    assert len(assigned) == 2
+    assert matched == 5
+    assert len(assigned) == 4
     assert released == []
-    assert overflow == ["1003"]
-    assert set(to_pause) == {"1001", "1002", "1003"}
+    assert overflow == ["1005"]
+    assert set(to_pause) == {"1001", "1002", "1003", "1004", "1005"}
     assert {repo.assignment(chat_id)["folder_code"] for chat_id in assigned} == {
-        "SUPPLIER", "SUPPLIER2",
+        "SUPPLIER", "SUPPLIER2", "SUPPLIER3", "SUPPLIER4",
     }
-    assert repo.is_supplier_member("1003")
+    assert repo.is_supplier_member("1005")
     # The cached group membership stops an answer even if a folder is full.
-    assert not BusinessRepository(repo.path).may_automate("1003", NOW)
+    assert not BusinessRepository(repo.path).may_automate("1005", NOW)
 
 
 def test_new_supplier_chat_uses_cached_membership_instead_of_new(tmp_path):
@@ -147,6 +147,18 @@ def test_new_supplier_chat_uses_cached_membership_instead_of_new(tmp_path):
     client = BusinessRepository(repo.path).client("1001")
     assert client["bot_paused"] == 1
     assert client["pause_reason"] == "supplier_group"
+
+
+def test_old_private_dialog_is_classified_without_business_history(tmp_path):
+    repo = FolderRepository(tmp_path / "business.db")
+    assigned, released, overflow, to_pause, matched = repo.sync_supplier_members(
+        {"1001": "-1001"}, NOW, complete=True, folder_capacity=199,
+        private_dialog_ids={"1001"},
+    )
+    assert (assigned, released, overflow, to_pause, matched) == (
+        ["1001"], [], [], [], 1,
+    )
+    assert repo.assignment("1001")["folder_code"] == "SUPPLIER"
 
 
 def test_supplier_leaving_all_groups_is_released_only_after_complete_scan(tmp_path):
@@ -170,8 +182,9 @@ def test_supplier_leaving_all_groups_is_released_only_after_complete_scan(tmp_pa
 def test_supplier_scan_uses_ids_and_requires_complete_group_lists():
     class Client:
         async def iter_dialogs(self, limit):
+            yield SimpleNamespace(id=1001, is_user=True, is_group=False)
             yield SimpleNamespace(
-                id=-1001, is_group=True, input_entity="group",
+                id=-1001, is_user=False, is_group=True, input_entity="group",
                 entity=SimpleNamespace(participants_count=2),
             )
         async def iter_participants(self, entity):
@@ -179,6 +192,7 @@ def test_supplier_scan_uses_ids_and_requires_complete_group_lists():
 
     scan = asyncio.run(scan_supplier_groups(Client(), (-1001, -1002)))
     assert scan.members == {"1001": "-1001"}
+    assert scan.private_dialog_ids == frozenset({"1001"})
     assert not scan.complete
     assert "-1002" in scan.unavailable
     assert any(item.startswith("-1001:partial_") for item in scan.unavailable)

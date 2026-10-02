@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-FOLDER_CODES = ("NEW", "OLMAS", "OTABEK", "ALI", "ABBOS", "DONE", "SUPPLIER", "SUPPLIER2")
-SUPPLIER_CODES = ("SUPPLIER", "SUPPLIER2")
+FOLDER_CODES = ("NEW", "OLMAS", "OTABEK", "ALI", "ABBOS", "DONE", "SUPPLIER", "SUPPLIER2", "SUPPLIER3", "SUPPLIER4")
+SUPPLIER_CODES = ("SUPPLIER", "SUPPLIER2", "SUPPLIER3", "SUPPLIER4")
 DEFAULT_SUPPLIER_GROUP_IDS = (
     -1002188560435,  # Malika bozor N1
     -1001173906517,  # Malika Akses N1
@@ -17,7 +17,10 @@ DEFAULT_SUPPLIER_GROUP_IDS = (
     -1001607065824,  # ПАКЕТЛАР Б-44
     -1002496061682,  # BM Electronics Malika
 )
-DEFAULT_TITLES = {"SUPPLIER": "Поставщики", "SUPPLIER2": "Поставщики 2"}
+DEFAULT_TITLES = {
+    "SUPPLIER": "Поставщики", "SUPPLIER2": "Поставщики 2",
+    "SUPPLIER3": "Поставщики 3", "SUPPLIER4": "Поставщики 4",
+}
 DEFAULT_COLORS = {
     "NEW": 1,       # orange
     "OLMAS": 3,     # green
@@ -27,6 +30,8 @@ DEFAULT_COLORS = {
     "DONE": 6,      # pink
     "SUPPLIER": 0,  # red
     "SUPPLIER2": 0, # red
+    "SUPPLIER3": 0, # red
+    "SUPPLIER4": 0, # red
 }
 
 
@@ -78,7 +83,7 @@ class FolderSettings:
     folders: tuple[FolderSpec, ...]
     supplier_sync_enabled: bool = False
     supplier_group_ids: tuple[int, ...] = DEFAULT_SUPPLIER_GROUP_IDS
-    supplier_scan_seconds: int = 3600
+    supplier_scan_seconds: int = 21600
     supplier_folder_capacity: int = 199
 
     @classmethod
@@ -146,7 +151,7 @@ class FolderSettings:
             folders=folders,
             supplier_sync_enabled=_bool("TELEGRAM_SUPPLIER_SYNC_ENABLED", enabled),
             supplier_group_ids=group_ids,
-            supplier_scan_seconds=_int("TELEGRAM_SUPPLIER_SCAN_SECONDS", 3600, minimum=300, maximum=86400),
+            supplier_scan_seconds=_int("TELEGRAM_SUPPLIER_SCAN_SECONDS", 21600, minimum=300, maximum=86400),
             supplier_folder_capacity=_int("TELEGRAM_SUPPLIER_FOLDER_CAPACITY", 199, minimum=1, maximum=199),
         )
         settings.validate()

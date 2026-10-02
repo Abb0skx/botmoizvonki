@@ -211,9 +211,11 @@ class FolderRepository:
 
     @staticmethod
     def _supplier_slot(db: sqlite3.Connection, capacity: int) -> str | None:
+        placeholders = ",".join("?" for _ in SUPPLIER_CODES)
         counts = dict(db.execute(
             "SELECT folder_code,COUNT(*) FROM telegram_folder_assignments "
-            "WHERE folder_code IN ('SUPPLIER','SUPPLIER2') GROUP BY folder_code"
+            f"WHERE folder_code IN ({placeholders}) GROUP BY folder_code",
+            SUPPLIER_CODES,
         ).fetchall())
         return next(
             (code for code in SUPPLIER_CODES if counts.get(code, 0) < capacity), None
@@ -222,6 +224,7 @@ class FolderRepository:
     def sync_supplier_members(
         self, members: dict[str, str], now: datetime,
         *, complete: bool, folder_capacity: int,
+        private_dialog_ids: set[str] | None = None,
     ) -> tuple[list[str], list[str], list[str], list[str], int]:
         """Cache verified group membership and queue existing Business chats."""
         stamp = iso(now)
@@ -232,6 +235,9 @@ class FolderRepository:
         newly_assigned: list[str] = []
         released: list[str] = []
         overflow: list[str] = []
+        private_dialog_ids = {
+            _chat_id(chat_id) for chat_id in (private_dialog_ids or ())
+        }
         with connect(self.path) as db:
             db.execute("BEGIN IMMEDIATE")
             if complete:
@@ -245,7 +251,7 @@ class FolderRepository:
             if complete:
                 former = db.execute(
                     """SELECT chat_id FROM telegram_folder_assignments a
-                       WHERE a.folder_code IN ('SUPPLIER','SUPPLIER2')
+                       WHERE a.folder_code IN ('SUPPLIER','SUPPLIER2','SUPPLIER3','SUPPLIER4')
                          AND a.source='supplier_group'
                          AND NOT EXISTS (
                            SELECT 1 FROM telegram_supplier_group_members m
@@ -255,13 +261,21 @@ class FolderRepository:
                     chat_id = str(row["chat_id"])
                     self._assign_in_db(db, chat_id, "NEW", now, source="supplier_group_exit")
                     released.append(chat_id)
-            matches = [
+            business_matches = [
                 str(row[0]) for row in db.execute(
                     """SELECT c.chat_id FROM business_clients c
                        JOIN telegram_supplier_group_members m ON m.user_id=c.chat_id
                        ORDER BY c.updated_at DESC,c.chat_id"""
                 )
             ]
+            cached_members = {
+                str(row[0]) for row in db.execute(
+                    "SELECT user_id FROM telegram_supplier_group_members"
+                )
+            }
+            matches = list(dict.fromkeys([
+                *business_matches, *sorted(private_dialog_ids & cached_members)
+            ]))
             to_pause = [
                 str(row[0]) for row in db.execute(
                     """SELECT c.chat_id FROM business_clients c

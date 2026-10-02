@@ -185,7 +185,7 @@ CREATE TABLE IF NOT EXISTS telegram_folder_assignments (
  revision INTEGER NOT NULL DEFAULT 1, source TEXT NOT NULL,
  assigned_by_id TEXT, assigned_by_name TEXT,
  assigned_at TEXT NOT NULL, updated_at TEXT NOT NULL,
- CHECK(folder_code IN ('NEW','OLMAS','OTABEK','ALI','ABBOS','DONE','SUPPLIER','SUPPLIER2')));
+ CHECK(folder_code IN ('NEW','OLMAS','OTABEK','ALI','ABBOS','DONE','SUPPLIER','SUPPLIER2','SUPPLIER3','SUPPLIER4')));
 CREATE TABLE IF NOT EXISTS telegram_folder_jobs (
  job_id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL,
  folder_code TEXT NOT NULL, revision INTEGER NOT NULL,
@@ -194,7 +194,7 @@ CREATE TABLE IF NOT EXISTS telegram_folder_jobs (
  last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
  completed_at TEXT,
  UNIQUE(chat_id,revision),
- CHECK(folder_code IN ('NEW','OLMAS','OTABEK','ALI','ABBOS','DONE','SUPPLIER','SUPPLIER2')),
+ CHECK(folder_code IN ('NEW','OLMAS','OTABEK','ALI','ABBOS','DONE','SUPPLIER','SUPPLIER2','SUPPLIER3','SUPPLIER4')),
  CHECK(state IN ('pending','running','retry','done','failed','superseded')));
 CREATE INDEX IF NOT EXISTS idx_telegram_folder_jobs_due
  ON telegram_folder_jobs(state,next_attempt_at,job_id);
@@ -370,7 +370,7 @@ def _migrate_supplier_folder_codes(db: sqlite3.Connection) -> None:
             revision INTEGER NOT NULL DEFAULT 1, source TEXT NOT NULL,
             assigned_by_id TEXT, assigned_by_name TEXT,
             assigned_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-            CHECK(folder_code IN ('NEW','OLMAS','OTABEK','ALI','ABBOS','DONE','SUPPLIER','SUPPLIER2')))""",
+            CHECK(folder_code IN ('NEW','OLMAS','OTABEK','ALI','ABBOS','DONE','SUPPLIER','SUPPLIER2','SUPPLIER3','SUPPLIER4')))""",
         "telegram_folder_jobs": """CREATE TABLE telegram_folder_jobs_supplier_migration (
             job_id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL,
             folder_code TEXT NOT NULL, revision INTEGER NOT NULL,
@@ -378,14 +378,14 @@ def _migrate_supplier_folder_codes(db: sqlite3.Connection) -> None:
             next_attempt_at TEXT NOT NULL, lease_token TEXT, lease_expires_at TEXT,
             last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
             completed_at TEXT, UNIQUE(chat_id,revision),
-            CHECK(folder_code IN ('NEW','OLMAS','OTABEK','ALI','ABBOS','DONE','SUPPLIER','SUPPLIER2')),
+            CHECK(folder_code IN ('NEW','OLMAS','OTABEK','ALI','ABBOS','DONE','SUPPLIER','SUPPLIER2','SUPPLIER3','SUPPLIER4')),
             CHECK(state IN ('pending','running','retry','done','failed','superseded')))""",
     }
     for table, create_sql in definitions.items():
         sql_row = db.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
         ).fetchone()
-        if sql_row is None or "'SUPPLIER2'" in str(sql_row["sql"]):
+        if sql_row is None or "'SUPPLIER4'" in str(sql_row["sql"]):
             continue
         migration = f"{table}_supplier_migration"
         columns = [str(row["name"]) for row in db.execute(f"PRAGMA table_info({table})")]
