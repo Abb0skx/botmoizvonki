@@ -89,6 +89,12 @@ class ManagerCards:
             or chat.get("username")
         ):
             raise ValueError("manager cards destination must be a private group")
+        bot_id = self.api.get_me().get("id")
+        if not isinstance(bot_id, int) or bot_id <= 0:
+            raise ValueError("manager card bot identity is invalid")
+        bot_membership = self.api.get_chat_member(self.group_chat_id, bot_id)
+        if bot_membership.get("status") not in {"creator", "administrator"}:
+            raise ValueError("manager card bot must be a group administrator")
         self._verified_private_group = True
 
     def _claim(self, now: datetime):

@@ -19,6 +19,7 @@ class FakeAPI:
         self.edited = []
         self.answered = []
         self.member_status = "member"
+        self.bot_status = "administrator"
         self.chat_type = "supergroup"
         self.username = None
         self.send_error = None
@@ -30,7 +31,10 @@ class FakeAPI:
         }
 
     def get_chat_member(self, chat_id, user_id):
-        return {"status": self.member_status}
+        return {"status": self.bot_status if user_id == 123 else self.member_status}
+
+    def get_me(self):
+        return {"id": 123}
 
     def send_manager_card(self, chat_id, text, reply_markup):
         self.sent.append((chat_id, text, reply_markup))
@@ -191,6 +195,13 @@ def test_rate_limit_is_retried_but_public_group_is_rejected(tmp_path):
     assert ManagerCards(second, GROUP, api=public_api).dispatch_due(NOW) == 0
     assert card_row(second)["status"] == "failed"
     assert public_api.sent == []
+
+    third = create_new_client(tmp_path / "third")
+    ordinary_bot = FakeAPI()
+    ordinary_bot.bot_status = "member"
+    assert ManagerCards(third, GROUP, api=ordinary_bot).dispatch_due(NOW) == 0
+    assert card_row(third)["status"] == "failed"
+    assert ordinary_bot.sent == []
 
 
 def test_missing_group_or_already_assigned_client_produces_no_card(tmp_path):
