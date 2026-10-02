@@ -7,7 +7,10 @@ from pathlib import Path
 
 from telegram_business.migrations import connect
 from telegram_folder_manager.auth import credentials_from_page
-from telegram_folder_manager.config import DEFAULT_COLORS, FOLDER_CODES, FolderSettings, FolderSpec
+from telegram_folder_manager.config import (
+    DEFAULT_COLORS, DEFAULT_TITLES, FOLDER_CODES, LEGACY_SUPPLIER_TITLES,
+    FolderSettings, FolderSpec,
+)
 from telegram_folder_manager.gateway import TelegramFolderGateway
 from telegram_folder_manager.repository import FolderRepository
 from telegram_folder_manager.service import TelegramFolderService
@@ -450,6 +453,51 @@ def test_gateway_creates_colored_folders_and_moves_one_private_chat(tmp_path):
         code: DEFAULT_COLORS[code] for code in FOLDER_CODES
     }
     assert snapshot == {"1001": {"OLMAS"}}
+
+
+def test_supplier_folders_are_renamed_without_losing_chats(tmp_path):
+    from dataclasses import replace
+    from telethon.tl import types
+
+    base = settings(tmp_path / "business.db")
+    config = replace(
+        base,
+        folders=tuple(
+            FolderSpec(code, DEFAULT_TITLES.get(code, code), DEFAULT_COLORS[code])
+            for code in FOLDER_CODES
+        ),
+    )
+    client = FakeMTProtoClient()
+    expected = {}
+    for index, code in enumerate(LEGACY_SUPPLIER_TITLES):
+        chat_id = 1001 + index
+        filter_id = 20 + index
+        client.filters.append(types.DialogFilter(
+            id=filter_id,
+            title=types.TextWithEntities(LEGACY_SUPPLIER_TITLES[code], []),
+            pinned_peers=[],
+            include_peers=[types.InputPeerUser(chat_id, chat_id * 10)],
+            exclude_peers=[],
+            color=0,
+        ))
+        expected[code] = (filter_id, chat_id)
+    gateway = TelegramFolderGateway(config, client=client)
+
+    async def scenario():
+        await gateway.connect()
+        await gateway.ensure_folders()
+        await gateway.ensure_folders()
+        return await gateway.snapshot()
+
+    snapshot = asyncio.run(scenario())
+    assert len(client.filters) == len(FOLDER_CODES)
+    for code, (filter_id, chat_id) in expected.items():
+        matches = [f for f in client.filters if gateway._title(f) == DEFAULT_TITLES[code]]
+        assert len(matches) == 1
+        assert matches[0].id == filter_id
+        assert gateway._contains(matches[0].include_peers, chat_id)
+        assert snapshot[str(chat_id)] == {code}
+        assert all(gateway._title(f) != LEGACY_SUPPLIER_TITLES[code] for f in client.filters)
 
 
 def test_moving_only_chat_keeps_source_folder_nonempty(tmp_path):

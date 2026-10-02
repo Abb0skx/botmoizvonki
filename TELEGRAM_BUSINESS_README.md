@@ -307,10 +307,10 @@ TELEGRAM_FOLDER_DONE=DONE
 TELEGRAM_SUPPLIER_SYNC_ENABLED=true
 TELEGRAM_SUPPLIER_GROUP_IDS=-1002188560435,-1001173906517,-1001463992108,-1002268274885,-1002480123950,-1001607065824,-1002496061682
 TELEGRAM_SUPPLIER_SCAN_SECONDS=21600
-TELEGRAM_FOLDER_SUPPLIER=Поставщики
-TELEGRAM_FOLDER_SUPPLIER2=Поставщики 2
-TELEGRAM_FOLDER_SUPPLIER3=Поставщики 3
-TELEGRAM_FOLDER_SUPPLIER4=Поставщики 4
+TELEGRAM_FOLDER_SUPPLIER=Опт
+TELEGRAM_FOLDER_SUPPLIER2=Опт 2
+TELEGRAM_FOLDER_SUPPLIER3=Опт 3
+TELEGRAM_FOLDER_SUPPLIER4=Опт 4
 ```
 
 `api_id` и `api_hash` берутся на `my.telegram.org` и задаются как скрытые runtime
@@ -363,7 +363,7 @@ BM Electronics Malika. Сопоставление идёт по Telegram user ID
 
 У Telegram Premium действует предел 200 чатов в одной папке. Один слот занимает
 «Избранное» как служебный элемент, поэтому модуль распределяет поставщиков
-между «Поставщики» и пронумерованными продолжениями по 199 личных чатов на
+между «Опт» и пронумерованными продолжениями по 199 личных чатов на
 папку. Все четыре раздела получают красный тег; клиентские папки очищаются от
 этих чатов. Для найденных
 поставщиков Business-бот ставится на паузу. Если после полного сканирования

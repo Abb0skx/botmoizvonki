@@ -5,7 +5,7 @@ import logging
 import os
 from typing import Any, Iterable
 
-from .config import FolderSettings, FolderSpec
+from .config import FolderSettings, FolderSpec, LEGACY_SUPPLIER_TITLES
 
 
 LOG = logging.getLogger("telegram_folder_manager.gateway")
@@ -169,6 +169,37 @@ class TelegramFolderGateway:
                 raise RuntimeError(
                     "a shared Telegram folder uses a managed title: "
                     + ", ".join(sorted(incompatible))
+                )
+            for spec in self.settings.folders:
+                legacy_title = LEGACY_SUPPLIER_TITLES.get(spec.code)
+                if not legacy_title or legacy_title == spec.title:
+                    continue
+                old = [folder for folder in filters if self._title(folder) == legacy_title]
+                if not old:
+                    continue
+                if len(old) != 1 or not hasattr(old[0], "exclude_peers"):
+                    raise RuntimeError(f"cannot safely rename legacy Telegram folder {legacy_title}")
+                if any(self._title(folder) == spec.title for folder in filters):
+                    raise RuntimeError(
+                        f"both legacy and renamed Telegram folders exist for {spec.code}"
+                    )
+                current = old[0]
+                replacement = self._clone_filter(
+                    current,
+                    pinned_peers=getattr(current, "pinned_peers", ()) or (),
+                    include_peers=getattr(current, "include_peers", ()) or (),
+                    exclude_peers=getattr(current, "exclude_peers", ()) or (),
+                )
+                from telethon.tl import types
+
+                replacement.title = types.TextWithEntities(spec.title, [])
+                await self.client(
+                    UpdateDialogFilterRequest(id=int(current.id), filter=replacement)
+                )
+                filters[filters.index(current)] = replacement
+                LOG.info(
+                    "telegram_folder_renamed code=%s filter_id=%s",
+                    spec.code, current.id,
                 )
             managed = self._managed(filters)
             for spec in self.settings.folders:

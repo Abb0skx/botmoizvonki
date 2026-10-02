@@ -18,6 +18,10 @@ DEFAULT_SUPPLIER_GROUP_IDS = (
     -1002496061682,  # BM Electronics Malika
 )
 DEFAULT_TITLES = {
+    "SUPPLIER": "Опт", "SUPPLIER2": "Опт 2",
+    "SUPPLIER3": "Опт 3", "SUPPLIER4": "Опт 4",
+}
+LEGACY_SUPPLIER_TITLES = {
     "SUPPLIER": "Поставщики", "SUPPLIER2": "Поставщики 2",
     "SUPPLIER3": "Поставщики 3", "SUPPLIER4": "Поставщики 4",
 }
