@@ -139,7 +139,7 @@ class FolderSettings:
                 "TELEGRAM_FOLDER_POLL_SECONDS", 5, minimum=2, maximum=300
             ),
             reconcile_seconds=_int(
-                "TELEGRAM_FOLDER_RECONCILE_SECONDS", 30,
+                "TELEGRAM_FOLDER_RECONCILE_SECONDS", 10,
                 minimum=10, maximum=3600,
             ),
             lease_seconds=_int(

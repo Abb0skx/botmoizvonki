@@ -455,6 +455,39 @@ def test_gateway_creates_colored_folders_and_moves_one_private_chat(tmp_path):
     assert snapshot == {"1001": {"OLMAS"}}
 
 
+def test_native_folder_selection_assigns_manager_and_removes_new(tmp_path):
+    config = settings(tmp_path / "business.db")
+    repo = FolderRepository(config.db_path)
+    client = FakeMTProtoClient()
+    gateway = TelegramFolderGateway(config, client=client)
+    service = TelegramFolderService(
+        config, repository=repo, gateway=gateway, clock=lambda: NOW,
+    )
+
+    async def scenario():
+        await gateway.connect()
+        await gateway.ensure_folders()
+        repo.assign("1001", "NEW", NOW)
+        assert await service.process_jobs() == 1
+        assert await gateway.snapshot() == {"1001": {"NEW"}}
+
+        # Telegram's native "Add to folder" adds the manager folder while
+        # leaving NEW selected until our next reconciliation pass.
+        manager = next(
+            folder for folder in client.filters
+            if gateway._title(folder) == "OLMAS"
+        )
+        manager.include_peers.append(await client.get_input_entity(1001))
+        assert await gateway.snapshot() == {"1001": {"NEW", "OLMAS"}}
+        assert await service.reconcile_manual_moves() == 1
+        assert repo.assignment("1001")["folder_code"] == "OLMAS"
+        assert repo.assignment("1001")["source"] == "telegram_manual"
+        assert await service.process_jobs() == 1
+        return await gateway.snapshot()
+
+    assert asyncio.run(scenario()) == {"1001": {"OLMAS"}}
+
+
 def test_supplier_folders_are_renamed_without_losing_chats(tmp_path):
     from dataclasses import replace
     from telethon.tl import types
