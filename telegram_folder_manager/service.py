@@ -115,6 +115,20 @@ class TelegramFolderService:
         changed = 0
         memberships = await self.gateway.snapshot()
         for chat_id, codes in memberships.items():
+            # Remote filters lag behind queued MTProto edits.  Do not interpret
+            # that lag as a manager's manual reassignment.
+            if self.repo.has_unfinished_current_job(chat_id):
+                continue
+            if self.repo.is_supplier_member(chat_id):
+                current = self.repo.assignment(chat_id)
+                if current and current["folder_code"] in SUPPLIER_CODES:
+                    if codes != {current["folder_code"]}:
+                        self.repo.assign(
+                            chat_id, current["folder_code"], self.clock(),
+                            source="supplier_group", force_sync=True,
+                        )
+                        changed += 1
+                    continue
             choice, normalize = self._remote_choice(codes)
             if choice is None:
                 LOG.warning(

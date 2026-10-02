@@ -184,6 +184,30 @@ def test_supplier_scan_uses_ids_and_requires_complete_group_lists():
     assert any(item.startswith("-1001:partial_") for item in scan.unavailable)
 
 
+def test_stale_new_tag_cannot_override_supplier_assignment(tmp_path):
+    config = settings(tmp_path / "business.db")
+    repo = FolderRepository(config.db_path)
+    add_business_client(repo, "1001")
+    repo.assign("1001", "NEW", NOW)
+    initial = repo.claim_due(NOW)[0]
+    repo.finish(initial["job_id"], initial["lease_token"], NOW)
+    repo.sync_supplier_members(
+        {"1001": "-1001"}, NOW, complete=True, folder_capacity=199,
+    )
+    gateway = FakeGateway({"1001": {"NEW"}})
+    service = TelegramFolderService(
+        config, repository=repo, gateway=gateway, clock=lambda: NOW,
+    )
+
+    assert asyncio.run(service.reconcile_manual_moves()) == 0
+    assert repo.assignment("1001")["folder_code"] == "SUPPLIER"
+    pending = repo.claim_due(NOW)[0]
+    repo.finish(pending["job_id"], pending["lease_token"], NOW)
+    assert asyncio.run(service.reconcile_manual_moves()) == 1
+    assert repo.assignment("1001")["folder_code"] == "SUPPLIER"
+    assert repo.jobs()[-1]["state"] == "pending"
+
+
 def test_supplier_folder_migration_preserves_old_assignments_and_jobs(tmp_path):
     path = tmp_path / "legacy.db"
     with sqlite3.connect(path) as db:

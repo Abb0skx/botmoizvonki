@@ -292,6 +292,17 @@ class FolderRepository:
                 (chat,),
             ).fetchone() is not None
 
+    def has_unfinished_current_job(self, chat_id: object) -> bool:
+        chat = _chat_id(chat_id)
+        with connect(self.path) as db:
+            return db.execute(
+                """SELECT 1 FROM telegram_folder_assignments a
+                   JOIN telegram_folder_jobs j ON j.chat_id=a.chat_id
+                    AND j.revision=a.revision
+                   WHERE a.chat_id=? AND j.state IN ('pending','retry','running')""",
+                (chat,),
+            ).fetchone() is not None
+
     def seed_new_clients(
         self,
         now: datetime | None = None,

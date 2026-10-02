@@ -16,7 +16,7 @@ class SupplierScan:
 
 
 async def scan_supplier_groups(
-    client: Any, group_ids: tuple[int, ...], *, dialog_limit: int = 5000
+    client: Any, group_ids: tuple[int, ...], *, dialog_limit: int = 12000
 ) -> SupplierScan:
     """Collect current user IDs without reading or marking group messages."""
     wanted = set(group_ids)
