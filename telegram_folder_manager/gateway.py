@@ -265,9 +265,13 @@ class TelegramFolderGateway:
                 else:
                     new_pinned = self._without(pinned, peer_id)
                     new_included = self._without(included, peer_id)
+                    if not new_pinned and not new_included:
+                        new_included = [self._self_peer]
                     changed = (
-                        len(new_pinned) != len(pinned)
-                        or len(new_included) != len(included)
+                        [self._peer_id(item) for item in new_pinned]
+                        != [self._peer_id(item) for item in pinned]
+                        or [self._peer_id(item) for item in new_included]
+                        != [self._peer_id(item) for item in included]
                     )
                     pinned, included = new_pinned, new_included
                 if not changed:

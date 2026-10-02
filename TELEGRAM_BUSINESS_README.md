@@ -281,9 +281,11 @@ replica unless all workers truly share the configured database file.
 
 Bot API не умеет добавлять личные чаты в папки. Опциональный модуль
 `telegram_folder_manager` подключается как отдельное Telegram-устройство через
-MTProto и использует только методы `messages.getDialogFilters`,
-`messages.updateDialogFilter` и `messages.toggleDialogFilterTags`. Он не вызывает
-`messages.readHistory`, не отправляет сообщения и не сохраняет их текст.
+MTProto. Для папок он использует `messages.getDialogFilters`,
+`messages.updateDialogFilter` и `messages.toggleDialogFilterTags`; для проверки
+поставщиков дополнительно получает список диалогов и участников указанных
+групп. Он не вызывает `messages.readHistory`, не отправляет сообщения и не
+сохраняет текст переписки в базе папок.
 
 По умолчанию модуль выключен. Добавьте в Coolify:
 

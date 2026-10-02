@@ -452,6 +452,29 @@ def test_gateway_creates_colored_folders_and_moves_one_private_chat(tmp_path):
     assert snapshot == {"1001": {"OLMAS"}}
 
 
+def test_moving_only_chat_keeps_source_folder_nonempty(tmp_path):
+    config = settings(tmp_path / "business.db")
+    client = FakeMTProtoClient()
+    gateway = TelegramFolderGateway(config, client=client)
+
+    async def scenario():
+        await gateway.connect()
+        await gateway.ensure_folders()
+        await gateway.move("1001", "SUPPLIER")
+        supplier = next(
+            folder for folder in client.filters if gateway._title(folder) == "SUPPLIER"
+        )
+        supplier.include_peers = [peer for peer in supplier.include_peers if gateway._peer_id(peer) != 999]
+        await gateway.move("1001", "SUPPLIER2")
+        return await gateway.snapshot()
+
+    assert asyncio.run(scenario()) == {"1001": {"SUPPLIER2"}}
+    supplier = next(
+        folder for folder in client.filters if gateway._title(folder) == "SUPPLIER"
+    )
+    assert gateway._contains(supplier.include_peers, 999)
+
+
 def test_gateway_preserves_case_distinct_personal_folder_and_ignores_channels(tmp_path):
     from telethon.tl import types
 
