@@ -196,6 +196,24 @@ def test_supplier_scan_uses_ids_and_requires_complete_group_lists():
     assert not scan.complete
     assert "-1002" in scan.unavailable
     assert any(item.startswith("-1001:partial_") for item in scan.unavailable)
+    without_self = asyncio.run(
+        scan_supplier_groups(Client(), (-1001,), self_user_id=1001)
+    )
+    assert without_self.members == {}
+    assert without_self.private_dialog_ids == frozenset()
+
+
+def test_saved_messages_assignment_is_removed_without_moving_a_folder(tmp_path):
+    repo = FolderRepository(tmp_path / "business.db")
+    repo.sync_supplier_members(
+        {"999": "-1001"}, NOW, complete=True, folder_capacity=199,
+        private_dialog_ids={"999"},
+    )
+    assert repo.assignment("999")["folder_code"] == "SUPPLIER"
+    assert repo.discard_reserved_self("999", NOW)
+    assert repo.assignment("999") is None
+    assert not repo.is_supplier_member("999")
+    assert repo.jobs()[-1]["state"] == "superseded"
 
 
 def test_stale_new_tag_cannot_override_supplier_assignment(tmp_path):

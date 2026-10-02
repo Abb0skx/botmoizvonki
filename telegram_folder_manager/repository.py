@@ -306,6 +306,36 @@ class FolderRepository:
                 (chat,),
             ).fetchone() is not None
 
+    def discard_reserved_self(self, self_user_id: object, now: datetime) -> bool:
+        """Saved Messages is a folder sentinel, never a supplier conversation."""
+        chat = _chat_id(self_user_id)
+        stamp = iso(now)
+        with connect(self.path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "DELETE FROM telegram_supplier_group_members WHERE user_id=?",
+                (chat,),
+            )
+            row = db.execute(
+                """SELECT 1 FROM telegram_folder_assignments
+                   WHERE chat_id=? AND source='supplier_group'
+                     AND folder_code IN ('SUPPLIER','SUPPLIER2','SUPPLIER3','SUPPLIER4')""",
+                (chat,),
+            ).fetchone()
+            if row is None:
+                return False
+            db.execute(
+                """UPDATE telegram_folder_jobs SET state='superseded',
+                   lease_token=NULL,lease_expires_at=NULL,updated_at=?
+                   WHERE chat_id=? AND state IN ('pending','retry','running')""",
+                (stamp, chat),
+            )
+            db.execute(
+                "DELETE FROM telegram_folder_assignments WHERE chat_id=?",
+                (chat,),
+            )
+            return True
+
     def has_unfinished_current_job(self, chat_id: object) -> bool:
         chat = _chat_id(chat_id)
         with connect(self.path) as db:

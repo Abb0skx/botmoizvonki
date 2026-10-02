@@ -17,7 +17,8 @@ class SupplierScan:
 
 
 async def scan_supplier_groups(
-    client: Any, group_ids: tuple[int, ...], *, dialog_limit: int = 25000
+    client: Any, group_ids: tuple[int, ...], *, dialog_limit: int = 25000,
+    self_user_id: int | None = None,
 ) -> SupplierScan:
     """Collect current user IDs without reading or marking group messages."""
     wanted = set(group_ids)
@@ -26,7 +27,11 @@ async def scan_supplier_groups(
     dialog_count = 0
     async for dialog in client.iter_dialogs(limit=dialog_limit):
         dialog_count += 1
-        if bool(getattr(dialog, "is_user", False)) and int(dialog.id) > 0:
+        if (
+            bool(getattr(dialog, "is_user", False))
+            and int(dialog.id) > 0
+            and int(dialog.id) != self_user_id
+        ):
             private_dialog_ids.add(str(dialog.id))
         if bool(getattr(dialog, "is_group", False)) and int(dialog.id) in wanted:
             groups[int(dialog.id)] = dialog
@@ -43,7 +48,7 @@ async def scan_supplier_groups(
         try:
             async for user in client.iter_participants(dialog.input_entity):
                 user_id = getattr(user, "id", None)
-                if isinstance(user_id, int) and user_id > 0:
+                if isinstance(user_id, int) and user_id > 0 and user_id != self_user_id:
                     members.setdefault(str(user_id), str(group_id))
                     count += 1
         except Exception as exc:

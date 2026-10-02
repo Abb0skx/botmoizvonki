@@ -171,8 +171,12 @@ class TelegramFolderService:
             wait_seconds = self.settings.supplier_scan_seconds
             try:
                 scan = await scan_supplier_groups(
-                    self.gateway.client, self.settings.supplier_group_ids
+                    self.gateway.client, self.settings.supplier_group_ids,
+                    self_user_id=getattr(self.gateway, "_self_id", None),
                 )
+                self_id = getattr(self.gateway, "_self_id", None)
+                if self_id is not None:
+                    self.repo.discard_reserved_self(str(self_id), self.clock())
                 assigned, released, overflow, to_pause, matched = (
                     self.repo.sync_supplier_members(
                         scan.members, self.clock(),

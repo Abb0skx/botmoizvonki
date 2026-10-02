@@ -247,6 +247,8 @@ class TelegramFolderGateway:
             peer_id = self._peer_id(peer)
             if peer_id is None:
                 raise LookupError("Telegram peer ID could not be resolved")
+            if peer_id == self._self_id:
+                raise ValueError("Saved Messages cannot be moved as a client chat")
             for spec in self.settings.folders:
                 current = managed[spec.code]
                 pinned = list(getattr(current, "pinned_peers", ()) or ())
