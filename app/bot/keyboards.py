@@ -376,7 +376,12 @@ def orders_channel_keyboard(order: Order) -> InlineKeyboardMarkup:
 
 def statistics_keyboard(base_url: str) -> InlineKeyboardMarkup:
     base = base_url.rstrip("/")
-    if base.endswith(("/monitoring", "/finance")):
+    if base.endswith("/finance"):
+        origin = base.removesuffix("/finance")
+        portal = base + "/#delivery-stats"
+        report_base = origin + "/monitoring/delivery/stats"
+        monitor = origin + "/monitoring/delivery/live"
+    elif base.endswith("/monitoring"):
         portal = base
         report_base = base + "/delivery/stats"
         monitor = base + "/delivery/live"

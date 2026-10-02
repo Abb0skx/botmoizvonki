@@ -341,14 +341,14 @@ class StatisticsKeyboardTests(unittest.TestCase):
             for button in row
         ]
         self.assertIn(
-            "https://bot.texnikach.uz/finance/delivery/stats?day=today",
+            "https://bot.texnikach.uz/monitoring/delivery/stats?day=today",
             urls,
         )
         self.assertIn(
-            "https://bot.texnikach.uz/finance/delivery/live",
+            "https://bot.texnikach.uz/monitoring/delivery/live",
             urls,
         )
-        self.assertIn("https://bot.texnikach.uz/finance", urls)
+        self.assertIn("https://bot.texnikach.uz/finance/#delivery-stats", urls)
 
 
 if __name__ == "__main__":
