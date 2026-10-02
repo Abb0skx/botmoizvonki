@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import sqlite3
 from types import SimpleNamespace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +11,8 @@ from telegram_folder_manager.config import DEFAULT_COLORS, FOLDER_CODES, FolderS
 from telegram_folder_manager.gateway import TelegramFolderGateway
 from telegram_folder_manager.repository import FolderRepository
 from telegram_folder_manager.service import TelegramFolderService
+from telegram_folder_manager.suppliers import scan_supplier_groups
+from telegram_business.repository import BusinessRepository
 
 
 NOW = datetime(2026, 9, 30, 7, 0, tzinfo=timezone.utc)
@@ -43,6 +46,15 @@ def add_client_message(repo: FolderRepository, chat_id: str, message_id: int) ->
                  message_type,created_at)
                VALUES('connection',?,?,'incoming','client','text',?)""",
             (chat_id, message_id, stamp),
+        )
+
+
+def add_business_client(repo: FolderRepository, chat_id: str) -> None:
+    with connect(repo.path) as db:
+        db.execute(
+            """INSERT INTO business_clients(chat_id,created_at,updated_at,last_client_message_at)
+               VALUES(?,?,?,?)""",
+            (chat_id, NOW.isoformat(), NOW.isoformat(), NOW.isoformat()),
         )
 
 
@@ -97,6 +109,120 @@ def test_new_message_reopens_done_but_keeps_active_manager(tmp_path):
     assert repo.seed_new_clients(NOW, reopen_done=True) == 1
     assert repo.assignment("1001")["folder_code"] == "NEW"
     assert repo.assignment("1002")["folder_code"] == "OLMAS"
+
+
+def test_supplier_group_members_are_split_and_pause_business_bot(tmp_path):
+    repo = FolderRepository(tmp_path / "business.db")
+    for chat_id in ("1001", "1002", "1003"):
+        add_business_client(repo, chat_id)
+    members = {chat_id: "-1001" for chat_id in ("1001", "1002", "1003")}
+
+    assigned, released, overflow, to_pause, matched = repo.sync_supplier_members(
+        members, NOW, complete=True, folder_capacity=1,
+    )
+    assert matched == 3
+    assert len(assigned) == 2
+    assert released == []
+    assert overflow == ["1003"]
+    assert set(to_pause) == {"1001", "1002", "1003"}
+    assert {repo.assignment(chat_id)["folder_code"] for chat_id in assigned} == {
+        "SUPPLIER", "SUPPLIER2",
+    }
+    assert repo.is_supplier_member("1003")
+    # The cached group membership stops an answer even if a folder is full.
+    assert not BusinessRepository(repo.path).may_automate("1003", NOW)
+
+
+def test_new_supplier_chat_uses_cached_membership_instead_of_new(tmp_path):
+    repo = FolderRepository(tmp_path / "business.db")
+    repo.seed_new_clients(NOW)
+    repo.sync_supplier_members(
+        {"1001": "-1001"}, NOW, complete=True, folder_capacity=199,
+    )
+    add_business_client(repo, "1001")
+    add_client_message(repo, "1001", 1)
+
+    assert repo.seed_new_clients(NOW) == 1
+    assert repo.assignment("1001")["folder_code"] == "SUPPLIER"
+    client = BusinessRepository(repo.path).client("1001")
+    assert client["bot_paused"] == 1
+    assert client["pause_reason"] == "supplier_group"
+
+
+def test_supplier_leaving_all_groups_is_released_only_after_complete_scan(tmp_path):
+    repo = FolderRepository(tmp_path / "business.db")
+    add_business_client(repo, "1001")
+    repo.sync_supplier_members(
+        {"1001": "-1001"}, NOW, complete=True, folder_capacity=199,
+    )
+    _, released, _, _, _ = repo.sync_supplier_members(
+        {}, NOW, complete=False, folder_capacity=199,
+    )
+    assert released == []
+    assert repo.assignment("1001")["folder_code"] == "SUPPLIER"
+    _, released, _, _, _ = repo.sync_supplier_members(
+        {}, NOW, complete=True, folder_capacity=199,
+    )
+    assert released == ["1001"]
+    assert repo.assignment("1001")["folder_code"] == "NEW"
+
+
+def test_supplier_scan_uses_ids_and_requires_complete_group_lists():
+    class Client:
+        async def iter_dialogs(self, limit):
+            yield SimpleNamespace(
+                id=-1001, is_group=True, input_entity="group",
+                entity=SimpleNamespace(participants_count=2),
+            )
+        async def iter_participants(self, entity):
+            yield SimpleNamespace(id=1001)
+
+    scan = asyncio.run(scan_supplier_groups(Client(), (-1001, -1002)))
+    assert scan.members == {"1001": "-1001"}
+    assert not scan.complete
+    assert "-1002" in scan.unavailable
+    assert any(item.startswith("-1001:partial_") for item in scan.unavailable)
+
+
+def test_supplier_folder_migration_preserves_old_assignments_and_jobs(tmp_path):
+    path = tmp_path / "legacy.db"
+    with sqlite3.connect(path) as db:
+        db.executescript("""
+            CREATE TABLE telegram_folder_assignments (
+              chat_id TEXT PRIMARY KEY, folder_code TEXT NOT NULL,
+              revision INTEGER NOT NULL DEFAULT 1, source TEXT NOT NULL,
+              assigned_by_id TEXT, assigned_by_name TEXT,
+              assigned_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+              CHECK(folder_code IN ('NEW','OLMAS','OTABEK','ALI','ABBOS','DONE')));
+            CREATE TABLE telegram_folder_jobs (
+              job_id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL,
+              folder_code TEXT NOT NULL, revision INTEGER NOT NULL,
+              state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+              next_attempt_at TEXT NOT NULL, lease_token TEXT, lease_expires_at TEXT,
+              last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+              completed_at TEXT, UNIQUE(chat_id,revision),
+              CHECK(folder_code IN ('NEW','OLMAS','OTABEK','ALI','ABBOS','DONE')),
+              CHECK(state IN ('pending','running','retry','done','failed','superseded')));
+        """)
+        stamp = NOW.isoformat()
+        db.execute(
+            """INSERT INTO telegram_folder_assignments
+               (chat_id,folder_code,revision,source,assigned_at,updated_at)
+               VALUES('1001','NEW',1,'legacy',?,?)""", (stamp, stamp),
+        )
+        db.execute(
+            """INSERT INTO telegram_folder_jobs
+               (job_id,chat_id,folder_code,revision,state,next_attempt_at,created_at,updated_at)
+               VALUES(7,'1001','NEW',1,'done',?,?,?)""", (stamp, stamp, stamp),
+        )
+
+    repo = FolderRepository(path)
+    assert repo.assignment("1001")["folder_code"] == "NEW"
+    assert repo.jobs()[0]["job_id"] == 7
+    repo.assign("1001", "SUPPLIER", NOW)
+    assert repo.assignment("1001")["folder_code"] == "SUPPLIER"
+    assert [row["job_id"] for row in repo.jobs()] == [7, 8]
+    assert FolderRepository(path).assignment("1001")["folder_code"] == "SUPPLIER"
 
 
 def test_newer_assignment_supersedes_old_job(tmp_path):

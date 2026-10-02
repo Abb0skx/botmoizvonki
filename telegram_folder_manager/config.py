@@ -6,7 +6,18 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-FOLDER_CODES = ("NEW", "OLMAS", "OTABEK", "ALI", "ABBOS", "DONE")
+FOLDER_CODES = ("NEW", "OLMAS", "OTABEK", "ALI", "ABBOS", "DONE", "SUPPLIER", "SUPPLIER2")
+SUPPLIER_CODES = ("SUPPLIER", "SUPPLIER2")
+DEFAULT_SUPPLIER_GROUP_IDS = (
+    -1002188560435,  # Malika bozor N1
+    -1001173906517,  # Malika Akses N1
+    -1001463992108,  # MALIKA case No1
+    -1002268274885,  # Malika DASTAVKA
+    -1002480123950,  # MALIKA AKSESSUAR
+    -1001607065824,  # ПАКЕТЛАР Б-44
+    -1002496061682,  # BM Electronics Malika
+)
+DEFAULT_TITLES = {"SUPPLIER": "Поставщики", "SUPPLIER2": "Поставщики 2"}
 DEFAULT_COLORS = {
     "NEW": 1,       # orange
     "OLMAS": 3,     # green
@@ -14,6 +25,8 @@ DEFAULT_COLORS = {
     "ALI": 2,       # violet
     "ABBOS": 4,     # cyan
     "DONE": 6,      # pink
+    "SUPPLIER": 0,  # red
+    "SUPPLIER2": 0, # red
 }
 
 
@@ -63,6 +76,10 @@ class FolderSettings:
     backfill_existing: bool
     reopen_done: bool
     folders: tuple[FolderSpec, ...]
+    supplier_sync_enabled: bool = False
+    supplier_group_ids: tuple[int, ...] = DEFAULT_SUPPLIER_GROUP_IDS
+    supplier_scan_seconds: int = 3600
+    supplier_folder_capacity: int = 199
 
     @classmethod
     def load(cls) -> "FolderSettings":
@@ -78,7 +95,7 @@ class FolderSettings:
         folders = tuple(
             FolderSpec(
                 code=code,
-                title=os.getenv(f"TELEGRAM_FOLDER_{code}", code).strip(),
+                title=os.getenv(f"TELEGRAM_FOLDER_{code}", DEFAULT_TITLES.get(code, code)).strip(),
                 color=_int(
                     f"TELEGRAM_FOLDER_{code}_COLOR",
                     DEFAULT_COLORS[code],
@@ -88,6 +105,14 @@ class FolderSettings:
             )
             for code in FOLDER_CODES
         )
+        group_ids_raw = os.getenv("TELEGRAM_SUPPLIER_GROUP_IDS", "").strip()
+        try:
+            group_ids = (
+                tuple(int(part.strip()) for part in group_ids_raw.split(",") if part.strip())
+                if group_ids_raw else DEFAULT_SUPPLIER_GROUP_IDS
+            )
+        except ValueError as exc:
+            raise ValueError("TELEGRAM_SUPPLIER_GROUP_IDS must be comma-separated numeric IDs") from exc
         settings = cls(
             enabled=enabled,
             api_id=api_id,
@@ -119,6 +144,10 @@ class FolderSettings:
             backfill_existing=_bool("TELEGRAM_FOLDER_BACKFILL_EXISTING"),
             reopen_done=_bool("TELEGRAM_FOLDER_REOPEN_DONE", True),
             folders=folders,
+            supplier_sync_enabled=_bool("TELEGRAM_SUPPLIER_SYNC_ENABLED", enabled),
+            supplier_group_ids=group_ids,
+            supplier_scan_seconds=_int("TELEGRAM_SUPPLIER_SCAN_SECONDS", 3600, minimum=300, maximum=86400),
+            supplier_folder_capacity=_int("TELEGRAM_SUPPLIER_FOLDER_CAPACITY", 199, minimum=1, maximum=199),
         )
         settings.validate()
         return settings
@@ -129,6 +158,12 @@ class FolderSettings:
         titles = [folder.title.casefold() for folder in self.folders]
         if len(set(titles)) != len(titles):
             raise ValueError("managed Telegram folder titles must be unique")
+        if self.supplier_sync_enabled and (
+            not self.enabled or not self.supplier_group_ids
+            or any(group_id >= 0 for group_id in self.supplier_group_ids)
+            or len(set(self.supplier_group_ids)) != len(self.supplier_group_ids)
+        ):
+            raise ValueError("supplier sync needs enabled folders and unique negative group IDs")
         if not self.enabled:
             return
         if self.api_id <= 0:

@@ -8,7 +8,7 @@ from pathlib import Path
 
 from telegram_business.migrations import connect, migrate
 
-from .config import FOLDER_CODES
+from .config import FOLDER_CODES, SUPPLIER_CODES
 
 
 CURSOR_KEY = "incoming_client_message_cursor"
@@ -209,12 +209,96 @@ class FolderRepository:
                 "SELECT * FROM telegram_folder_assignments ORDER BY updated_at DESC"
             ).fetchall()
 
+    @staticmethod
+    def _supplier_slot(db: sqlite3.Connection, capacity: int) -> str | None:
+        counts = dict(db.execute(
+            "SELECT folder_code,COUNT(*) FROM telegram_folder_assignments "
+            "WHERE folder_code IN ('SUPPLIER','SUPPLIER2') GROUP BY folder_code"
+        ).fetchall())
+        return next(
+            (code for code in SUPPLIER_CODES if counts.get(code, 0) < capacity), None
+        )
+
+    def sync_supplier_members(
+        self, members: dict[str, str], now: datetime,
+        *, complete: bool, folder_capacity: int,
+    ) -> tuple[list[str], list[str], list[str], list[str], int]:
+        """Cache verified group membership and queue existing Business chats."""
+        stamp = iso(now)
+        normalized = {
+            _chat_id(user_id): str(group_id)
+            for user_id, group_id in members.items()
+        }
+        newly_assigned: list[str] = []
+        released: list[str] = []
+        overflow: list[str] = []
+        with connect(self.path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            if complete:
+                db.execute("DELETE FROM telegram_supplier_group_members")
+            db.executemany(
+                """INSERT INTO telegram_supplier_group_members(user_id,group_id,updated_at)
+                   VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET
+                   group_id=excluded.group_id,updated_at=excluded.updated_at""",
+                ((user_id, group_id, stamp) for user_id, group_id in normalized.items()),
+            )
+            if complete:
+                former = db.execute(
+                    """SELECT chat_id FROM telegram_folder_assignments a
+                       WHERE a.folder_code IN ('SUPPLIER','SUPPLIER2')
+                         AND a.source='supplier_group'
+                         AND NOT EXISTS (
+                           SELECT 1 FROM telegram_supplier_group_members m
+                           WHERE m.user_id=a.chat_id)"""
+                ).fetchall()
+                for row in former:
+                    chat_id = str(row["chat_id"])
+                    self._assign_in_db(db, chat_id, "NEW", now, source="supplier_group_exit")
+                    released.append(chat_id)
+            matches = [
+                str(row[0]) for row in db.execute(
+                    """SELECT c.chat_id FROM business_clients c
+                       JOIN telegram_supplier_group_members m ON m.user_id=c.chat_id
+                       ORDER BY c.updated_at DESC,c.chat_id"""
+                )
+            ]
+            to_pause = [
+                str(row[0]) for row in db.execute(
+                    """SELECT c.chat_id FROM business_clients c
+                       JOIN telegram_supplier_group_members m ON m.user_id=c.chat_id
+                       WHERE c.bot_paused=0"""
+                )
+            ]
+            for chat_id in matches:
+                existing = db.execute(
+                    "SELECT folder_code FROM telegram_folder_assignments WHERE chat_id=?",
+                    (chat_id,),
+                ).fetchone()
+                if existing and existing["folder_code"] in SUPPLIER_CODES:
+                    continue
+                slot = self._supplier_slot(db, folder_capacity)
+                if slot is None:
+                    overflow.append(chat_id)
+                    continue
+                self._assign_in_db(db, chat_id, slot, now, source="supplier_group")
+                newly_assigned.append(chat_id)
+        return newly_assigned, released, overflow, to_pause, len(matches)
+
+    def is_supplier_member(self, chat_id: object) -> bool:
+        chat = _chat_id(chat_id)
+        with connect(self.path) as db:
+            return db.execute(
+                "SELECT 1 FROM telegram_supplier_group_members WHERE user_id=?",
+                (chat,),
+            ).fetchone() is not None
+
     def seed_new_clients(
         self,
         now: datetime | None = None,
         *,
         backfill_existing: bool = False,
         reopen_done: bool = True,
+        supplier_folder_capacity: int = 199,
         limit: int = 500,
     ) -> int:
         """Queue NEW only for messages arriving after the durable cursor.
@@ -225,6 +309,7 @@ class FolderRepository:
         when = now or utcnow()
         stamp = iso(when)
         created = 0
+        newly_identified_suppliers: list[str] = []
         with connect(self.path) as db:
             db.execute("BEGIN IMMEDIATE")
             state = db.execute(
@@ -265,6 +350,19 @@ class FolderRepository:
                        WHERE chat_id=?""",
                     (chat,),
                 ).fetchone()
+                supplier_member = db.execute(
+                    "SELECT 1 FROM telegram_supplier_group_members WHERE user_id=?",
+                    (chat,),
+                ).fetchone()
+                if supplier_member and (current is None or current["folder_code"] not in SUPPLIER_CODES):
+                    slot = self._supplier_slot(db, supplier_folder_capacity)
+                    if slot is not None:
+                        self._assign_in_db(
+                            db, chat, slot, when, source="supplier_group"
+                        )
+                        newly_identified_suppliers.append(chat)
+                        created += 1
+                    continue
                 if current is None or (reopen_done and current["folder_code"] == "DONE"):
                     _, changed = self._assign_in_db(
                         db, chat, "NEW", when,
@@ -278,6 +376,14 @@ class FolderRepository:
                    WHERE key=?""",
                 (str(cursor), stamp, CURSOR_KEY),
             )
+        if newly_identified_suppliers:
+            from telegram_business.repository import BusinessRepository
+
+            business = BusinessRepository(self.path)
+            for chat in newly_identified_suppliers:
+                client = business.client(chat)
+                if client and not client["bot_paused"]:
+                    business.set_bot_paused(chat, True, when, "supplier_group")
         return created
 
     def claim_due(

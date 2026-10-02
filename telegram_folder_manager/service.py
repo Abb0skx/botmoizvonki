@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from .config import FolderSettings
 from .gateway import TelegramFolderGateway
 from .repository import FolderRepository
+from .config import SUPPLIER_CODES
+from .suppliers import scan_supplier_groups
 
 
 LOG = logging.getLogger("telegram_folder_manager")
@@ -39,6 +41,7 @@ class TelegramFolderService:
         self.market_collector = market_collector
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self._last_reconcile = 0.0
+        self._supplier_task: asyncio.Task | None = None
 
     async def start(self) -> None:
         await self.gateway.connect()
@@ -49,9 +52,21 @@ class TelegramFolderService:
             self.clock(),
             backfill_existing=self.settings.backfill_existing,
             reopen_done=self.settings.reopen_done,
+            supplier_folder_capacity=self.settings.supplier_folder_capacity,
         )
+        if self.settings.supplier_sync_enabled:
+            self._supplier_task = asyncio.create_task(
+                self._supplier_loop(), name="telegram-supplier-groups"
+            )
 
     async def stop(self) -> None:
+        if self._supplier_task is not None:
+            self._supplier_task.cancel()
+            try:
+                await self._supplier_task
+            except asyncio.CancelledError:
+                pass
+            self._supplier_task = None
         if self.market_collector is not None:
             await self.market_collector.stop()
         await self.gateway.disconnect()
@@ -86,6 +101,9 @@ class TelegramFolderService:
     def _remote_choice(self, codes: set[str]) -> tuple[str | None, bool]:
         if len(codes) == 1:
             return next(iter(codes)), False
+        for supplier_code in SUPPLIER_CODES:
+            if supplier_code in codes:
+                return supplier_code, True
         if "DONE" in codes:
             return "DONE", True
         active = codes - {"NEW"}
@@ -120,6 +138,7 @@ class TelegramFolderService:
             self.clock(),
             backfill_existing=self.settings.backfill_existing,
             reopen_done=self.settings.reopen_done,
+            supplier_folder_capacity=self.settings.supplier_folder_capacity,
         )
         processed = await self.process_jobs()
         if self.market_collector is not None:
@@ -129,6 +148,53 @@ class TelegramFolderService:
             await self.reconcile_manual_moves()
             self._last_reconcile = monotonic
         return processed
+
+    async def _supplier_loop(self) -> None:
+        from telegram_business.repository import BusinessRepository
+
+        business = BusinessRepository(self.settings.db_path)
+        while True:
+            wait_seconds = self.settings.supplier_scan_seconds
+            try:
+                scan = await scan_supplier_groups(
+                    self.gateway.client, self.settings.supplier_group_ids
+                )
+                assigned, released, overflow, to_pause, matched = (
+                    self.repo.sync_supplier_members(
+                        scan.members, self.clock(),
+                        complete=scan.complete,
+                        folder_capacity=self.settings.supplier_folder_capacity,
+                    )
+                )
+                for chat_id in to_pause:
+                    business.set_bot_paused(
+                        chat_id, True, self.clock(), "supplier_group"
+                    )
+                for chat_id in released:
+                    row = business.client(chat_id)
+                    if row and row["pause_reason"] == "supplier_group":
+                        business.set_bot_paused(chat_id, False, self.clock())
+                LOG.info(
+                    "telegram_supplier_scan groups=%s/%s members=%s matched_chats=%s "
+                    "queued=%s released=%s overflow=%s complete=%s",
+                    scan.groups_found, scan.groups_expected, len(scan.members),
+                    matched, len(assigned), len(released), len(overflow),
+                    scan.complete,
+                )
+                if scan.unavailable:
+                    LOG.warning(
+                        "telegram_supplier_groups_unavailable groups=%s",
+                        ",".join(scan.unavailable),
+                    )
+                    wait_seconds = min(wait_seconds, 600)
+                if overflow:
+                    LOG.error("telegram_supplier_folder_full chats=%s", len(overflow))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                LOG.error("telegram_supplier_scan_failed type=%s", type(exc).__name__)
+                wait_seconds = min(wait_seconds, 600)
+            await asyncio.sleep(wait_seconds)
 
 
 class TelegramFolderScheduler:

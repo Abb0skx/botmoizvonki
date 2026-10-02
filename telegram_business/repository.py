@@ -2242,6 +2242,7 @@ class BusinessRepository:
             return False
         row = self.client(chat_id)
         if not row or row["bot_paused"]: return False
+        if self._is_supplier_group_member(chat_id): return False
         if row["manager_lock_until"] and datetime.fromisoformat(row["manager_lock_until"]) > now: return False
         return bool(row["last_client_message_at"] and datetime.fromisoformat(row["last_client_message_at"]) >= now - timedelta(hours=24))
 
@@ -2292,7 +2293,14 @@ class BusinessRepository:
 
     def is_bot_paused(self, chat_id: str) -> bool:
         row = self.client(chat_id)
-        return bool(row and row["bot_paused"])
+        return bool(row and row["bot_paused"]) or self._is_supplier_group_member(chat_id)
+
+    def _is_supplier_group_member(self, chat_id: str) -> bool:
+        with connect(self.path) as db:
+            return db.execute(
+                "SELECT 1 FROM telegram_supplier_group_members WHERE user_id=?",
+                (str(chat_id),),
+            ).fetchone() is not None
 
     def session_may_automate(self, session_id: str) -> bool:
         row = self.session_by_id(session_id)

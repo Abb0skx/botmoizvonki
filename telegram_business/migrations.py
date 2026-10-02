@@ -185,7 +185,7 @@ CREATE TABLE IF NOT EXISTS telegram_folder_assignments (
  revision INTEGER NOT NULL DEFAULT 1, source TEXT NOT NULL,
  assigned_by_id TEXT, assigned_by_name TEXT,
  assigned_at TEXT NOT NULL, updated_at TEXT NOT NULL,
- CHECK(folder_code IN ('NEW','OLMAS','OTABEK','ALI','ABBOS','DONE')));
+ CHECK(folder_code IN ('NEW','OLMAS','OTABEK','ALI','ABBOS','DONE','SUPPLIER','SUPPLIER2')));
 CREATE TABLE IF NOT EXISTS telegram_folder_jobs (
  job_id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL,
  folder_code TEXT NOT NULL, revision INTEGER NOT NULL,
@@ -194,12 +194,14 @@ CREATE TABLE IF NOT EXISTS telegram_folder_jobs (
  last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
  completed_at TEXT,
  UNIQUE(chat_id,revision),
- CHECK(folder_code IN ('NEW','OLMAS','OTABEK','ALI','ABBOS','DONE')),
+ CHECK(folder_code IN ('NEW','OLMAS','OTABEK','ALI','ABBOS','DONE','SUPPLIER','SUPPLIER2')),
  CHECK(state IN ('pending','running','retry','done','failed','superseded')));
 CREATE INDEX IF NOT EXISTS idx_telegram_folder_jobs_due
  ON telegram_folder_jobs(state,next_attempt_at,job_id);
 CREATE TABLE IF NOT EXISTS telegram_folder_state (
  key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS telegram_supplier_group_members (
+ user_id TEXT PRIMARY KEY, group_id TEXT NOT NULL, updated_at TEXT NOT NULL);
 """
 
 
@@ -218,6 +220,7 @@ def connect(path: Path | str) -> sqlite3.Connection:
 def migrate(path: Path | str) -> None:
     with connect(path) as db:
         db.executescript(SCHEMA)
+        _migrate_supplier_folder_codes(db)
         _migrate_delivery_notifications_to_event_identity(db)
         # CREATE TABLE IF NOT EXISTS cannot evolve databases created by an older
         # release.  Additive migrations keep existing calls/messages untouched.
@@ -357,6 +360,51 @@ def _ensure_columns(
     for name, definition in definitions.items():
         if name not in existing:
             db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+
+def _migrate_supplier_folder_codes(db: sqlite3.Connection) -> None:
+    """Expand the two folder CHECK constraints without losing queued work."""
+    definitions = {
+        "telegram_folder_assignments": """CREATE TABLE telegram_folder_assignments_supplier_migration (
+            chat_id TEXT PRIMARY KEY, folder_code TEXT NOT NULL,
+            revision INTEGER NOT NULL DEFAULT 1, source TEXT NOT NULL,
+            assigned_by_id TEXT, assigned_by_name TEXT,
+            assigned_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            CHECK(folder_code IN ('NEW','OLMAS','OTABEK','ALI','ABBOS','DONE','SUPPLIER','SUPPLIER2')))""",
+        "telegram_folder_jobs": """CREATE TABLE telegram_folder_jobs_supplier_migration (
+            job_id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL,
+            folder_code TEXT NOT NULL, revision INTEGER NOT NULL,
+            state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TEXT NOT NULL, lease_token TEXT, lease_expires_at TEXT,
+            last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            completed_at TEXT, UNIQUE(chat_id,revision),
+            CHECK(folder_code IN ('NEW','OLMAS','OTABEK','ALI','ABBOS','DONE','SUPPLIER','SUPPLIER2')),
+            CHECK(state IN ('pending','running','retry','done','failed','superseded')))""",
+    }
+    for table, create_sql in definitions.items():
+        sql_row = db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        if sql_row is None or "'SUPPLIER2'" in str(sql_row["sql"]):
+            continue
+        migration = f"{table}_supplier_migration"
+        columns = [str(row["name"]) for row in db.execute(f"PRAGMA table_info({table})")]
+        column_list = ",".join(columns)
+        before = db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        db.execute(create_sql)
+        db.execute(
+            f"INSERT INTO {migration}({column_list}) "
+            f"SELECT {column_list} FROM {table}"
+        )
+        copied = db.execute(f"SELECT COUNT(*) FROM {migration}").fetchone()[0]
+        if copied != before:
+            raise RuntimeError(f"{table} supplier migration row count mismatch")
+        db.execute(f"DROP TABLE {table}")
+        db.execute(f"ALTER TABLE {migration} RENAME TO {table}")
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_telegram_folder_jobs_due "
+        "ON telegram_folder_jobs(state,next_attempt_at,job_id)"
+    )
 
 
 def _migrate_delivery_notifications_to_event_identity(
