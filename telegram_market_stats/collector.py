@@ -146,12 +146,33 @@ class MarketStatsCollector:
             elif not backfill_complete:
                 backfill_complete = True
             messages = list({int(message.id): message for message in messages}.values())
+            # Old statistics did not retain reply links or display names.
+            # Fill only relevant historical windows, without resetting any cursor.
+            missing = self.repo.missing_quote_metadata(self.settings.group_id, now)
+            if missing:
+                try:
+                    hydrated = list(await self.client.get_messages(self.entity, ids=missing))
+                    valid = [m for m in hydrated if getattr(m, 'date', None) is not None]
+                    found = {int(m.id) for m in valid}
+                    self.repo.unavailable_metadata(self.settings.group_id, [i for i in missing if i not in found])
+                    messages = list({int(m.id): m for m in [*valid, *messages]}.values())
+                except Exception as exc:
+                    LOG.warning('market_quote_metadata_retry group_id=%s type=%s', self.settings.group_id, type(exc).__name__)
             messages.sort(key=lambda message: int(message.id))
             competitor_ids = {user_id for user_id, label in self.settings.competitors.items() if label != "TEXNIKACH"}
             for message in messages:
                 message_id = int(message.id)
                 text = str(getattr(message, "message", "") or "")
                 analysis = self.analyzer.analyze(text)
+                sender = getattr(message, 'sender', None)
+                sender_name = ' '.join(filter(None, (
+                    getattr(sender, 'first_name', None), getattr(sender, 'last_name', None),
+                ))) or getattr(sender, 'title', None)
+                reply = getattr(message, 'reply_to', None)
+                external = getattr(reply, 'reply_to_peer_id', None)
+                if external is not None:
+                    from telethon.utils import get_peer_id
+                    external = get_peer_id(external) != self.settings.group_id
                 has_models = self.repo.upsert_message(
                     group_id=self.settings.group_id,
                     message_id=message_id,
@@ -165,6 +186,10 @@ class MarketStatsCollector:
                     analysis=analysis,
                     competitor_ids=competitor_ids,
                     processed_at=now,
+                    reply_to_message_id=getattr(reply, 'reply_to_msg_id', None),
+                    reply_external=bool(external), sender_name=sender_name,
+                    sender_username=getattr(sender, 'username', None),
+                    reply_metadata_loaded=True,
                 )
                 scanned += 1
                 with_models += int(has_models)

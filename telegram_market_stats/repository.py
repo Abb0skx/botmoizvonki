@@ -118,6 +118,37 @@ class MarketStatsRepository:
                     db.execute(
                         f"ALTER TABLE market_checkpoints ADD COLUMN {name} {definition}"
                     )
+            columns = {row['name'] for row in db.execute('PRAGMA table_info(market_messages)')}
+            for name, definition in {
+                'reply_to_message_id': 'INTEGER', 'reply_external': 'INTEGER NOT NULL DEFAULT 0',
+                'sender_name': 'TEXT', 'sender_username': 'TEXT',
+                'reply_metadata_loaded': 'INTEGER NOT NULL DEFAULT 0',
+            }.items():
+                if name not in columns:
+                    db.execute(f'ALTER TABLE market_messages ADD COLUMN {name} {definition}')
+            db.execute('CREATE INDEX IF NOT EXISTS market_messages_group_date_idx ON market_messages(group_id,telegram_date)')
+
+    def missing_quote_metadata(self, group_id: int, now: datetime, limit: int = 200) -> list[int]:
+        """Hydrate historical seven-minute windows around our requests only."""
+        with self.connect() as db:
+            return [int(row[0]) for row in db.execute(
+                """SELECT m.message_id FROM market_messages m
+                   WHERE m.group_id=? AND m.reply_metadata_loaded=0 AND m.telegram_date>=?
+                   AND EXISTS (
+                     SELECT 1 FROM market_messages q JOIN market_competitors c ON c.telegram_user_id=q.sender_id
+                     WHERE q.group_id=m.group_id AND c.label='TEXNIKACH' AND c.enabled=1
+                       AND q.telegram_date<=m.telegram_date
+                       AND q.telegram_date>=strftime('%Y-%m-%dT%H:%M:%S',m.telegram_date,'-7 minutes')||'+00:00')
+                   ORDER BY m.message_id DESC LIMIT ?""",
+                (str(group_id), _iso(now-timedelta(days=30)), limit),
+            )]
+
+    def unavailable_metadata(self, group_id: int, ids: list[int]) -> None:
+        with self.connect() as db:
+            db.executemany(
+                'UPDATE market_messages SET reply_metadata_loaded=-1 WHERE group_id=? AND message_id=?',
+                ((str(group_id), message_id) for message_id in ids),
+            )
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -270,6 +301,11 @@ class MarketStatsRepository:
         analysis: MessageAnalysis,
         competitor_ids: set[int],
         processed_at: datetime,
+        reply_to_message_id: int | None = None,
+        reply_external: bool = False,
+        sender_name: str | None = None,
+        sender_username: str | None = None,
+        reply_metadata_loaded: bool = False,
     ) -> bool:
         safe = (redact_payment_data(text) or "").strip()
         digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
@@ -297,6 +333,13 @@ class MarketStatsRepository:
                 "DELETE FROM market_model_mentions WHERE group_id=? AND message_id=?",
                 (str(group_id), int(message_id)),
             )
+            if reply_metadata_loaded:
+                db.execute(
+                    """UPDATE market_messages SET reply_to_message_id=?,reply_external=?,sender_name=?,
+                       sender_username=?,reply_metadata_loaded=1 WHERE group_id=? AND message_id=?""",
+                    (reply_to_message_id, int(reply_external), (sender_name or '')[:160],
+                     (sender_username or '')[:64], str(group_id), int(message_id)),
+                )
             for mention in analysis.mentions:
                 db.execute(
                     """INSERT INTO market_model_mentions(

@@ -177,6 +177,24 @@ def test_repository_is_separate_idempotent_and_tracks_competitor(tmp_path):
     assert competitors["213962560"]["searches"] == 1
 
 
+def test_reply_metadata_is_additive_and_historical_hydration_is_scoped(tmp_path):
+    repo=MarketStatsRepository(tmp_path/'market.db')
+    repo.configure(-1001,'group',{1:'TEXNIKACH'},NOW)
+    base=dict(group_id=-1001,edited_at=None,analysis=analyzer().analyze(''),competitor_ids=set(),processed_at=NOW)
+    for mid,sender,seconds in [(1,1,0),(2,2,60),(3,3,500)]:
+        repo.upsert_message(**base,message_id=mid,sender_id=sender,telegram_date=NOW+timedelta(seconds=seconds),text='query' if mid==1 else '100$')
+    assert repo.missing_quote_metadata(-1001,NOW)==[2,1]
+    repo.upsert_message(**base,message_id=2,sender_id=2,telegram_date=NOW+timedelta(seconds=60),text='100$',
+                        reply_to_message_id=1,sender_name='Vendor',sender_username='vendor_shop',reply_metadata_loaded=True)
+    assert repo.missing_quote_metadata(-1001,NOW)==[1]
+    with repo.connect() as db:
+        row=db.execute('select * from market_messages where message_id=2').fetchone()
+        assert row['reply_to_message_id']==1 and row['sender_name']=='Vendor'
+    repo.unavailable_metadata(-1001,[1])
+    assert repo.missing_quote_metadata(-1001,NOW)==[]
+    MarketStatsRepository(repo.path)
+
+
 def test_edit_replaces_old_model_mentions(tmp_path):
     repo = MarketStatsRepository(tmp_path / "market.db")
     repo.configure(-1002188560435, "Malika bozor N1", DEFAULT_COMPETITORS, NOW)
