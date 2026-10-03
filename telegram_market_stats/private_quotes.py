@@ -127,6 +127,10 @@ def match_private(requests, messages, links=(), *, near=.15, far=.40):
             if target:
                 reply_context[(chat, mid)] = key(target)
             continue
+        # A forward/model introduction anchors the next quote, not every later
+        # bare price in this chat. Subsequent quotes must qualify independently
+        # (or explicitly reply to the anchored message).
+        context.pop(chat, None)
         saved = manual.get((chat, mid))
         if saved:
             choice = by_key.get(saved['request_key'])

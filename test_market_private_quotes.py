@@ -62,6 +62,16 @@ def test_forward_by_text_and_origin_date_not_saved_messages_metadata():
     assert linked[key(first)][0]['method'] == 'forward_context'
 
 
+def test_forward_context_does_not_capture_all_following_prices():
+    first, second = q(), q(2, 'Watch kere', seconds=60)
+    forward = {**dm(2, first['text_excerpt'], seconds=10), 'forwarded': True}
+    linked, unknown = match_private([first, second], [forward, dm(3, '$1000', seconds=20),
+        dm(4, '$120', seconds=70)])
+    assert linked[key(first)][0]['method'] == 'forward_context'
+    assert len(linked[key(first)]) == 1
+    assert linked[key(second)][0]['method'] == 'price_far'
+
+
 def test_context_scoped_to_chat_and_reply_to_unknown_not_reassigned():
     first, second = q(), q(2, 'Watch kere', seconds=60)
     forward = {**dm(2, first['text_excerpt'], seconds=62), 'forwarded': True}
