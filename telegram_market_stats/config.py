@@ -87,6 +87,8 @@ class MarketStatsSettings:
     edit_rescan_messages: int
     competitors: dict[int, str]
     additional_groups: tuple[MarketGroup, ...] = ()
+    private_quotes_enabled: bool = False
+    supplier_db_path: Path = Path('/app/data/business_telegram.db')
 
     @property
     def groups(self) -> tuple[MarketGroup, ...]:
@@ -123,6 +125,8 @@ class MarketStatsSettings:
             ),
             competitors=_competitors(),
             additional_groups=_additional_groups(),
+            private_quotes_enabled=_bool('TELEGRAM_MARKET_PRIVATE_QUOTES_ENABLED'),
+            supplier_db_path=Path(os.getenv('BUSINESS_DB_PATH', '/app/data/business_telegram.db')),
         )
         settings.validate()
         return settings
@@ -142,6 +146,8 @@ class MarketStatsSettings:
             raise ValueError("TELEGRAM_MARKET_STATS_DB_PATH must be absolute")
         if not self.catalog_path.is_absolute():
             raise ValueError("TELEGRAM_MARKET_CATALOG_PATH must be absolute")
+        if self.private_quotes_enabled and not self.supplier_db_path.is_absolute():
+            raise ValueError('BUSINESS_DB_PATH must be absolute for supplier quote collection')
         if self.db_path == Path(os.getenv(
             "BUSINESS_DB_PATH", "/app/data/business_telegram.db"
         )):

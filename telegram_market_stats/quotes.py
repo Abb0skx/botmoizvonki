@@ -40,13 +40,25 @@ def _minor(raw, scale=''):
 
 def prices(text, *, has_model=False):
     """Never treat capacity, generation, phone, shop number or time as a price."""
+    relative = re.fullmatch(rf'\s*[-−–]\s*(?P<n>{NUMBER})\s*(?P<c>{CURRENCY})?\s*', text, re.I)
+    if relative:
+        amount = _minor(relative['n'])
+        currency = relative['c'] or '$'
+        return ([{'minor': None, 'relative_minor': -amount,
+                  'currency': 'UZS' if re.search(r'so|с[уў]м|uzs', currency, re.I) else 'USD',
+                  'raw': text.strip()}] if amount else [])
     found = []
     for match in PRICE_RE.finditer(text):
         raw = match.group('first') or match.group('amount')
         value = _minor(raw, match.group('scale') or '')
         currency = (match.group('before') or match.group('currency')).casefold()
         if value is not None:
-            found.append({'minor': value, 'currency': 'USD' if re.search(r'\$|usd|дол|^у', currency) else 'UZS', 'raw': match.group().strip()})
+            unit = 'USD' if re.search(r'\$|usd|дол|^у', currency) else 'UZS'
+            relative = re.search(r'[-−–]\s*$', text[:match.start()])
+            if relative:
+                found.append({'minor': None, 'relative_minor': -value, 'currency': unit, 'raw': '-'+match.group().strip()})
+            else:
+                found.append({'minor': value, 'currency': unit, 'raw': match.group().strip()})
     if found:
         return found
     match = BARE_RE.fullmatch(text)

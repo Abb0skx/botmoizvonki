@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import asyncio
 import time
 from dataclasses import replace
 
@@ -24,6 +25,7 @@ class MultiGroupMarketStatsCollector:
         self.client = None
         self.collectors: list[MarketStatsCollector] = []
         self._last_run: float | None = None
+        self._private_task = None
 
     async def start(self, client) -> None:
         self.client = client
@@ -40,8 +42,19 @@ class MultiGroupMarketStatsCollector:
             for group in self.settings.groups
         ]
         self._last_run = None
+        if self.settings.private_quotes_enabled:
+            from .private_collector import PrivateQuotesCollector
+            private = PrivateQuotesCollector(self.repo, self.analyzer, self.settings.supplier_db_path, clock=self.clock)
+            self._private_task = asyncio.create_task(private.run(client), name='market-private-quotes')
 
     async def stop(self) -> None:
+        if self._private_task is not None:
+            self._private_task.cancel()
+            try:
+                await self._private_task
+            except asyncio.CancelledError:
+                pass
+            self._private_task = None
         for collector in self.collectors:
             await collector.stop()
         self.client = None
