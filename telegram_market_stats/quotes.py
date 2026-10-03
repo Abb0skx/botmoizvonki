@@ -1,4 +1,4 @@
-"""Deterministic supplier offers. No network, AI, currency inference or fuzzy joins.
+"""Deterministic supplier offers. No network, AI, FX conversion or fuzzy joins.
 
 Shared with the read-only Finance dashboard as finance/market_quotes.py.
 Input rows are from ONE group and contain original text plus Telegram reply links.
@@ -9,6 +9,9 @@ from decimal import Decimal, InvalidOperation
 import re
 
 WINDOW_SECONDS = 420
+# Owner-approved market convention, applied ONLY when currency is omitted.
+# Amounts are stored in hundredths: exactly 5000 is USD, strictly above is UZS.
+BARE_USD_LIMIT_MINOR = 5000 * 100
 NUMBER = r'\d{1,3}(?:[ \u00a0.,]\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?'
 CURRENCY = r"\$|usd|доллар(?:ов|а)?|долл?\.?|у\.?\s?е\.?|so['‘’`ʻʼ]?m|с[уў]м|uzs"
 PRICE_RE = re.compile(rf'(?<![\w+])(?:(?P<before>\$|usd)\s*(?P<first>{NUMBER})|(?P<amount>{NUMBER})\s*(?P<scale>млн|million|mln|тыс\.?|ming|k)?\s*(?P<currency>{CURRENCY}))(?!\w)', re.I)
@@ -67,7 +70,7 @@ def prices(text, *, has_model=False):
         match = BARE_RE.fullmatch(clean)
     if match is None:
         # With a known model, a final standalone price is acceptable only when
-        # it cannot be a standard memory capacity; currency remains unknown.
+        # it cannot be a standard memory capacity; then apply the market rule.
         match = re.search(rf'(?:цена|narx|narxi)\s*[:=-]?\s*(?P<amount>{NUMBER})\s*(?P<scale>ming|тыс|mln|k)?\s*$', text, re.I)
         if match is None and has_model:
             match = re.search(r'\s(?P<amount>\d{2,7}(?:[.,]\d{1,2})?)\s*$', text)
@@ -80,7 +83,9 @@ def prices(text, *, has_model=False):
         if len(re.sub(r'\D', '', raw)) < 9:
             value = _minor(raw, match.groupdict().get('scale') or '')
             if value is not None:
-                return [{'minor': value, 'currency': 'UNKNOWN', 'raw': match.group().strip()}]
+                return [{'minor': value,
+                         'currency': 'UZS' if value > BARE_USD_LIMIT_MINOR else 'USD',
+                         'currency_source': 'amount_rule', 'raw': match.group().strip()}]
     return []
 
 

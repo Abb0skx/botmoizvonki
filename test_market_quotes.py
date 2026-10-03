@@ -26,8 +26,8 @@ def build(rows, ids=(1,)):
     ('$1,250','USD',125000),('1 250 $','USD',125000),('1250 usd','USD',125000),
     ('1 250 000 so‘m','UZS',125000000),('150 ming som','UZS',15000000),
     ('1.5 mln сум','UZS',150000000),('$9.50','USD',950),('1.250$','USD',125000),
-    ('1250','UNKNOWN',125000),('120 ming','UNKNOWN',12000000),
-    ('1250 B21','UNKNOWN',125000),('Bor 1250','UNKNOWN',125000),
+    ('1250','USD',125000),('120 ming','UZS',12000000),
+    ('1250 B21','USD',125000),('Bor 1250','USD',125000),
 ])
 def test_price_formats(text,currency,minor):
     assert prices(text)[0]['minor']==minor
@@ -49,12 +49,12 @@ def test_reply_correct_when_many_models_requested_concurrently():
     assert not other
 
 
-def test_min_max_separate_currency_unknown_and_equal_prices_neutral():
+def test_min_max_separate_currencies_and_equal_prices_neutral():
     req,_=build([query(),row(2,'100$',seconds=1,reply=1),row(3,'200$',sender='11',seconds=2,reply=1),
                  row(4,'90',sender='12',seconds=3,reply=1),row(5,'100000 so’m',sender='13',seconds=4,reply=1),
                  row(6,'100$',sender='14',seconds=5,reply=1)])
     offers=req[0]['offers']
-    assert [o['highlight'] for o in offers]==['min','max','','','min']
+    assert [o['highlight'] for o in offers]==['','max','min','','']
     req,_=build([query(),row(2,'100$',seconds=1,reply=1),row(3,'100$',sender='11',seconds=2,reply=1)])
     assert all(o['highlight']=='' for o in req[0]['offers'])
 
@@ -65,10 +65,39 @@ def test_bare_price_ambiguous_even_when_other_request_is_competitor():
     assert other[0]['reason']=='ambiguous'
 
 
-def test_one_request_numeric_price_is_linked_but_unknown_currency_not_colored():
+def test_one_request_numeric_price_uses_market_currency_rule():
     req,other=build([query(),row(2,'1200',seconds=11)])
     assert not other and req[0]['offers'][0]['method']=='single_request'
-    assert not req[0]['offers'][0]['comparable']
+    assert req[0]['offers'][0]['comparable']
+    assert req[0]['offers'][0]['currency']=='USD'
+
+
+@pytest.mark.parametrize('text,currency',[
+    ('4999','USD'),('5000','USD'),('5000.00','USD'),('5 000','USD'),('5.000','USD'),
+    ('5000.01','UZS'),('5001','UZS'),('5 001','UZS'),('5.001','UZS'),
+    ('150000','UZS'),('5k','USD'),('6k','UZS'),('1.5 mln','UZS'),
+    ('narxi 5000','USD'),('цена: 5001','UZS'),
+])
+def test_bare_currency_boundary_and_scaled_amounts(text,currency):
+    value=prices(text)[0]
+    assert value['currency']==currency
+    assert value['currency_source']=='amount_rule'
+
+
+@pytest.mark.parametrize('text,currency',[
+    ('$6000','USD'),('6000 usd','USD'),('4000 сум','UZS'),('5000 so‘m','UZS'),
+    ('5 ming som','UZS'),('-5','USD'),('-5$','USD'),('-5000 сум','UZS'),
+])
+def test_explicit_currency_and_relative_discount_override_amount_rule(text,currency):
+    value=prices(text)[0]
+    assert value['currency']==currency
+    assert value.get('currency_source')!='amount_rule'
+
+
+def test_bare_model_price_rule_does_not_turn_memory_into_price():
+    assert prices('iPhone 16 Pro Max 256',has_model=True)==[]
+    assert prices('iPhone 16 Pro Max 1250',has_model=True)[0]['currency']=='USD'
+    assert prices('Case 15000',has_model=True)[0]['currency']=='UZS'
 
 
 def test_exact_model_without_reply_and_repeated_identical_requests():

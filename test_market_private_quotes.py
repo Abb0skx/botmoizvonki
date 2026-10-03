@@ -39,7 +39,7 @@ def test_close_reference_prices_are_ambiguous():
 def test_different_currencies_do_not_infer_and_relative_stays_literal():
     first, second = q(), q(2, 'Watch kere', seconds=60)
     linked, unknown = match_private([first, second], [dm(1, '$1000', seconds=10),
-        dm(2, '990', seconds=65), dm(3, '-5', seconds=70)])
+        dm(2, '990 сум', seconds=65), dm(3, '-5', seconds=70)])
     assert len(unknown) == 2
     assert unknown[1]['minor'] is None and unknown[1]['relative_minor'] == -500
     assert prices('-5$')[0]['minor'] is None
@@ -103,15 +103,33 @@ def test_boundaries_outgoing_and_late_edit():
     assert next(o for o in offers if o['message_id'] == 5)['reason'] == 'late'
 
 
-def test_ranking_excludes_inferred_relative_and_unknown_units():
+def test_ranking_includes_rule_currency_but_excludes_inferred_and_relative():
     first, second = q(), q(2, 'Watch kere', seconds=60)
     linked, _ = match_private([first, second], [dm(1, '$1000', seconds=10),
         dm(2, '$1050', seconds=20, chat='11'), dm(3, '-5', seconds=30),
         dm(4, '$990', seconds=65), dm(5, '800', seconds=40, chat='12')])
     offers = linked[key(first)]
     rank_offers(offers)
-    assert [o['highlight'] for o in offers] == ['min', 'max', '', '', '']
+    assert [o['highlight'] for o in offers] == ['', 'max', '', 'min', '']
     assert not offers[0]['superseded']
+
+
+def test_rule_currency_can_match_explicit_dollar_anchor():
+    first, second=q(),q(2,'Watch kere',seconds=60)
+    linked,unknown=match_private([first,second],[dm(1,'$1000',seconds=10),dm(2,'990',seconds=70)])
+    assert not unknown
+    assert linked[key(first)][1]['method']=='price_near'
+    assert linked[key(first)][1]['currency']=='USD'
+    assert linked[key(first)][1]['currency_source']=='amount_rule'
+    assert not linked[key(first)][1]['comparable']  # Target still only a hypothesis.
+
+
+def test_rule_currency_does_not_cross_dollar_sum_boundary():
+    first,second=q(),q(2,'Watch kere',seconds=60)
+    linked,unknown=match_private([first,second],[dm(1,'5000',seconds=10),dm(2,'5001',seconds=70)])
+    assert linked[key(first)][0]['currency']=='USD'
+    assert unknown[0]['currency']=='UZS'
+    assert unknown[0]['reason']=='ambiguous'
 
 
 def test_collector_only_known_suppliers_cursor_restart_and_deleted(tmp_path):
