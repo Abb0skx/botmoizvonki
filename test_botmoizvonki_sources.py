@@ -454,7 +454,15 @@ class CallSourceTests(unittest.TestCase):
         )
 
     def test_sms_sender_defaults_persist_and_do_not_change_managers(self):
-        before = bot.admin_device_managers()["devices"]
+        def cards():
+            with mock.patch.object(bot, "get_monitoring_auth") as get_auth:
+                result = bot.admin_device_managers(mock.Mock())["devices"]
+                get_auth.return_value.principal.assert_called_once_with(
+                    mock.ANY, admin=True
+                )
+                return result
+
+        before = cards()
         for device in before:
             self.assertEqual(device["sms_sender_user_login"], "texnikach@gmail.com")
             self.assertEqual(device["sms_sender_device_name"], "Poco")
@@ -476,7 +484,7 @@ class CallSourceTests(unittest.TestCase):
         self.assertEqual(bot.get_device_sms_sender(tecno), poco)
         self.assertEqual(bot.get_device_sms_sender("other@example.com"), poco)
         self.assertEqual(bot.get_effective_device_manager(redmi), manager)
-        devices = {d["user_login"]: d for d in bot.admin_device_managers()["devices"]}
+        devices = {d["user_login"]: d for d in cards()}
         self.assertEqual(devices[redmi]["sms_sender_user_login"], poco)
         with self.assertRaises(ValueError):
             bot.set_device_sms_sender(redmi, redmi)

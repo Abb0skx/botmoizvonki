@@ -55,7 +55,18 @@ class ForwardingDashboardHTTPTests(unittest.TestCase):
         response = self.client.get("/admin/device-managers")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["forwarding"][0]["code"], "poco")
+        self.auth.principal.assert_any_call(mock.ANY, admin=True)
         self.service.states.assert_called_once_with()
+        self.send_sms.assert_not_called()
+
+    def test_get_denies_unauthenticated_when_monitoring_middleware_is_off(self):
+        bot.monitoring_settings.enabled = False
+        self.auth.principal.side_effect = bot.HTTPException(
+            status_code=401, detail="monitoring_session_required"
+        )
+        response = self.client.get("/admin/device-managers")
+        self.assertEqual(response.status_code, 401)
+        self.service.states.assert_not_called()
         self.send_sms.assert_not_called()
 
     def test_post_queues_command_only_after_admin_and_csrf(self):

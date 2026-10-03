@@ -18522,7 +18522,11 @@ def require_dashboard_same_origin(
     "/admin/device-managers"
 )
 def admin_device_managers(
+    request: Request,
 ):
+    # The route must stay protected even if the optional monitoring
+    # middleware is disabled or its route list changes.
+    get_monitoring_auth().principal(request, admin=True)
 
     return {
         "forwarding": get_forwarding_service().states(),
