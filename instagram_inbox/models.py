@@ -1,5 +1,5 @@
 import time
-from sqlalchemy import Boolean, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -61,7 +61,7 @@ class Draft(Base):
     status: Mapped[str] = mapped_column(String(24), default='pending', index=True)
     telegram_message_id: Mapped[int | None] = mapped_column(Integer)
     presentation_state: Mapped[str] = mapped_column(String(24), default='pending')
-    manager_id: Mapped[int | None] = mapped_column(Integer)
+    manager_id: Mapped[int | None] = mapped_column(BigInteger)
     manager_name: Mapped[str] = mapped_column(String(180), default='')
     external_message_id: Mapped[str] = mapped_column(String(512), default='')
     error: Mapped[str] = mapped_column(Text, default='')
@@ -75,7 +75,7 @@ class Draft(Base):
 
 class Manager(Base):
     __tablename__ = 'inbox_managers'
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=False)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
     username: Mapped[str] = mapped_column(String(150), default='')
     first_name: Mapped[str] = mapped_column(String(180), default='')
     updated_at: Mapped[float] = mapped_column(Float, default=time.time)
