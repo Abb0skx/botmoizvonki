@@ -4,6 +4,7 @@ WORKDIR /app
 COPY requirements-instagram-inbox.txt .
 RUN pip install --no-cache-dir -r requirements-instagram-inbox.txt
 COPY instagram_inbox instagram_inbox
+COPY telegram_business/__init__.py telegram_business/products.py telegram_business/
 RUN useradd -u 10001 -m inbox && mkdir /data && chown inbox:inbox /data
 USER inbox
 EXPOSE 8000

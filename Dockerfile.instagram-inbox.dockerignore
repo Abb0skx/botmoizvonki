@@ -2,6 +2,9 @@
 !requirements-instagram-inbox.txt
 !instagram_inbox/
 !instagram_inbox/**
+!telegram_business/
+!telegram_business/__init__.py
+!telegram_business/products.py
 instagram_inbox/**/__pycache__
 instagram_inbox/tests
 instagram_inbox/ops

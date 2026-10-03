@@ -57,7 +57,7 @@ class Draft(Base):
     revision: Mapped[int] = mapped_column()
     text: Mapped[str] = mapped_column(Text)
     category: Mapped[str] = mapped_column(String(64))
-    origin: Mapped[str] = mapped_column(String(16), default='ai')
+    origin: Mapped[str] = mapped_column(String(16), default='template')
     status: Mapped[str] = mapped_column(String(24), default='pending', index=True)
     telegram_message_id: Mapped[int | None] = mapped_column(Integer)
     presentation_state: Mapped[str] = mapped_column(String(24), default='pending')

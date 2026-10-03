@@ -4,7 +4,7 @@ import logging
 import time
 from zoneinfo import ZoneInfo
 from sqlalchemy import select, update
-from .ai import Classification
+from .replies import Classification
 from .instagram import SendError
 from .models import Client, Draft, Job, Message, TelegramLink
 from .telegram import keyboard
@@ -104,9 +104,9 @@ class InboxService:
             classification = await self.assistant.classify(batch, history)
             reply = await self.assistant.propose(classification, batch, history, previous) if classification.requires_reply else None
         except Exception as exc:
-            log.error('ai_failed client=%s error_type=%s', c.id, type(exc).__name__)
+            log.error('template_failed client=%s error_type=%s', c.id, type(exc).__name__)
             classification = Classification(action='manager_only', category='unclear', requires_reply=False,
-                confidence=0, reason='Нужен ответ менеджера — AI временно недоступен.')
+                confidence=0, reason='Нужен ответ менеджера — не удалось загрузить или проверить шаблоны.')
             reply = None
         with self.repo.transaction() as s:
             result = s.execute(update(Client).where(Client.id == c.id, Client.revision == c.revision,
@@ -115,7 +115,8 @@ class InboxService:
             if result.rowcount != 1:
                 return
             s.execute(update(Message).where(Message.id.in_([m.id for m in batch])).values(
-                classification=classification.model_dump(), requires_reply=classification.requires_reply))
+                classification={**classification.model_dump(), 'batch_ids': [m.id for m in batch]},
+                requires_reply=classification.requires_reply))
             if reply:
                 d = Draft(client_id=c.id, revision=c.revision, source_message_id=batch[-1].id,
                           text=reply, category=classification.category)
@@ -136,7 +137,9 @@ class InboxService:
         if d.status != 'pending' or d.revision != c.revision or d.presentation_state != 'pending':
             return
         source = self.repo.get(Message, d.source_message_id)
-        title = 'Отправить клиенту?' if d.origin == 'manual' else '🤖 Предлагаемый ответ'
+        title = 'Отправить клиенту?' if d.origin == 'manual' else '📝 Готовый ответ по шаблону'
+        if d.category == 'price_question' and d.origin != 'manual':
+            title += '\nИсточник: bot_prices • цены в сумах'
         self.repo.change(Draft, d.id, presentation_state='sending')
         try:
             tid = await self.telegram.text(c.topic_id, title + '\n\n' + d.text,
@@ -159,7 +162,8 @@ class InboxService:
             if d.retry_safe:
                 markup = keyboard(d.id, retry=True)
         elif d.status == 'cancelled':
-            header = 'Отменено: клиент написал новое сообщение.' if d.error == 'superseded' else 'Не отвечаем.'
+            header = {'superseded': 'Отменено: клиент написал новое сообщение.',
+                      'price_changed': 'Прайс или шаблон изменился. Подтвердите новый черновик ниже.'}.get(d.error, 'Не отвечаем.')
         else:
             header = '⏳ Отправляем…'
         await self.telegram.edit(d.telegram_message_id, header + '\n\n' + d.text, markup)
@@ -179,6 +183,39 @@ class InboxService:
             self.repo.change(Draft, d.id, status='failed', error='Истекло 24-часовое окно ответа Instagram. Нужно новое сообщение клиента.', retry_safe=False)
             await self.render_status(d.id)
             return
+        if d.origin != 'manual' and d.category == 'price_question':
+            # Source may change while the manager reads the draft. Never silently
+            # substitute text after approval; changed prices require a new approval.
+            source = self.repo.get(Message, d.source_message_id)
+            batch = self.draft_batch(source)
+            try:
+                check = await self.assistant.classify(batch, self.repo.history(c.id, self.settings.context_messages), force=True)
+                current = check.reply_text if check.requires_reply else None
+            except Exception:
+                current = None
+            if not current:
+                with self.repo.transaction() as s:
+                    restored = s.execute(update(Draft).where(Draft.id == d.id, Draft.status == 'sending',
+                        Draft.dispatch_started_at.is_(None),
+                        Draft.revision == select(Client.revision).where(Client.id == c.id).scalar_subquery())
+                        .values(status='pending', manager_id=None, manager_name=''))
+                if restored.rowcount:
+                    await self.telegram.edit(d.telegram_message_id,
+                        '⚠️ Не отправлено: не удалось проверить актуальные цены. Обновите ответ или напишите вручную.\n\n' + d.text,
+                        keyboard(d.id))
+                return
+            if current != d.text:
+                with self.repo.transaction() as s:
+                    claimed = s.execute(update(Draft).where(Draft.id == d.id, Draft.status == 'sending',
+                        Draft.dispatch_started_at.is_(None)).values(status='cancelled', error='price_changed'))
+                    if claimed.rowcount and current and s.get(Client, c.id).revision == d.revision:
+                        replacement = Draft(client_id=c.id, revision=c.revision, source_message_id=source.id,
+                                            text=current, category=check.category, replaces_id=d.id)
+                        s.add(replacement)
+                        s.flush()
+                        self.repo.enqueue(s, f'draft:{replacement.id}', 'present', {'draft_id': replacement.id})
+                await self.render_status(d.id)
+                return
         with self.repo.transaction() as s:
             claimed = s.execute(update(Draft).where(Draft.id == d.id, Draft.status == 'sending',
                 Draft.dispatch_started_at.is_(None), Draft.manager_id.is_not(None),
@@ -262,8 +299,9 @@ class InboxService:
             await self.telegram.text(topic, HELP)
             return
         if command == '/status':
-            await self.telegram.text(topic, 'Instagram: подтверждение менеджера обязательно.\nAI: ' +
-                ('подключён' if self.assistant.client else 'ключ не настроен; доступны ручные ответы и шаблоны.'))
+            await self.telegram.text(topic, 'Instagram: подтверждение менеджера обязательно.\n'
+                'Ответы: шаблоны Google Sheets + поиск модели в прайсе. AI не используется.\n'
+                f'Кэш таблиц: {self.settings.sheets_cache_seconds} секунд. Перед отправкой цены проверяются повторно.')
             return
         if command == '/close' and c:
             await self.telegram.close_topic(topic)
@@ -304,6 +342,11 @@ class InboxService:
                 s.flush()
                 self.repo.enqueue(s, f'draft:{d.id}', 'present', {'draft_id': d.id})
 
+    def draft_batch(self, source):
+        ids = source.classification.get('batch_ids', [source.id])
+        return self.repo.rows(Message, Message.client_id == source.client_id, Message.direction == 'incoming',
+                              Message.id.in_(ids), order=Message.id, limit=100) or [source]
+
     async def regenerate(self, draft_id):
         d = self.repo.get(Draft, draft_id)
         c = self.repo.get(Client, d.client_id)
@@ -311,10 +354,12 @@ class InboxService:
             return
         history = self.repo.history(c.id, self.settings.context_messages)
         source = self.repo.get(Message, d.source_message_id)
-        classification = Classification(action='reply', category=d.category, requires_reply=True, confidence=1, reason='Другой вариант')
-        text = await self.assistant.propose(classification, [source], history, previous=d.text)
+        classification = await self.assistant.classify(self.draft_batch(source), history, force=True)
+        text = await self.assistant.propose(classification, self.draft_batch(source), history)
         if text:
-            self.repo.draft(c.id, c.revision, source.id, text, d.category, replaces_id=d.id)
+            self.repo.draft(c.id, c.revision, source.id, text, classification.category, replaces_id=d.id)
+        else:
+            await self.telegram.text(c.topic_id, classification.reason, reply_id=source.telegram_message_id)
 
     async def handle_job(self, job):
         if job.kind == 'incoming':

@@ -9,7 +9,7 @@ from pathlib import Path
 import time
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import PlainTextResponse, JSONResponse
-from .ai import Assistant
+from .replies import TemplateResponder
 from .config import Settings
 from .instagram import InstagramAPI, normalize_events, valid_signature
 from .repository import Repository
@@ -31,7 +31,7 @@ def create_app(settings=None, service=None):
         logging.getLogger('httpx').setLevel(logging.WARNING)
         logging.getLogger('httpcore').setLevel(logging.WARNING)
         app.state.service = service or InboxService(Repository(settings.database_url), settings,
-            TelegramAPI(settings), InstagramAPI(settings), Assistant(settings))
+            TelegramAPI(settings), InstagramAPI(settings), TemplateResponder(settings))
         running = app.state.service
         tasks, lock = [], None
         try:
@@ -53,8 +53,7 @@ def create_app(settings=None, service=None):
             if not service:
                 await running.telegram.bot.session.close()
                 await running.instagram.http.aclose()
-                if running.assistant.client:
-                    await running.assistant.client.close()
+                await running.assistant.close()
                 running.repo.engine.dispose()
             if lock:
                 lock.close()
@@ -119,7 +118,7 @@ def create_app(settings=None, service=None):
         polling = float(repo.state('telegram_poll_heartbeat', '0'))
         healthy = not settings.worker_enabled or (time.time() - worker < 180 and time.time() - polling < 90)
         return JSONResponse({'status': 'ok' if healthy else 'starting_or_degraded',
-                             'mode': 'manager_approval', 'ai_configured': bool(settings.openai_api_key)},
+                             'mode': 'manager_approval', 'reply_engine': 'templates', 'ai_enabled': False},
                             status_code=200 if healthy else 503)
     return app
 

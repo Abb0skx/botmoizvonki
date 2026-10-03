@@ -5,7 +5,7 @@ import time
 from types import SimpleNamespace
 import httpx
 import pytest
-from instagram_inbox.ai import Assistant, Classification, rule_classification
+from instagram_inbox.replies import TemplateResponder, Classification, rule_classification, DEFAULT_TEXTS
 from instagram_inbox.config import Settings
 from instagram_inbox.instagram import normalize_events, signature, SendError
 from instagram_inbox.main import create_app
@@ -63,19 +63,19 @@ class Instagram:
         self.relays.append(payload)
 
 
-class AI(Assistant):
+class FakeResponder(TemplateResponder):
     def __init__(self, settings):
         super().__init__(settings)
         self.calls = []
 
-    async def classify(self, batch, history):
+    async def classify(self, batch, history, force=False):
         return rule_classification(batch) or Classification(action='reply', category='product_question',
             requires_reply=True, confidence=.99, reason='Вопрос о товаре')
 
     async def propose(self, classification, batch, history, previous=''):
         self.calls.append([m.text for m in history])
         if classification.category in ('credit_or_installment', 'greeting'):
-            return await super().propose(classification, batch, history, previous)
+            return DEFAULT_TEXTS['credit_reply' if classification.category == 'credit_or_installment' else 'greeting_ru']
         return 'Уточню наличие. Какой объём памяти нужен?'
 
 
@@ -86,7 +86,7 @@ def service(tmp_path):
         meta_verify_token='verify', meta_access_token='fake', worker_enabled=False, debounce_seconds=0)
     repo = Repository(config.database_url)
     Base.metadata.create_all(repo.engine)
-    return InboxService(repo, config, Telegram(), Instagram(), AI(config))
+    return InboxService(repo, config, Telegram(), Instagram(), FakeResponder(config))
 
 
 def ingest(service, text='Есть S25?', mid='m1', attachments=None, sender='customer'):
@@ -186,7 +186,7 @@ def test_duplicate_does_not_increment_revision(service):
 
 
 @pytest.mark.asyncio
-async def test_internal_note_never_sends_or_enters_ai_context(service):
+async def test_internal_note_never_sends_or_enters_reply_context(service):
     await prepare(service)
     await service.telegram_update({'message': {'message_id': 900, 'message_thread_id': 51,
         'chat': {'id': -1001}, 'from': {'id': 1}, 'text': 'Проверь цену у поставщика'}})
@@ -307,7 +307,7 @@ def test_credit_languages(text):
 
 
 @pytest.mark.asyncio
-async def test_new_message_during_ai_discards_generated_draft(service):
+async def test_new_message_during_lookup_discards_generated_draft(service):
     ingest(service)
     await drain(service)
     original = service.assistant.propose

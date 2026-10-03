@@ -9,7 +9,7 @@ def keyboard(draft_id, retry=False, manual=False):
             callback_data=f'ig:{"retry" if retry else "send"}:{draft_id}')]]
     if not retry:
         if not manual:
-            rows.append([InlineKeyboardButton(text='🔄 Другой вариант', callback_data=f'ig:regenerate:{draft_id}')])
+            rows.append([InlineKeyboardButton(text='🔄 Обновить ответ', callback_data=f'ig:regenerate:{draft_id}')])
         rows.append([InlineKeyboardButton(text='❌ Не отвечать', callback_data=f'ig:cancel:{draft_id}')])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 

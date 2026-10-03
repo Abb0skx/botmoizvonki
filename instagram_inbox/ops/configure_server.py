@@ -24,10 +24,11 @@ config = {
     'TELEGRAM_BOT_TOKEN': state['bot_token'],
     'TELEGRAM_GROUP_ID': str(state['group_id']),
     'TELEGRAM_MANAGER_IDS': str(state['owner_id']),
-    'OPENAI_API_KEY': '',
-    'OPENAI_MODEL': 'gpt-4.1-mini',
     'DATABASE_URL': 'sqlite:////data/inbox.db',
-    'AI_CONTEXT_MESSAGES': '20',
+    'CONTEXT_MESSAGES': '20',
+    'INSTAGRAM_RULES_SHEET_ID': source.get('INSTAGRAM_RULES_SHEET_ID', '1ZdSyTJr9jSBdBDUZowXi2CpjTb7GZMQCQNsMRCMjywk'),
+    'INSTAGRAM_PRODUCTS_SHEET_ID': source.get('INSTAGRAM_PRODUCTS_SHEET_ID', '1TrS6C4oHe6nzQTPTa_4se_upXBFF6rmbfnE7RqznR8U'),
+    'SHEETS_CACHE_SECONDS': '60',
     'INCOMING_DEBOUNCE_SECONDS': '4',
     'TOPIC_CLOSE_AFTER_HOURS': '72',
     'LEGACY_INSTAGRAM_WEBHOOK_URL': 'http://texnikach-calls-service:8000/webhooks/instagram',
@@ -36,8 +37,10 @@ env_path = root / '.env'
 if env_path.exists():
     previous = dict(line.split('=', 1) for line in env_path.read_text().splitlines()
                     if '=' in line and not line.startswith('#'))
-    # Retain separately provisioned AI credentials and intentional settings on re-run.
+    # Retain intentional runtime settings on re-run.
     config.update(previous)
+for retired in ('OPENAI_API_KEY', 'OPENAI_MODEL', 'AI_CONTEXT_MESSAGES'):
+    config.pop(retired, None)
 for value in config.values():
     if '\n' in value or '\r' in value:
         raise ValueError('Unexpected multiline secret')
@@ -48,4 +51,4 @@ data = root / 'data'
 data.mkdir(mode=0o700, exist_ok=True)
 os.chown(data, 10001, 10001)
 print(json.dumps({'configured': True, 'group_id': state['group_id'],
-                  'bot_username': state['bot_username'], 'ai_key_present': bool(config['OPENAI_API_KEY'])}))
+                  'bot_username': state['bot_username'], 'reply_engine': 'templates'}))

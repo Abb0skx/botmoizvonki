@@ -100,7 +100,7 @@ class Repository:
         return list(reversed(self.rows(Message, Message.client_id == client_id,
                     Message.direction != 'internal', limit=limit, order=Message.id.desc())))
 
-    def draft(self, client_id, revision, source_id, text, category, origin='ai', replaces_id=None):
+    def draft(self, client_id, revision, source_id, text, category, origin='template', replaces_id=None):
         with self.transaction() as s:
             if replaces_id and s.scalar(select(Draft.id).where(Draft.replaces_id == replaces_id)):
                 return None
