@@ -10,7 +10,7 @@ from pathlib import Path
 from telegram_business.migrations import connect, migrate
 
 from .config import FOLDER_CODES, SUPPLIER_CODES
-from .daily import DAILY_CODES, day_key, is_today
+from .daily import DAILY_CODES, day_key, stamp_day
 
 
 CURSOR_KEY = "incoming_client_message_cursor"
@@ -492,9 +492,15 @@ class FolderRepository:
                 (cursor, max(1, min(int(limit), 5000))),
             ).fetchall()
             for row in rows:
+                message_day = stamp_day(row["telegram_date"] or row["created_at"])
+                if message_day and message_day > day_key(when):
+                    # The DB lock may have crossed midnight after the caller
+                    # sampled its clock. Leave this event for the next cycle.
+                    break
+                cursor = int(row["id"])
                 # Delayed/replayed updates from yesterday cannot repopulate
                 # today's queues. The original Telegram date wins over receipt.
-                if not is_today(row["telegram_date"] or row["created_at"], when):
+                if message_day != day_key(when):
                     continue
                 chat = str(row["chat_id"] or "")
                 if not re.fullmatch(r"[1-9][0-9]{0,19}", chat):
@@ -531,8 +537,6 @@ class FolderRepository:
                                VALUES(?,?,?,?,?,?)""",
                             (chat, revision, manager_cards_chat_id, stamp, stamp, stamp),
                         )
-            if rows:
-                cursor = int(rows[-1]["id"])
             db.execute(
                 """UPDATE telegram_folder_state SET value=?,updated_at=?
                    WHERE key=?""",

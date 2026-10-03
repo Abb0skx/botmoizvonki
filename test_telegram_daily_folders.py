@@ -168,3 +168,13 @@ def test_first_install_does_not_clear_midday(tmp_path):
     repo.assign('1001', 'ALI', BEFORE)
     assert repo.begin_day(BEFORE) is None
     assert repo.assignment('1001')['folder_code'] == 'ALI'
+
+
+def test_clock_sample_before_midnight_does_not_consume_next_day_message(tmp_path):
+    repo = prepare(tmp_path / 'business.db')
+    incoming(repo, '1001', 1, MIDNIGHT)
+    assert repo.seed_new_clients(BEFORE) == 0
+    repo.begin_day(MIDNIGHT)
+    repo.complete_day_clear('2026-10-04')
+    assert repo.seed_new_clients(MIDNIGHT) == 1
+    assert repo.assignment('1001')['folder_code'] == 'NEW'
