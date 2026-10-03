@@ -631,7 +631,10 @@ class ForwardingRepository:
         now_ts: int,
         cooldown_seconds: int,
         correlation_window_seconds: int,
+        origin: str = "telegram",
     ) -> dict:
+        if origin not in {"telegram", "web"}:
+            raise ValueError("Неизвестный источник команды")
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
 
@@ -741,12 +744,13 @@ class ForwardingRepository:
                     requested_username, telegram_chat_id,
                     telegram_message_id, status
                 ) VALUES (
-                    ?, 'telegram', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, 'queued'
                 )
                 """,
                 (
                     callback_query_id,
+                    origin,
                     employee.code,
                     employee.name,
                     employee.moizvonki_user.casefold(),

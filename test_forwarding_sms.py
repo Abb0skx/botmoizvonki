@@ -118,6 +118,17 @@ class SMSControlsTests(unittest.TestCase):
         self.assertEqual(self.repo.get_operation(1)["status"], "api_accepted")
         self.assertFalse(self.service.dispatch_one(self.now + 1)["processed"])
 
+    def test_web_and_telegram_commands_keep_distinct_origins(self):
+        web = self.service.queue_web("poco", "redmi", "web-request-1")
+        self.assertTrue(web["queued"])
+        self.assertEqual(self.repo.get_operation(1)["origin"], "web")
+        self.assertEqual(self.repo.get_operation(1)["service_number"], "ON Redmi")
+
+        telegram = self.queue("redmi", "poco", key="telegram-request-1")
+        self.assertTrue(telegram["queued"])
+        self.assertEqual(self.repo.get_operation(2)["origin"], "telegram")
+        self.sender.assert_not_called()
+
     def test_acl_and_poco_admin(self):
         self.assertEqual(self.queue("tecno", actor=7636344727)["reason"], "forbidden")
         self.assertEqual(self.queue("poco", "redmi", actor=702960146)["reason"], "forbidden")

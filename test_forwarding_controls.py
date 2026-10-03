@@ -468,6 +468,12 @@ class ForwardingControlTests(unittest.TestCase):
             settings = load_forwarding_settings()
         self.assertFalse(settings.enabled)
 
+    def test_command_cooldown_defaults_to_five_minutes(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("FORWARDING_COMMAND_COOLDOWN_SECONDS", None)
+            settings = load_forwarding_settings()
+        self.assertEqual(settings.command_cooldown_seconds, 300)
+
     def test_parallel_clicks_create_only_one_active_operation(self):
         self.activate_post()
 

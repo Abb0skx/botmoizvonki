@@ -239,7 +239,7 @@ def load_forwarding_settings() -> ForwardingSettings:
         ),
         command_cooldown_seconds=_env_int(
             "FORWARDING_COMMAND_COOLDOWN_SECONDS",
-            90,
+            300,
             10,
             3600,
         ),
