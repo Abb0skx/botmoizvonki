@@ -1,0 +1,333 @@
+import asyncio
+from datetime import datetime
+import logging
+import time
+from zoneinfo import ZoneInfo
+from sqlalchemy import select, update
+from .ai import Classification
+from .instagram import SendError
+from .models import Client, Draft, Job, Message, TelegramLink
+from .telegram import keyboard
+
+log = logging.getLogger(__name__)
+HELP = ('Instagram → Telegram\n\nКаждый клиент — отдельная постоянная тема. '
+        'Кнопка «Отправить» подтверждает отправку клиенту.\n'
+        'Свой ответ: сделайте Reply на сообщение клиента, затем подтвердите. '
+        'Обычные сообщения внутри темы остаются внутренними.\n'
+        '/close — закрыть тему; новое сообщение откроет её.\n'
+        '/status — состояние сервиса. Отвечать могут администраторы группы и разрешённые менеджеры.')
+
+
+class InboxService:
+    def __init__(self, repo, settings, telegram, instagram, assistant):
+        self.repo, self.settings = repo, settings
+        self.telegram, self.instagram, self.assistant = telegram, instagram, assistant
+
+    async def ensure_topic(self, client_id):
+        c = self.repo.get(Client, client_id)
+        if c.topic_id:
+            if c.topic_state == 'closed':
+                await self.telegram.reopen(c.topic_id)
+                self.repo.change(Client, c.id, topic_state='open', status='active')
+                log.info('topic_reopened client=%s topic=%s', c.id, c.topic_id)
+            return c.topic_id
+        if c.topic_state in ('creating', 'uncertain'):
+            raise RuntimeError(f'Topic creation uncertain for client {c.id}; bind existing topic before retry')
+        profile = await self.instagram.profile(c.external_id)
+        username = str(profile.get('username') or c.username)[:150]
+        display = str(profile.get('name') or c.display_name)[:150]
+        name = ('IG • ' + ('@' + username if username else display or c.external_id[-12:]))[:128]
+        with self.repo.transaction() as s:
+            result = s.execute(update(Client).where(Client.id == c.id, Client.topic_state == 'new', Client.topic_id.is_(None))
+                .values(topic_state='creating', username=username, display_name=display, topic_name=name))
+            if result.rowcount != 1:
+                raise RuntimeError('Topic already claimed')
+        try:
+            topic_id = await self.telegram.create_topic(name)
+        except Exception:
+            self.repo.change(Client, c.id, topic_state='uncertain')
+            raise
+        self.repo.change(Client, c.id, topic_id=topic_id, topic_state='open')
+        log.info('topic_created client=%s topic=%s', c.id, topic_id)
+        return topic_id
+
+    def link(self, message_id, telegram_id):
+        with self.repo.transaction() as s:
+            s.merge(TelegramLink(telegram_id=telegram_id, message_id=message_id))
+
+    async def publish_incoming(self, message_id):
+        m = self.repo.get(Message, message_id)
+        if m.telegram_state == 'uncertain':
+            raise RuntimeError('Telegram delivery needs reconciliation')
+        if m.telegram_state != 'pending':
+            return
+        topic = await self.ensure_topic(m.client_id)
+        c = self.repo.get(Client, m.client_id)
+        prefix = '👤 ' + ('@' + c.username if c.username else c.display_name or 'Клиент')
+        if m.direction == 'outgoing':
+            prefix = '↗️ Ответ из Instagram'
+        text = prefix + '\n' + (m.text or ('📎 ' + m.message_type))
+        reply_id = None
+        if m.reply_to_external_id:
+            previous = self.repo.rows(Message, Message.external_id == m.reply_to_external_id, limit=1)
+            if previous:
+                reply_id = previous[0].telegram_message_id
+        self.repo.change(Message, m.id, telegram_state='sending')
+        try:
+            ids = []
+            for i in range(0, len(text), 3800):
+                mid = await self.telegram.text(topic, text[i:i+3800], reply_id=reply_id)
+                ids.append(mid)
+                self.link(m.id, mid)
+                if i == 0:
+                    self.repo.change(Message, m.id, telegram_message_id=mid)
+            for attachment in m.attachments:
+                mid = await self.telegram.attachment(topic, attachment, ids[0])
+                self.link(m.id, mid)
+            self.repo.change(Message, m.id, telegram_state='sent')
+        except Exception:
+            self.repo.change(Message, m.id, telegram_state='uncertain')
+            raise
+        log.info('telegram_message_sent message=%s client=%s', m.id, c.id)
+
+    async def classify_client(self, client_id, previous=''):
+        c = self.repo.get(Client, client_id)
+        history = self.repo.history(c.id, self.settings.context_messages)
+        batch = self.repo.rows(Message, Message.client_id == c.id, Message.revision > c.classified_revision,
+                              Message.direction == 'incoming', order=Message.id, limit=100)
+        if not batch:
+            self.repo.change(Client, c.id, classified_revision=c.revision)
+            return
+        if any(m.telegram_state == 'pending' for m in batch):
+            return
+        try:
+            classification = await self.assistant.classify(batch, history)
+            reply = await self.assistant.propose(classification, batch, history, previous) if classification.requires_reply else None
+        except Exception as exc:
+            log.error('ai_failed client=%s error_type=%s', c.id, type(exc).__name__)
+            classification = Classification(action='manager_only', category='unclear', requires_reply=False,
+                confidence=0, reason='Нужен ответ менеджера — AI временно недоступен.')
+            reply = None
+        with self.repo.transaction() as s:
+            result = s.execute(update(Client).where(Client.id == c.id, Client.revision == c.revision,
+                               Client.classified_revision == c.classified_revision)
+                               .values(classified_revision=c.revision))
+            if result.rowcount != 1:
+                return
+            s.execute(update(Message).where(Message.id.in_([m.id for m in batch])).values(
+                classification=classification.model_dump(), requires_reply=classification.requires_reply))
+            if reply:
+                d = Draft(client_id=c.id, revision=c.revision, source_message_id=batch[-1].id,
+                          text=reply, category=classification.category)
+                s.add(d)
+                s.flush()
+                self.repo.enqueue(s, f'draft:{d.id}', 'present', {'draft_id': d.id})
+            elif c.topic_id:
+                self.repo.enqueue(s, f'status:{c.id}:{c.revision}', 'status', {
+                    'topic_id': c.topic_id, 'text': classification.reason[:350],
+                    'reply_id': batch[-1].telegram_message_id})
+        log.info('classification client=%s category=%s action=%s', c.id, classification.category, classification.action)
+
+    async def present(self, draft_id):
+        d = self.repo.get(Draft, draft_id)
+        c = self.repo.get(Client, d.client_id)
+        if d.presentation_state == 'uncertain':
+            raise RuntimeError('Draft publication needs reconciliation')
+        if d.status != 'pending' or d.revision != c.revision or d.presentation_state != 'pending':
+            return
+        source = self.repo.get(Message, d.source_message_id)
+        title = 'Отправить клиенту?' if d.origin == 'manual' else '🤖 Предлагаемый ответ'
+        self.repo.change(Draft, d.id, presentation_state='sending')
+        try:
+            tid = await self.telegram.text(c.topic_id, title + '\n\n' + d.text,
+                keyboard(d.id, manual=d.origin == 'manual'), reply_id=source.telegram_message_id)
+            self.repo.change(Draft, d.id, telegram_message_id=tid, presentation_state='sent')
+        except Exception:
+            self.repo.change(Draft, d.id, presentation_state='uncertain')
+            raise
+
+    async def render_status(self, draft_id):
+        d = self.repo.get(Draft, draft_id)
+        if not d.telegram_message_id:
+            return
+        markup = None
+        if d.status == 'sent':
+            stamp = datetime.fromtimestamp(d.sent_at, ZoneInfo('Asia/Tashkent')).strftime('%H:%M')
+            header = f'✅ Отправлено\nМенеджер: {d.manager_name or d.manager_id}\n{stamp}'
+        elif d.status == 'failed':
+            header = '❌ Не удалось подтвердить отправку.\n' + d.error
+            if d.retry_safe:
+                markup = keyboard(d.id, retry=True)
+        elif d.status == 'cancelled':
+            header = 'Отменено: клиент написал новое сообщение.' if d.error == 'superseded' else 'Не отвечаем.'
+        else:
+            header = '⏳ Отправляем…'
+        await self.telegram.edit(d.telegram_message_id, header + '\n\n' + d.text, markup)
+
+    async def dispatch(self, draft_id):
+        d = self.repo.get(Draft, draft_id)
+        c = self.repo.get(Client, d.client_id)
+        if d.status in ('sent', 'failed', 'cancelled'):
+            await self.render_status(d.id)
+            return
+        if d.status != 'sending' or d.dispatch_started_at is not None:
+            return
+        if c.revision != d.revision:
+            self.repo.change(Draft, d.id, status='cancelled', error='superseded')
+            return
+        if time.time() - c.last_customer_at > 24 * 3600:
+            self.repo.change(Draft, d.id, status='failed', error='Истекло 24-часовое окно ответа Instagram. Нужно новое сообщение клиента.', retry_safe=False)
+            await self.render_status(d.id)
+            return
+        with self.repo.transaction() as s:
+            claimed = s.execute(update(Draft).where(Draft.id == d.id, Draft.status == 'sending',
+                Draft.dispatch_started_at.is_(None), Draft.manager_id.is_not(None),
+                Draft.revision == select(Client.revision).where(Client.id == c.id).scalar_subquery())
+                .values(dispatch_started_at=time.time()))
+            if claimed.rowcount != 1:
+                return
+        try:
+            mid = await self.instagram.send(c.external_id, d.text)
+        except SendError as exc:
+            self.repo.change(Draft, d.id, status='failed', error=str(exc), retry_safe=exc.retry_safe)
+            await self.render_status(d.id)
+            return
+        except Exception:
+            self.repo.change(Draft, d.id, status='failed', error='Результат неизвестен. Проверьте Instagram.', retry_safe=False)
+            raise
+        with self.repo.transaction() as s:
+            saved = s.get(Draft, d.id)
+            saved.status, saved.external_message_id, saved.sent_at = 'sent', mid, time.time()
+            if not s.scalar(select(Message.id).where(Message.external_id == mid)):
+                s.add(Message(client_id=c.id, external_id=mid, text=d.text, direction='outgoing',
+                    sender_type='manager', telegram_state='sent', telegram_message_id=d.telegram_message_id,
+                    revision=c.revision, raw={'approved_by': d.manager_id, 'draft_id': d.id}))
+        log.info('instagram_send_success draft=%s manager=%s', d.id, d.manager_id)
+        await self.render_status(d.id)
+
+    async def callback(self, callback):
+        msg, user = callback.get('message') or {}, callback.get('from') or {}
+        if msg.get('chat', {}).get('id') != self.settings.telegram_group_id:
+            return
+        if not await self.telegram.authorized(user):
+            await self.telegram.answer(callback['id'], 'Недостаточно прав.')
+            return
+        parts = str(callback.get('data', '')).split(':')
+        if len(parts) != 3 or parts[0] != 'ig' or not parts[2].isdigit():
+            return
+        action, did = parts[1], int(parts[2])
+        d = self.repo.get(Draft, did)
+        if not d or d.telegram_message_id != msg.get('message_id'):
+            return
+        c = self.repo.get(Client, d.client_id)
+        if msg.get('message_thread_id') != c.topic_id:
+            return
+        if action in ('send', 'retry'):
+            state = self.repo.approve(did, user, retry=action == 'retry')
+            answer = {'approved': 'Принято, отправляем.', 'sent': 'Сообщение уже отправлено.',
+                      'sending': 'Отправка уже выполняется.', 'superseded': 'Есть новое сообщение клиента.',
+                      'cancelled': 'Черновик отменён.', 'failed': 'Проверьте результат предыдущей отправки.'}.get(state, 'Действие недоступно.')
+            await self.telegram.answer(callback['id'], answer)
+            log.info('manager_send_confirmation draft=%s manager=%s result=%s', did, user['id'], state)
+        elif action in ('cancel', 'regenerate'):
+            if self.repo.cancel(did, user['id'], 'regenerated' if action == 'regenerate' else 'manager_cancelled'):
+                if action == 'regenerate' and c.revision == d.revision:
+                    with self.repo.transaction() as s:
+                        self.repo.enqueue(s, f'regen:{did}', 'regenerate', {'draft_id': did})
+                await self.telegram.answer(callback['id'], 'Готово.')
+                await self.render_status(did)
+            else:
+                await self.telegram.answer(callback['id'], 'Черновик уже обработан.')
+
+    async def telegram_update(self, payload):
+        if payload.get('callback_query'):
+            await self.callback(payload['callback_query'])
+            return
+        msg = payload.get('message') or {}
+        if msg.get('chat', {}).get('id') != self.settings.telegram_group_id:
+            return
+        topic = msg.get('message_thread_id')
+        clients = self.repo.rows(Client, Client.topic_id == topic, limit=1) if topic else []
+        c = clients[0] if clients else None
+        if c and ('forum_topic_closed' in msg or 'forum_topic_reopened' in msg):
+            closed = 'forum_topic_closed' in msg
+            self.repo.change(Client, c.id, topic_state='closed' if closed else 'open', status='closed' if closed else 'active')
+            return
+        user = msg.get('from', {})
+        if not await self.telegram.authorized(user):
+            return
+        text = str(msg.get('text') or msg.get('caption') or '')
+        command = text.split()[0].split('@')[0] if text else ''
+        if command in ('/start', '/help'):
+            await self.telegram.text(topic, HELP)
+            return
+        if command == '/status':
+            await self.telegram.text(topic, 'Instagram: подтверждение менеджера обязательно.\nAI: ' +
+                ('подключён' if self.assistant.client else 'ключ не настроен; доступны ручные ответы и шаблоны.'))
+            return
+        if command == '/close' and c:
+            await self.telegram.close_topic(topic)
+            self.repo.change(Client, c.id, topic_state='closed', status='closed')
+            return
+        if command == '/bind' and user['id'] in self.settings.manager_ids and topic:
+            parts = text.split()
+            target = self.repo.get(Client, int(parts[1])) if len(parts) == 2 and parts[1].isdigit() else None
+            if target and not target.topic_id and target.topic_state == 'uncertain':
+                self.repo.change(Client, target.id, topic_id=topic, topic_state='open')
+                with self.repo.transaction() as s:
+                    s.execute(update(Job).where(Job.kind == 'incoming', Job.status == 'failed').values(status='pending', attempts=0))
+                await self.telegram.text(topic, 'Тема привязана к клиенту.')
+            return
+        if not c or not text.strip():
+            return
+        external = f'tg:{self.settings.telegram_group_id}:{msg["message_id"]}'
+        if self.repo.rows(Message, Message.external_id == external, limit=1):
+            return
+        reply = msg.get('reply_to_message') or {}
+        link = self.repo.get(TelegramLink, reply.get('message_id', 0))
+        original = self.repo.get(Message, link.message_id) if link else None
+        is_manual = bool(original and original.client_id == c.id and original.direction == 'incoming')
+        if is_manual and len(text) > 1000:
+            await self.telegram.text(topic, 'Ответ длиннее 1000 символов. Сократите текст и повторите Reply.')
+            is_manual = False
+        with self.repo.transaction() as s:
+            s.add(Message(client_id=c.id, external_id=external, text=text, direction='internal',
+                          sender_type='manager', telegram_state='sent', telegram_message_id=msg['message_id'],
+                          raw={'manager_id': user['id']}, revision=c.revision))
+            if is_manual:
+                s.execute(update(Draft).where(Draft.client_id == c.id, Draft.status == 'pending')
+                          .values(status='cancelled', error='manual_replacement'))
+                # Manual reply text is immutable once confirmed, including after Telegram edits.
+                d = Draft(client_id=c.id, source_message_id=original.id, revision=c.revision,
+                          text=text[:1000], category='manual', origin='manual')
+                s.add(d)
+                s.flush()
+                self.repo.enqueue(s, f'draft:{d.id}', 'present', {'draft_id': d.id})
+
+    async def regenerate(self, draft_id):
+        d = self.repo.get(Draft, draft_id)
+        c = self.repo.get(Client, d.client_id)
+        if c.revision != d.revision:
+            return
+        history = self.repo.history(c.id, self.settings.context_messages)
+        source = self.repo.get(Message, d.source_message_id)
+        classification = Classification(action='reply', category=d.category, requires_reply=True, confidence=1, reason='Другой вариант')
+        text = await self.assistant.propose(classification, [source], history, previous=d.text)
+        if text:
+            self.repo.draft(c.id, c.revision, source.id, text, d.category, replaces_id=d.id)
+
+    async def handle_job(self, job):
+        if job.kind == 'incoming':
+            await self.publish_incoming(job.payload['message_id'])
+        elif job.kind == 'present':
+            await self.present(job.payload['draft_id'])
+        elif job.kind == 'send':
+            await self.dispatch(job.payload['draft_id'])
+        elif job.kind == 'telegram':
+            await self.telegram_update(job.payload)
+        elif job.kind == 'relay':
+            await self.instagram.relay(job.payload)
+        elif job.kind == 'regenerate':
+            await self.regenerate(job.payload['draft_id'])
+        elif job.kind == 'status':
+            await self.telegram.text(job.payload['topic_id'], job.payload['text'], reply_id=job.payload.get('reply_id'))

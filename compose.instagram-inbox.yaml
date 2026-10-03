@@ -1,0 +1,26 @@
+services:
+  inbox:
+    build:
+      context: .
+      dockerfile: Dockerfile.instagram-inbox
+    image: texnikach-instagram-inbox:${INBOX_RELEASE:-local}
+    container_name: texnikach-instagram-inbox
+    restart: unless-stopped
+    env_file: ${INBOX_ENV_FILE:-/opt/texnikach-instagram-inbox/.env}
+    volumes:
+      - /opt/texnikach-instagram-inbox/data:/data
+    networks: [coolify]
+    mem_limit: 512m
+    cpus: 1.0
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+    labels:
+      # Routing lives in Traefik's file provider so unhealthy containers cannot
+      # make requests fall back to the old automatic Direct responder.
+      traefik.enable: 'false'
+networks:
+  coolify:
+    external: true

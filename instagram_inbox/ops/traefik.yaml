@@ -1,0 +1,14 @@
+http:
+  routers:
+    instagram-inbox:
+      rule: Host(`bot.texnikach.uz`) && (Path(`/webhooks/instagram`) || Path(`/instagram/inbox/health`))
+      priority: 1000
+      entryPoints: [https]
+      tls:
+        certResolver: letsencrypt
+      service: instagram-inbox
+  services:
+    instagram-inbox:
+      loadBalancer:
+        servers:
+          - url: http://texnikach-instagram-inbox:8000

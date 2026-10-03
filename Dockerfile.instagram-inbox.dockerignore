@@ -1,0 +1,7 @@
+**
+!requirements-instagram-inbox.txt
+!instagram_inbox/
+!instagram_inbox/**
+instagram_inbox/**/__pycache__
+instagram_inbox/tests
+instagram_inbox/ops

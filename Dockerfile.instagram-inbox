@@ -1,0 +1,11 @@
+FROM python:3.11-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+WORKDIR /app
+COPY requirements-instagram-inbox.txt .
+RUN pip install --no-cache-dir -r requirements-instagram-inbox.txt
+COPY instagram_inbox instagram_inbox
+RUN useradd -u 10001 -m inbox && mkdir /data && chown inbox:inbox /data
+USER inbox
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=45s CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz',timeout=4)"
+CMD ["sh", "-c", "alembic -c instagram_inbox/alembic.ini upgrade head && exec uvicorn instagram_inbox.main:app --host 0.0.0.0 --port 8000 --workers 1 --no-access-log"]

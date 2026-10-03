@@ -1,0 +1,8 @@
+[Unit]
+Description=Consistent backup of Instagram manager inbox
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/texnikach-instagram-inbox/source/instagram_inbox/ops/backup.py
+UMask=0077
+NoNewPrivileges=true
