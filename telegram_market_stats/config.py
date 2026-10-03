@@ -13,6 +13,26 @@ DEFAULT_COMPETITORS = {
 }
 
 
+@dataclass(frozen=True, slots=True)
+class MarketGroup:
+    group_id: int
+    title: str
+
+
+def _additional_groups() -> tuple[MarketGroup, ...]:
+    raw = os.getenv(
+        "TELEGRAM_MARKET_EXTRA_GROUPS_JSON",
+        '{"-1001463992108":"MALIKA case  No1"}',
+    ).strip() or "{}"
+    try:
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            raise ValueError
+        return tuple(MarketGroup(int(key), str(title).strip()) for key, title in parsed.items())
+    except (TypeError, ValueError) as exc:
+        raise ValueError("TELEGRAM_MARKET_EXTRA_GROUPS_JSON must map numeric group IDs to titles") from exc
+
+
 def _bool(name: str, default: bool = False) -> bool:
     return os.getenv(name, str(default)).strip().casefold() in {
         "1", "true", "yes", "on",
@@ -66,6 +86,11 @@ class MarketStatsSettings:
     batch_size: int
     edit_rescan_messages: int
     competitors: dict[int, str]
+    additional_groups: tuple[MarketGroup, ...] = ()
+
+    @property
+    def groups(self) -> tuple[MarketGroup, ...]:
+        return (MarketGroup(self.group_id, self.group_title), *self.additional_groups)
 
     @classmethod
     def load(cls) -> "MarketStatsSettings":
@@ -97,11 +122,16 @@ class MarketStatsSettings:
                 "TELEGRAM_MARKET_EDIT_RESCAN_MESSAGES", 500, 0, 5000
             ),
             competitors=_competitors(),
+            additional_groups=_additional_groups(),
         )
         settings.validate()
         return settings
 
     def validate(self) -> None:
+        if len({group.group_id for group in self.groups}) != len(self.groups):
+            raise ValueError("market group IDs must be unique")
+        if any(group.group_id >= 0 or not group.title or len(group.title) > 255 for group in self.groups):
+            raise ValueError("market groups require negative Telegram IDs and titles")
         if not self.enabled:
             return
         if self.group_id >= 0:

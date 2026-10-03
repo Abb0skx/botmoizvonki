@@ -328,6 +328,18 @@ class MonitoringRouteTests(unittest.TestCase):
             "market_stats_database_not_found",
         )
 
+    def test_finance_group_selection_is_allowlisted(self):
+        self.login()
+        with patch("monitoring.router.build_market_report", return_value={"source": {"group_id": "-1001463992108", "title": ""}}) as report:
+            response = self.client.get("/monitoring/api/finance?group_id=-1001463992108")
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(report.call_args.kwargs["group_id"], -1001463992108)
+            self.assertIn("MALIKA case", response.json()["data"]["source"]["title"])
+            self.assertEqual(len(response.json()["data"]["groups"]), 2)
+            invalid = self.client.get("/monitoring/api/finance?group_id=-999")
+            self.assertEqual(invalid.status_code, 422)
+            self.assertEqual(report.call_count, 1)
+
     def test_reduced_portal_sections_return_to_complete_legacy_pages(self):
         anonymous = self.client.get(
             "/monitoring/calls?period=30d", follow_redirects=False

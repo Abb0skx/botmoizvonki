@@ -62,12 +62,16 @@ class MarketStatsCollector:
         backfill_before_message_id: int | None,
         backfill_complete: bool,
         backfill_scanned: int,
-    ) -> tuple[list[Any], list[Any]]:
+    ) -> tuple[list[Any], list[Any], int]:
         messages = await self.client.get_messages(
             self.entity,
             limit=self.settings.batch_size,
             min_id=last_message_id,
+            reverse=True,
         )
+        # Only contiguous forward history may advance the checkpoint. Recent
+        # edits can include IDs beyond this batch during a busy interval.
+        forward_max_id = max((int(message.id) for message in messages), default=last_message_id)
         recent = []
         if self.settings.edit_rescan_messages:
             recent = await self.client.get_messages(
@@ -90,7 +94,7 @@ class MarketStatsCollector:
             for message in [*messages, *recent]
             if getattr(message, "id", None) is not None
         }
-        return list(by_id.values()), backfill
+        return list(by_id.values()), backfill, forward_max_id
 
     async def collect_once(self) -> dict[str, int]:
         if self.client is None or self.entity is None or self.analyzer is None:
@@ -106,10 +110,11 @@ class MarketStatsCollector:
         )
         backfill_scanned = int(checkpoint["backfill_scanned"] or 0) if checkpoint else 0
         backfill_complete = bool(checkpoint and checkpoint["backfill_complete"])
+        previous_backfill = (backfill_before, backfill_scanned, backfill_complete)
         scanned = with_models = demand_mentions = 0
         try:
             if initialized:
-                messages, backfill = await self._incremental_messages(
+                messages, backfill, max_id = await self._incremental_messages(
                     last_id,
                     backfill_before_message_id=backfill_before,
                     backfill_complete=backfill_complete,
@@ -118,6 +123,7 @@ class MarketStatsCollector:
             else:
                 backfill = await self._initial_messages()
                 messages = []
+                max_id = max((int(message.id) for message in backfill), default=last_id)
             cutoff = now - timedelta(days=self.settings.backfill_days)
             if backfill:
                 backfill_before = min(int(message.id) for message in backfill)
@@ -141,11 +147,9 @@ class MarketStatsCollector:
                 backfill_complete = True
             messages = list({int(message.id): message for message in messages}.values())
             messages.sort(key=lambda message: int(message.id))
-            max_id = last_id
             competitor_ids = set(self.settings.competitors)
             for message in messages:
                 message_id = int(message.id)
-                max_id = max(max_id, message_id)
                 text = str(getattr(message, "message", "") or "")
                 analysis = self.analyzer.analyze(text)
                 has_models = self.repo.upsert_message(
@@ -187,6 +191,7 @@ class MarketStatsCollector:
             }
         except Exception as exc:
             error_type = type(exc).__name__
+            backfill_before, backfill_scanned, backfill_complete = previous_backfill
             self.repo.save_checkpoint(
                 self.settings.group_id,
                 last_id,

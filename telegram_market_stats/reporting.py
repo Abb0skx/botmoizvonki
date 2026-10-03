@@ -161,6 +161,15 @@ def build_market_report(
         )]
         for row in competitors:
             row["last_search_at"] = _local_iso(row["last_search_at"])
+            counts = database.execute(
+                """SELECT COUNT(*) AS messages,
+                          SUM(CASE WHEN has_model=0 THEN 1 ELSE 0 END) AS unrecognized_messages
+                   FROM market_messages
+                   WHERE group_id=? AND sender_id=? AND telegram_date>=? AND telegram_date<?""",
+                (group, row["telegram_user_id"], start_utc, end_utc),
+            ).fetchone()
+            row["messages"] = int(counts["messages"] or 0)
+            row["unrecognized_messages"] = int(counts["unrecognized_messages"] or 0)
 
         competitor_models = [dict(row) for row in database.execute(
             """SELECT c.label,m.model_name,COUNT(*) AS searches,

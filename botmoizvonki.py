@@ -59,7 +59,8 @@ from telegram_folder_manager.service import (
     TelegramFolderScheduler,
     TelegramFolderService,
 )
-from telegram_market_stats import MarketStatsCollector, MarketStatsSettings
+from telegram_market_stats import MarketStatsSettings
+from telegram_market_stats.multi_collector import MultiGroupMarketStatsCollector
 from forwarding import (
     DEVICES as FORWARDING_DEVICES,
     OPERATOR as FORWARDING_OPERATOR,
@@ -219,13 +220,13 @@ async def start_telegram_business():
     if folder_settings.enabled:
         # One authorized MTProto client owns the SQLite session.  Folder tags
         # never inspect chat text; the optional market collector only reads the
-        # explicitly configured supplier group into its separate statistics DB.
+        # explicitly configured supplier groups into its separate statistics DB.
         # Run one application replica while either feature is enabled.
         _telegram_folder_scheduler = TelegramFolderScheduler(
             TelegramFolderService(
                 folder_settings,
                 market_collector=(
-                    MarketStatsCollector(market_settings)
+                    MultiGroupMarketStatsCollector(market_settings)
                     if market_settings.enabled else None
                 ),
             )

@@ -145,6 +145,9 @@ class MarketStatsRepository:
     ) -> None:
         stamp = _iso(now)
         with self.connect() as db:
+            previous_ids = {int(row[0]) for row in db.execute(
+                "SELECT telegram_user_id FROM market_competitors WHERE enabled=1"
+            )}
             db.execute(
                 """INSERT INTO market_sources(group_id,title,created_at,updated_at)
                    VALUES(?,?,?,?) ON CONFLICT(group_id) DO UPDATE SET
@@ -166,6 +169,14 @@ class MarketStatsRepository:
                         WHERE telegram_user_id NOT IN ({placeholders})""",
                     (stamp, *(str(value) for value in competitors)),
                 )
+            else:
+                db.execute("UPDATE market_competitors SET enabled=0,updated_at=?", (stamp,))
+            for user_id in previous_ids ^ set(competitors):
+                for table in ("market_messages", "market_model_mentions"):
+                    db.execute(
+                        f"UPDATE {table} SET is_competitor=? WHERE sender_id=?",
+                        (int(user_id in competitors), str(user_id)),
+                    )
 
     def checkpoint(self, group_id: int) -> sqlite3.Row | None:
         with self.connect() as db:
@@ -262,7 +273,7 @@ class MarketStatsRepository:
         safe = (redact_payment_data(text) or "").strip()
         digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
         is_competitor = int(sender_id in competitor_ids if sender_id else False)
-        excerpt = safe[:500] if analysis.mentions or analysis.intent != "unknown" else None
+        excerpt = safe[:4000] or None
         with self.connect() as db:
             db.execute(
                 """INSERT INTO market_messages(

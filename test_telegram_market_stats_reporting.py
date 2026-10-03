@@ -104,3 +104,19 @@ def test_missing_database_is_reported_without_creating_it(tmp_path: Path):
     with pytest.raises(MarketStatsUnavailable, match="database_not_found"):
         build_market_report(path, group_id=-1002188560435)
     assert not path.exists()
+
+
+def test_reports_do_not_mix_groups_and_count_unrecognized_company_messages(tmp_path):
+    path = tmp_path / "market.db"
+    _seed(path)
+    with sqlite3.connect(path) as db:
+        db.execute(
+            "INSERT INTO market_messages(group_id,message_id,sender_id,telegram_date,text_hash,intent,has_model,processed_at) VALUES(?,?,?,?,?,?,?,?)",
+            ("-1001463992108", 1, "213962560", "2026-09-30T06:00:00+00:00", "accessory", "unknown", 0, "2026-09-30T06:00:00+00:00"),
+        )
+    report = build_market_report(path, group_id=-1001463992108, now=datetime(2026, 9, 30, 15, tzinfo=TASHKENT))
+    assert report["summary"]["messages"] == 1
+    assert report["summary"]["searches"] == 0
+    mobilon = next(row for row in report["competitors"] if row["label"] == "Mobilon")
+    assert mobilon["messages"] == mobilon["unrecognized_messages"] == 1
+    assert mobilon["searches"] == 0

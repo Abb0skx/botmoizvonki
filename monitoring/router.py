@@ -38,6 +38,7 @@ from telegram_market_stats.reporting import (
     MarketStatsUnavailable,
     build_market_report,
 )
+from telegram_market_stats.config import MarketStatsSettings
 
 
 LOG = logging.getLogger("monitoring")
@@ -471,20 +472,22 @@ async def api_finance(
     period: str = Query("today"),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
+    group_id: int | None = Query(None),
 ):
     _principal(request)
     try:
-        group_id = int(os.getenv("TELEGRAM_MARKET_GROUP_ID", "-1002188560435"))
+        market_settings = MarketStatsSettings.load()
     except ValueError as exc:
         raise HTTPException(status_code=503, detail="market_group_not_configured") from exc
-    database_path = Path(os.getenv(
-        "TELEGRAM_MARKET_STATS_DB_PATH", "/app/data/telegram_market_stats.db"
-    ))
+    groups = {group.group_id: group.title for group in market_settings.groups}
+    selected_group = group_id if group_id is not None else market_settings.group_id
+    if selected_group not in groups:
+        raise HTTPException(status_code=422, detail="unknown_market_group")
     try:
         data = await run_in_threadpool(
             build_market_report,
-            database_path,
-            group_id=group_id,
+            market_settings.db_path,
+            group_id=selected_group,
             period=period,
             date_from=date_from,
             date_to=date_to,
@@ -498,6 +501,8 @@ async def api_finance(
             )},
             status_code=503,
         )
+    data["groups"] = [{"group_id": str(key), "title": title} for key, title in groups.items()]
+    data["source"]["title"] = data["source"]["title"] or groups[selected_group]
     return _json({"data": data, "meta": _meta("market_stats")})
 
 

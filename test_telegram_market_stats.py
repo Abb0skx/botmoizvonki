@@ -1,14 +1,18 @@
 import asyncio
 import sqlite3
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from openpyxl import Workbook
 
 from telegram_market_stats.analyzer import MarketMessageAnalyzer, ProductModelIndex
 from telegram_market_stats.collector import MarketStatsCollector
-from telegram_market_stats.config import DEFAULT_COMPETITORS, MarketStatsSettings
+from telegram_market_stats.config import DEFAULT_COMPETITORS, MarketGroup, MarketStatsSettings
+from telegram_market_stats.multi_collector import MultiGroupMarketStatsCollector
 from telegram_market_stats.repository import MarketStatsRepository
 
 
@@ -206,12 +210,12 @@ class FakeClient:
         self.entities.append(group_id)
         return SimpleNamespace(channel_id=abs(group_id))
 
-    async def get_messages(self, _entity, *, limit, min_id=0, max_id=0):
+    async def get_messages(self, _entity, *, limit, min_id=0, max_id=0, reverse=False):
         rows = [
             message for message in self.messages
             if message.id > min_id and (not max_id or message.id < max_id)
         ]
-        return sorted(rows, key=lambda message: message.id, reverse=True)[:limit]
+        return sorted(rows, key=lambda message: message.id, reverse=not reverse)[:limit]
 
 
 def message(message_id, text, sender_id=999, date=NOW, edit_date=None):
@@ -306,3 +310,107 @@ def test_market_database_cannot_equal_business_database(tmp_path, monkeypatch):
         assert "separate SQLite database" in str(exc)
     else:
         raise AssertionError("shared business/market database was accepted")
+
+
+def test_multi_group_collection_isolated_and_restores_after_restart(tmp_path):
+    base = settings(tmp_path, tmp_path / "unused.xlsx")
+    second = -1001463992108
+    config = replace(base, additional_groups=(MarketGroup(second, "MALIKA case No1"),))
+
+    class GroupClient:
+        blocked = False
+
+        async def get_me(self):
+            return SimpleNamespace(id=5619452809)
+
+        async def get_input_entity(self, group_id):
+            if group_id == second and self.blocked:
+                raise ValueError("group temporarily unavailable")
+            return group_id
+
+        async def get_messages(self, group_id, **kwargs):
+            rows = [message(1, "обычный разговор", sender_id=5619452809)] if group_id == second else [message(1, "iPhone 16 Pro Max kerak", sender_id=213962560)]
+            return await FakeClient(rows).get_messages(group_id, **kwargs)
+
+    client = GroupClient()
+    client.blocked = True
+
+    async def scenario():
+        collector = MultiGroupMarketStatsCollector(config, analyzer=analyzer(), clock=lambda: NOW)
+        await collector.start(client)
+        first = await collector.collect_once()
+        assert first[str(second)] == {"error": "ValueError"}
+        assert collector.repo.checkpoint(base.group_id)["last_message_id"] == 1
+        client.blocked = False
+        second_pass = await collector.collect_once()
+        assert second_pass[str(second)]["scanned"] == 1
+        await collector.stop()
+        restarted = MultiGroupMarketStatsCollector(config, analyzer=analyzer(), clock=lambda: NOW)
+        await restarted.start(client)
+        assert all(row["scanned"] == 0 for row in (await restarted.collect_once()).values())
+        await restarted.stop()
+
+    asyncio.run(scenario())
+    with sqlite3.connect(config.db_path) as db:
+        assert db.execute("SELECT COUNT(*) FROM market_messages").fetchone()[0] == 2
+        assert db.execute("SELECT COUNT(*) FROM market_checkpoints").fetchone()[0] == 2
+        assert db.execute("SELECT label FROM market_competitors WHERE telegram_user_id='5619452809'").fetchone()[0] == "TEXNIKACH"
+        assert db.execute("SELECT text_excerpt FROM market_messages WHERE group_id=?", (str(second),)).fetchone()[0] == "обычный разговор"
+
+
+def test_busy_group_does_not_skip_forward_history_when_rescanning_edits(tmp_path):
+    config = replace(settings(tmp_path, tmp_path / "unused.xlsx"), batch_size=10, edit_rescan_messages=5)
+    client = FakeClient([message(1, "chat")])
+    collector = MarketStatsCollector(config, analyzer=analyzer(), clock=lambda: NOW)
+
+    async def scenario():
+        await collector.start(client)
+        await collector.collect_once()
+        client.messages.extend(message(i, "chat") for i in range(2, 42))
+        await collector.collect_once()
+        assert collector.repo.checkpoint(config.group_id)["last_message_id"] == 11
+        for _ in range(3):
+            await collector.collect_once()
+        await collector.stop()
+
+    asyncio.run(scenario())
+    with sqlite3.connect(config.db_path) as db:
+        assert db.execute("SELECT COUNT(*) FROM market_messages").fetchone()[0] == 41
+
+
+def test_failed_backfill_does_not_advance_its_checkpoint(tmp_path):
+    config = replace(settings(tmp_path, tmp_path / "unused.xlsx"), batch_size=10)
+    client = FakeClient([message(i, "chat") for i in range(1, 31)])
+    collector = MarketStatsCollector(config, analyzer=analyzer(), clock=lambda: NOW)
+    original = collector.repo.upsert_message
+
+    async def scenario():
+        await collector.start(client)
+        await collector.collect_once()
+        def failing(**kwargs):
+            if kwargs["message_id"] == 15:
+                raise RuntimeError("transient storage failure")
+            return original(**kwargs)
+        collector.repo.upsert_message = failing
+        with pytest.raises(RuntimeError):
+            await collector.collect_once()
+        assert collector.repo.checkpoint(config.group_id)["backfill_before_message_id"] == 21
+        collector.repo.upsert_message = original
+        await collector.collect_once()
+        await collector.collect_once()
+        await collector.stop()
+
+    asyncio.run(scenario())
+    with sqlite3.connect(config.db_path) as db:
+        assert db.execute("SELECT COUNT(*) FROM market_messages").fetchone()[0] == 30
+
+
+def test_additional_group_settings_validation(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_MARKET_EXTRA_GROUPS_JSON", '{"-1001463992108":"MALIKA case No1"}')
+    assert MarketStatsSettings.load().groups[-1].group_id == -1001463992108
+    for value in ('[]', '{"abc":"group"}', '{"12":"group"}', '{"-1002188560435":"duplicate"}'):
+        monkeypatch.setenv("TELEGRAM_MARKET_EXTRA_GROUPS_JSON", value)
+        with pytest.raises(ValueError):
+            MarketStatsSettings.load()
+    monkeypatch.setenv("TELEGRAM_MARKET_EXTRA_GROUPS_JSON", '{}')
+    assert len(MarketStatsSettings.load().groups) == 1
