@@ -43,6 +43,8 @@ class TelegramFolderService:
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self._last_reconcile = 0.0
         self._supplier_task: asyncio.Task | None = None
+        self._daily_task: asyncio.Task | None = None
+        self._queue_lock = asyncio.Lock()
         self.manager_cards = (
             ManagerCards(
                 self.repo, settings.manager_cards_chat_id,
@@ -54,6 +56,7 @@ class TelegramFolderService:
     async def start(self) -> None:
         await self.gateway.connect()
         await self.gateway.ensure_folders()
+        await self.rollover_day()
         if self.market_collector is not None:
             await self.market_collector.start(self.gateway.client)
         self.repo.seed_new_clients(
@@ -67,8 +70,16 @@ class TelegramFolderService:
             self._supplier_task = asyncio.create_task(
                 self._supplier_loop(), name="telegram-supplier-groups"
             )
+        self._daily_task = asyncio.create_task(self._daily_loop(), name="telegram-daily-folders")
 
     async def stop(self) -> None:
+        if self._daily_task is not None:
+            self._daily_task.cancel()
+            try:
+                await self._daily_task
+            except asyncio.CancelledError:
+                pass
+            self._daily_task = None
         if self._supplier_task is not None:
             self._supplier_task.cancel()
             try:
@@ -156,7 +167,45 @@ class TelegramFolderService:
                 changed += 1
         return changed
 
+    async def rollover_day(self) -> bool:
+        pending = self.repo.begin_day(self.clock())
+        if pending:
+            if not self.repo.day_clear_due(self.clock()):
+                return False
+            try:
+                await self.gateway.clear_daily()
+            except Exception as exc:
+                self.repo.defer_day_clear(self.clock(), _retry_after(exc) or 30)
+                LOG.error("telegram_daily_reset_retry type=%s", type(exc).__name__)
+                return False
+            self.repo.complete_day_clear(pending)
+            LOG.info("telegram_daily_folders_cleared day=%s timezone=Asia/Tashkent", pending)
+        return True
+
+    async def _daily_loop(self) -> None:
+        # Independent of long market backfills / supplier scans. The same lock
+        # prevents an old queued move from racing the remote midnight clear.
+        while True:
+            try:
+                async with self._queue_lock:
+                    await self.rollover_day()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                LOG.error("telegram_daily_reset_retry type=%s", type(exc).__name__)
+                await asyncio.sleep(max(5.0, _retry_after(exc) or 5.0))
+            else:
+                await asyncio.sleep(1)
+
     async def run_once(self) -> int:
+        async with self._queue_lock:
+            ready = await self.rollover_day()
+            processed = await self._run_queues() if ready else 0
+        if self.market_collector is not None:
+            await self.market_collector.run_if_due()
+        return processed
+
+    async def _run_queues(self) -> int:
         self.repo.seed_new_clients(
             self.clock(),
             backfill_existing=self.settings.backfill_existing,
@@ -171,8 +220,6 @@ class TelegramFolderService:
             except Exception as exc:
                 # Internal card delivery must not stop folder reconciliation.
                 LOG.error("manager_card_cycle_failed type=%s", type(exc).__name__)
-        if self.market_collector is not None:
-            await self.market_collector.run_if_due()
         monotonic = time.monotonic()
         if monotonic - self._last_reconcile >= self.settings.reconcile_seconds:
             await self.reconcile_manual_moves()

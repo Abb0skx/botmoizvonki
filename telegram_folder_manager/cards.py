@@ -16,6 +16,7 @@ from telegram_business.migrations import connect
 from telegram_business.telegram_api import TelegramAPIError, TelegramBusinessAPI
 
 from .repository import FolderRepository, iso
+from .daily import is_today
 
 
 LOG = logging.getLogger("telegram_folder_manager.cards")
@@ -124,6 +125,7 @@ class ManagerCards:
             ).fetchone()
             if (
                 not assignment or assignment["folder_code"] != "NEW"
+                or not is_today(row["created_at"], now)
                 or int(assignment["revision"]) != int(row["assignment_revision"])
                 or row["group_chat_id"] != self.group_chat_id
             ):
@@ -244,10 +246,12 @@ class ManagerCards:
                 (callback_id,),
             ).fetchone()
             card = db.execute(
-                """SELECT chat_id,assignment_revision FROM telegram_manager_cards WHERE card_id=?
+                """SELECT chat_id,assignment_revision,created_at FROM telegram_manager_cards WHERE card_id=?
                    AND status='sent' AND group_chat_id=? AND group_message_id=?""",
                 (card_id, group_id, message_id),
             ).fetchone()
+            if card and not is_today(card["created_at"], now):
+                card = None
             if receipt:
                 outcome = str(receipt["outcome"])
                 customer_id = str(card["chat_id"]) if card else None

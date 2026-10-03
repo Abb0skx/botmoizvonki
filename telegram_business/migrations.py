@@ -200,6 +200,9 @@ CREATE INDEX IF NOT EXISTS idx_telegram_folder_jobs_due
  ON telegram_folder_jobs(state,next_attempt_at,job_id);
 CREATE TABLE IF NOT EXISTS telegram_folder_state (
  key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS telegram_folder_daily_history (
+ day TEXT NOT NULL, chat_id TEXT NOT NULL, assignment_json TEXT NOT NULL,
+ archived_at TEXT NOT NULL, PRIMARY KEY(day,chat_id));
 CREATE TABLE IF NOT EXISTS telegram_manager_cards (
  card_id INTEGER PRIMARY KEY AUTOINCREMENT,
  chat_id TEXT NOT NULL, assignment_revision INTEGER NOT NULL,

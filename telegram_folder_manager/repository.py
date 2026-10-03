@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import json
 import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -9,6 +10,7 @@ from pathlib import Path
 from telegram_business.migrations import connect, migrate
 
 from .config import FOLDER_CODES, SUPPLIER_CODES
+from .daily import DAILY_CODES, day_key, is_today
 
 
 CURSOR_KEY = "incoming_client_message_cursor"
@@ -70,7 +72,15 @@ class FolderRepository:
             (chat_id,),
         ).fetchone()
         changed = row is None or row["folder_code"] != folder_code
-        revision = 1 if row is None else int(row["revision"]) + (1 if changed else 0)
+        # Daily clearing removes the current assignment, never its durable
+        # jobs/cards. Revisions must not be reused on the next day.
+        previous = db.execute(
+            """SELECT MAX(revision) FROM (
+                 SELECT revision FROM telegram_folder_jobs WHERE chat_id=?
+                 UNION ALL SELECT assignment_revision FROM telegram_manager_cards WHERE chat_id=?)""",
+            (chat_id, chat_id),
+        ).fetchone()[0] if row is None else row["revision"]
+        revision = int(previous or 0) + (1 if changed else 0)
         stamp = iso(now)
         if row is None:
             db.execute(
@@ -208,6 +218,86 @@ class FolderRepository:
             return db.execute(
                 "SELECT * FROM telegram_folder_assignments ORDER BY updated_at DESC"
             ).fetchall()
+
+    def begin_day(self, now: datetime) -> str | None:
+        """Durably expire yesterday, then request an idempotent remote clear.
+
+        First installation keeps today's existing folders. A restart after a
+        missed midnight catches up before processing any new client messages.
+        """
+        today, stamp = day_key(now), iso(now)
+        with connect(self.path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            state = db.execute(
+                "SELECT value FROM telegram_folder_state WHERE key='daily_queue_day'"
+            ).fetchone()
+            if state is None:
+                db.execute(
+                    "INSERT INTO telegram_folder_state VALUES('daily_queue_day',?,?)",
+                    (today, stamp),
+                )
+            elif state["value"] < today:
+                placeholders = ",".join("?" for _ in DAILY_CODES)
+                rows = db.execute(
+                    f"SELECT * FROM telegram_folder_assignments WHERE folder_code IN ({placeholders})",
+                    DAILY_CODES,
+                ).fetchall()
+                for row in rows:
+                    db.execute(
+                        "INSERT OR IGNORE INTO telegram_folder_daily_history VALUES(?,?,?,?)",
+                        (state["value"], row["chat_id"], json.dumps(dict(row)), stamp),
+                    )
+                db.execute(
+                    f"DELETE FROM telegram_folder_assignments WHERE folder_code IN ({placeholders})",
+                    DAILY_CODES,
+                )
+                db.execute(
+                    f"""UPDATE telegram_folder_jobs SET state='superseded',updated_at=?,
+                        lease_token=NULL,lease_expires_at=NULL
+                        WHERE folder_code IN ({placeholders}) AND state IN ('pending','retry','running')""",
+                    (stamp, *DAILY_CODES),
+                )
+                db.execute(
+                    """UPDATE telegram_manager_cards SET status='cancelled',updated_at=?,
+                       lease_token=NULL,lease_expires_at=NULL WHERE status!='cancelled'""",
+                    (stamp,),
+                )
+                db.execute(
+                    "UPDATE telegram_folder_state SET value=?,updated_at=? WHERE key='daily_queue_day'",
+                    (today, stamp),
+                )
+                db.execute(
+                    """INSERT INTO telegram_folder_state VALUES('daily_clear_pending',?,?)
+                       ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at""",
+                    (today, stamp),
+                )
+            pending = db.execute(
+                "SELECT value FROM telegram_folder_state WHERE key='daily_clear_pending'"
+            ).fetchone()
+            return str(pending["value"]) if pending else None
+
+    def complete_day_clear(self, day: str) -> None:
+        with connect(self.path) as db:
+            db.execute(
+                "DELETE FROM telegram_folder_state WHERE key='daily_clear_pending' AND value=?",
+                (day,),
+            )
+            db.execute("DELETE FROM telegram_folder_state WHERE key='daily_clear_retry_at'")
+
+    def day_clear_due(self, now: datetime) -> bool:
+        with connect(self.path) as db:
+            row = db.execute(
+                "SELECT value FROM telegram_folder_state WHERE key='daily_clear_retry_at'"
+            ).fetchone()
+            return row is None or row["value"] <= iso(now)
+
+    def defer_day_clear(self, now: datetime, seconds: float) -> None:
+        with connect(self.path) as db:
+            db.execute(
+                """INSERT INTO telegram_folder_state VALUES('daily_clear_retry_at',?,?)
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at""",
+                (iso(now + timedelta(seconds=max(5, seconds))), iso(now)),
+            )
 
     @staticmethod
     def _supplier_slot(db: sqlite3.Connection, capacity: int) -> str | None:
@@ -368,6 +458,10 @@ class FolderRepository:
         newly_identified_suppliers: list[str] = []
         with connect(self.path) as db:
             db.execute("BEGIN IMMEDIATE")
+            if db.execute(
+                "SELECT 1 FROM telegram_folder_state WHERE key='daily_clear_pending'"
+            ).fetchone():
+                return 0
             state = db.execute(
                 "SELECT value FROM telegram_folder_state WHERE key=?", (CURSOR_KEY,)
             ).fetchone()
@@ -392,12 +486,16 @@ class FolderRepository:
                     cursor = maximum
 
             rows = db.execute(
-                """SELECT id,chat_id FROM business_messages
+                """SELECT id,chat_id,telegram_date,created_at FROM business_messages
                     WHERE id>? AND sender_type='client' AND deleted_at IS NULL
                     ORDER BY id LIMIT ?""",
                 (cursor, max(1, min(int(limit), 5000))),
             ).fetchall()
             for row in rows:
+                # Delayed/replayed updates from yesterday cannot repopulate
+                # today's queues. The original Telegram date wins over receipt.
+                if not is_today(row["telegram_date"] or row["created_at"], when):
+                    continue
                 chat = str(row["chat_id"] or "")
                 if not re.fullmatch(r"[1-9][0-9]{0,19}", chat):
                     continue

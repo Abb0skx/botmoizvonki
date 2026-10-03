@@ -6,6 +6,7 @@ import os
 from typing import Any, Iterable
 
 from .config import FolderSettings, FolderSpec, LEGACY_SUPPLIER_TITLES
+from .daily import DAILY_CODES
 
 
 LOG = logging.getLogger("telegram_folder_manager.gateway")
@@ -320,6 +321,25 @@ class TelegramFolderGateway:
             LOG.info(
                 "telegram_folder_moved chat_id=%s folder=%s", chat_id, folder_code
             )
+
+    async def clear_daily(self) -> None:
+        """Clear only daily filters; never delete chats, messages or supplier tags."""
+        from telethon.tl.functions.messages import UpdateDialogFilterRequest
+
+        async with self._lock:
+            _, filters = await self._filters()
+            managed = self._managed(filters)
+            for code in DAILY_CODES:
+                current = managed.get(code)
+                filter_id = int(current.id) if current is not None else self._next_filter_id(filters)
+                # Explicit-only filters prevent Telegram's contacts/groups flags
+                # from making yesterday's chats reappear automatically.
+                replacement = self._new_filter(
+                    self.settings.by_code[code], filter_id, [self._self_peer]
+                )
+                await self.client(UpdateDialogFilterRequest(id=filter_id, filter=replacement))
+                if current is None:
+                    filters.append(replacement)
 
     async def snapshot(self) -> dict[str, set[str]]:
         async with self._lock:
