@@ -146,7 +146,7 @@ class MarketStatsRepository:
         stamp = _iso(now)
         with self.connect() as db:
             previous_ids = {int(row[0]) for row in db.execute(
-                "SELECT telegram_user_id FROM market_competitors WHERE enabled=1"
+                "SELECT telegram_user_id FROM market_competitors WHERE enabled=1 AND label!='TEXNIKACH'"
             )}
             db.execute(
                 """INSERT INTO market_sources(group_id,title,created_at,updated_at)
@@ -171,11 +171,12 @@ class MarketStatsRepository:
                 )
             else:
                 db.execute("UPDATE market_competitors SET enabled=0,updated_at=?", (stamp,))
-            for user_id in previous_ids ^ set(competitors):
+            competitor_ids = {user_id for user_id, label in competitors.items() if label != "TEXNIKACH"}
+            for user_id in previous_ids ^ competitor_ids:
                 for table in ("market_messages", "market_model_mentions"):
                     db.execute(
                         f"UPDATE {table} SET is_competitor=? WHERE sender_id=?",
-                        (int(user_id in competitors), str(user_id)),
+                        (int(user_id in competitor_ids), str(user_id)),
                     )
 
     def checkpoint(self, group_id: int) -> sqlite3.Row | None:

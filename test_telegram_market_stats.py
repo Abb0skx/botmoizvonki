@@ -355,6 +355,7 @@ def test_multi_group_collection_isolated_and_restores_after_restart(tmp_path):
         assert db.execute("SELECT COUNT(*) FROM market_messages").fetchone()[0] == 2
         assert db.execute("SELECT COUNT(*) FROM market_checkpoints").fetchone()[0] == 2
         assert db.execute("SELECT label FROM market_competitors WHERE telegram_user_id='5619452809'").fetchone()[0] == "TEXNIKACH"
+        assert db.execute("SELECT is_competitor FROM market_messages WHERE sender_id='5619452809'").fetchone()[0] == 0
         assert db.execute("SELECT text_excerpt FROM market_messages WHERE group_id=?", (str(second),)).fetchone()[0] == "обычный разговор"
 
 

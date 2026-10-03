@@ -147,7 +147,7 @@ class MarketStatsCollector:
                 backfill_complete = True
             messages = list({int(message.id): message for message in messages}.values())
             messages.sort(key=lambda message: int(message.id))
-            competitor_ids = set(self.settings.competitors)
+            competitor_ids = {user_id for user_id, label in self.settings.competitors.items() if label != "TEXNIKACH"}
             for message in messages:
                 message_id = int(message.id)
                 text = str(getattr(message, "message", "") or "")
