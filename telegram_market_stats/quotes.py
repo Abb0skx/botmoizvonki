@@ -7,6 +7,7 @@ from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import re
+import unicodedata
 
 WINDOW_SECONDS = 420
 # Owner-approved market convention, applied ONLY when currency is omitted.
@@ -24,6 +25,24 @@ CAPACITIES = {'32','64','128','256','512','1024','2048'}
 def timestamp(value):
     dt = datetime.fromisoformat(value)
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+
+
+def request_identity(row):
+    """Exact product request identity; never drop variant words or group ID."""
+    text = ' '.join(unicodedata.normalize('NFC', row.get('text_excerpt') or '').casefold().split())
+    return str(row.get('group_id', '')), text or ('empty', row['message_id'])
+
+
+def distinct_requests(active):
+    """One latest original per identical request inside the active 7m window.
+
+    Do not rewrite IDs/timestamps: replies/manual choices still target originals.
+    The latest post is the eligible representative for a bare-price inference.
+    """
+    latest = {}
+    for request in sorted(active, key=lambda r: (timestamp(r['telegram_date']), r['message_id'])):
+        latest[request_identity(request)] = request
+    return list(latest.values())
 
 
 def _minor(raw, scale=''):
@@ -199,7 +218,7 @@ def build_quotes(rows, own_ids, selected_ids, now):
             elif row.get('reply_external') or row.get('reply_to_message_id'):
                 reason='reply_not_found'
             else:
-                candidates=[q for q in active if same_model(q,row)] if row.get('mentions') or len(tokens(text))>=2 else list(active)
+                candidates=distinct_requests([q for q in active if same_model(q,row)] if row.get('mentions') or len(tokens(text))>=2 else list(active))
                 # No inference while historical reply metadata is incomplete.
                 if any(q.get('reply_metadata_loaded') != 1 for q in active):
                     reason='metadata_missing'

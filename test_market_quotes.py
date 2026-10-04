@@ -106,7 +106,9 @@ def test_exact_model_without_reply_and_repeated_identical_requests():
     req,_=build(rows,(1,2));assert req[0]['offers'][0]['method']=='model'
     rows.append(query(4,seconds=21,model='iphone'))
     rows.append(row(5,'iPhone $800',seconds=22,model='iphone'))
-    _,other=build(rows,(1,2,4));assert other[0]['reason']=='ambiguous'
+    requests,other=build(rows,(1,2,4))
+    assert not other
+    assert next(r for r in requests if r['message_id']==4)['offers'][0]['minor']==80000
 
 
 def test_reply_chain_and_later_correction_keeps_history():

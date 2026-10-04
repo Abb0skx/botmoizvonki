@@ -132,6 +132,75 @@ def test_rule_currency_does_not_cross_dollar_sum_boundary():
     assert unknown[0]['reason']=='ambiguous'
 
 
+def test_duplicate_requests_are_one_product_for_bare_prices():
+    first,repeat=q(),q(2,seconds=15)
+    linked,unknown=match_private([first,repeat],[dm(1,'1470',seconds=20),dm(2,'1475',seconds=30,chat='11')])
+    assert not unknown and not linked[key(first)]
+    assert [o['minor'] for o in linked[key(repeat)]]==[147000,147500]
+    assert all(o['method']=='private_time' for o in linked[key(repeat)])
+
+
+def test_real_watch_then_duplicate_iphone_prices_remain_hypotheses():
+    watch={**q(1,'Amazfit balance 3 kere'),'group_id':'-1002'}
+    first=q(2,'17 max 256 silver sim esim kere',seconds=333)
+    repeat=q(3,first['text_excerpt'],seconds=364)
+    linked,unknown=match_private([watch,first,repeat],[dm(1,'330',seconds=9),
+        dm(2,'1470',seconds=393,chat='11'),dm(3,'1475',seconds=411,chat='12')])
+    assert not unknown
+    assert [o['minor'] for o in linked[key(repeat)]]==[147000,147500]
+    assert all(o['method']=='price_far' and o['inferred'] and not o['comparable'] for o in linked[key(repeat)])
+    assert len(linked[key(watch)])==1
+
+
+def test_older_duplicate_price_anchor_is_available_without_inference_cascade():
+    first,repeat,watch=q(),q(2,seconds=15),q(3,'Watch kere',seconds=60)
+    linked,unknown=match_private([first,repeat,watch],[dm(1,'1000',seconds=10),dm(2,'990',seconds=65,chat='11'),dm(3,'120',seconds=70,chat='12')])
+    assert not unknown
+    assert linked[key(repeat)][0]['method']=='price_near'
+    assert linked[key(watch)][0]['method']=='price_far' and not linked[key(watch)][0]['comparable']
+
+
+def test_reposting_an_old_product_does_not_make_it_new_for_price_far():
+    first=q(model='iphone')
+    watch=q(2,'Watch kere',seconds=60,model='watch')
+    repeat=q(3,seconds=80,model='iphone')
+    linked,unknown=match_private([first,watch,repeat],[dm(1,'Watch 300$',seconds=70,model='watch'),dm(2,'1500',seconds=90)])
+    assert len(unknown)==1 and unknown[0]['reason']=='ambiguous'
+    assert not linked[key(repeat)]
+
+
+@pytest.mark.parametrize('text,group', [('iPhone 256 black kere','-1001'),('iPhone 512 silver kere','-1001'),('iPhone 256 silver esim kere','-1001'),('iPhone 256 silver kere','-1002')])
+def test_different_variants_or_groups_are_not_duplicates(text,group):
+    first=q(text='iPhone 256 silver kere')
+    second={**q(2,text,seconds=15),'group_id':group}
+    linked,unknown=match_private([first,second],[dm(1,'1470',seconds=20)])
+    assert len(unknown)==1 and not any(linked.values())
+
+
+def test_exact_forward_keeps_original_but_hidden_origin_accepts_reposts():
+    first,repeat=q(),q(2,seconds=15)
+    exact={**dm(1,first['text_excerpt'],seconds=20),'forwarded':True,'forward_group_id':'-1001','forward_message_id':1}
+    hidden={**dm(3,first['text_excerpt'],seconds=22,chat='11'),'forwarded':True}
+    linked,unknown=match_private([first,repeat],[exact,dm(2,'1000',seconds=21),hidden,dm(4,'1100',seconds=23,chat='11')])
+    assert not unknown and linked[key(first)][0]['method']=='forward_context'
+    assert linked[key(repeat)][0]['method']=='forward_context'
+
+
+def test_model_and_outgoing_context_with_reposts():
+    first,repeat=q(model='iphone'),q(2,seconds=15,model='iphone')
+    linked,unknown=match_private([first,repeat],[dm(1,'iPhone 1000$',seconds=20,model='iphone'),
+        {**dm(2,first['text_excerpt'],seconds=30,chat='11',model='iphone'),'outgoing':True},dm(3,'990',seconds=40,chat='11')])
+    assert not unknown
+    assert [o['method'] for o in linked[key(repeat)]]==['private_model','forward_context']
+
+
+def test_expired_original_reply_is_not_reassigned_to_repost():
+    first,repeat=q(),q(2,seconds=400)
+    linked,unknown=match_private([first,repeat],[dm(1,'1000',seconds=10),dm(2,'990',seconds=430,reply=1)])
+    assert not linked[key(repeat)]
+    assert unknown[0]['reason']=='reply_not_found'
+
+
 def test_collector_only_known_suppliers_cursor_restart_and_deleted(tmp_path):
     from telegram_market_stats.private_collector import PrivateQuotesCollector
     from telegram_market_stats.private_store import load_messages

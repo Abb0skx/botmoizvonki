@@ -9,7 +9,7 @@ import re
 import statistics
 from datetime import timedelta
 
-from .quotes import prices, timestamp, same_model, compatible, qualifiers, tokens
+from .quotes import prices, timestamp, same_model, compatible, qualifiers, tokens, request_identity, distinct_requests
 
 
 def key(row):
@@ -26,13 +26,14 @@ def normalized(text):
     return ' '.join((text or '').casefold().split())
 
 
-def price_target(candidates, value, anchors, at, near=.15, far=.40):
+def price_target(candidates, value, anchors, at, near=.15, far=.40, originals=()):
     """Distances use the same currency/notation. Unknown units remain unknown."""
     if value.get('minor') is None:
         return None, ''
     distances = []
     for request in candidates:
-        samples = [a for a in anchors.get(key(request), []) if a[0] == value['currency'] and a[2] <= at]
+        family = [q for q in originals if request_identity(q) == request_identity(request)] or [request]
+        samples = [a for q in family for a in anchors.get(key(q), []) if a[0] == value['currency'] and a[2] <= at]
         if samples:
             median = statistics.median(a[1] for a in samples)
             distances.append((abs(value['minor'] - median) / median, request, min(a[2] for a in samples)))
@@ -42,7 +43,8 @@ def price_target(candidates, value, anchors, at, near=.15, far=.40):
     # A large difference is only a hypothesis, never a confirmed price for #2.
     if len(candidates) == 2 and len(distances) == 1 and distances[0][0] >= far:
         other = next(q for q in candidates if key(q) != key(distances[0][1]))
-        if timestamp(other['telegram_date']) > distances[0][2]:
+        family = [q for q in originals if request_identity(q) == request_identity(other)] or [other]
+        if min(timestamp(q['telegram_date']) for q in family) > distances[0][2]:
             return other, 'price_far'
     return None, ''
 
@@ -92,6 +94,11 @@ def match_private(requests, messages, links=(), *, near=.15, far=.40):
                 and (not message.get('forward_from_id') or str(message['forward_from_id']) == str(q.get('sender_id')))
                 and (not message.get('forward_date') or timestamp(message['forward_date']) == timestamp(q['telegram_date']))
             )]
+            # A concrete forwarded post outranks a same-text repost. Only when
+            # Telegram hides the origin can identical active posts act as one.
+            if message.get('forward_group_id') and message.get('forward_message_id'):
+                exact = [q for q in exact if message['forward_group_id'] == q['group_id'] and message['forward_message_id'] == q['message_id']]
+            exact = distinct_requests(exact)
             context.pop(chat, None)
             if len(exact) == 1:
                 context[chat] = key(exact[0])
@@ -99,6 +106,7 @@ def match_private(requests, messages, links=(), *, near=.15, far=.40):
             # A forwarded request is context, not a supplier's quote.
             continue
         explicit = [q for q in active if same_model(q, message)]
+        distinct_explicit = distinct_requests(explicit)
         has_model = bool(message.get('mentions'))
         if message.get('reply_to_message_id'):
             parent = reply_context.get((chat, message['reply_to_message_id']))
@@ -107,8 +115,8 @@ def match_private(requests, messages, links=(), *, near=.15, far=.40):
                 method = 'private_reply'
             else:
                 target, reason = None, 'reply_not_found'
-        elif len(explicit) == 1:
-            target, method = explicit[0], 'private_model'
+        elif len(distinct_explicit) == 1:
+            target, method = distinct_explicit[0], 'private_model'
             context[chat] = key(target)
         elif has_model:
             context.pop(chat, None)
@@ -140,11 +148,12 @@ def match_private(requests, messages, links=(), *, near=.15, far=.40):
             else:
                 target, method, reason = None, '', 'manual_stale'
         if not target and not reason:
-            candidates = [q for q in active if compatible(q, message)]
+            originals = [q for q in active if compatible(q, message)]
+            candidates = distinct_requests(originals)
             if len(candidates) == 1:
                 target, method = candidates[0], 'private_time'
             elif len(values) == 1:
-                target, method = price_target(candidates, values[0], anchors, at, near, far)
+                target, method = price_target(candidates, values[0], anchors, at, near, far, originals)
             if not target:
                 reason = 'ambiguous'
         if target:
@@ -152,7 +161,7 @@ def match_private(requests, messages, links=(), *, near=.15, far=.40):
                 reason = 'late'
             elif target.get('edited_at') and timestamp(target['edited_at']) > at:
                 reason = 'request_edited'
-            if has_model and (len(explicit) != 1 or key(explicit[0]) != key(target)) and method != 'manual':
+            if has_model and (len(distinct_explicit) != 1 or not any(key(q) == key(target) for q in explicit)) and method != 'manual':
                 reason = 'variant_mismatch'
         options = [{'request_key': key(q), 'request_fingerprint': fingerprint(q), 'text': q.get('text_excerpt', ''), 'telegram_date': q['telegram_date'],
                     'group_id': q['group_id'], 'message_id': q['message_id']} for q in active]
