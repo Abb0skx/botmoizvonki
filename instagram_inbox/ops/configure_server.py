@@ -1,10 +1,15 @@
 """Executed on the deployment host. Reuse Meta credentials without exposing secrets."""
 import json
+import argparse
 import os
 from pathlib import Path
 import subprocess
+import time
 
 
+parser = argparse.ArgumentParser()
+parser.add_argument('--enable-auto-prices', action='store_true')
+args = parser.parse_args()
 root = Path('/opt/texnikach-instagram-inbox')
 root.mkdir(mode=0o700, parents=True, exist_ok=True)
 state = json.loads(subprocess.check_output(['docker', 'exec', 'texnikach-mtproto-jobs',
@@ -29,6 +34,8 @@ config = {
     'INSTAGRAM_RULES_SHEET_ID': source.get('INSTAGRAM_RULES_SHEET_ID', '1ZdSyTJr9jSBdBDUZowXi2CpjTb7GZMQCQNsMRCMjywk'),
     'INSTAGRAM_PRODUCTS_SHEET_ID': source.get('INSTAGRAM_PRODUCTS_SHEET_ID', '1TrS6C4oHe6nzQTPTa_4se_upXBFF6rmbfnE7RqznR8U'),
     'SHEETS_CACHE_SECONDS': '60',
+    'AUTO_PRICE_ENABLED': 'false',
+    'AUTO_PRICE_SINCE': '0',
     'INCOMING_DEBOUNCE_SECONDS': '4',
     'TOPIC_CLOSE_AFTER_HOURS': '72',
     'LEGACY_INSTAGRAM_WEBHOOK_URL': 'http://texnikach-calls-service:8000/webhooks/instagram',
@@ -39,6 +46,10 @@ if env_path.exists():
                     if '=' in line and not line.startswith('#'))
     # Retain intentional runtime settings on re-run.
     config.update(previous)
+if args.enable_auto_prices:
+    if config['AUTO_PRICE_ENABLED'] != 'true' or float(config['AUTO_PRICE_SINCE']) <= 0:
+        config['AUTO_PRICE_SINCE'] = str(time.time())
+    config['AUTO_PRICE_ENABLED'] = 'true'
 for retired in ('OPENAI_API_KEY', 'OPENAI_MODEL', 'AI_CONTEXT_MESSAGES'):
     config.pop(retired, None)
 for value in config.values():

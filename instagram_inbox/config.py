@@ -20,6 +20,8 @@ class Settings:
     products_sheet_name: str = 'bot_prices'
     product_settings_sheet_name: str = 'bot_settings'
     sheets_cache_seconds: int = 60
+    auto_price_enabled: bool = False
+    auto_price_since: float = 0
     context_messages: int = 20
     debounce_seconds: float = 4
     close_after_hours: float = 72
@@ -47,6 +49,8 @@ class Settings:
             products_sheet_name=os.getenv('INSTAGRAM_PRODUCTS_SHEET_NAME', 'bot_prices'),
             product_settings_sheet_name=os.getenv('INSTAGRAM_SETTINGS_SHEET_NAME', 'bot_settings'),
             sheets_cache_seconds=max(5, min(240, int(os.getenv('SHEETS_CACHE_SECONDS', '60')))),
+            auto_price_enabled=os.getenv('AUTO_PRICE_ENABLED', 'false').lower() == 'true',
+            auto_price_since=float(os.getenv('AUTO_PRICE_SINCE', '0')),
             context_messages=max(2, min(100, int(os.getenv('CONTEXT_MESSAGES', '20')))),
             debounce_seconds=max(0, float(os.getenv('INCOMING_DEBOUNCE_SECONDS', '4'))),
             close_after_hours=float(os.getenv('TOPIC_CLOSE_AFTER_HOURS', '72')),
@@ -56,6 +60,8 @@ class Settings:
         )
 
     def validate(self):
+        if self.auto_price_enabled and self.auto_price_since <= 0:
+            raise ValueError('AUTO_PRICE_SINCE must be the activation UTC timestamp')
         missing = [name for name in ('meta_app_secret', 'meta_access_token', 'meta_verify_token',
                    'instagram_account_id', 'telegram_bot_token', 'telegram_group_id') if not getattr(self, name)]
         if missing:

@@ -18,6 +18,7 @@ class Classification(BaseModel):
     reply_text: str = ''
     query: str = ''
     source: str = ''
+    auto_eligible: bool = False
 
 
 DEFAULT_TEXTS = {
@@ -37,6 +38,9 @@ DEFAULT_TEXTS = {
     'model_empty_memory_label': 'Цена',
     'model_warranty_label': 'гарантия / kafolat: {months} мес. / oy',
     'model_footer': 'Для оформления заказа / Buyurtma uchun:\n{manager_url}',
+    'direct_order_prompt_ru': 'Куда доставить? Напишите адрес доставки и номер телефона здесь, в Direct.',
+    'direct_order_prompt_uz': 'Qayerga yetkazib beramiz? Yetkazib berish manzili va telefon raqamingizni shu yerga, Directga yozing.',
+    'direct_order_prompt_bilingual': 'Куда доставить? Напишите адрес доставки и номер телефона здесь, в Direct.\n\nQayerga yetkazib beramiz? Yetkazib berish manzili va telefon raqamingizni shu yerga, Directga yozing.',
 }
 
 
@@ -108,7 +112,7 @@ def rule_classification(batch):
     return None
 
 
-def price_text(match, settings):
+def price_text(match, settings, customer_language='bilingual'):
     grouped = {}
     warranties = {v.warranty_months for v in match.variants}
     for variant in match.variants:
@@ -127,7 +131,8 @@ def price_text(match, settings):
         lines.append(f'• {label} — {formatted_amount} сум')
     heading = '\n\n'.join(v for v in (render(settings['model_intro'], settings), ', '.join(match.models),
                                       render(settings['model_prices_label'], settings)) if v)
-    footer = render(settings['model_footer'], settings)
+    # Inbox-specific footer: the shared model_footer is still used by comments.
+    footer = render(settings['direct_order_prompt_' + customer_language], settings)
     omitted = render(settings['model_other_variants'], settings)
     selected = []
     for line in lines:
@@ -186,8 +191,13 @@ class TemplateResponder:
             if not match.filters_matched:
                 return decision('reply', 'product_question', 'Запрошенного варианта нет в прайсе.',
                     render(settings['model_variant_not_found_reply'], settings), query, 'direct_settings')
-            return decision('reply', 'price_question', 'Модель найдена в прайсе; цены в сумах.',
-                price_text(match, settings), query, 'bot_prices')
+            result = decision('reply', 'price_question', 'Модель найдена в прайсе; цены в сумах.',
+                price_text(match, settings, language(text)), query, 'bot_prices')
+            # Fuzzy spelling matches remain drafts for a human, never auto-send.
+            words = normalize_model(extract_product_query(query)[0]).split()
+            model_words = set(normalize_model(' '.join(match.models)).split())
+            result.auto_eligible = bool(words) and all(word in model_words for word in words)
+            return result
         if match.status == 'ambiguous' or looks_like_product(text):
             return decision('reply', 'product_question', 'Нужно уточнить модель.',
                 render(settings['model_not_found_reply'], settings), text, 'direct_settings')
@@ -204,10 +214,19 @@ class TemplateResponder:
 
 
 def is_followup(text):
+    if not text.strip() or has_contact_details(text):
+        return False
     query, memory, color = extract_product_query(text)
     rest = normalize_model(query).split()
     return len(text) < 80 and (bool(memory or color) or not rest or
         set(rest).issubset({'а', 'такой', 'такое', 'этот', 'эта', 'его', 'у', 'вас'}))
+
+
+def has_contact_details(text):
+    # Only a routing hint, never parse/confirm an order from this heuristic.
+    return any(9 <= len(re.sub(r'\D', '', number)) <= 15 for number in
+        re.findall(r'(?<!\w)\+?\d[\d\s()\-]{7,}\d(?!\w)', text)) or bool(
+            re.search(r'\b(адрес|телефон|манзил|manzil|telefon|address|adres)\b', text, re.I))
 
 
 def looks_like_product(text):

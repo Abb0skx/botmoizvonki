@@ -63,7 +63,7 @@ async def test_models_memory_colors_ru_uz(text, model, price):
     assert result.category == 'price_question'
     assert model in result.reply_text and price in result.reply_text and 'сум' in result.reply_text
     assert '$' not in result.reply_text and 'USD' not in result.reply_text
-    assert 'https://t.me/texnikach_admin' in result.reply_text
+    assert 'Direct' in result.reply_text and 'https://t.me/' not in result.reply_text
 
 
 @pytest.mark.asyncio

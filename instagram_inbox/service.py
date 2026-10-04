@@ -4,13 +4,15 @@ import logging
 import time
 from zoneinfo import ZoneInfo
 from sqlalchemy import select, update
-from .replies import Classification
+from .replies import Classification, has_contact_details
 from .instagram import SendError
 from .models import Client, Draft, Job, Message, TelegramLink
 from .telegram import keyboard
 
 log = logging.getLogger(__name__)
 HELP = ('Instagram → Telegram\n\nКаждый клиент — отдельная постоянная тема. '
+        'При включённом автоответе точная модель получает цену и запрос адреса/телефона автоматически. '
+        'Данные заказа проверяет менеджер. Остальные ответы — после подтверждения.\n'
         'Кнопка «Отправить» подтверждает отправку клиенту.\n'
         'Свой ответ: сделайте Reply на сообщение клиента, затем подтвердите. '
         'Обычные сообщения внутри темы остаются внутренними.\n'
@@ -22,6 +24,23 @@ class InboxService:
     def __init__(self, repo, settings, telegram, instagram, assistant):
         self.repo, self.settings = repo, settings
         self.telegram, self.instagram, self.assistant = telegram, instagram, assistant
+
+    def auto_allowed(self, classification, batch):
+        return bool(self.settings.auto_price_enabled and self.settings.auto_price_since > 0
+            and classification.category == 'price_question' and classification.source == 'bot_prices'
+            and classification.auto_eligible and batch
+            and all(m.direction == 'incoming' and m.telegram_state == 'sent' and m.created_at >= max(
+                self.settings.auto_price_since, time.time() - 900) for m in batch))
+
+    def active_order(self, client_id):
+        # The messages themselves retain the phone/address; do not copy PII into
+        # public Sheets or extract/guess an address. This marker survives restarts.
+        sent_at = float(self.repo.state(f'order_quote:{client_id}', '0'))
+        return sent_at > 0 and time.time() - sent_at < 72 * 3600
+
+    def close_order(self, client_id):
+        with self.repo.transaction() as s:
+            self.repo.put_state(s, f'order_quote:{client_id}', '0')
 
     async def ensure_topic(self, client_id):
         c = self.repo.get(Client, client_id)
@@ -102,6 +121,12 @@ class InboxService:
             return
         try:
             classification = await self.assistant.classify(batch, history)
+            if (self.active_order(c.id) and (classification.category != 'price_question'
+                    or any(has_contact_details(m.text) for m in batch))
+                    and not all(m.message_type in ('reaction', 'deleted') for m in batch)):
+                classification = Classification(action='manager_only', category='order_details', requires_reply=False,
+                    confidence=1, reason='📦 Продолжение заказа в Direct: проверьте адрес, телефон, цвет и доставку. '
+                    'Ответьте клиенту здесь через Reply. Заказ ещё не подтверждён.')
             reply = await self.assistant.propose(classification, batch, history, previous) if classification.requires_reply else None
         except Exception as exc:
             log.error('template_failed client=%s error_type=%s', c.id, type(exc).__name__)
@@ -118,8 +143,9 @@ class InboxService:
                 classification={**classification.model_dump(), 'batch_ids': [m.id for m in batch]},
                 requires_reply=classification.requires_reply))
             if reply:
+                automatic = self.auto_allowed(classification, batch)
                 d = Draft(client_id=c.id, revision=c.revision, source_message_id=batch[-1].id,
-                          text=reply, category=classification.category)
+                          text=reply, category=classification.category, origin='auto_price' if automatic else 'template')
                 s.add(d)
                 s.flush()
                 self.repo.enqueue(s, f'draft:{d.id}', 'present', {'draft_id': d.id})
@@ -137,14 +163,21 @@ class InboxService:
         if d.status != 'pending' or d.revision != c.revision or d.presentation_state != 'pending':
             return
         source = self.repo.get(Message, d.source_message_id)
-        title = 'Отправить клиенту?' if d.origin == 'manual' else '📝 Готовый ответ по шаблону'
+        automatic = d.origin == 'auto_price'
+        title = ('⏳ Автоответ: проверяем цену перед отправкой' if automatic else
+                 'Отправить клиенту?' if d.origin == 'manual' else '📝 Готовый ответ по шаблону')
         if d.category == 'price_question' and d.origin != 'manual':
             title += '\nИсточник: bot_prices • цены в сумах'
         self.repo.change(Draft, d.id, presentation_state='sending')
         try:
             tid = await self.telegram.text(c.topic_id, title + '\n\n' + d.text,
-                keyboard(d.id, manual=d.origin == 'manual'), reply_id=source.telegram_message_id)
-            self.repo.change(Draft, d.id, telegram_message_id=tid, presentation_state='sent')
+                None if automatic else keyboard(d.id, manual=d.origin == 'manual'), reply_id=source.telegram_message_id)
+            with self.repo.transaction() as s:
+                saved = s.get(Draft, d.id)
+                saved.telegram_message_id, saved.presentation_state = tid, 'sent'
+                if automatic and saved.status == 'pending' and s.get(Client, c.id).revision == d.revision:
+                    saved.status = 'sending'
+                    self.repo.enqueue(s, f'auto-send:{d.id}', 'send', {'draft_id': d.id})
         except Exception:
             self.repo.change(Draft, d.id, presentation_state='uncertain')
             raise
@@ -156,7 +189,8 @@ class InboxService:
         markup = None
         if d.status == 'sent':
             stamp = datetime.fromtimestamp(d.sent_at, ZoneInfo('Asia/Tashkent')).strftime('%H:%M')
-            header = f'✅ Отправлено\nМенеджер: {d.manager_name or d.manager_id}\n{stamp}'
+            author = 'Автоответ по прайсу' if d.origin == 'auto_price' and d.manager_id is None else f'Менеджер: {d.manager_name or d.manager_id}'
+            header = f'✅ Отправлено\n{author}\n{stamp}'
         elif d.status == 'failed':
             header = '❌ Не удалось подтвердить отправку.\n' + d.error
             if d.retry_safe:
@@ -164,14 +198,27 @@ class InboxService:
         elif d.status == 'cancelled':
             header = {'superseded': 'Отменено: клиент написал новое сообщение.',
                       'price_changed': 'Прайс или шаблон изменился. Подтвердите новый черновик ниже.'}.get(d.error, 'Не отвечаем.')
+        elif d.status == 'pending':
+            header = '⚠️ Требуется подтверждение менеджера.\n' + d.error
+            markup = keyboard(d.id, manual=d.origin == 'manual')
         else:
             header = '⏳ Отправляем…'
         await self.telegram.edit(d.telegram_message_id, header + '\n\n' + d.text, markup)
+
+    async def hold_auto(self, draft, reason):
+        with self.repo.transaction() as s:
+            s.execute(update(Draft).where(Draft.id == draft.id, Draft.status == 'sending',
+                Draft.dispatch_started_at.is_(None)).values(status='pending', origin='template',
+                    manager_id=None, manager_name='', error=reason))
+        await self.render_status(draft.id)
 
     async def dispatch(self, draft_id):
         d = self.repo.get(Draft, draft_id)
         c = self.repo.get(Client, d.client_id)
         if d.status in ('sent', 'failed', 'cancelled'):
+            await self.render_status(d.id)
+            return
+        if d.status == 'pending' and d.error:
             await self.render_status(d.id)
             return
         if d.status != 'sending' or d.dispatch_started_at is not None:
@@ -183,6 +230,13 @@ class InboxService:
             self.repo.change(Draft, d.id, status='failed', error='Истекло 24-часовое окно ответа Instagram. Нужно новое сообщение клиента.', retry_safe=False)
             await self.render_status(d.id)
             return
+        automatic = d.origin == 'auto_price' and d.manager_id is None
+        if automatic and not self.auto_allowed(Classification.model_validate(
+                self.repo.get(Message, d.source_message_id).classification or {
+                    'action': 'ignore', 'category': '', 'requires_reply': False, 'confidence': 0, 'reason': ''}),
+                self.draft_batch(self.repo.get(Message, d.source_message_id))):
+            await self.hold_auto(d, 'Автоответ выключен или сообщение не подходит для автоматической отправки.')
+            return
         if d.origin != 'manual' and d.category == 'price_question':
             # Source may change while the manager reads the draft. Never silently
             # substitute text after approval; changed prices require a new approval.
@@ -193,6 +247,13 @@ class InboxService:
                 current = check.reply_text if check.requires_reply else None
             except Exception:
                 current = None
+            if automatic:
+                if not current or not self.auto_allowed(check, batch):
+                    await self.hold_auto(d, 'Автоответ не отправлен: нужна проверка актуального прайса и модели.')
+                    return
+                # No manager approved this draft: use the just-refreshed price.
+                # Store the exact outbound text atomically with the dispatch claim.
+                d.text = current
             if not current:
                 with self.repo.transaction() as s:
                     restored = s.execute(update(Draft).where(Draft.id == d.id, Draft.status == 'sending',
@@ -204,7 +265,7 @@ class InboxService:
                         '⚠️ Не отправлено: не удалось проверить актуальные цены. Обновите ответ или напишите вручную.\n\n' + d.text,
                         keyboard(d.id))
                 return
-            if current != d.text:
+            if not automatic and current != d.text:
                 with self.repo.transaction() as s:
                     claimed = s.execute(update(Draft).where(Draft.id == d.id, Draft.status == 'sending',
                         Draft.dispatch_started_at.is_(None)).values(status='cancelled', error='price_changed'))
@@ -217,10 +278,11 @@ class InboxService:
                 await self.render_status(d.id)
                 return
         with self.repo.transaction() as s:
+            authorization = Draft.origin == 'auto_price' if automatic else Draft.manager_id.is_not(None)
             claimed = s.execute(update(Draft).where(Draft.id == d.id, Draft.status == 'sending',
-                Draft.dispatch_started_at.is_(None), Draft.manager_id.is_not(None),
+                Draft.dispatch_started_at.is_(None), authorization,
                 Draft.revision == select(Client.revision).where(Client.id == c.id).scalar_subquery())
-                .values(dispatch_started_at=time.time()))
+                .values(dispatch_started_at=time.time(), text=d.text))
             if claimed.rowcount != 1:
                 return
         try:
@@ -235,10 +297,12 @@ class InboxService:
         with self.repo.transaction() as s:
             saved = s.get(Draft, d.id)
             saved.status, saved.external_message_id, saved.sent_at = 'sent', mid, time.time()
+            if d.category == 'price_question' and d.origin != 'manual':
+                self.repo.put_state(s, f'order_quote:{c.id}', saved.sent_at)
             if not s.scalar(select(Message.id).where(Message.external_id == mid)):
                 s.add(Message(client_id=c.id, external_id=mid, text=d.text, direction='outgoing',
-                    sender_type='manager', telegram_state='sent', telegram_message_id=d.telegram_message_id,
-                    revision=c.revision, raw={'approved_by': d.manager_id, 'draft_id': d.id}))
+                    sender_type='bot' if automatic else 'manager', telegram_state='sent', telegram_message_id=d.telegram_message_id,
+                    revision=c.revision, raw={'approved_by': d.manager_id, 'draft_id': d.id, 'automated': automatic}))
         log.info('instagram_send_success draft=%s manager=%s', d.id, d.manager_id)
         await self.render_status(d.id)
 
@@ -289,6 +353,8 @@ class InboxService:
         if c and ('forum_topic_closed' in msg or 'forum_topic_reopened' in msg):
             closed = 'forum_topic_closed' in msg
             self.repo.change(Client, c.id, topic_state='closed' if closed else 'open', status='closed' if closed else 'active')
+            if closed:
+                self.close_order(c.id)
             return
         user = msg.get('from', {})
         if not await self.telegram.authorized(user):
@@ -299,13 +365,16 @@ class InboxService:
             await self.telegram.text(topic, HELP)
             return
         if command == '/status':
-            await self.telegram.text(topic, 'Instagram: подтверждение менеджера обязательно.\n'
+            mode = 'Точные модели: автоматический ответ с ценой, запрос адреса и телефона.' if self.settings.auto_price_enabled else 'Все ответы: после подтверждения менеджера.'
+            await self.telegram.text(topic, 'Instagram: ' + mode + '\n'
+                'Остальные ответы и подтверждение заказа: менеджер.\n'
                 'Ответы: шаблоны Google Sheets + поиск модели в прайсе. AI не используется.\n'
                 f'Кэш таблиц: {self.settings.sheets_cache_seconds} секунд. Перед отправкой цены проверяются повторно.')
             return
         if command == '/close' and c:
             await self.telegram.close_topic(topic)
             self.repo.change(Client, c.id, topic_state='closed', status='closed')
+            self.close_order(c.id)
             return
         if command == '/bind' and user['id'] in self.settings.manager_ids and topic:
             parts = text.split()
@@ -333,7 +402,8 @@ class InboxService:
                           sender_type='manager', telegram_state='sent', telegram_message_id=msg['message_id'],
                           raw={'manager_id': user['id']}, revision=c.revision))
             if is_manual:
-                s.execute(update(Draft).where(Draft.client_id == c.id, Draft.status == 'pending')
+                s.execute(update(Draft).where(Draft.client_id == c.id,
+                    (Draft.status == 'pending') | ((Draft.status == 'sending') & Draft.dispatch_started_at.is_(None)))
                           .values(status='cancelled', error='manual_replacement'))
                 # Manual reply text is immutable once confirmed, including after Telegram edits.
                 d = Draft(client_id=c.id, source_message_id=original.id, revision=c.revision,
@@ -343,7 +413,7 @@ class InboxService:
                 self.repo.enqueue(s, f'draft:{d.id}', 'present', {'draft_id': d.id})
 
     def draft_batch(self, source):
-        ids = source.classification.get('batch_ids', [source.id])
+        ids = (source.classification or {}).get('batch_ids', [source.id])
         return self.repo.rows(Message, Message.client_id == source.client_id, Message.direction == 'incoming',
                               Message.id.in_(ids), order=Message.id, limit=100) or [source]
 
