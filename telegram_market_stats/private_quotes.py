@@ -1,4 +1,4 @@
-"""Pure matching of supplier DMs to OUR requests across all market groups.
+"""Pure matching of supplier DMs to OUR group and direct supplier requests.
 
 No sending, AI, currency conversion or calculated relative discounts. Price
 inferences never become reference prices; ambiguous offers stay unassigned.
@@ -14,6 +14,51 @@ from .quotes import prices, timestamp, same_model, compatible, qualifiers, token
 
 def key(row):
     return f"{row['group_id']}:{row['message_id']}"
+
+
+def direct_chat(row):
+    """Private request namespaces cannot leak into another supplier's chat."""
+    group = str(row.get('group_id', ''))
+    if group.startswith('private:'):
+        return group.removeprefix('private:')
+    return str(row.get('chat_id', '')) if row.get('source') == 'private' else None
+
+
+def _raw_price_requests(message, requests):
+    """An unknown model's final bare amount needs exact chat-local evidence."""
+    if message.get('mentions'):
+        return []
+    text = message.get('text_excerpt') or ''
+    suffix = re.search(r'\s(?P<amount>\d{2,7}(?:[.,]\d{1,2})?)\s*$', text)
+    if suffix is None or not prices(text, has_model=True):
+        return []
+    product = tokens(text[:suffix.start()])
+    if not product or not any(re.search(r'[a-zа-я]', word, re.I) for word in product):
+        return []
+    # Size-only watch replies are not prices. Explicit currency and a standalone
+    # price message still use the ordinary parser, unaffected by this fallback.
+    if (re.search(r'\b(?:watch|часы|часов|soat)\b', text, re.I)
+            and suffix['amount'] in {'38', '40', '41', '42', '44', '45', '46', '47', '49'}):
+        return []
+    at, chat = timestamp(message['telegram_date']), str(message['chat_id'])
+    return [request for request in requests if direct_chat(request) == chat
+            and 0 <= (at - timestamp(request['telegram_date'])).total_seconds() <= 420
+            and tokens(request.get('text_excerpt') or '') == product]
+
+
+def private_prices(message, requests):
+    """Normal prices plus an exact, active same-chat unknown-model fallback.
+
+    ``Nova Q99 kere`` followed by ``Nova Q99 330`` is valid without a catalog
+    entry. A different model/variant, a group-only query, or another supplier's
+    enquiry cannot supply this evidence. No guessed product or numeric amount
+    bypasses the ordinary parser's capacity/phone/time guards.
+    """
+    text = message.get('text_excerpt') or ''
+    ordinary = prices(text, has_model=bool(message.get('mentions')))
+    if ordinary:
+        return ordinary
+    return prices(text, has_model=True) if _raw_price_requests(message, requests) else []
 
 
 def fingerprint(row):
@@ -75,16 +120,18 @@ def match_private(requests, messages, links=(), *, near=.15, far=.40):
     requests = sorted(requests, key=lambda q: (q['telegram_date'], key(q)))
     by_key = {key(q): q for q in requests}
     manual = {(str(r['chat_id']), int(r['message_id'])): r for r in links}
+    direct_replies = {(direct_chat(q), q['message_id']): key(q) for q in requests if direct_chat(q) is not None}
     anchors, context, reply_context = {}, {}, {}
     linked, unresolved = {key(q): [] for q in requests}, []
     for message in sorted(messages, key=lambda m: (m['telegram_date'], m['message_id'], str(m['chat_id']))):
         chat, mid = str(message['chat_id']), message['message_id']
         at = timestamp(message['telegram_date'])
-        active = [q for q in requests if 0 <= (at - timestamp(q['telegram_date'])).total_seconds() <= 420]
+        active = [q for q in requests if direct_chat(q) in (None, chat)
+                  and 0 <= (at - timestamp(q['telegram_date'])).total_seconds() <= 420]
         if not active:
             continue
         text = message.get('text_excerpt') or ''
-        values = prices(text, has_model=bool(message.get('mentions')))
+        values = private_prices(message, active)
         target, method, reason = None, '', ''
         if message.get('forwarded'):
             exact = [q for q in active if (
@@ -105,11 +152,21 @@ def match_private(requests, messages, links=(), *, near=.15, far=.40):
                 reply_context[(chat, mid)] = key(exact[0])
             # A forwarded request is context, not a supplier's quote.
             continue
-        explicit = [q for q in active if same_model(q, message)]
+        own_request = by_key.get(direct_replies.get((chat, mid))) if message.get('outgoing') else None
+        if own_request in active:
+            # The collector has classified this exact outgoing message as a
+            # request. Its raw model may be new/unrecognized; no fuzzy model
+            # match is needed to anchor the next quote or a later direct reply.
+            context[chat] = key(own_request)
+            reply_context[(chat, mid)] = key(own_request)
+            continue
+        raw_models = _raw_price_requests(message, active) if not prices(text, has_model=bool(message.get('mentions'))) else []
+        explicit = [q for q in active if same_model(q, message) or q in raw_models]
         distinct_explicit = distinct_requests(explicit)
-        has_model = bool(message.get('mentions'))
+        has_model = bool(message.get('mentions') or raw_models)
         if message.get('reply_to_message_id'):
-            parent = reply_context.get((chat, message['reply_to_message_id']))
+            reply = (chat, message['reply_to_message_id'])
+            parent = reply_context.get(reply) or direct_replies.get(reply)
             target = by_key.get(parent)
             if target and target in active and compatible(target, message):
                 method = 'private_reply'
@@ -119,12 +176,20 @@ def match_private(requests, messages, links=(), *, near=.15, far=.40):
             target, method = distinct_explicit[0], 'private_model'
             context[chat] = key(target)
         elif has_model:
-            context.pop(chat, None)
-            reason = 'ambiguous' if explicit else 'model_not_found'
+            possible = by_key.get(context.get(chat))
+            if possible in explicit:
+                # An explicit introduction/reply remains stronger than two
+                # identical model candidates from a group and this same DM.
+                target = possible
+                method = 'private_context' if direct_chat(possible) is not None else 'forward_context'
+            else:
+                context.pop(chat, None)
+                reason = 'ambiguous' if explicit else 'model_not_found'
         elif context.get(chat):
             possible = by_key.get(context[chat])
             if possible in active and compatible(possible, message):
-                target, method = possible, 'forward_context'
+                target = possible
+                method = 'private_context' if direct_chat(possible) is not None else 'forward_context'
             else:
                 context.pop(chat, None)
         if message.get('outgoing'):
@@ -161,10 +226,13 @@ def match_private(requests, messages, links=(), *, near=.15, far=.40):
                 reason = 'late'
             elif target.get('edited_at') and timestamp(target['edited_at']) > at:
                 reason = 'request_edited'
-            if has_model and (len(distinct_explicit) != 1 or not any(key(q) == key(target) for q in explicit)) and method != 'manual':
+            if has_model and not any(key(q) == key(target) for q in explicit) and method != 'manual':
                 reason = 'variant_mismatch'
         options = [{'request_key': key(q), 'request_fingerprint': fingerprint(q), 'text': q.get('text_excerpt', ''), 'telegram_date': q['telegram_date'],
-                    'group_id': q['group_id'], 'message_id': q['message_id']} for q in active]
+                    'group_id': q['group_id'], 'message_id': q['message_id'],
+                    'source': 'private' if direct_chat(q) is not None else 'group',
+                    **({'chat_id': direct_chat(q), 'supplier_name': q.get('sender_name') or f'ID {direct_chat(q)}',
+                        'supplier_username': q.get('sender_username') or ''} if direct_chat(q) is not None else {})} for q in active]
         inferred = method in ('price_near', 'price_far')
         for index, value in enumerate(values):
             offer = {**value, 'source': 'private', 'chat_id': chat, 'message_id': mid, 'index': index,
