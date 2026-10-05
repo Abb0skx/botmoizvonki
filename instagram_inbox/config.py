@@ -22,6 +22,7 @@ class Settings:
     sheets_cache_seconds: int = 60
     auto_price_enabled: bool = False
     auto_price_since: float = 0
+    direct_reply_since: float = 0
     context_messages: int = 20
     debounce_seconds: float = 4
     close_after_hours: float = 72
@@ -51,6 +52,7 @@ class Settings:
             sheets_cache_seconds=max(5, min(240, int(os.getenv('SHEETS_CACHE_SECONDS', '60')))),
             auto_price_enabled=os.getenv('AUTO_PRICE_ENABLED', 'false').lower() == 'true',
             auto_price_since=float(os.getenv('AUTO_PRICE_SINCE', '0')),
+            direct_reply_since=float(os.getenv('DIRECT_REPLY_SINCE', '0')),
             context_messages=max(2, min(100, int(os.getenv('CONTEXT_MESSAGES', '20')))),
             debounce_seconds=max(0, float(os.getenv('INCOMING_DEBOUNCE_SECONDS', '4'))),
             close_after_hours=float(os.getenv('TOPIC_CLOSE_AFTER_HOURS', '72')),

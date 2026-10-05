@@ -6,15 +6,15 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select, update
 from .replies import Classification, has_contact_details
 from .instagram import SendError
-from .models import Client, Draft, Job, Message, TelegramLink
+from .models import Client, Draft, Job, Manager, Message, TelegramLink
 from .telegram import keyboard
 
 log = logging.getLogger(__name__)
 HELP = ('Instagram → Telegram\n\nКаждый клиент — отдельная постоянная тема. '
         'При включённом автоответе точная модель получает цену и запрос адреса/телефона автоматически. '
-        'Данные заказа проверяет менеджер. Остальные ответы — после подтверждения.\n'
-        'Кнопка «Отправить» подтверждает отправку клиенту.\n'
-        'Свой ответ: сделайте Reply на сообщение клиента, затем подтвердите. '
+        'Данные заказа проверяет менеджер. Остальные шаблоны — после подтверждения.\n'
+        'Кнопка «Отправить» подтверждает отправку шаблона клиенту.\n'
+        'Свой ответ: сделайте Reply на сообщение клиента. При включённом прямом Reply он сразу уйдёт в Direct, без кнопки. '
         'Обычные сообщения внутри темы остаются внутренними.\n'
         '/close — закрыть тему; новое сообщение откроет её.\n'
         '/status — состояние сервиса. Отвечать могут администраторы группы и разрешённые менеджеры.')
@@ -164,20 +164,23 @@ class InboxService:
             return
         source = self.repo.get(Message, d.source_message_id)
         automatic = d.origin == 'auto_price'
-        title = ('⏳ Автоответ: проверяем цену перед отправкой' if automatic else
+        direct_reply = d.category == 'manual_reply' and d.manager_id is not None
+        immediate = automatic or direct_reply
+        title = ('⏳ Ответ менеджера — отправляем в Direct' if direct_reply else
+                 '⏳ Автоответ: проверяем цену перед отправкой' if automatic else
                  'Отправить клиенту?' if d.origin == 'manual' else '📝 Готовый ответ по шаблону')
         if d.category == 'price_question' and d.origin != 'manual':
             title += '\nИсточник: bot_prices • цены в сумах'
         self.repo.change(Draft, d.id, presentation_state='sending')
         try:
             tid = await self.telegram.text(c.topic_id, title + '\n\n' + d.text,
-                None if automatic else keyboard(d.id, manual=d.origin == 'manual'), reply_id=source.telegram_message_id)
+                None if immediate else keyboard(d.id, manual=d.origin == 'manual'), reply_id=source.telegram_message_id)
             with self.repo.transaction() as s:
                 saved = s.get(Draft, d.id)
                 saved.telegram_message_id, saved.presentation_state = tid, 'sent'
-                if automatic and saved.status == 'pending' and s.get(Client, c.id).revision == d.revision:
+                if immediate and saved.status == 'pending' and s.get(Client, c.id).revision == d.revision:
                     saved.status = 'sending'
-                    self.repo.enqueue(s, f'auto-send:{d.id}', 'send', {'draft_id': d.id})
+                    self.repo.enqueue(s, f'immediate-send:{d.id}', 'send', {'draft_id': d.id})
         except Exception:
             self.repo.change(Draft, d.id, presentation_state='uncertain')
             raise
@@ -302,12 +305,13 @@ class InboxService:
             if not s.scalar(select(Message.id).where(Message.external_id == mid)):
                 s.add(Message(client_id=c.id, external_id=mid, text=d.text, direction='outgoing',
                     sender_type='bot' if automatic else 'manager', telegram_state='sent', telegram_message_id=d.telegram_message_id,
-                    revision=c.revision, raw={'approved_by': d.manager_id, 'draft_id': d.id, 'automated': automatic}))
+                    revision=c.revision, raw={'approved_by': d.manager_id, 'draft_id': d.id, 'automated': automatic,
+                        'authorization': 'auto_price' if automatic else 'telegram_reply' if d.category == 'manual_reply' else 'button'}))
         log.info('instagram_send_success draft=%s manager=%s', d.id, d.manager_id)
         await self.render_status(d.id)
 
     async def callback(self, callback):
-        msg, user = callback.get('message') or {}, callback.get('from') or {}
+        msg, user = callback.get('message') or {}, callback.get('from') or callback.get('from_user') or {}
         if msg.get('chat', {}).get('id') != self.settings.telegram_group_id:
             return
         if not await self.telegram.authorized(user):
@@ -356,7 +360,12 @@ class InboxService:
             if closed:
                 self.close_order(c.id)
             return
-        user = msg.get('from', {})
+        user = msg.get('from') or msg.get('from_user') or {}
+        if c and msg.get('sender_chat') and msg.get('reply_to_message') and (msg.get('text') or msg.get('caption')):
+            await self.telegram.text(topic, 'Не отправлено: отвечайте от своего личного аккаунта Telegram, '
+                'не от имени группы или канала. Анонимного отправителя нельзя проверить как менеджера.',
+                reply_id=msg['message_id'])
+            return
         if not await self.telegram.authorized(user):
             return
         text = str(msg.get('text') or msg.get('caption') or '')
@@ -366,8 +375,10 @@ class InboxService:
             return
         if command == '/status':
             mode = 'Точные модели: автоматический ответ с ценой, запрос адреса и телефона.' if self.settings.auto_price_enabled else 'Все ответы: после подтверждения менеджера.'
-            await self.telegram.text(topic, 'Instagram: ' + mode + '\n'
-                'Остальные ответы и подтверждение заказа: менеджер.\n'
+            manual_mode = ('Reply менеджера на сообщение клиента: сразу в Direct, без кнопки.'
+                if self.settings.direct_reply_since > 0 else 'Reply менеджера: после кнопки «Отправить».')
+            await self.telegram.text(topic, 'Instagram: ' + mode + '\n' + manual_mode + '\n'
+                'Остальные шаблоны и подтверждение заказа: менеджер.\n'
                 'Ответы: шаблоны Google Sheets + поиск модели в прайсе. AI не используется.\n'
                 f'Кэш таблиц: {self.settings.sheets_cache_seconds} секунд. Перед отправкой цены проверяются повторно.')
             return
@@ -397,17 +408,29 @@ class InboxService:
         if is_manual and len(text) > 1000:
             await self.telegram.text(topic, 'Ответ длиннее 1000 символов. Сократите текст и повторите Reply.')
             is_manual = False
+        immediate = bool(is_manual and self.settings.direct_reply_since > 0
+            and float(msg.get('date') or 0) >= self.settings.direct_reply_since)
         with self.repo.transaction() as s:
             s.add(Message(client_id=c.id, external_id=external, text=text, direction='internal',
                           sender_type='manager', telegram_state='sent', telegram_message_id=msg['message_id'],
-                          raw={'manager_id': user['id']}, revision=c.revision))
+                          raw={'manager_id': user['id'], 'direct_reply': immediate,
+                               'reply_to': reply.get('message_id'), 'telegram_date': msg.get('date')}, revision=c.revision))
             if is_manual:
                 s.execute(update(Draft).where(Draft.client_id == c.id,
+                    Draft.category != 'manual_reply',
                     (Draft.status == 'pending') | ((Draft.status == 'sending') & Draft.dispatch_started_at.is_(None)))
                           .values(status='cancelled', error='manual_replacement'))
-                # Manual reply text is immutable once confirmed, including after Telegram edits.
+                # Do not generate a competing automatic reply after a manager has answered.
+                s.execute(update(Client).where(Client.id == c.id, Client.revision == c.revision)
+                    .values(classified_revision=c.revision))
+                # The Reply itself authorizes this immutable text; edits never resend it.
                 d = Draft(client_id=c.id, source_message_id=original.id, revision=c.revision,
-                          text=text[:1000], category='manual', origin='manual')
+                          text=text[:1000], category='manual_reply' if immediate else 'manual', origin='manual',
+                          manager_id=user['id'] if immediate else None,
+                          manager_name=user.get('first_name', '')[:180] if immediate else '')
+                if immediate:
+                    s.merge(Manager(id=user['id'], username=user.get('username', '')[:150],
+                        first_name=user.get('first_name', '')[:180], updated_at=time.time()))
                 s.add(d)
                 s.flush()
                 self.repo.enqueue(s, f'draft:{d.id}', 'present', {'draft_id': d.id})

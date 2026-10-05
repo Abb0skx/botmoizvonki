@@ -119,6 +119,7 @@ def create_app(settings=None, service=None):
         healthy = not settings.worker_enabled or (time.time() - worker < 180 and time.time() - polling < 90)
         return JSONResponse({'status': 'ok' if healthy else 'starting_or_degraded',
                              'mode': 'auto_prices_manager_orders' if settings.auto_price_enabled else 'manager_approval',
+                             'manager_reply_mode': 'direct' if settings.direct_reply_since > 0 else 'confirmation',
                              'reply_engine': 'templates', 'ai_enabled': False},
                             status_code=200 if healthy else 503)
     return app

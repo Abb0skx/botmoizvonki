@@ -13,7 +13,7 @@ async def poll_telegram(service):
             updates = await service.telegram.bot.get_updates(offset=offset, timeout=20,
                 allowed_updates=['message', 'callback_query'], request_timeout=30)
             for update in updates:
-                service.repo.store_telegram_update(update.model_dump(mode='json', exclude_none=True))
+                service.repo.store_telegram_update(update.model_dump(mode='json', exclude_none=True, by_alias=True))
             with service.repo.transaction() as s:
                 service.repo.put_state(s, 'telegram_poll_heartbeat', time.time())
         except asyncio.CancelledError:
