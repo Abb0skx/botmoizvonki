@@ -85,6 +85,29 @@ def _sim_evidence(operation, event: dict) -> str:
     return "unknown"
 
 
+class _ClosingConnection:
+    """Preserve SQLite's commit/rollback context and release its WAL handles."""
+
+    def __init__(self, connection: sqlite3.Connection):
+        self._connection = connection
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+    def __enter__(self):
+        self._connection.__enter__()
+        return self._connection
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return self._connection.__exit__(exc_type, exc_value, traceback)
+        finally:
+            self._connection.close()
+
+    def close(self):
+        self._connection.close()
+
+
 class ForwardingRepository:
     """SQLite persistence and atomic claims for forwarding operations."""
 
@@ -95,7 +118,7 @@ class ForwardingRepository:
         devices: dict[str, DeviceConfig],
         routes: dict[tuple[str, str], RouteConfig],
     ):
-        self.connect = connect
+        self.connect = lambda: _ClosingConnection(connect())
         self.operator = operator
         self.devices = devices
         self.routes = routes
