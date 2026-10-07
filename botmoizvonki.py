@@ -71,6 +71,7 @@ from forwarding import (
     load_forwarding_settings,
 )
 from forwarding.service import canonical_dial_string
+from forwarding.sqlite_anchor import SQLiteWalAnchor
 from dataclasses import replace as dataclass_replace
 from forwarding.sms_service import SMSForwardingService, SMS_DEVICES, SMS_ROUTES
 
@@ -125,6 +126,7 @@ _telegram_folder_scheduler = None
 _transcription_worker = None
 _forwarding_scheduler = None
 _forwarding_service = None
+_calls_db_anchor = None
 
 
 @app.middleware("http")
@@ -198,11 +200,14 @@ async def protect_legacy_manager_routes(request: Request, call_next):
 
 @app.on_event("startup")
 async def start_telegram_business():
+    global _calls_db_anchor
     global _telegram_business_scheduler
     global _telegram_folder_scheduler
     global _transcription_worker
     global _forwarding_scheduler
 
+    _calls_db_anchor = SQLiteWalAnchor(DB_PATH)
+    _calls_db_anchor.start()
     await start_price_server()
 
     if telegram_business_settings.enabled:
@@ -274,6 +279,9 @@ async def stop_telegram_business():
 
     if _forwarding_scheduler:
         await _forwarding_scheduler.stop()
+
+    if _calls_db_anchor:
+        _calls_db_anchor.close()
 
 
 # =========================================================
