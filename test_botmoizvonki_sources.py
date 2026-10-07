@@ -1888,6 +1888,16 @@ class CallSourceTests(unittest.TestCase):
         self.assertEqual(result["telegram"], "sent")
         self.assertEqual(retry["sms"], "cooldown")
 
+    def test_missing_call_phone_does_not_fall_back_to_poco(self):
+        event = self.event(685, "+998900000685", 0)
+        with mock.patch.object(bot.HTTP, "post") as post:
+            result = self.run_sms_call(
+                event, login=None, MOIZVONKI_USER_NAME="texnikach@gmail.com",
+            )
+        post.assert_not_called()
+        self.assertEqual(result["sms"], "error")
+        self.assertEqual(result["telegram"], "sent")
+
     def test_combined_sms_cooldown_survives_retries_new_calls_and_db_init(self):
         event = self.event(601, "+998900000601", 0)
         later = self.event(602, "998900000601", 0)

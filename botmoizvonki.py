@@ -23027,7 +23027,7 @@ async def moizvonki_webhook(
         or ""
     )
 
-    sender_user_login = get_device_sms_sender(
+    sender_user_login = normalize_user_login(
         (
             saved_call["user_login"]
             if saved_call
@@ -23036,7 +23036,6 @@ async def moizvonki_webhook(
         or webhook.get(
             "user_login"
         )
-        or MOIZVONKI_USER_NAME
     )
 
     call_start_time = (
