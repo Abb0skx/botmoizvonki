@@ -290,13 +290,15 @@ def install_entry_routes(router, admin, enabled, settings):
         operation_id = request.headers.get("idempotency-key", "")
         if (isinstance(body, dict)
                 and set(body) == {"action", "expected_revision", "confirm"}
-                and body.get("action") == "delete"):
+                and body.get("action") in {"delete", "delete_variant"}):
             delete_body = {
                 "expected_revision": body["expected_revision"],
                 "confirm": body["confirm"],
             }
+            function = (catalog_service().delete if body["action"] == "delete"
+                        else catalog_service().delete_variant)
             result = await run_in_threadpool(
-                call, catalog_service().delete, product_id, delete_body, operation_id,
+                call, function, product_id, delete_body, operation_id,
             )
         else:
             result = await run_in_threadpool(

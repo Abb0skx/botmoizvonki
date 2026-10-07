@@ -11,6 +11,9 @@
     invalid_catalog_variants: "Добавьте от 1 до 100 вариантов.",
     invalid_catalog_request: "Проверьте категорию, название и варианты.",
     catalog_model_delete_confirmation_required: "Подтвердите удаление модели.",
+    catalog_variant_not_found: "Конфигурация больше не найдена. Обновите модель.",
+    catalog_variant_delete_confirmation_required: "Подтвердите удаление конфигурации.",
+    catalog_last_variant_delete_forbidden: "Последнюю конфигурацию можно удалить только вместе с моделью.",
     catalog_category_exists: "Такая категория уже есть — выберите её из списка.",
     catalog_model_exists: "Одна или несколько моделей уже есть в выбранной категории. Отредактируйте существующую модель отдельно.",
     duplicate_catalog_model: "Название модели повторяется в списке.",
@@ -82,12 +85,21 @@
     wrap.append(input, suggestions);
     return {element: wrap, input, value: () => selected ? selected.category_id : null, select: item => { selected = item; input.value = item.name; }};
   }
-  function appendVariant(container, item = {}) {
+  function appendVariant(container, item = {}, options = {}) {
     const row = node("div", undefined, "variant-row " + (item.product_id ? "existing" : "new")); row.dataset.productId = item.product_id || "";
     const id = node("span", item.product_id ? `ID ${item.product_id}` : "Новый", "variant-id");
     const memory = node("input"); memory.placeholder = "Память"; memory.maxLength = 100; memory.value = item.memory || ""; memory.setAttribute("aria-label", "Память");
     const color = node("input"); color.placeholder = "Цвет"; color.maxLength = 150; color.value = item.color || ""; color.setAttribute("aria-label", "Цвет");
-    const remove = node("button", "×", "remove"); remove.type = "button"; remove.title = item.product_id ? "Существующий вариант нельзя удалить" : "Убрать новый вариант"; remove.addEventListener("click", () => { if (!item.product_id) row.remove(); });
+    const remove = node("button", item.product_id ? "Удалить" : "×", "remove"); remove.type = "button";
+    if (item.product_id) {
+      remove.classList.add("existing-remove");
+      remove.title = options.canDelete ? "Удалить эту конфигурацию" : "Последнюю конфигурацию можно удалить только вместе с моделью";
+      remove.disabled = !options.canDelete;
+      remove.addEventListener("click", () => options.onDelete?.(item));
+    } else {
+      remove.title = "Убрать новый вариант";
+      remove.addEventListener("click", () => row.remove());
+    }
     row.append(id, memory, color, remove); container.append(row);
   }
   function parseBulk(text) {
@@ -110,7 +122,11 @@
     grid.append(categoryLabel, modelLabel); wrap.append(grid);
     const variantsWrap = node("div", undefined, "variant-editor"), head = node("div", undefined, "variant-editor-head"), list = node("div", undefined, "variant-list");
     head.append(node("strong", "Варианты памяти и цвета"), button("＋ Один вариант", () => appendVariant(list))); variantsWrap.append(head, list);
-    (initial.variants || [{}]).forEach(item => appendVariant(list, item)); wrap.append(variantsWrap);
+    const initialVariants = initial.variants || [{}];
+    initialVariants.forEach(item => appendVariant(list, item, {
+      canDelete: editing && initialVariants.length > 1,
+      onDelete: variant => confirmDeleteVariant(initial, variant),
+    })); wrap.append(variantsWrap);
     const bulk = node("div", undefined, "bulk-add"), textarea = node("textarea"); textarea.placeholder = "256 GB | Black, Silver\n512 GB | Black";
     const bulkStatus = node("p", "Можно вставить несколько строк. Цвета через запятую автоматически станут отдельными вариантами.", "form-note");
     bulk.append(node("strong", "Быстро добавить списком"), textarea, bulkStatus, button("Добавить строки", () => { try { const values = parseBulk(textarea.value); values.forEach(item => appendVariant(list, item)); textarea.value = ""; bulkStatus.textContent = `Добавлено вариантов: ${values.length}`; bulkStatus.classList.remove("danger"); } catch (error) { bulkStatus.textContent = error.message; bulkStatus.classList.add("danger"); } })); wrap.append(bulk);
@@ -160,6 +176,35 @@
     remove.classList.add("danger-solid"); remove.disabled = true;
     checkbox.addEventListener("change", () => { remove.disabled = !checkbox.checked; });
     modal("Удалить модель?", [wrap], [button("Вернуться к редактированию", () => openEditor(model)), remove]);
+  }
+  function confirmDeleteVariant(model, variant) {
+    const wrap = node("div", undefined, "delete-confirm");
+    const warning = node("div", undefined, "delete-warning");
+    warning.append(node("strong", "Это удалит только выбранную конфигурацию"), node("p", "Её текущие цены поставщиков будут удалены. Остальные конфигурации модели сохранятся, а использованные ID не будут выданы повторно."));
+    const summary = node("div", undefined, "delete-model-summary variant-delete-summary");
+    const modelCell = node("div"), idCell = node("div"), memoryCell = node("div"), colorCell = node("div");
+    modelCell.append(node("span", "Модель"), node("strong", model.model_name));
+    idCell.append(node("span", "ID товара"), node("strong", String(variant.product_id)));
+    memoryCell.append(node("span", "Память / размер"), node("strong", variant.memory || "Не указано"));
+    colorCell.append(node("span", "Цвет"), node("strong", variant.color || "Не указан"));
+    summary.append(modelCell, idCell, memoryCell, colorCell);
+    const acknowledge = node("label", undefined, "delete-acknowledge"), checkbox = node("input"), acknowledgement = node("span", "Я понимаю, что эта конфигурация исчезнет из каталога вместе с её текущими ценами.");
+    checkbox.type = "checkbox"; acknowledge.append(checkbox, acknowledgement);
+    const status = node("p", "Модель останется в каталоге с остальными конфигурациями.", "form-note");
+    wrap.append(warning, summary, acknowledge, status);
+    const remove = button("Удалить конфигурацию", async () => {
+      remove.disabled = true; checkbox.disabled = true; status.textContent = "Удаляем конфигурацию…"; status.classList.remove("danger");
+      try {
+        const result = await api(`models/${variant.product_id}`, {action: "delete_variant", expected_revision: model.revision, confirm: true});
+        $("dialog").close(); await load();
+        notice(`Конфигурация ID ${result.product_id} удалена. Осталось вариантов: ${number(result.remaining_variant_count)}, удалено текущих цен: ${number(result.deleted_price_count)}.`);
+      } catch (error) {
+        status.textContent = error.message; status.classList.add("danger"); checkbox.disabled = false; remove.disabled = !checkbox.checked;
+      }
+    });
+    remove.classList.add("danger-solid"); remove.disabled = true;
+    checkbox.addEventListener("change", () => { remove.disabled = !checkbox.checked; });
+    modal("Удалить конфигурацию?", [wrap], [button("Вернуться к редактированию", () => openEditor(model)), remove]);
   }
   async function editModel(productId) { try { notice("Загружаем модель…"); const detail = await api("models/" + productId); notice(""); openEditor(detail); } catch (error) { notice(error.message, true); } }
   function invalidateImport() {

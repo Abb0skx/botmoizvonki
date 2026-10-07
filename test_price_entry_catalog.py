@@ -263,6 +263,71 @@ class EntryCatalogTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "catalog_model_changed")
         self.assertEqual(self.service.model(1)["model_name"], detail["model_name"])
 
+    def test_variant_delete_removes_only_selected_configuration_and_prices(self):
+        created_model = self.service.create(self.request(), str(uuid.uuid4()))
+        target = created_model["created"][0]
+        remaining = created_model["created"][1]
+        with sqlite3.connect(self.path) as db:
+            db.executemany(
+                "INSERT INTO entry_prices(sheet_id,product_key,price_1,price_12) "
+                "VALUES (?,?,?,?)",
+                [(sheet_id, target["key"], 100 + sheet_id, 110 + sheet_id)
+                 for sheet_id in (1, 2)],
+            )
+        detail = self.service.model(target["product_id"])
+        operation = str(uuid.uuid4())
+        result = self.service.delete_variant(target["product_id"], {
+            "expected_revision": detail["revision"], "confirm": True,
+        }, operation)
+        self.assertEqual(result["status"], "deleted_variant")
+        self.assertEqual(result["product_id"], target["product_id"])
+        self.assertEqual(result["memory"], "256 GB")
+        self.assertEqual(result["color"], "Black")
+        self.assertEqual(result["deleted_price_count"], 2)
+        self.assertEqual(result["remaining_variant_count"], 1)
+        self.assertEqual(
+            self.service.delete_variant(target["product_id"], {
+                "expected_revision": detail["revision"], "confirm": True,
+            }, operation),
+            result,
+        )
+
+        current = self.service.model(remaining["product_id"])
+        self.assertEqual(
+            [item["product_id"] for item in current["variants"]],
+            [remaining["product_id"]],
+        )
+        for sheet_id in (1, 2):
+            rows = SQLitePriceSource(self.path).read(sheet_id)["rows"]
+            self.assertNotIn(target["product_id"], [row["product_id"] for row in rows])
+            self.assertIn(remaining["product_id"], [row["product_id"] for row in rows])
+        with sqlite3.connect(self.path) as db:
+            self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
+            self.assertEqual(db.execute(
+                "SELECT next_product_id,next_version_id FROM entry_catalog_state WHERE id=1"
+            ).fetchone(), (1003, 2005))
+
+    def test_variant_delete_requires_confirmation_current_revision_and_a_sibling(self):
+        detail = self.service.model(1)
+        with self.assertRaises(EntryError) as caught:
+            self.service.delete_variant(1, {
+                "expected_revision": detail["revision"], "confirm": False,
+            }, str(uuid.uuid4()))
+        self.assertEqual(
+            caught.exception.code, "catalog_variant_delete_confirmation_required"
+        )
+        with self.assertRaises(EntryError) as caught:
+            self.service.delete_variant(1, {
+                "expected_revision": "0" * 64, "confirm": True,
+            }, str(uuid.uuid4()))
+        self.assertEqual(caught.exception.code, "catalog_model_changed")
+        with self.assertRaises(EntryError) as caught:
+            self.service.delete_variant(1, {
+                "expected_revision": detail["revision"], "confirm": True,
+            }, str(uuid.uuid4()))
+        self.assertEqual(caught.exception.code, "catalog_last_variant_delete_forbidden")
+        self.assertEqual(self.service.model(1)["model_name"], detail["model_name"])
+
     def test_large_existing_model_remains_editable(self):
         variants = [{"memory": f"{index} GB", "color": "Black"}
                     for index in range(101)]
@@ -504,6 +569,20 @@ class EntryCatalogRouteTests(unittest.TestCase):
                 }).status_code, 200)
             service.return_value.delete.assert_called_with(
                 1, {"expected_revision": "a" * 64, "confirm": True},
+                "123e4567-e89b-42d3-a456-426614174000",
+            )
+            service.return_value.delete_variant.return_value = {
+                "status": "deleted_variant"
+            }
+            self.assertEqual(self.client.post(
+                "/price/api/v1/entry/models/2", json={
+                    "action": "delete_variant", "expected_revision": "a" * 64,
+                    "confirm": True,
+                }, headers={
+                    "Idempotency-Key": "123e4567-e89b-42d3-a456-426614174000"
+                }).status_code, 200)
+            service.return_value.delete_variant.assert_called_with(
+                2, {"expected_revision": "a" * 64, "confirm": True},
                 "123e4567-e89b-42d3-a456-426614174000",
             )
             self.assertEqual(self.client.post(

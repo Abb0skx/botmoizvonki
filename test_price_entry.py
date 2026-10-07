@@ -428,9 +428,13 @@ class EntryRouteTests(unittest.TestCase):
         self.assertEqual(models_js.status_code, 200)
         self.assertIn("Удалить модель", models_js.text)
         self.assertIn('action: "delete"', models_js.text)
+        self.assertIn("Удалить конфигурацию", models_js.text)
+        self.assertIn('action: "delete_variant"', models_js.text)
+        self.assertIn("catalog_last_variant_delete_forbidden", models_js.text)
         models_css = self.client.get("/price/assets/price-models.css")
         self.assertEqual(models_css.status_code, 200)
         self.assertIn(".delete-confirm", models_css.text)
+        self.assertIn(".existing-remove", models_css.text)
         self.assertEqual(self.client.get("/price/assets/price-models.env").status_code, 404)
 
     def test_every_data_route_requires_auth(self):
