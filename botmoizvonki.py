@@ -4502,8 +4502,15 @@ def get_effective_device_manager(
 
 
 def get_device_sms_sender(user_login: str | None, conn=None) -> str:
-    """All outbound SMS use Poco, including legacy persisted sender routes."""
-    return "texnikach@gmail.com"
+    """Send client SMS from the device that handled the call.
+
+    The persisted per-device sender overrides are intentionally ignored. The
+    forwarding/settings control service passes Poco's login explicitly.
+    """
+    source_login = normalize_user_login(user_login)
+    if not source_login:
+        raise ValueError("Не удалось определить телефон звонка для SMS")
+    return source_login
 
 
 def get_device_sms_settings(user_login: str | None, conn=None) -> dict:
@@ -4525,8 +4532,8 @@ def set_device_sms_sender(
     sender_login = normalize_user_login(sender_user_login)
     if source_login not in CALL_SOURCE_PROFILES:
         raise ValueError("Неизвестный телефон звонка")
-    if sender_login != get_device_sms_sender(source_login):
-        raise ValueError("Все SMS отправляются только с Poco")
+    if sender_login != source_login:
+        raise ValueError("SMS клиенту отправляются с телефона разговора")
 
     with connect_db() as conn:
         conn.execute(
@@ -5297,8 +5304,8 @@ def send_client_sms(
             "MOIZVONKI_API_URL не указан"
         )
 
-    # Enforce at the transport boundary as well as in the dashboard: callers
-    # with a previously saved sender must never dispatch through another phone.
+    # The caller's account is the sender for client SMS. Control commands
+    # continue to pass Poco's account explicitly; no SIM selector exists here.
     user_name = get_device_sms_sender(sender_user_login)
 
     if not user_name:
@@ -19453,7 +19460,8 @@ tbody tr:last-child td {
                 «На сегодня» действует до 00:00.
                 «Постоянно» меняет менеджера для всех новых звонков.
                 История звонков не изменяется.
-                Все SMS отправляются только с Poco.
+                Клиентские SMS отправляются с телефона разговора.
+                Служебные команды телефонам отправляются с Poco.
                 Оценка клиента относится к менеджеру исходного звонка.
             </div>
         </div>
@@ -20627,7 +20635,7 @@ function renderDeviceManagers(
             smsSection.className = "device-sms-section";
             const smsLabel = document.createElement("label");
             smsLabel.className = "device-sms-label";
-            smsLabel.textContent = "Отправитель всех SMS: Poco";
+            smsLabel.textContent = "SMS клиентам с телефона разговора";
             const smsSelect = document.createElement("select");
             smsSelect.className = "device-manager-select";
             smsSelect.id = "sms_sender_" + device.user_login;
@@ -20651,7 +20659,7 @@ function renderDeviceManagers(
             const smsStatus = document.createElement("div");
             smsStatus.className = "device-sms-status";
             smsStatus.textContent = "Сейчас SMS отправляет: " + device.sms_sender_device_name;
-            // Sender is fixed server-side. Do not offer an ineffective selector.
+            // The call device is fixed server-side; do not offer another sender.
             smsSection.append(smsLabel, smsStatus);
             [select, smsSelect].forEach(input => input.addEventListener("change", () => {
                 card.dataset.dirty = "true";

@@ -456,37 +456,40 @@ class CallSourceTests(unittest.TestCase):
     def test_sms_sender_defaults_persist_and_do_not_change_managers(self):
         before = bot.admin_device_managers()["devices"]
         for device in before:
-            self.assertEqual(device["sms_sender_user_login"], "texnikach@gmail.com")
-            self.assertEqual(device["sms_sender_device_name"], "Poco")
+            self.assertEqual(device["sms_sender_user_login"], device["user_login"])
+            self.assertEqual(device["sms_sender_device_name"], device["device_name"])
         redmi = "aashshdjdjdjsj@gmail.com"
         poco = "texnikach@gmail.com"
         tecno = "texnikacholx@gmail.com"
         bot.set_permanent_device_manager(redmi, "ali", changed_by="test")
         manager = bot.get_effective_device_manager(redmi)
+        with self.assertRaises(ValueError):
+            bot.set_device_sms_sender(redmi, poco)
         result = bot.set_device_sms_sender(
-            "  AASHSHDJDJDJSJ@gmail.com ", " TEXNIKACH@gmail.com ", changed_by="test",
+            "  AASHSHDJDJDJSJ@gmail.com ", " AASHSHDJDJDJSJ@gmail.com ", changed_by="test",
         )
-        self.assertEqual(result["sms_sender_device_name"], "Poco")
+        self.assertEqual(result["sms_sender_device_name"], "Redmi")
         self.assertEqual(result["manager_code"], "ali")
         with self.assertRaises(ValueError):
             bot.set_device_sms_sender(poco, tecno)
         bot.init_db()  # Reinitialization must not reset the saved choices.
-        self.assertEqual(bot.get_device_sms_sender(redmi), poco)  # No routing chain.
+        self.assertEqual(bot.get_device_sms_sender(redmi), redmi)
         self.assertEqual(bot.get_device_sms_sender(poco), poco)
-        self.assertEqual(bot.get_device_sms_sender(tecno), poco)
-        self.assertEqual(bot.get_device_sms_sender("other@example.com"), poco)
+        self.assertEqual(bot.get_device_sms_sender(tecno), tecno)
+        self.assertEqual(bot.get_device_sms_sender("other@example.com"), "other@example.com")
+        with self.assertRaises(ValueError):
+            bot.get_device_sms_sender(None)
         self.assertEqual(bot.get_effective_device_manager(redmi), manager)
         devices = {d["user_login"]: d for d in bot.admin_device_managers()["devices"]}
-        self.assertEqual(devices[redmi]["sms_sender_user_login"], poco)
-        with self.assertRaises(ValueError):
-            bot.set_device_sms_sender(redmi, redmi)
-        self.assertEqual(bot.get_device_sms_sender(redmi), poco)
+        self.assertEqual(devices[redmi]["sms_sender_user_login"], redmi)
+        bot.set_device_sms_sender(redmi, redmi)
+        self.assertEqual(bot.get_device_sms_sender(redmi), redmi)
         with bot.connect_db() as conn:
             self.assertEqual(conn.execute(
                 "SELECT COUNT(*) FROM device_sms_senders WHERE user_login = ?", (redmi,),
             ).fetchone()[0], 1)
 
-    def test_sms_transport_forces_poco_without_changing_recipient(self):
+    def test_sms_transport_uses_call_phone_without_changing_recipient(self):
         response = mock.Mock(text="SMS posted")
         response.json.side_effect = ValueError("plain text")
         with (
@@ -494,12 +497,14 @@ class CallSourceTests(unittest.TestCase):
             mock.patch.object(bot, "MOIZVONKI_API_KEY", "test-key"),
             mock.patch.object(bot.HTTP, "post", return_value=response) as post,
         ):
-            for number in ("+998908456162", "+998908534466"):
-                bot.send_client_sms(number, "texnikacholx@gmail.com", "OFF")
+            for sender, number in (("texnikacholx@gmail.com", "+998900000001"),
+                                   ("aashshdjdjdjsj@gmail.com", "+998900000002"),
+                                   ("texnikach@gmail.com", "+998900000003")):
+                bot.send_client_sms(number, sender, "TEXNIKACH")
                 payload = post.call_args.kwargs["json"]
-                self.assertEqual(payload["user_name"], "texnikach@gmail.com")
+                self.assertEqual(payload["user_name"], sender)
                 self.assertEqual(payload["to"], number)
-                self.assertEqual(payload["text"], "OFF")
+                self.assertEqual(payload["text"], "TEXNIKACH")
 
     def test_sms_sender_endpoint_validates_both_devices_and_keeps_manager(self):
         def request(source, sender):
@@ -511,21 +516,22 @@ class CallSourceTests(unittest.TestCase):
             return req
 
         source = "texnikacholx@gmail.com"
-        result = asyncio.run(bot.update_admin_device_manager(request(source, "texnikach@gmail.com")))
+        result = asyncio.run(bot.update_admin_device_manager(request(source, source)))
         self.assertTrue(result["ok"])
-        self.assertEqual(result["device"]["sms_sender_device_name"], "Poco")
+        self.assertEqual(result["device"]["sms_sender_device_name"], "Tecno")
         self.assertEqual(result["device"]["manager_code"], "otabek")
         for bad_source, bad_sender in (
             (source, None), (source, ""), (source, "unknown@example.com"),
+            (source, "texnikach@gmail.com"),
             ("unknown@example.com", source), (None, source),
         ):
             with self.subTest(source=bad_source, sender=bad_sender):
                 with self.assertRaises(bot.HTTPException) as error:
                     asyncio.run(bot.update_admin_device_manager(request(bad_source, bad_sender)))
                 self.assertEqual(error.exception.status_code, 400)
-        self.assertEqual(bot.get_device_sms_sender(source), "texnikach@gmail.com")
+        self.assertEqual(bot.get_device_sms_sender(source), source)
         html = bot.dashboard()
-        self.assertIn("Отправитель всех SMS: Poco", html)
+        self.assertIn("SMS клиентам с телефона разговора", html)
         self.assertIn("Сохранить SMS", html)
         self.assertIn("payload.sender_user_login = smsSelect.value", html)
 
@@ -1768,7 +1774,7 @@ class CallSourceTests(unittest.TestCase):
         post.assert_called_once()
         payload = post.call_args.kwargs["json"]
         self.assertEqual(payload["action"], "calls.send_sms")
-        self.assertEqual(payload["user_name"], "texnikach@gmail.com")
+        self.assertEqual(payload["user_name"], "texnikacholx@gmail.com")
         self.assertEqual(payload["to"], "+998900000600")
         token = payload["text"].split("https://example.test/rate/")[1].split()[0]
         self.assertEqual(payload["text"], (
@@ -1798,7 +1804,7 @@ class CallSourceTests(unittest.TestCase):
 
         with mock.patch.object(bot, "MOIZVONKI_WEBHOOK_SECRET", ""):
             reply = asyncio.run(bot.moizvonki_webhook(self.inbound_sms_request(
-                "+998900000600", "5", user_login="texnikach@gmail.com",
+                "+998900000600", "5", user_login="texnikacholx@gmail.com",
                 event_created=history[0]["sent_at"] + 10,
                 start_time=history[0]["sent_at"] + 5,
                 event_pbx_call_id="combined-sms-reply",
@@ -1807,22 +1813,23 @@ class CallSourceTests(unittest.TestCase):
         self.assertEqual(reply["sms_rating"]["score"], 5)
         self.assertEqual(reply["sms_rating"]["call_id"], result["call_id"])
 
-    def test_sms_route_sends_from_selected_phone_and_matches_reply_to_original_call(self):
+    def test_sms_route_uses_call_phone_and_matches_reply_to_original_call(self):
         redmi = "aashshdjdjdjsj@gmail.com"
         poco = "texnikach@gmail.com"
-        bot.set_device_sms_sender(redmi, poco)
+        with self.assertRaises(ValueError):
+            bot.set_device_sms_sender(redmi, poco)
         event = self.event(680, "+998900000680", 0)
         response = mock.Mock(text="SMS posted")
         response.json.side_effect = ValueError("plain text")
         with mock.patch.object(bot.HTTP, "post", return_value=response) as post:
             result = self.run_sms_call(event, login=redmi)
         post.assert_called_once()
-        self.assertEqual(post.call_args.kwargs["json"]["user_name"], poco)
+        self.assertEqual(post.call_args.kwargs["json"]["user_name"], redmi)
         with bot.connect_db() as conn:
             history = conn.execute("SELECT * FROM sms_history").fetchone()
             rating = conn.execute("SELECT * FROM call_ratings").fetchone()
-        self.assertEqual(history["sender_user_login"], poco)
-        self.assertEqual(rating["sender_user_login"], poco)
+        self.assertEqual(history["sender_user_login"], redmi)
+        self.assertEqual(rating["sender_user_login"], redmi)
         call = bot.get_call(result["call_id"])
         self.assertEqual(call["user_login"], redmi)
         self.assertEqual(call["device_name"], "Redmi")
@@ -1833,7 +1840,7 @@ class CallSourceTests(unittest.TestCase):
             bot.set_device_sms_sender(redmi, "texnikacholx@gmail.com")
         bot.init_db()
         with mock.patch.object(bot, "MOIZVONKI_WEBHOOK_SECRET", ""):
-            for index, (login, processed) in enumerate(((redmi, False), (poco, True))):
+            for index, (login, processed) in enumerate(((poco, False), (redmi, True))):
                 reply = asyncio.run(bot.moizvonki_webhook(self.inbound_sms_request(
                     event["client_number"], "5", user_login=login,
                     event_created=history["sent_at"] + 10,
@@ -1853,7 +1860,7 @@ class CallSourceTests(unittest.TestCase):
 
     def test_sms_route_applies_to_missed_after_hours_and_friday_break(self):
         source = "texnikacholx@gmail.com"
-        sender = "texnikach@gmail.com"
+        sender = source
         bot.set_device_sms_sender(source, sender)
         for index, hour in enumerate((13, 21)):
             with self.subTest(hour=hour):
@@ -1869,7 +1876,7 @@ class CallSourceTests(unittest.TestCase):
 
     def test_sms_route_failure_never_falls_back_to_another_phone(self):
         source = "texnikacholx@gmail.com"
-        sender = "texnikach@gmail.com"
+        sender = source
         bot.set_device_sms_sender(source, sender)
         event = self.event(684, "+998900000684", 0)
         with mock.patch.object(bot, "send_client_sms", side_effect=RuntimeError("offline")) as send:
