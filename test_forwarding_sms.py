@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import requests
 
@@ -147,6 +147,75 @@ class SMSControlsTests(unittest.TestCase):
         self.service.dispatch_one(self.now + 1)
         self.assertEqual(self.sender.call_count, 1)
         self.assertEqual(self.queue(key="new")["reason"], "unconfirmed")
+
+    def test_answer_unlocks_next_command_and_next_reply_matches(self):
+        self.assertTrue(self.queue()["queued"])
+        self.service.dispatch_one(self.now)
+        webhook = {"user_login": "texnikach@gmail.com"}
+        first = {"direction": 0, "event_type": 32,
+                 "client_number": "+998908534466", "start_time": self.now + 10,
+                 "db_call_id": 101,
+                 "text": "ON Poco\nПереадресация выполнена\nБатарея: 80%\nРежим звонка: Normal"}
+        self.assertTrue(self.service.handle_sms_reply(webhook, first, self.now + 10))
+        self.assertEqual(self.repo.get_operation(1)["status"], "sms_reply_received")
+
+        self.now += 11
+        self.assertTrue(self.queue(target="off", key="second")["queued"])
+        self.service.dispatch_one(self.now)
+        second = {**first, "start_time": self.now + 10, "db_call_id": 102,
+                  "text": "OFF\nУдаление выполнено успешно.\nБатарея: 79%\nРежим звонка: Normal"}
+        self.assertTrue(self.service.handle_sms_reply(webhook, second, self.now + 10))
+        self.assertEqual(self.repo.get_operation(2)["status"], "sms_reply_received")
+        with self.repo.connect() as conn:
+            self.assertEqual([row[0] for row in conn.execute(
+                "SELECT operation_id FROM forwarding_sms_replies ORDER BY received_at"
+            )], [1, 2])
+
+    def test_unanswered_command_waits_at_most_two_minutes(self):
+        self.assertTrue(self.queue()["queued"])
+        self.sender.side_effect = requests.Timeout()
+        self.service.dispatch_one(self.now)
+        self.now += 119
+        blocked = self.queue(key="early")
+        self.assertEqual(blocked["reason"], "unconfirmed")
+        self.assertEqual(blocked["retry_after"], 1)
+        self.now += 1
+        self.assertTrue(self.queue(key="after-two-minutes")["queued"])
+        self.assertEqual(self.sender.call_count, 1)
+
+    def test_web_command_unlocks_after_reply(self):
+        with patch("forwarding.sms_service.utc_timestamp", return_value=self.now):
+            self.assertTrue(self.service.queue_web("tecno", "off", "web-first")["queued"])
+        self.service.dispatch_one(self.now)
+        reply = {"direction": 0, "event_type": 32,
+                 "client_number": "+998908456162", "start_time": self.now + 10,
+                 "db_call_id": 104,
+                 "text": "OFF\nУдаление выполнено успешно.\nБатарея: 10%\nРежим звонка: Normal"}
+        self.assertTrue(self.service.handle_sms_reply(
+            {"user_login": "texnikach@gmail.com"}, reply, self.now + 10))
+        with patch("forwarding.sms_service.utc_timestamp", return_value=self.now + 11):
+            self.assertTrue(self.service.queue_web("tecno", "redmi", "web-second")["queued"])
+
+    def test_late_reply_after_manual_repeat_is_not_assigned_arbitrarily(self):
+        self.assertTrue(self.queue()["queued"])
+        self.sender.side_effect = requests.Timeout()
+        self.service.dispatch_one(self.now)
+        self.now += 120
+        self.assertTrue(self.queue(key="manual-repeat")["queued"])
+        self.sender.side_effect = None
+        self.sender.return_value = {"success": True, "status": "SMS posted"}
+        self.service.dispatch_one(self.now)
+        late = {"direction": 0, "event_type": 32,
+                "client_number": "+998908534466", "start_time": self.now + 1,
+                "db_call_id": 103,
+                "text": "ON Poco\nПереадресация выполнена\nБатарея: 78%\nРежим звонка: Normal"}
+        self.assertTrue(self.service.handle_sms_reply(
+            {"user_login": "texnikach@gmail.com"}, late, self.now + 1))
+        with self.repo.connect() as conn:
+            self.assertIsNone(conn.execute(
+                "SELECT operation_id FROM forwarding_sms_replies"
+            ).fetchone()[0])
+        self.assertEqual(self.repo.get_operation(2)["status"], "api_accepted")
 
     def test_reply_only_incoming_preserves_operator_error(self):
         self.queue()

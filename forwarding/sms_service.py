@@ -131,7 +131,7 @@ class SMSForwardingService(ForwardingService):
                 lines.append("<blockquote>" + escape(device["reply"][:650]) + "</blockquote>")
             lines.append("")
         lines.extend(["Принятие SMS не подтверждает включение переадресации. Ответ оператора появится при получении ответного SMS на Poco.",
-                      "Пауза между командами: 5 минут. Poco → Poco требует доставки SMS самому себе.",
+                      "После ответа телефона следующая команда доступна сразу. Без ответа ожидание — не более 2 минут. Poco → Poco требует доставки SMS самому себе.",
                       "Redmi: свой оператор; Tecno: свой оператор; Abbos: все телефоны."])
         return "\n".join(lines)
 
@@ -184,6 +184,7 @@ class SMSForwardingService(ForwardingService):
             if looks_like_reply:
                 rows = conn.execute("""SELECT * FROM forwarding_operations
                     WHERE employee_id=? AND attempt_count > 0
+                    AND status IN ('sending','api_accepted','unconfirmed')
                     AND service_number IN ('OFF','ON Redmi','ON Tecno','ON Poco')
                     AND request_time <= ? AND request_time >= ?
                     ORDER BY id DESC""", (source.code, timestamp, timestamp - self.settings.correlation_window_seconds)).fetchall()

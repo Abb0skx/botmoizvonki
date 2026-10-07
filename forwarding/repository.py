@@ -701,60 +701,45 @@ class ForwardingRepository:
                     "operation": dict(active),
                 }
 
-            ambiguous = conn.execute(
-                """
-                SELECT * FROM forwarding_operations
-                WHERE employee_id = ?
-                    AND status = 'unconfirmed'
-                    AND attempt_count > 0
-                    AND request_time > ?
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (
-                    employee.code,
-                    now_ts - correlation_window_seconds,
-                ),
+            # A phone reply closes the last command and permits the next one
+            # immediately. An unanswered SMS may still arrive late, so keep
+            # a short manual-repeat pause without shortening reply matching.
+            sms_command = service_number == "OFF" or service_number.startswith("ON ")
+            wait_seconds = min(cooldown_seconds, 120) if sms_command else cooldown_seconds
+            latest = conn.execute(
+                """SELECT * FROM forwarding_operations
+                   WHERE employee_id = ? ORDER BY id DESC LIMIT 1""",
+                (employee.code,),
             ).fetchone()
-            if ambiguous:
+            ambiguous_window = (min(correlation_window_seconds, 120)
+                                if sms_command else correlation_window_seconds)
+            if (latest and latest["status"] == "unconfirmed"
+                    and latest["attempt_count"] > 0
+                    and latest["request_time"] + ambiguous_window > now_ts):
                 conn.commit()
                 return {
                     "queued": False,
                     "reason": "unconfirmed",
-                    "operation": dict(ambiguous),
+                    "operation": dict(latest),
                     "retry_after": max(
                         1,
-                        int(ambiguous["request_time"])
-                        + correlation_window_seconds
+                        int(latest["request_time"])
+                        + ambiguous_window
                         - now_ts,
                     ),
                 }
-
-            recent = conn.execute(
-                """
-                SELECT * FROM forwarding_operations
-                WHERE employee_id = ?
-                    AND COALESCE(completed_at, request_time) > ?
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (employee.code, now_ts - cooldown_seconds),
-            ).fetchone()
-            if recent:
+            wait_until = 0
+            if latest and not (sms_command and latest["status"] == "sms_reply_received"):
+                wait_from = (latest["request_time"] if sms_command else
+                             latest["completed_at"] or latest["request_time"])
+                wait_until = int(wait_from) + wait_seconds
+            if wait_until > now_ts:
                 conn.commit()
                 return {
                     "queued": False,
                     "reason": "cooldown",
-                    "operation": dict(recent),
-                    "retry_after": max(
-                        1,
-                        int(
-                            recent["completed_at"]
-                            or recent["request_time"]
-                        )
-                        + cooldown_seconds
-                        - now_ts,
-                    ),
+                    "operation": dict(latest),
+                    "retry_after": wait_until - now_ts,
                 }
 
             cursor = conn.execute(
