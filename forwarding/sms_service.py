@@ -122,7 +122,7 @@ class SMSForwardingService(ForwardingService):
 
     def build_post_text(self):
         lines = ["<b>📞 Переадресация · управление по SMS</b>",
-                 "Команды отправляются с Poco. Нажатие изменяет переадресацию выбранного телефона.", ""]
+                 "Команды отправляются с Poco. Нажатие ставит SMS-команду в очередь; изменение переадресации требует подтверждения.", ""]
         if not self.settings.enabled:
             lines.append("⛔ Управление временно отключено.")
         for device in self.states():
@@ -164,28 +164,36 @@ class SMSForwardingService(ForwardingService):
         source = next((d for d in self.devices.values() if dial_digit_signature(d.sim_number) == sender), None)
         text = str(event.get("text") or "").strip()[:10000]
         # Do not mistake ordinary employee SMS or commands for an Automate reply.
-        if not source or not text:
+        if not source:
             return False
         timestamp = event_timestamp(event, now_ts)
         key = hashlib.sha256(json.dumps([webhook.get("user_login"), event.get("db_call_id"), sender,
                                         event.get("start_time"), text], ensure_ascii=False).encode()).hexdigest()
         if self.device_controls.handle_reply(source.code, text, timestamp, now_ts, key):
             return True
-        if "Батарея:" not in text or "Режим звонка:" not in text:
-            return False
+        looks_like_reply = "Батарея:" in text and "Режим звонка:" in text
         with self.repository.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             if conn.execute("SELECT 1 FROM forwarding_sms_replies WHERE event_key=?", (key,)).fetchone():
                 return True
             # No command ID is returned by Automate. Require exactly one recent
-            # dispatched operation; ambiguous/delayed replies are never attributed.
-            rows = conn.execute("""SELECT * FROM forwarding_operations
-                WHERE employee_id=? AND attempt_count > 0
-                AND service_number IN ('OFF','ON Redmi','ON Tecno','ON Poco')
-                AND request_time <= ? AND request_time >= ?
-                ORDER BY id DESC""", (source.code, timestamp, timestamp - self.settings.correlation_window_seconds)).fetchall()
-            row = rows[0] if len(rows) == 1 else None
-            first_line = text.splitlines()[0].strip()
+            # dispatched operation and no competing device-control command.
+            # Other SMS from a known service phone are kept unlinked here so
+            # they never enter the customer-rating pipeline.
+            row = None
+            if looks_like_reply:
+                rows = conn.execute("""SELECT * FROM forwarding_operations
+                    WHERE employee_id=? AND attempt_count > 0
+                    AND service_number IN ('OFF','ON Redmi','ON Tecno','ON Poco')
+                    AND request_time <= ? AND request_time >= ?
+                    ORDER BY id DESC""", (source.code, timestamp, timestamp - self.settings.correlation_window_seconds)).fetchall()
+                competing_controls = conn.execute("""SELECT COUNT(*) FROM device_sms_commands
+                    WHERE device_code=? AND dispatched_at IS NOT NULL
+                    AND requested_at <= ? AND requested_at >= ?""",
+                    (source.code, timestamp, timestamp - self.settings.correlation_window_seconds)).fetchone()[0]
+                if len(rows) == 1 and competing_controls == 0:
+                    row = rows[0]
+            first_line = text.splitlines()[0].strip() if text else ""
             known_commands = {value[0] for value in COMMANDS.values()} | {"OFF", "ON Poco", "ON Redmi", "ON Tecno"}
             if row and first_line in known_commands and first_line != row["service_number"]:
                 row = None

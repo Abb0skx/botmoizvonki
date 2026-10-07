@@ -107,13 +107,16 @@ class DeviceSMSControls:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM device_sms_commands WHERE device_code=? ORDER BY id DESC LIMIT 1", (device,)).fetchone()
         if not row:
-            return {"status_label": "Команд настройки ещё не было", "reply": None}
+            return {"status_label": "Команд настройки ещё не было", "reply": None,
+                    "requested_at": None, "completed_at": None}
         labels = {"queued": "SMS в очереди", "sending": "Отправляем SMS с Poco",
                   "api_accepted": "SMS принято сервисом; ждём ответ телефона",
                   "location_requested": "Запрос координат принят сервисом. Результат ищите в таблице; ожидание до 30 минут. Доставка не подтверждена.",
                   "sms_reply_received": "Получен ответ телефона — проверьте текст",
                   "unconfirmed": "Подтверждения нет; автоповтор отключён", "api_failed": "Ошибка отправки"}
-        return {"command": row["command"], "status_label": labels[row["status"]], "reply": row["reply"]}
+        return {"command": row["command"], "status_label": labels[row["status"]],
+                "reply": row["reply"], "requested_at": row["requested_at"],
+                "completed_at": row["completed_at"]}
 
     def handle_reply(self, device, text, timestamp, now, event_key):
         if not (("Батарея:" in text and "Режим звонка:" in text) or text == "Нет интернета"):
