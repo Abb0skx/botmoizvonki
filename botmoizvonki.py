@@ -1142,11 +1142,22 @@ def get_result_category(
 # DATABASE
 # =========================================================
 
+class ClosingSQLiteConnection(sqlite3.Connection):
+    """Commit or roll back a `with` block, then release the SQLite handles."""
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 def connect_db():
 
     conn = sqlite3.connect(
         DB_PATH,
         timeout=30,
+        factory=ClosingSQLiteConnection,
     )
 
     conn.row_factory = sqlite3.Row
