@@ -1,4 +1,5 @@
 import asyncio
+import traceback
 
 
 class ForwardingScheduler:
@@ -31,5 +32,12 @@ class ForwardingScheduler:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                print("FORWARDING SCHEDULER ERROR:", repr(exc))
+                print(
+                    "FORWARDING SCHEDULER ERROR:",
+                    repr(exc),
+                    getattr(exc, "sqlite_errorname", None),
+                    getattr(exc, "sqlite_errorcode", None),
+                    flush=True,
+                )
+                traceback.print_exc()
             await asyncio.sleep(self.service.settings.poll_seconds)
