@@ -693,6 +693,32 @@ class ForwardingRepository:
                 """,
                 (employee.code,),
             ).fetchone()
+            sms_command = service_number == "OFF" or service_number.startswith("ON ")
+            if (sms_command and active
+                    and active["service_number"] in ("OFF", "ON Poco", "ON Redmi", "ON Tecno")
+                    and active["status"] in ("queued", "api_accepted")
+                    and active["request_time"] + 120 <= now_ts):
+                # The scheduler may not have reached this row at the exact
+                # two-minute boundary. Close it atomically before accepting a
+                # new manual command. Never reclaim a still-sending request.
+                result = ("Команда устарела до отправки; автозапуск отменён"
+                          if active["status"] == "queued" else
+                          "Ответ телефона не получен вовремя; автоповтор отключён")
+                conn.execute(
+                    """UPDATE forwarding_operations
+                       SET status='unconfirmed', completed_at=?, result=?,
+                           error=? WHERE id=?""",
+                    (now_ts, result,
+                     "queue_expired" if active["status"] == "queued" else "confirmation_timeout",
+                     active["id"]),
+                )
+                conn.execute(
+                    """UPDATE forwarding_devices
+                       SET forwarding_status='unknown', updated_at=?
+                       WHERE code=? AND last_operation_id=?""",
+                    (now_ts, employee.code, active["id"]),
+                )
+                active = None
             if active:
                 conn.commit()
                 return {
@@ -704,7 +730,6 @@ class ForwardingRepository:
             # A phone reply closes the last command and permits the next one
             # immediately. An unanswered SMS may still arrive late, so keep
             # a short manual-repeat pause without shortening reply matching.
-            sms_command = service_number == "OFF" or service_number.startswith("ON ")
             wait_seconds = min(cooldown_seconds, 120) if sms_command else cooldown_seconds
             latest = conn.execute(
                 """SELECT * FROM forwarding_operations

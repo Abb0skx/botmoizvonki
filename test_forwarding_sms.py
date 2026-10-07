@@ -196,6 +196,24 @@ class SMSControlsTests(unittest.TestCase):
         with patch("forwarding.sms_service.utc_timestamp", return_value=self.now + 11):
             self.assertTrue(self.service.queue_web("tecno", "redmi", "web-second")["queued"])
 
+    def test_two_minute_boundary_closes_unanswered_request_before_scheduler(self):
+        self.assertTrue(self.queue()["queued"])
+        self.service.dispatch_one(self.now)
+        self.assertEqual(self.repo.get_operation(1)["status"], "api_accepted")
+        self.now += 120
+        self.assertTrue(self.queue(key="after-boundary")["queued"])
+        self.assertEqual(self.repo.get_operation(1)["status"], "unconfirmed")
+        self.assertEqual(self.sender.call_count, 1)
+
+    def test_two_minute_boundary_discards_stale_queued_request(self):
+        self.assertTrue(self.queue()["queued"])
+        self.now += 120
+        self.assertTrue(self.queue(key="replacement")["queued"])
+        self.assertEqual(self.repo.get_operation(1)["status"], "unconfirmed")
+        self.service.dispatch_one(self.now)
+        self.sender.assert_called_once()
+        self.assertEqual(self.repo.get_operation(2)["status"], "api_accepted")
+
     def test_late_reply_after_manual_repeat_is_not_assigned_arbitrarily(self):
         self.assertTrue(self.queue()["queued"])
         self.sender.side_effect = requests.Timeout()
