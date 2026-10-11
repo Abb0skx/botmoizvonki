@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from typing import Any
 
 import httpx
 
 from monitoring.config import MonitoringSettings
+
+
+LOG = logging.getLogger("monitoring")
+CONNECT_ATTEMPTS = 3
 
 
 class PriceAdapter:
@@ -85,16 +91,36 @@ class PriceAdapter:
             headers["Content-Type"] = "application/json"
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
+        timeout = 45.0 if path.startswith("/price/api/v1/entry/") else 15.0
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(45.0 if path.startswith("/price/api/v1/entry/") else 15.0, connect=2.0),
+            timeout=httpx.Timeout(timeout, connect=2.0),
             follow_redirects=False,
         ) as client:
-            response = await client.request(
-                method,
-                self.settings.price_base_url + path,
-                headers=headers,
-                content=body if method == "POST" else None,
-            )
+            for attempt in range(1, CONNECT_ATTEMPTS + 1):
+                try:
+                    response = await client.request(
+                        method,
+                        self.settings.price_base_url + path,
+                        headers=headers,
+                        content=body if method == "POST" else None,
+                    )
+                    break
+                except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                    if attempt == CONNECT_ATTEMPTS:
+                        raise
+                    # A connect failure happens before HTTP request bytes are
+                    # sent.  Retrying is therefore safe for POST as well as
+                    # GET, while read/write timeouts must remain ambiguous and
+                    # are deliberately not retried here.
+                    LOG.warning(
+                        "price_admin_connect_retry attempt=%s method=%s "
+                        "path=%s type=%s",
+                        attempt,
+                        method,
+                        path,
+                        type(exc).__name__,
+                    )
+                    await asyncio.sleep(0.1 * attempt)
         response_limit = 16 if path.startswith("/price/api/v1/entry/") else 4
         if len(response.content) > response_limit * 1024 * 1024:
             raise RuntimeError("price_source_response_too_large")
