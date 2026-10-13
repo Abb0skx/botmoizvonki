@@ -6,10 +6,10 @@
   <meta name="robots" content="noindex,nofollow">
   <title>Модели · Texnikach</title>
   <link rel="stylesheet" href="/price/assets/price-entry.css?v=3">
-  <link rel="stylesheet" href="/price/assets/price-models.css?v=4">
-  <script src="/price/assets/price-models.js?v=4" defer></script>
+  <link rel="stylesheet" href="/price/assets/price-models.css?v=5">
+  <script src="/price/assets/price-models.js?v=5" defer></script>
 </head>
-<body>
+<body class="models-page">
 <aside class="sidebar">
   <a class="brand" href="/monitoring"><span class="brand-mark">t.</span> texnikach<span class="brand-sub">РАБОЧЕЕ ПРОСТРАНСТВО</span></a>
   <div class="nav-label">ПРАЙС И КАТАЛОГ</div>
@@ -22,40 +22,58 @@
 </aside>
 <main>
   <header class="topline"><span>Каталог <span class="slash">/</span> <strong>Модели</strong></span><span class="private-label">Закрытый доступ</span></header>
-  <section class="page-heading"><div><div class="eyebrow">УПРАВЛЕНИЕ КАТАЛОГОМ</div><h1>Модели и варианты<span>.</span></h1><p>Добавляйте модели, исправляйте названия, категории, память и цвета.</p></div><div class="heading-actions"><button class="button primary" id="add-model" hidden>＋ Добавить модель</button></div></section>
+  <section class="page-heading"><div><div class="eyebrow">УПРАВЛЕНИЕ КАТАЛОГОМ</div><h1>Модели и варианты<span>.</span></h1><p>От одной новинки до целой поставки — добавьте модели и переходите к ценам.</p></div><div class="heading-actions"><button class="button secondary" id="show-catalog">Найти модель ↓</button><button class="button primary" id="add-model" hidden>＋ Добавить модель</button></div></section>
   <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
   <section id="login-panel" class="empty-state" hidden><h2>Войдите в рабочий кабинет</h2><p>Каталог доступен только сотрудникам с правом управления прайсом.</p><a class="button primary" href="/monitoring/login?next=%2Fprice%2Fmodels">Войти</a></section>
   <div id="workspace" hidden>
     <section class="summary-grid model-summary"><div class="summary-card"><span>МОДЕЛЕЙ</span><strong id="model-count">—</strong><small>Сгруппировано по названию</small></div><div class="summary-card"><span>ВАРИАНТОВ</span><strong id="variant-count">—</strong><small>Память и цвет</small></div><div class="summary-card"><span>КАТЕГОРИЙ</span><strong id="category-count">—</strong><small>Доступно для выбора</small></div><div class="summary-card"><span>ИСТОЧНИК</span><strong>Сервер</strong><small>Google Price не используется</small></div></section>
-    <section class="import-panel" id="import-panel">
-      <div class="import-intro"><div class="eyebrow">МАССОВОЕ ДОБАВЛЕНИЕ</div><h2>Подготовить новые модели</h2><p>Вставьте привычный список, выберите категорию по названию и сначала проверьте готовый результат. Каталог изменится только после второго подтверждения.</p><pre class="import-example">0. 26
-1. Samsung Galaxy A57 5G
-2. 8/128Gb, 8/256Gb
-3. Black, Gray, Blue</pre></div>
-      <div class="import-form">
-        <label class="field-label" for="import-category-search">Категория</label>
-        <div class="category-picker" id="import-category-picker">
-          <input id="import-category-search" type="search" placeholder="Начните вводить название категории…" autocomplete="off" aria-autocomplete="list" aria-expanded="false">
-          <div class="category-suggestions" id="import-category-suggestions" role="listbox" hidden></div>
+    <section class="import-panel" id="import-panel" aria-labelledby="creator-title">
+      <div class="creator-heading"><div><div class="eyebrow">НОВОЕ В КАТАЛОГЕ</div><h2 id="creator-title">Добавить модели</h2><p>Выберите категорию, заполните данные и проверьте результат.</p></div><span class="draft-indicator" id="draft-indicator">Черновик в этой вкладке</span></div>
+      <div id="creator-inputs">
+        <div class="creator-tabs" role="tablist" aria-label="Способ добавления">
+          <button id="single-tab" role="tab" aria-selected="true" aria-controls="single-form" type="button" class="active">＋ Одна модель</button>
+          <button id="batch-tab" role="tab" aria-selected="false" aria-controls="batch-form" type="button" tabindex="-1">≡ Списком</button>
         </div>
-        <p class="selected-category" id="import-category-selected">Категория не выбрана</p>
-        <label class="field-label" for="import-text">Список моделей</label>
-        <textarea id="import-text" rows="12" placeholder="0. 26&#10;1. Apple Watch Series 12 Aluminum&#10;2. 42mm, 46mm&#10;3. Black, Dark Bronze, Light Gold, Space Gray"></textarea>
-        <button class="button primary" id="preview-import" type="button">Подготовить к проверке</button>
+        <div class="creator-category"><label class="field-label" for="import-category-search">Категория <span class="required">*</span></label><div id="import-category-picker"></div><p class="selected-category" id="import-category-selected">Начните вводить название и выберите категорию.</p></div>
+        <div id="single-form" class="single-form" role="tabpanel" aria-labelledby="single-tab">
+          <div class="single-fields">
+            <label class="model-field" for="new-model-name">Название модели <span class="required">*</span><input id="new-model-name" type="text" maxlength="250" placeholder="Например, Apple Watch Series 12" autocomplete="off"><small>Одна модель — несколько вариантов памяти, размера и цвета.</small></label>
+            <div class="dimension-fields">
+              <label for="new-memories">Память / размер <span class="optional">необязательно</span><textarea id="new-memories" rows="2" placeholder="42mm, 46mm"></textarea><small>Через запятую или с новой строки.</small><span class="value-suggestions" id="memory-suggestions" aria-label="Подсказки памяти и размеров"></span></label>
+              <label for="new-colors">Цвета <span class="optional">необязательно</span><textarea id="new-colors" rows="2" placeholder="Black, Silver, Gold"></textarea><small>Каждый цвет будет отдельным товаром.</small><span class="value-suggestions" id="color-suggestions" aria-label="Подсказки цветов"></span></label>
+            </div>
+          </div>
+          <aside class="variant-preview"><div class="variant-preview-title"><strong>Получатся конфигурации</strong><span id="single-count" class="count-badge">1</span></div><p id="single-hint">Без памяти и цвета — один товар.</p><div id="single-variants" class="generated-variants"></div><p class="form-note" id="single-validation" role="status"></p></aside>
+        </div>
+        <div id="batch-form" class="batch-form" role="tabpanel" aria-labelledby="batch-tab" hidden>
+          <div class="batch-input"><label class="field-label" for="import-text">Вставьте список моделей</label><textarea id="import-text" rows="11" maxlength="12000" spellcheck="false" placeholder="Apple Watch Series 12 Aluminum&#10;42mm, 46mm&#10;Black, Silver, Gold&#10;&#10;Apple Watch Ultra 4&#10;49mm&#10;Black, Natural"></textarea><div class="batch-input-meta"><span id="batch-length">0 / 12 000 символов</span><button class="text-button" id="clear-batch" type="button">Очистить</button></div></div>
+          <aside class="batch-guide">
+            <span class="guide-label">КАК ДОБАВИТЬ СПИСОК</span><h3>Три строки на модель</h3>
+            <ol><li>Название модели</li><li>Память или размеры через запятую</li><li>Цвета через запятую</li></ol>
+            <p>Между моделями оставьте пустую строку. Если память или цвет не нужны, напишите <strong>-</strong>.</p>
+            <button class="button secondary" id="insert-example" type="button">Вставить пример</button>
+            <details><summary>Из Excel или привычного списка</summary>
+              <p>Можно скопировать три столбца: <strong>модель → память → цвета</strong>. Одна строка — одна модель. Также подходят строки с разделителем <strong>|</strong> и прежний формат <strong>0. / 1. / 2. / 3.</strong></p>
+              <p>Вся партия попадёт в выбранную выше категорию. До 100 моделей и 5 000 конфигураций за раз.</p>
+            </details>
+          </aside>
+        </div>
+        <div class="creator-footer"><p id="creator-help">Сначала покажем результат. Цены можно заполнить после добавления.</p><button class="button primary" id="preview-import" type="button">Проверить модель →</button></div>
       </div>
       <div class="import-preview" id="import-preview" hidden>
         <div class="preview-head"><div><div class="eyebrow">ПРЕДВАРИТЕЛЬНАЯ ПРОВЕРКА</div><h3 id="preview-title">Готово к добавлению</h3><p id="preview-summary"></p></div><button class="text-button" id="reset-import" type="button">Изменить данные</button></div>
         <div id="preview-warning" class="preview-warning" hidden></div>
         <div id="preview-models" class="preview-models"></div>
-        <div class="sorting-grid">
+        <details class="sorting-details"><summary>Списки для сортировки и копирования</summary><div class="sorting-grid">
           <label>Модели для сортировки<textarea id="sorting-models" readonly></textarea><button class="text-button copy-list" type="button" data-copy="sorting-models">Скопировать</button></label>
           <label>Память / размеры<textarea id="sorting-memories" readonly></textarea><button class="text-button copy-list" type="button" data-copy="sorting-memories">Скопировать</button></label>
           <label>Цвета<textarea id="sorting-colors" readonly></textarea><button class="text-button copy-list" type="button" data-copy="sorting-colors">Скопировать</button></label>
-        </div>
-        <div class="confirm-import"><p>Проверьте названия, размеры и цвета. После подтверждения всем вариантам будут выданы новые ID.</p><button class="button primary" id="apply-import" type="button">Добавить модели в каталог</button></div>
+        </div></details>
+        <div class="confirm-import"><p id="confirm-note">Каждая конфигурация получит свой ID и появится во «Вводе цен» у всех поставщиков.</p><button class="button primary" id="apply-import" type="button">Добавить в каталог</button></div>
       </div>
+      <div id="create-success" class="create-success" hidden><span class="success-mark">✓</span><h3 id="success-title"></h3><p id="success-detail"></p><div class="success-actions"><button id="create-another" class="button primary" type="button">＋ Добавить ещё</button><a href="/price/entry" class="button secondary">Перейти к ценам ↗</a></div></div>
     </section>
-    <section class="catalog-panel model-panel">
+    <section class="catalog-panel model-panel" id="catalog-panel"><div class="catalog-heading"><div><h2>Модели в каталоге</h2><p>Найдите модель, чтобы изменить название или конфигурации.</p></div></div>
       <div class="toolbar"><label class="search"><span>⌕</span><input id="search" type="search" placeholder="Название модели или ID…" autocomplete="off" aria-label="Поиск моделей"><kbd>/</kbd></label><select id="category" aria-label="Категория"><option value="">Все категории</option></select></div>
       <div class="table-meta"><strong id="found-count">Загрузка…</strong><button class="text-button" id="refresh">↻ Обновить</button></div>
       <div id="models" class="model-list"></div>
