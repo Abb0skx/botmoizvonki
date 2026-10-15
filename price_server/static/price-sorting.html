@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <title>Сортировка · Texnikach</title>
+  <link rel="stylesheet" href="/price/assets/price-entry.css?v=11">
+  <link rel="stylesheet" href="/price/assets/price-sorting.css?v=1">
+  <script src="/price/assets/price-sorting.js?v=1" defer></script>
+</head>
+<body class="sorting-page">
+<aside class="sidebar">
+  <a class="brand" href="/price/entry"><span class="brand-mark">t.</span> texnikach<span class="brand-sub">РАБОЧЕЕ ПРОСТРАНСТВО</span></a>
+  <div class="nav-label">ПРАЙС И КАТАЛОГ</div>
+  <a class="nav-item" href="/price/entry"><span aria-hidden="true">▦</span> Ввод цен</a>
+  <a class="nav-item" href="/price/models"><span aria-hidden="true">◇</span> Модели</a>
+  <a class="nav-item" href="/price/categories"><span aria-hidden="true">⌘</span> Категории</a>
+  <a class="nav-item active" href="/price/sorting" aria-current="page"><span aria-hidden="true">⇅</span> Сортировка <span class="nav-dot"></span></a>
+  <a class="nav-item" href="/monitoring/prices/manage"><span aria-hidden="true">↗</span> Прайс и публикации</a>
+  <div class="sidebar-note"><span class="green-dot"></span> Порядок на сервере<strong>Новинки не потеряются</strong><p>Новые позиции появляются в конце своей группы.</p></div>
+  <a class="back-link" href="/price/entry">← Перейти к ценам</a>
+</aside>
+<main>
+  <header class="topline"><span>Каталог <span class="slash">/</span> <strong>Сортировка</strong></span><span class="private-label">Закрытый доступ</span></header>
+  <section class="page-heading"><div><div class="eyebrow">КАЖДАЯ ПОЗИЦИЯ НА СВОЁМ МЕСТЕ</div><h1>Порядок в каталоге<span>.</span></h1><p>Расставьте модели, память и цвета так, как их удобно видеть в прайсе.</p></div><button class="button secondary" id="refresh" type="button">↻ Обновить список</button></section>
+  <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+  <section id="login-panel" class="empty-state" hidden><h2>Войдите в рабочий кабинет</h2><p>Сортировка доступна сотрудникам с правом управления прайсом. Ваш черновик сохранён в этой вкладке.</p><a class="button primary" href="/monitoring/login?next=%2Fprice%2Fsorting">Войти</a></section>
+  <div id="loading" class="loading-panel" role="status"><span class="loading-mark" aria-hidden="true">⇅</span><strong>Загружаем порядок каталога</strong><p>Собираем модели, память и цвета по группам.</p></div>
+  <div id="workspace" hidden>
+    <section id="recovery-panel" class="draft-recovery" hidden><div><strong>Ваш прежний черновик сохранён</strong><p>На сервере уже другой порядок. Можно проверить и вернуть свои правки поверх свежего списка.</p></div><button id="recover-draft" class="button secondary" type="button">Проверить черновик</button><button id="dismiss-recovery" class="text-button" type="button">Не нужен</button></section>
+    <section class="sorting-intro" aria-label="Как работает сортировка"><div class="intro-symbol" aria-hidden="true">⇅</div><div><strong>Перетащите. Проверьте. Сохраните.</strong><p>Или используйте стрелки и номер позиции. Новинки отмечены меткой <span class="new-label">Новое</span> — они всегда добавляются в конец своей группы.</p></div><button class="text-button" id="show-history" type="button">◷ История</button></section>
+    <div class="sorting-tabs" role="tablist" aria-label="Что сортируем">
+      <button id="tab-models" type="button" role="tab" aria-selected="true" aria-controls="sorting-panel" data-kind="models" class="active"><span>Модели</span><span class="tab-count" data-count="models">—</span></button>
+      <button id="tab-memories" type="button" role="tab" aria-selected="false" aria-controls="sorting-panel" data-kind="memories" tabindex="-1"><span>Память / размер</span><span class="tab-count" data-count="memories">—</span></button>
+      <button id="tab-colors" type="button" role="tab" aria-selected="false" aria-controls="sorting-panel" data-kind="colors" tabindex="-1"><span>Цвета</span><span class="tab-count" data-count="colors">—</span></button>
+      <button id="tab-categories" type="button" role="tab" aria-selected="false" aria-controls="sorting-panel" data-kind="categories" tabindex="-1"><span>Категории</span><span class="tab-count" data-count="categories">—</span></button>
+    </div>
+    <div id="sorting-panel" class="sorting-layout" role="tabpanel" aria-labelledby="tab-models">
+      <aside class="group-panel" aria-label="Группы сортировки">
+        <div class="group-heading"><span id="groups-label">КАТЕГОРИИ МОДЕЛЕЙ</span><strong id="groups-count">—</strong></div>
+        <label class="group-search"><span aria-hidden="true">⌕</span><input id="group-search" type="search" placeholder="Найти категорию…" autocomplete="off" aria-label="Найти группу"></label>
+        <nav id="group-list" class="group-list" aria-label="Выбрать группу"></nav>
+        <p id="groups-empty" class="groups-empty" hidden>Такая группа не найдена.</p>
+        <div class="group-legend"><span class="new-dot" aria-hidden="true"></span> Есть новые позиции</div>
+      </aside>
+      <section class="order-panel" aria-labelledby="group-title">
+        <div class="order-heading"><div><div class="eyebrow" id="group-kind">МОДЕЛИ В КАТЕГОРИИ</div><h2 id="group-title">—</h2><p id="group-meta">—</p></div><span class="saved-label" id="group-saved">Сохранено</span></div>
+        <div class="order-toolbar"><label class="item-search"><span aria-hidden="true">⌕</span><input id="item-search" type="search" placeholder="Найти в этой группе…" autocomplete="off" aria-label="Найти позицию в группе"><kbd>/</kbd></label><button id="only-new" class="filter-toggle" type="button" aria-pressed="false"><span class="new-dot" aria-hidden="true"></span> Только новые <span id="group-new-count">0</span></button></div>
+        <p id="category-scope-note" class="category-scope-note" hidden>Порядок разделов каталога и расписание публикаций здесь не меняются.</p>
+        <div id="new-items-note" class="new-items-note" hidden><p id="new-items-text"></p><button id="acknowledge-group" class="text-button" type="button">Порядок верный ✓</button></div>
+        <div class="list-heading"><span>ПОЗИЦИЯ</span><span>НАЗВАНИЕ</span><span>ПЕРЕМЕСТИТЬ</span></div>
+        <ol id="order-list" class="order-list" aria-label="Порядок позиций"></ol>
+        <div id="items-empty" class="empty-state" hidden><span class="empty-icon" aria-hidden="true">⌕</span><h3 id="empty-title">Ничего не найдено</h3><p id="empty-text">Измените запрос или выключите фильтр «Только новые».</p><button id="clear-filters" class="button secondary" type="button">Сбросить фильтры</button></div>
+        <footer class="order-footer"><span id="list-total">—</span><button id="reset-group" class="text-button" type="button" disabled>Сбросить правки группы</button></footer>
+      </section>
+    </div>
+    <p class="sorting-footnote">ⓘ Здесь меняется только порядок. Названия, ID товаров, цены и история остаются прежними. Сохранённый порядок применяется при следующем формировании прайса.</p>
+  </div>
+  <footer id="savebar" class="sorting-savebar" hidden><div class="save-status"><span id="save-status-mark" class="status-dot"></span><div><strong id="change-count">Все изменения сохранены</strong><small id="save-hint">—</small></div></div><div class="save-actions"><button id="undo" class="button secondary" type="button" disabled aria-label="Отменить последнее перемещение">↶ Отменить шаг</button><button id="discard" class="text-button" type="button" disabled>Сбросить всё</button><button id="save" class="button primary" type="button" disabled>Сохранить порядок</button></div></footer>
+</main>
+<dialog id="dialog" aria-labelledby="dialog-title"><div class="dialog-header"><div><div class="eyebrow">СОРТИРОВКА</div><h2 id="dialog-title"></h2></div><button class="close" id="close-dialog" type="button" aria-label="Закрыть">×</button></div><div id="dialog-body"></div><div id="dialog-actions" class="dialog-actions"></div></dialog>
+<span id="announcement" class="visually-hidden" role="status" aria-live="polite"></span>
+</body>
+</html>

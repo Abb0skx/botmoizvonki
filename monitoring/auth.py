@@ -65,6 +65,7 @@ def _safe_next(value: str | None) -> str:
         "/price/entry",
         "/price/models",
         "/price/categories",
+        "/price/sorting",
         "/monitoring",
         "/monitoring/calls",
         "/monitoring/site",

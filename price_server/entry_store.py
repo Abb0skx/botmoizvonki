@@ -105,6 +105,8 @@ class SQLitePriceSource:
                            key=stored["product_key"], row=stored["position"] + 2, locked=[])
                 row["revision"] = revision(row)
                 rows.append(row)
+            from .sorting import sort_rows_if_ready
+            rows = sort_rows_if_ready(db, rows)
             return {"sheet_id": sheet_id, "title": supplier["title"], "rows": rows,
                     "source": "sqlite", "fetched_at": now(), "spreadsheet_url": None}
 

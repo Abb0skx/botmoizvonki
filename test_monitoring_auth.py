@@ -781,7 +781,7 @@ class MonitoringRouteTests(unittest.TestCase):
         )
 
     def test_price_entry_proxy_is_authenticated_and_csrf_protected(self):
-        paths = ["entry/suppliers", "entry/history", "entry/categories", "entry/models",
+        paths = ["entry/suppliers", "entry/history", "entry/categories", "entry/models", "entry/sorting",
                  "entry/model-inbox", "entry/models/1", "entry/catalog/1027960070",
                  "entry/cell-history/1027960070/1:10:11/price_1/0",
                  "entry/cell-history/1027960070/1:10:11/price_12/123",
@@ -810,6 +810,15 @@ class MonitoringRouteTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             self.assertEqual(upstream.await_args.args, ("POST", "/price/api/v1/entry/save/1027960070"))
             product_url = "/monitoring/api/prices/admin/entry/products"
+            sorting_url = "/monitoring/api/prices/admin/entry/sorting"
+            self.assertEqual(self.client.post(sorting_url, json={}).status_code, 403)
+            self.assertEqual(self.client.post(sorting_url, json={}, headers={
+                "X-CSRF-Token": csrf, "Origin": "https://evil.example"}).status_code, 403)
+            self.assertEqual(self.client.post(sorting_url, json={"revision": 1, "groups": []}, headers={
+                "X-CSRF-Token": csrf, "Origin": "https://bot.texnikach.uz",
+                "Idempotency-Key": "123e4567-e89b-42d3-a456-426614174000"}).status_code, 200)
+            self.assertEqual(upstream.await_args.args, ("POST", "/price/api/v1/entry/sorting"))
+            self.assertEqual(self.client.get(sorting_url + "/export").status_code, 404)
             self.assertEqual(self.client.post(product_url, json={}, headers={
                 "X-CSRF-Token": csrf, "Origin": "https://bot.texnikach.uz",
                 "Idempotency-Key": "123e4567-e89b-42d3-a456-426614174000"}).status_code, 200)
@@ -855,6 +864,7 @@ class MonitoringRouteTests(unittest.TestCase):
         self.assertEqual(_safe_next("/price/entry"), "/price/entry")
         self.assertEqual(_safe_next("/price/models"), "/price/models")
         self.assertEqual(_safe_next("/price/categories"), "/price/categories")
+        self.assertEqual(_safe_next("/price/sorting"), "/price/sorting")
 
     def test_price_admin_proxy_restores_manager_actions_with_csrf(self):
         self.assertEqual(self.client.get(

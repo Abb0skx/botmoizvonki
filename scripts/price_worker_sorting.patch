@@ -1,0 +1,43 @@
+--- a/Cod/Price.py
++++ b/Cod/Price.py
+@@ -554,0 +555,8 @@
++
++    source = os.getenv("PRICE_SORT_SOURCE", "google_sheets").strip().lower()
++    if source == "server":
++        from server_sorting_source import load_server_sorting
++
++        return load_server_sorting(CatalogGroup, CatalogEntry)
++    if source != "google_sheets":
++        raise RuntimeError("Unknown PRICE_SORT_SOURCE; publication stopped without fallback")
+@@ -1494,0 +1503,7 @@
++    if os.getenv("PRICE_SORT_SOURCE", "google_sheets").strip().lower() == "server":
++        from server_sorting_source import sort_price_rows
++
++        sorted_group = sort_price_rows(group)
++    else:
++        sorted_group = group.sort_values(by="price")
++
+@@ -1515,4 +1530 @@
+-            group
+-            .sort_values(
+-                by="price"
+-            )
++            sorted_group
+@@ -1614,4 +1626 @@
+-            group
+-            .sort_values(
+-                by="price"
+-            )
++            sorted_group
+@@ -1684,4 +1693 @@
+-            group
+-            .sort_values(
+-                by="price"
+-            )
++            sorted_group
+@@ -1778,4 +1784 @@
+-            group
+-            .sort_values(
+-                by="price"
+-            )
++            sorted_group

@@ -50,7 +50,7 @@ DELIVERY_TEMPLATES = ROOT.parent / "app" / "templates"
 
 _PRICE_ADMIN_GET_PATHS = frozenset({
     "jobs", "sections", "entry/suppliers", "entry/history", "entry/categories",
-    "entry/models", "entry/model-inbox",
+    "entry/models", "entry/model-inbox", "entry/sorting",
 })
 _PRICE_ADMIN_POST_PATHS = (
     re.compile(
@@ -66,6 +66,7 @@ _PRICE_ADMIN_POST_PATHS = (
     re.compile(r"entry/save/[0-9]{1,12}"),
     re.compile(r"entry/products"),
     re.compile(r"entry/categories"),
+    re.compile(r"entry/sorting"),
     re.compile(r"entry/categories/[1-9][0-9]{0,18}"),
     re.compile(r"entry/model-import/(?:preview|apply)"),
     re.compile(r"entry/models/[1-9][0-9]{0,18}(?:/delete)?"),
@@ -647,14 +648,15 @@ async def api_price_admin(request: Request, path: str):
     idempotency_key = request.headers.get("idempotency-key", "")[:128]
     if method == "POST":
         get_auth().verify_csrf(request, principal)
+        max_body = 256 * 1024 if path == "entry/sorting" else 64 * 1024
         content_length = request.headers.get("content-length", "")
         try:
-            if content_length and int(content_length) > 64 * 1024:
+            if content_length and int(content_length) > max_body:
                 raise HTTPException(status_code=413, detail="request_too_large")
         except ValueError:
             raise HTTPException(status_code=400, detail="invalid_content_length")
         body = await request.body()
-        if len(body) > 64 * 1024:
+        if len(body) > max_body:
             raise HTTPException(status_code=413, detail="request_too_large")
     try:
         status_code, content, media_type = await prices_adapter.PriceAdapter(

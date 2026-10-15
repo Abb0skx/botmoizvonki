@@ -22,6 +22,9 @@ STATIC = Path(__file__).parent / "static"
 
 
 def install_entry_routes(router, admin, enabled, settings):
+    from .sorting_routes import install_sorting_routes
+    install_sorting_routes(router, admin, enabled, settings)
+
     def service():
         return PriceEntryService(settings.db_path)
 

@@ -1,0 +1,42 @@
+--- a/Cod/Excel new.py
++++ b/Cod/Excel new.py
+@@ -115,3 +115,9 @@
+-print(
+-    "⬇️ Загружаю product_sort из Google Sheets..."
+-)
++sort_source = os.getenv("PRICE_SORT_SOURCE", "google_sheets").strip().lower()
++if sort_source == "google_sheets":
++    print("⬇️ Загружаю product_sort из Google Sheets...")
++    sort_spreadsheet = gc.open_by_key(SORT_SPREADSHEET_ID)
++elif sort_source == "server":
++    print("⬇️ Загружаю сортировку с сайта...")
++    sort_spreadsheet = None
++else:
++    raise RuntimeError("Unknown PRICE_SORT_SOURCE; export stopped without fallback")
+@@ -119,4 +124,0 @@
+-sort_spreadsheet = gc.open_by_key(
+-    SORT_SPREADSHEET_ID
+-)
+-
+@@ -134,8 +136,13 @@
+-(
+-    sort_worksheet,
+-    sort_values,
+-    sort_headers,
+-) = worksheet_with_columns(
+-    sort_spreadsheet,
+-    required_sort_columns,
+-)
++if sort_source == "server":
++    from server_sorting_source import load_server_sorting_rows
++
++    sort_worksheet, sort_values, sort_headers = load_server_sorting_rows()
++else:
++    (
++        sort_worksheet,
++        sort_values,
++        sort_headers,
++    ) = worksheet_with_columns(
++        sort_spreadsheet,
++        required_sort_columns,
++    )
