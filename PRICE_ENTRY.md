@@ -156,3 +156,32 @@ Google Product Sort после переключения не управляет 
 runtime. **Не восстанавливать целиком устаревшую базу поверх рабочей** — так можно
 потерять новые цены, задания и Telegram ID. Полный restore допустим только как
 отдельное обслуживание с остановкой записей и планом сохранения новых данных.
+
+### Фактическая выкладка 15.10.2026
+
+- Код: `7a6c049`, ветка `codex/price-sorting-manager`. Main не переключался:
+  действующий portal содержит отдельные серверные изменения; применён узкий
+  overlay поверх текущего образа, без пересборки остальных функций из main.
+- Web: `texnikach-price-server:site-sorting-20261015`.
+  Worker scheduler/dispatcher/runner: `texnikach-price-worker:site-sorting-20261015`.
+  Portal: `texnikach-calls:site-sorting-20261015-r3`.
+  Telegram dispatcher, archive-worker, controller и backup-контейнеры не менялись.
+- Release/seed/прежние compose overrides: `/opt/texnikach-site-sorting-20261015/`.
+  Проверенная SQLite backup и `.gz`:
+  `/opt/texnikach-price-server/data/manual-backups/site-sorting-20261015/before.db`.
+- Начальная ревизия 1: 157 групп, 2 679 позиций. Все прежние ранги и `Catalog`
+  перенесены точно. На тестовой копии не изменена ни одна из 38 старых таблиц.
+- `publish-price --no-downstream` успешно сформировал snapshot 535. До/после:
+  1 520 товаров, 65 разделов, 3 424 задания; hash бизнес-полей товаров совпал.
+  Проверены защищённый API, авторизованный интерфейс, export, integrity/FK и
+  здоровое состояние worker. Тестовые Telegram-сообщения не отправлялись.
+- Профильные тесты: 211 проходят, дополнительно 13 проверок portal/proxy.
+  Полный набор: 1 421 проходят, два прежних сбоя delivery и четыре ошибки
+  импорта Instagram-тестов из-за отсутствующего `aiogram`; они вне этой задачи.
+- При пересоздании portal обнаружен прежний незаписанный в образ hotfix GO
+  от 13.10; недостающий модуль вызвал краткую недоступность кабинета. Сохранены
+  его `go_details.py`, router и три UI-файла из исходного release, включены в r3.
+  Для точного отката portal использовать подготовленный образ
+  `texnikach-calls:pre-site-sorting-20261015`, а не базовый образ без GO-hotfix.
+  Дополнительный portal override указан последним в Compose-конфигурации
+  контейнера; прежний список файлов доступен в его сохранённых release.
