@@ -5,7 +5,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from price_server.accessories import (ACCESSORIES_CATEGORIES, ACCESSORIES_KEY,
     ACCESSORIES_LEGACY_KEYS, ACCESSORIES_TITLE, unified_accessories_catalog)
@@ -124,3 +124,22 @@ class AccessoriesTests(unittest.TestCase):
         self.assertEqual(target['fallback_url'], 'https://t.me/texnikach/5251')
         keys = self.service._bulk_section_keys({'payload':{'section_keys':list(ACCESSORIES_LEGACY_KEYS)}})
         self.assertEqual(keys, [ACCESSORIES_KEY])
+
+    def test_legacy_http_actions_keep_working_with_the_combined_identity(self):
+        import inspect
+        import importlib
+        router = importlib.import_module('price_server.router')
+        repository = Mock()
+        repository.get_section.return_value = {'section_key':ACCESSORIES_KEY,'title':ACCESSORIES_TITLE}
+        repository.get_current_snapshot.return_value = {'snapshot_id':5}
+        repository.enqueue_job.return_value = {'job_id':123,'action':'edit','execute_at':self.now.isoformat()}
+        with patch.object(router,'get_repository',return_value=repository), \
+             patch.object(router,'get_service',return_value=object()), \
+             patch.object(router,'settings',self.settings):
+            arguments = ({'idempotency_key':'b2c4f720-ccda-4b72-aac3-5edc07161016',
+                          'request_fingerprint':'edit-current:accessories-pencil'}
+                         if 'idempotency_key' in inspect.signature(router._enqueue).parameters else {})
+            router._enqueue('accessories-pencil','edit',self.now,**arguments)
+        self.assertEqual(repository.get_section.call_args.args[0],ACCESSORIES_KEY)
+        self.assertEqual(repository.has_current_telegram_post.call_args.args[0],ACCESSORIES_KEY)
+        self.assertEqual(repository.enqueue_job.call_args.args[0],ACCESSORIES_KEY)

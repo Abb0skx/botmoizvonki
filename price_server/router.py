@@ -423,6 +423,8 @@ def _admin(request: Request, *, action: bool = False) -> None:
 
 
 def _section_or_404(section_key: str) -> dict[str, Any]:
+    from .accessories import canonical_publication_key
+    section_key = canonical_publication_key(section_key)
     if not SECTION_KEY_RE.fullmatch(section_key):
         raise HTTPException(status_code=404, detail="section_not_found")
     section = get_repository().get_section(section_key)
@@ -668,6 +670,8 @@ async def retry_price_quick_link_rotation(
 
 
 def _enqueue(section_key: str, action: str, execute_at: datetime) -> dict[str, Any]:
+    from .accessories import canonical_publication_key
+    section_key = canonical_publication_key(section_key)
     _section_or_404(section_key)
     get_service()
     if action == "edit" and not get_repository().has_current_telegram_post(
