@@ -123,13 +123,10 @@ QUICK_LINK_POST_SPECS: tuple[dict[str, Any], ...] = (
             _target("storage-all", 4671),
             _target(
                 "accessories-tags",
-                4824,
+                5251,
                 link_key="accessories-combined",
                 section_keys=(
                     "accessories-tags",
-                    "accessories-pencil",
-                    "accessories-keyboard",
-                    "accessories-mouse",
                 ),
             ),
         ],

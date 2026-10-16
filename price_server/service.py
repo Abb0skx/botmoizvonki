@@ -16,7 +16,9 @@ from .quick_links import (
     CATALOG_QUICK_POST_KEY,
     QUICK_LINK_POST_SPECS,
 )
-from .post_formatting import format_price_sections
+from .post_formatting import format_price_sections, merge_price_section_blocks
+from .accessories import (ACCESSORIES_KEY, ACCESSORIES_KEYS, ACCESSORIES_LEGACY_KEYS,
+                          ACCESSORIES_TITLE, canonical_publication_key)
 from .model_inbox import ModelInbox
 from .sheets_registry import (
     BotSettingsRegistry,
@@ -114,6 +116,31 @@ class PricePublicationService:
             if snapshot_policy == "pinned"
             else None
         )
+        if section_key in ACCESSORIES_KEYS:
+            # Resolve "latest" once so a simultaneous sync cannot mix sections
+            # from two snapshots while gathering the legacy accessory parts.
+            current = (self.repository.get_current_snapshot(include_payload=False)
+                       if not snapshot_id else None)
+            accessory_snapshot_id = snapshot_id or _value(current, "snapshot_id")
+            candidates = [
+                section for key in (*ACCESSORIES_LEGACY_KEYS, "accessories-combined")
+                if accessory_snapshot_id is not None
+                and (section := self.repository.get_section(key, snapshot_id=accessory_snapshot_id)) is not None
+            ]
+            if candidates:
+                combined = next((item for item in candidates
+                                 if str(_value(item, "title", "")) == ACCESSORIES_TITLE), None)
+                if combined is not None and len(candidates) == 1:
+                    section = dict(combined)
+                else:
+                    section = dict(candidates[0])
+                    source = [(str(_value(item, "section_key")), str(_value(item, "title")),
+                               self._raw_section_blocks(item)) for item in candidates]
+                    section["payload"] = dict(section.get("payload") or {})
+                    section["payload"]["telegram_blocks"] = merge_price_section_blocks(source)
+                    section["telegram_blocks"] = section["payload"]["telegram_blocks"]
+                section.update(section_key=ACCESSORIES_KEY, title=ACCESSORIES_TITLE)
+                return section
         section = self.repository.get_section(
             section_key,
             snapshot_id=snapshot_id or None,
@@ -141,7 +168,7 @@ class PricePublicationService:
         title = str(_value(section, "title", section_key)).strip()
         return format_price_sections([
             (section_key, title, cls._raw_section_blocks(section))
-        ])
+        ], single_message=section_key in ACCESSORIES_KEYS)
 
     def _current_posts(self, section_key: str, channel_id: str) -> list[Any]:
         posts = self.repository.list_telegram_posts(
@@ -166,7 +193,7 @@ class PricePublicationService:
         ):
             return []
         result = list(dict.fromkeys(
-            str(item).strip() for item in raw if str(item).strip()
+            canonical_publication_key(str(item).strip()) for item in raw if str(item).strip()
         ))
         return result[:100]
 
@@ -276,7 +303,7 @@ class PricePublicationService:
                 self._raw_section_blocks(section),
             )
             for section in sections
-        ])
+        ], single_message=(len(section_keys) == 1 and section_keys[0] == ACCESSORIES_KEY))
         if len(chunks) != len(expected_ids):
             return {
                 "status": "skipped",

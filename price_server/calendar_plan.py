@@ -168,12 +168,7 @@ _PLAN: dict[int, tuple[tuple[str, tuple[str, ...]], ...]] = {
         ("HDD, SSD, USB, MicroSD", ("storage-all",)),
         (
             "AirTag, SmartTag, Pencil, Keyboard, Mouse",
-            (
-                "accessories-tags",
-                "accessories-pencil",
-                "accessories-keyboard",
-                "accessories-mouse",
-            ),
+            ("accessories-tags",),
         ),
     ),
 }

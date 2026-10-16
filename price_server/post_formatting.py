@@ -15,6 +15,7 @@ from html.parser import HTMLParser
 from .telegram_api import (
     TELEGRAM_CHUNK_TARGET,
     TELEGRAM_MESSAGE_LIMIT,
+    TelegramContentTooLong,
     split_telegram_blocks,
     telegram_text_units,
 )
@@ -394,11 +395,29 @@ def _section_body_blocks(
 
 def format_price_sections(
     sections: Sequence[tuple[str, str, Sequence[str]]],
+    *,
+    single_message: bool = False,
 ) -> list[str]:
     """Return canonical Telegram HTML for one or more bound sections."""
 
     if not sections:
         raise ValueError("at least one price section is required")
+    if single_message:
+        bodies = []
+        for section_key, title, raw_blocks in sections:
+            content = "\n\n".join(
+                cleaned for raw in raw_blocks
+                if (cleaned := _clean_source_block(raw, section_key, title))
+            )
+            bodies.append(_heading_html(section_key, title) + ("\n\n" + content if content else ""))
+        rendered = (PRICE_INFO_UZ_HTML + "\n\n" + "\n\n".join(bodies)
+                    + "\n\n" + PRICE_NOTICE_HTML + "\n\n" + PRICE_INFO_RU_HTML)
+        if telegram_text_units(rendered) > TELEGRAM_MESSAGE_LIMIT:
+            raise TelegramContentTooLong(
+                "Объединённый прайс аксессуаров превышает лимит Telegram 4096. "
+                "Публикация остановлена без разделения и без потери товаров."
+            )
+        return [rendered]
     wrapper_units = telegram_text_units(
         PRICE_INFO_UZ_HTML
         + "\n\n\n\n"
@@ -433,4 +452,16 @@ def format_price_sections(
     ]
     if any(telegram_text_units(item) > TELEGRAM_MESSAGE_LIMIT for item in result):
         raise AssertionError("formatted price post exceeds Telegram limit")
+    return result
+
+
+def merge_price_section_blocks(sections: Sequence[tuple[str, str, Sequence[str]]]) -> list[str]:
+    """Keep every source model/link/price under compact subsection headings."""
+    result = []
+    for key, title, blocks in sections:
+        cleaned = "\n\n".join(
+            value for raw in blocks if (value := _clean_source_block(raw, key, title))
+        )
+        if cleaned:
+            result.append(f"<b>{html.escape(title, quote=False)}</b>\n{cleaned}")
     return result

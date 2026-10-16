@@ -434,13 +434,14 @@ class SortingService:
             return _state(db)
 
     def export(self) -> dict:
+        from .accessories import unified_accessories_catalog
         with _connection(self.db_path) as db:
             _require(db)
             _discover(db)
             state = _require(db)
             result = {"schema_version": 1, "source": "sqlite", "revision": state["revision"],
                       "updated_at": state["updated_at"],
-                      "catalog_groups": json.loads(state["catalog_groups_json"])}
+                      "catalog_groups": unified_accessories_catalog(json.loads(state["catalog_groups_json"]))}
             for dimension in ORDER_NAMES:
                 result[dimension] = {row[0]: row[1] for row in db.execute(
                     "SELECT name,rank FROM price_sorting_orders WHERE dimension=? ORDER BY rank,name",

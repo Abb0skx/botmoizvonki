@@ -1667,7 +1667,7 @@ class PriceRepositoryTests(unittest.TestCase):
             "dyson-hair": 5021,
             "voice-recorders-plaud": 4955,
             "storage-all": 4671,
-            "accessories-combined": 4824,
+            "accessories-combined": 5251,
             "smartphones-xiaomi-poco": 5031,
             "smartphones-samsung": 5037,
             "smartphones-iphone-18-duo": 5203,
@@ -2515,7 +2515,7 @@ class PriceRepositoryTests(unittest.TestCase):
                 now=now,
             )
 
-        self.assertEqual(len(repo.list_calendar_plan()), 95)
+        self.assertEqual(len(repo.list_calendar_plan()), 92)
         self.assertEqual(repo.materialize_due_schedules(now, horizon_days=1), 1)
         self.assertEqual(repo.materialize_due_schedules(now, horizon_days=1), 0)
         jobs = [job for job in repo.list_jobs(limit=20) if job["execute_at"] == execute_at.isoformat(timespec="microseconds")]
@@ -2551,9 +2551,9 @@ class PriceRepositoryTests(unittest.TestCase):
         })
         now = datetime(2027, 2, 28, 10, 0, tzinfo=timezone.utc)
         repo.ingest_snapshot(snapshot_with_sections(now, overflow_keys))
-        self.assertEqual(repo.materialize_due_schedules(now, horizon_days=1), 12)
+        self.assertEqual(repo.materialize_due_schedules(now, horizon_days=1), 9)
         jobs = repo.list_jobs(limit=50)
-        self.assertEqual(len(jobs), 12)
+        self.assertEqual(len(jobs), 9)
         self.assertEqual(
             {job["payload"]["plan_day"] for job in jobs},
             {1, 29, 30},
@@ -2578,7 +2578,7 @@ class PriceRepositoryTests(unittest.TestCase):
         )
         self.assertEqual(
             leap_repo.materialize_due_schedules(leap_now, horizon_days=1),
-            9,
+            6,
         )
         self.assertEqual(
             {
