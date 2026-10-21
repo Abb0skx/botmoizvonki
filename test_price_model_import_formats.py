@@ -266,6 +266,7 @@ class ModelImportFormatTests(unittest.TestCase):
         with self.assertRaises(EntryError) as caught:
             prepare_model_import("x" * 12001, 10)
         self.assertEqual(caught.exception.code, "invalid_model_draft")
+        self.assertIn("12000", caught.exception.details["message"])
 
 
 class ModelImportFormatApplyTests(unittest.TestCase):

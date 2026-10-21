@@ -75,7 +75,8 @@ def _site_model(columns: list[str], location: dict) -> dict:
 
 def _parse_site_models(raw_text: str) -> list[dict]:
     if not isinstance(raw_text, str) or not raw_text.strip() or len(raw_text) > MAX_TEXT:
-        raise EntryError("invalid_model_draft", limit=MAX_TEXT)
+        raise EntryError("invalid_model_draft", limit=MAX_TEXT,
+                         message=f"Вставьте список моделей длиной до {MAX_TEXT} символов.")
     normalized = raw_text.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
     lines = list(enumerate(normalized.split("\n"), 1))
     populated = [(number, line) for number, line in lines if line.strip()]
