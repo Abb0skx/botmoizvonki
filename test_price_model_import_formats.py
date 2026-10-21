@@ -8,11 +8,71 @@ from pathlib import Path
 from price_server.entry_catalog import EntryCatalogService, install_catalog
 from price_server.entry_store import initialize
 from price_server.model_import import prepare_model_import
+from price_server.model_inbox import parse_model_drafts
 from price_server.price_entry import EntryError
 from test_price_entry import sample
 
 
+RAY_BAN_COLORS = [
+    "Havana/Green", "Matte Black/Clear",
+    "Matte Black/Clear to Graphite Green Transitions", "Matte Black/Grey",
+    "Shiny Black/Clear to Grey Transitions", "Shiny Black/Polarized Green",
+    "Transparent Black/Clear to Aquamarine Transitions",
+    "Transparent Matte Ocean Blue/Clear to Grey Transitions",
+]
+RAY_BAN_DRAFT = (
+    "0. 120\n1. Ray Ban Meta Wayfarer Gen 3\n2. S(50mm), L(53mm)\n3. "
+    + ", ".join(RAY_BAN_COLORS)
+)
+
+
 class ModelImportFormatTests(unittest.TestCase):
+    def test_numbered_ray_ban_long_color_list_keeps_every_color_and_size(self):
+        self.assertGreater(len(", ".join(RAY_BAN_COLORS)), 250)
+        expected = [{"memory": memory, "color": color}
+                    for memory in ("S(50mm)", "L(53mm)")
+                    for color in RAY_BAN_COLORS + [""]]
+        parsed = parse_model_drafts(RAY_BAN_DRAFT)
+        self.assertEqual(parsed[0]["category_id"], 120)
+        self.assertEqual(parsed[0]["model_name"], "Ray Ban Meta Wayfarer Gen 3")
+        self.assertEqual(parsed[0]["variants"], expected)
+        preview = prepare_model_import(RAY_BAN_DRAFT, 10)
+        self.assertEqual(preview["variant_count"], 18)
+        self.assertEqual(preview["models"][0]["variants"], expected)
+        self.assertEqual(preview["models"][0]["category_id"], 10)
+        self.assertEqual(preview["sorting"]["colors"], RAY_BAN_COLORS)
+        self.assertEqual(preview["warnings"], ["source_category_ignored"])
+        self.assertEqual(preview, prepare_model_import(RAY_BAN_DRAFT, 10))
+
+    def test_numbered_long_memory_list_is_limited_per_item(self):
+        memories = [f"Size {index:02d}(50mm)" for index in range(30)]
+        self.assertGreater(len(", ".join(memories)), 250)
+        text = "0. 120\n1. Watch\n2. " + ", ".join(memories) + "\n3. Black"
+        preview = prepare_model_import(text, 10)
+        self.assertEqual(preview["sorting"]["memories"], memories)
+        self.assertEqual(preview["variant_count"], 30)
+
+    def test_numbered_individual_field_and_overall_text_limits_remain(self):
+        for text in (
+            "1. " + "x" * 251 + "\n2. 50mm\n3. Black",
+            "1. Watch\n2. " + "x" * 101 + "\n3. Black",
+            "1. Watch\n2. 50mm\n3. " + "x" * 151,
+            RAY_BAN_DRAFT + " " * 12000,
+        ):
+            with self.subTest(text=text[:30]), self.assertRaises(EntryError) as caught:
+                prepare_model_import(text, 10)
+            self.assertEqual(caught.exception.code, "invalid_model_draft")
+
+    def test_numbered_long_lists_still_respect_variant_limit(self):
+        colors = ", ".join(f"Named color {index:02d}" for index in range(19))
+        self.assertGreater(len(colors), 250)
+        def text(count):
+            return "1. Watch\n2. " + ",".join(map(str, range(count))) + "\n3. " + colors
+        self.assertEqual(prepare_model_import(text(25), 10)["variant_count"], 500)
+        with self.assertRaises(EntryError) as caught:
+            prepare_model_import(text(26), 10)
+        self.assertEqual(caught.exception.code, "invalid_catalog_variants")
+
     def test_plain_blocks_expand_only_explicit_combinations(self):
         preview = prepare_model_import(
             "Phone Pro\n256 GB, 512 GB\nBlack, Silver\n\n"
@@ -140,6 +200,27 @@ class ModelImportFormatTests(unittest.TestCase):
 
 
 class ModelImportFormatApplyTests(unittest.TestCase):
+    def test_numbered_long_list_preview_and_apply_preserve_all_variants(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "price.db"
+            initialize(path, [{"sheet_id": 1, "title": "1-Supplier", "rows": [sample()]}])
+            install_catalog(path, [{"category_id": 10, "name": "Phones"}],
+                            max_product_id=100, max_version_id=200)
+            service = EntryCatalogService(path)
+            preview = service.preview_import(RAY_BAN_DRAFT, 10)
+            operation = str(uuid.uuid4())
+            result = service.import_models(RAY_BAN_DRAFT, 10, preview["preview_hash"], operation)
+            self.assertEqual(result["created_count"], 18)
+            self.assertEqual(service.import_models(RAY_BAN_DRAFT, 10, preview["preview_hash"], operation), result)
+            actual = service.model(101)
+            self.assertEqual(actual["model_name"], "Ray Ban Meta Wayfarer Gen 3")
+            self.assertEqual([{k: item[k] for k in ("memory", "color")}
+                              for item in actual["variants"]], preview["models"][0]["variants"])
+            self.assertEqual(len(actual["variants"]), 18)
+            with sqlite3.connect(path) as db:
+                self.assertEqual(db.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+                self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
+
     def test_new_formats_preview_and_apply_exact_variants_idempotently(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "price.db"

@@ -97,7 +97,10 @@ def _parse_numbered(lines: list[str]) -> list[dict]:
         match = _NUMBERED.fullmatch(line)
         if match is None:
             raise EntryError("model_draft_numbered_format")
-        prefix, value = int(match.group(1)), _text(match.group(2), 250)
+        prefix = int(match.group(1))
+        # Memory/color lines are lists, not single names. Validate their
+        # individual values in finish(), keeping the overall draft bound.
+        value = _text(match.group(2), 250 if prefix in (0, 1) else MAX_TEXT)
         if prefix == 0:
             finish()
             if not re.fullmatch(r"[1-9][0-9]{0,8}", value):
