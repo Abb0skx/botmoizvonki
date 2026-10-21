@@ -135,7 +135,7 @@
       const line = raw.replace(/^[•·▪️\-–—]+\s*/, "");
       if (line.split("|").length !== 2) throw new Error("В каждой строке нужен один разделитель | между памятью и цветом.");
       const [memory, colors] = line.split("|").map(value => value.trim());
-      for (const color of colors.split(",").map(value => value.trim())) result.push({memory, color});
+      for (const color of colors.split(/[,;，；،]/).map(value => value.trim())) result.push({memory, color});
     }
     return result;
   }
@@ -236,7 +236,7 @@
   async function editModel(productId) { try { notice("Загружаем модель…"); const detail = await api("models/" + productId); notice(""); openEditor(detail); } catch (error) { notice(error.message, true); } }
   const clean = value => value.normalize("NFC").trim().replace(/\s+/g, " ");
   const unique = values => [...new Map(values.map(value => [value.toLocaleLowerCase("ru"), value])).values()];
-  function dimensionValues(raw) { return unique(raw.split(/[,;，\n]+/).map(clean).filter(Boolean)); }
+  function dimensionValues(raw) { return unique(raw.split(/[,;，；،\r\n]+/).map(clean).filter(Boolean)); }
   const variantKey = variant => JSON.stringify([variant.memory, variant.color]);
   function singleVariants() {
     const memories = dimensionValues($("new-memories").value), colors = dimensionValues($("new-colors").value);
@@ -334,7 +334,7 @@
     const warning = $("preview-warning");
     const warnings = [];
     if (data.warnings.includes("source_category_ignored")) warnings.push(`Номера из строк 0 проигнорированы. Все модели попадут в «${data.category_name}».`);
-    if (state.mode === "batch" && /^\s*[0123][.)]/m.test($("import-text").value) && data.models.some(item => item.variants.some(v => !v.color) && item.variants.some(v => v.color))) warnings.push("В привычном нумерованном формате также создаётся вариант без цвета. Он показан ниже. Для точных сочетаний используйте простой список из трёх строк.");
+    if (state.mode === "batch" && /^\s*[0123][.)：:．）]/m.test($("import-text").value) && data.models.some(item => item.variants.some(v => !v.color) && item.variants.some(v => v.color))) warnings.push("В привычном нумерованном формате также создаётся вариант без цвета. Он показан ниже. Для точных сочетаний используйте простой список из трёх строк.");
     warning.hidden = !warnings.length; warning.textContent = warnings.join("\n");
     $("preview-models").replaceChildren(...data.models.map(item => {
       const card = node("article", undefined, "review-model"), header = node("header");

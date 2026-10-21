@@ -11,7 +11,7 @@ from .price_entry import EntryError
 
 MAX_IMPORT_VARIANTS = 5_000
 _LEGACY_HEADER = re.compile(
-    r"^(?:[0123]\s*[.)]|(?:категория|модель)\s*:|(?:добавить|новая)\s+модель\s*:?\s*$)",
+    r"^(?:[0123]\s*[.)：:．）]|(?:категория|модель)\s*:|(?:добавить|новая)\s+модель\s*:?\s*$)",
     re.I,
 )
 _TABLE_HEADERS = {
@@ -33,7 +33,7 @@ def _site_text(value: str, maximum: int, field: str, location: dict) -> str:
 def _site_values(value: str, maximum: int, field: str, location: dict) -> list[str]:
     values: list[str] = []
     seen: set[str] = set()
-    for raw in re.split(r"[,;，]", value):
+    for raw in re.split(r"[,;，；،]", value):
         item = _site_text(raw, maximum, field, location)
         if not item:
             continue
@@ -76,8 +76,12 @@ def _site_model(columns: list[str], location: dict) -> dict:
 def _parse_site_models(raw_text: str) -> list[dict]:
     if not isinstance(raw_text, str) or not raw_text.strip() or len(raw_text) > MAX_TEXT:
         raise EntryError("invalid_model_draft", limit=MAX_TEXT)
-    lines = list(enumerate(raw_text.replace("\r\n", "\n").replace("\r", "\n").split("\n"), 1))
+    normalized = raw_text.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+    lines = list(enumerate(normalized.split("\n"), 1))
     populated = [(number, line) for number, line in lines if line.strip()]
+    if not populated:
+        raise EntryError("invalid_model_draft", limit=MAX_TEXT,
+                         message="Вставьте хотя бы одну модель в список.")
     first = populated[0][1].strip()
     legacy_plain = (len(populated) >= 3
                     and all("|" not in line and "\t" not in line for _, line in populated[:2])

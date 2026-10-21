@@ -20,7 +20,9 @@ MAX_VARIANTS = 500
 _PREFIX = re.compile(r"^(?:добавить|новая)\s+модель\s*:?\s*$", re.I)
 _CATEGORY = re.compile(r"^категория\s*:\s*(.+)$", re.I)
 _MODEL = re.compile(r"^модель\s*:\s*(.+)$", re.I)
-_NUMBERED = re.compile(r"^\s*([0123])\s*[.)]\s*(.*?)\s*$")
+_NUMBERED = re.compile(r"^\s*([0123])\s*[.)：:．）]\s*(.*?)\s*$")
+_SEPARATORS = ",;，；،"
+_BULLET = re.compile(r"^(?:[•·▪●◦*]|[-–—])\s+(.+)$")
 
 
 def _tables(db: sqlite3.Connection) -> None:
@@ -40,18 +42,21 @@ def _tables(db: sqlite3.Connection) -> None:
     )""")
 
 
-def _text(value: str, maximum: int) -> str:
+def _text(value: str, maximum: int, **location) -> str:
     value = " ".join(unicodedata.normalize("NFC", str(value)).split())
     if len(value) > maximum or any(ord(character) < 32 for character in value):
-        raise EntryError("invalid_model_draft")
+        field = location.get("field", "Значение")
+        raise EntryError("invalid_model_draft", **location, limit=maximum,
+                         message=f"Поле «{field}» должно содержать не более {maximum} символов "
+                                 "и не должно содержать управляющих символов.")
     return value
 
 
-def _values(value: str, maximum: int) -> tuple[str, ...]:
+def _values(value: str, maximum: int, **location) -> tuple[str, ...]:
     result: list[str] = []
     seen: set[str] = set()
-    for raw in value.replace(";", ",").replace("，", ",").split(","):
-        item = _text(raw, maximum)
+    for raw in re.split("[" + _SEPARATORS + "]", value):
+        item = _text(raw, maximum, **location)
         if item and item.casefold() not in seen:
             seen.add(item.casefold())
             result.append(item)
@@ -65,6 +70,9 @@ def _variants(memories: tuple[str, ...], colors: tuple[str, ...]) -> list[dict]:
     materialized_colors = real_colors + (("",) if len(real_colors) > 1 else ())
     if not materialized_colors:
         materialized_colors = ("",)
+    if len(memories) * len(materialized_colors) > MAX_VARIANTS:
+        raise EntryError("invalid_catalog_variants", limit=MAX_VARIANTS,
+                         message=f"У одной модели может быть не более {MAX_VARIANTS} конфигураций.")
     result = [
         {"memory": memory, "color": color}
         for memory in memories
@@ -75,95 +83,124 @@ def _variants(memories: tuple[str, ...], colors: tuple[str, ...]) -> list[dict]:
     return result
 
 
-def _parse_numbered(lines: list[str]) -> list[dict]:
+def _parse_numbered(lines: list[tuple[int, str]]) -> list[dict]:
     models: list[dict] = []
     active_category: int | None = None
     current: dict | None = None
     seen: set[str] = set()
+    field_lines: dict[int, int] = {}
+    last_field: int | None = None
+    separate_lines = False
 
     def finish() -> None:
         nonlocal current
         if current is None:
             return
-        memories = _values(current.pop("memory_text", ""), 100)
-        colors = _values(current.pop("color_text", ""), 150)
+        memories = _values(current.pop("memory_text", ""), 100,
+                           field="Память / размер", line=field_lines.get(2, field_lines[1]))
+        colors = _values(current.pop("color_text", ""), 150,
+                         field="Цвета", line=field_lines.get(3, field_lines[1]))
         current["variants"] = _variants(memories, colors)
         models.append(current)
         if len(models) > MAX_MODELS:
             raise EntryError("invalid_catalog_variants")
         current = None
 
-    for line in lines:
+    for line_number, line in lines:
         match = _NUMBERED.fullmatch(line)
         if match is None:
-            raise EntryError("model_draft_numbered_format")
+            bullet = _BULLET.fullmatch(line)
+            key = "memory_text" if last_field == 2 else "color_text"
+            if current is not None and last_field in (2, 3):
+                previous = current[key]
+                # Continuations must be explicit: a list starting on its own
+                # line, a bullet, or a separator at the end of the prior line.
+                if separate_lines or bullet or previous.endswith(tuple(_SEPARATORS)):
+                    value = bullet.group(1) if bullet else line
+                    separator = ", " if previous and not previous.endswith(tuple(_SEPARATORS)) else " "
+                    current[key] += separator + value
+                    continue
+            raise EntryError("model_draft_numbered_format", line=line_number,
+                             message="Ожидается строка 0, 1, 2 или 3. Продолжайте список "
+                                     "после запятой или начните строку с маркера •.")
         prefix = int(match.group(1))
         # Memory/color lines are lists, not single names. Validate their
         # individual values in finish(), keeping the overall draft bound.
-        value = _text(match.group(2), 250 if prefix in (0, 1) else MAX_TEXT)
+        fields = {0: "Категория", 1: "Модель", 2: "Память / размер", 3: "Цвета"}
+        value = _text(match.group(2), 250 if prefix in (0, 1) else MAX_TEXT,
+                      field=fields[prefix], line=line_number)
         if prefix == 0:
             finish()
             if not re.fullmatch(r"[1-9][0-9]{0,8}", value):
-                raise EntryError("model_draft_category_format")
+                raise EntryError("model_draft_category_format", line=line_number)
             active_category = int(value)
         elif prefix == 1:
             finish()
             if not value or value.casefold() in seen:
-                raise EntryError("model_draft_model_format")
+                raise EntryError("model_draft_model_format", line=line_number,
+                                 message="Укажите непустое уникальное название модели после 1.")
             seen.add(value.casefold())
             current = {
                 "category_id": active_category,
                 "category_name": "",
                 "model_name": value,
             }
+            field_lines = {1: line_number}
         elif current is None:
-            raise EntryError("model_draft_model_format")
+            raise EntryError("model_draft_model_format", line=line_number)
         elif prefix == 2:
             if "memory_text" in current or "color_text" in current:
-                raise EntryError("model_draft_numbered_format")
+                raise EntryError("model_draft_numbered_format", line=line_number)
             current["memory_text"] = value
         else:
             if "color_text" in current:
-                raise EntryError("model_draft_numbered_format")
+                raise EntryError("model_draft_numbered_format", line=line_number)
             current["color_text"] = value
+        field_lines[prefix] = line_number
+        last_field = prefix
+        separate_lines = not value
     finish()
     if not models:
         raise EntryError("model_draft_model_format")
     return models
 
 
-def _parse_labelled(lines: list[str]) -> list[dict]:
-    if lines and _PREFIX.fullmatch(lines[0]):
+def _parse_labelled(lines: list[tuple[int, str]]) -> list[dict]:
+    if lines and _PREFIX.fullmatch(lines[0][1]):
         lines.pop(0)
     category_name = model_name = None
     remaining = []
-    for line in lines:
+    for line_number, line in lines:
         category = _CATEGORY.fullmatch(line)
         model = _MODEL.fullmatch(line)
         if category and category_name is None:
-            category_name = _text(category.group(1), 200)
+            category_name = _text(category.group(1), 200, field="Категория", line=line_number)
         elif model and model_name is None:
-            model_name = _text(model.group(1), 250)
+            model_name = _text(model.group(1), 250, field="Модель", line=line_number)
         else:
-            remaining.append(line)
+            remaining.append((line_number, line))
     if category_name is None and model_name is None and len(remaining) >= 3:
-        category_name, model_name = remaining.pop(0), remaining.pop(0)
+        category_line, raw_category = remaining.pop(0)
+        model_line, raw_model = remaining.pop(0)
+        category_name = _text(raw_category, 200, field="Категория", line=category_line)
+        model_name = _text(raw_model, 250, field="Модель", line=model_line)
     if not category_name or not model_name:
         raise EntryError("model_draft_headers_required")
     variants: list[dict] = []
     seen: set[tuple[str, str]] = set()
-    for line in remaining:
+    for line_number, line in remaining:
         line = re.sub(r"^[•·▪️\-–—]+\s*", "", line).strip()
         if line.casefold() in {"память | цвет", "memory | color"}:
             continue
         if line.count("|") != 1:
-            raise EntryError("model_draft_variant_format")
+            raise EntryError("model_draft_variant_format", line=line_number,
+                             message="Укажите память или размер, затем | и список цветов.")
         memory, colors = (part.strip() for part in line.split("|", 1))
-        for color in _values(colors, 150):
-            item = {"memory": _text(memory, 100), "color": color}
+        for color in _values(colors, 150, field="Цвета", line=line_number):
+            item = {"memory": _text(memory, 100, field="Память / размер", line=line_number), "color": color}
             marker = (item["memory"].casefold(), item["color"].casefold())
             if marker in seen:
-                raise EntryError("duplicate_catalog_variant", 409)
+                raise EntryError("duplicate_catalog_variant", 409, line=line_number)
             seen.add(marker)
             variants.append(item)
     if not 1 <= len(variants) <= MAX_VARIANTS:
@@ -178,9 +215,11 @@ def _parse_labelled(lines: list[str]) -> list[dict]:
 
 def parse_model_drafts(raw_text: str) -> list[dict]:
     if not isinstance(raw_text, str) or not raw_text.strip() or len(raw_text) > MAX_TEXT:
-        raise EntryError("invalid_model_draft")
-    lines = [line.strip() for line in raw_text.replace("\r", "").split("\n") if line.strip()]
-    if lines and _NUMBERED.fullmatch(lines[0]):
+        raise EntryError("invalid_model_draft", limit=MAX_TEXT,
+                         message=f"Вставьте список моделей длиной до {MAX_TEXT} символов.")
+    normalized = raw_text.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+    lines = [(number, line.strip()) for number, line in enumerate(normalized.split("\n"), 1) if line.strip()]
+    if lines and _NUMBERED.fullmatch(lines[0][1]):
         return _parse_numbered(lines)
     return _parse_labelled(lines)
 

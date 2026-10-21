@@ -27,6 +27,75 @@ RAY_BAN_DRAFT = (
 
 
 class ModelImportFormatTests(unittest.TestCase):
+    def test_arbitrary_models_share_the_same_list_rules(self):
+        cases = [
+            ("Future Phone Pro (SIM + eSIM)", "8/256 GB, 12/512 GB", "Purple/Gold, Silver"),
+            ("New Watch Titanium (Loop)", "42mm, 49mm", "Burgundy/Olive, Natural"),
+            ("Other Glasses Gen 9", "S(50mm), L(53mm)", "Matte Ocean Blue/Clear, Havana/Green"),
+            ("Unknown accessory №42", "", ""),
+        ]
+        for model, memories, colors in cases:
+            with self.subTest(model=model):
+                preview = prepare_model_import(f"0. 120\n1. {model}\n2. {memories}\n3. {colors}", 10)
+                self.assertEqual(preview["models"][0]["model_name"], model)
+                self.assertEqual(preview["sorting"]["memories"], memories.split(", ") if memories else [])
+                self.assertEqual(preview["sorting"]["colors"], colors.split(", ") if colors else [])
+
+    def test_alternate_separators_are_consistent_across_formats(self):
+        for separator in (",", ";", "，", "；", "،"):
+            for text in (
+                f"1. New Model\n2. S(50mm){separator}L(53mm)\n3. Black/Clear{separator}Havana/Green",
+                f"New Model | S(50mm){separator}L(53mm) | Black/Clear{separator}Havana/Green",
+                f"New Model\nS(50mm){separator}L(53mm)\nBlack/Clear{separator}Havana/Green",
+                f"Категория: Glasses\nМодель: New Model\nS(50mm) | Black/Clear{separator}Havana/Green",
+            ):
+                with self.subTest(separator=separator, text=text):
+                    preview = prepare_model_import(text, 10)
+                    self.assertEqual(preview["sorting"]["colors"], ["Black/Clear", "Havana/Green"])
+                    self.assertEqual(preview["sorting"]["memories"][0], "S(50mm)")
+
+    def test_numbered_continuations_match_the_original_preview(self):
+        expected = prepare_model_import("0. 120\n1. Model\n2. S(50mm), L(53mm)\n3. Black/Clear, Havana/Green", 10)
+        texts = [
+            "0: 120\n1: Model\n2: S(50mm),\nL(53mm)\n3: Black/Clear;\nHavana/Green",
+            "0）120\n1）Model\n2）\nS(50mm)\nL(53mm)\n3）\nBlack/Clear\nHavana/Green",
+            "0. 120\n1. Model\n2. S(50mm)\n• L(53mm)\n3. Black/Clear\n• Havana/Green",
+        ]
+        for text in texts:
+            for newline in ("\n", "\r\n", "\r"):
+                with self.subTest(text=text, newline=repr(newline)):
+                    preview = prepare_model_import("\ufeff" + text.replace("\n", newline), 10)
+                    self.assertEqual(preview, expected)
+
+    def test_multiple_numbered_blocks_preserve_different_categories_and_dimensions(self):
+        preview = prepare_model_import(
+            "0. 26\n1. Watch\n2. 42mm,\n46mm\n3. Black\n• Silver\n\n"
+            "0: 120\n1: Glasses\n2: L(53mm)\n3: Clear/Green\n\n"
+            "1. Cable\n2. 2m\n3. White", 10)
+        self.assertEqual(preview["source_category_ids"], [26, 120])
+        self.assertEqual([m["model_name"] for m in preview["models"]], ["Watch", "Glasses", "Cable"])
+        self.assertEqual(preview["models"][1]["variants"], [{"memory": "L(53mm)", "color": "Clear/Green"}])
+        self.assertEqual(preview["models"][2]["variants"], [{"memory": "2m", "color": "White"}])
+
+    def test_numbered_errors_identify_the_field_and_physical_line(self):
+        for prefix, field, size in ((1, "Модель", 251), (2, "Память / размер", 101), (3, "Цвета", 151)):
+            lines = ["0. 120", "", "1. Model", "2. Size", "3. Color"]
+            line_number = {1: 3, 2: 4, 3: 5}[prefix]
+            lines[line_number - 1] = f"{prefix}. " + "x" * size
+            with self.subTest(field=field), self.assertRaises(EntryError) as caught:
+                prepare_model_import("\n".join(lines), 10)
+            self.assertEqual(caught.exception.details["field"], field)
+            self.assertEqual(caught.exception.details["line"], line_number)
+            self.assertIn(field, caught.exception.details["message"])
+        with self.assertRaises(EntryError) as caught:
+            prepare_model_import("1. Model\n2. Size\n3. Color\nUnexpected unmarked text", 10)
+        self.assertEqual(caught.exception.details["line"], 4)
+        self.assertIn("маркер", caught.exception.details["message"])
+
+    def test_empty_bom_text_is_a_validation_error(self):
+        with self.assertRaises(EntryError):
+            prepare_model_import("\ufeff  \r\n ", 10)
+
     def test_numbered_ray_ban_long_color_list_keeps_every_color_and_size(self):
         self.assertGreater(len(", ".join(RAY_BAN_COLORS)), 250)
         expected = [{"memory": memory, "color": color}
